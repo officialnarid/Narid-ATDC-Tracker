@@ -1,0 +1,226 @@
+{
+  "entities": {
+    "Employee": {
+      "title": "Employee",
+      "description": "Master employee record",
+      "type": "object",
+      "properties": {
+        "employeeId": { "type": "string", "description": "Unique Employee ID e.g. JMD12345" },
+        "employeeName": { "type": "string", "description": "Full name of the employee" },
+        "employeeType": { "type": "string", "enum": ["Permanent", "Staff", "Offroll"] },
+        "section": { "type": "string", "description": "Section assigned" },
+        "department": { "type": "string", "description": "Department assigned" },
+        "floor": { "type": "string", "description": "Floor assigned" },
+        "designation": { "type": "string", "description": "Job designation" },
+        "qrCodeToken": { "type": "string", "description": "Unique security token for QR validation" },
+        "employeeStatus": { "type": "string", "enum": ["Active", "Inactive"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["employeeId", "employeeName", "employeeType", "section", "department", "floor", "employeeStatus"]
+    },
+    "Attendance": {
+      "title": "Attendance",
+      "description": "Daily attendance record per employee and shift cycle",
+      "type": "object",
+      "properties": {
+        "employeeId": { "type": "string" },
+        "employeeNameSnapshot": { "type": "string" },
+        "employeeTypeSnapshot": { "type": "string" },
+        "floorIdSnapshot": { "type": "string" },
+        "sectionIdSnapshot": { "type": "string" },
+        "departmentIdSnapshot": { "type": "string" },
+        "shiftId": { "type": "string" },
+        "shiftDate": { "type": "string", "description": "YYYY-MM-DD shift date" },
+        "punchIn": { "type": "string", "format": "date-time" },
+        "scheduledPunchOut": { "type": "string" },
+        "actualPunchOut": { "type": "string", "format": "date-time" },
+        "effectivePunchOut": { "type": "string", "format": "date-time" },
+        "punchOutType": { "type": "string", "enum": ["ACTUAL", "AUTO", "NONE"] },
+        "regularDutyMinutes": { "type": "number" },
+        "overtimeMinutes": { "type": "number" },
+        "attendanceStatus": { "type": "string", "enum": ["PRESENT", "LATE", "MISSED PUNCH OUT", "AUTO CLOSED", "COMPLETED", "EARLY EXIT"] },
+        "qrTokenReference": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["employeeId", "shiftId", "shiftDate", "punchIn", "attendanceStatus"]
+    },
+    "Floor": {
+      "title": "Floor",
+      "description": "Floor configuration master",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "code": { "type": "string" },
+        "order": { "type": "number" },
+        "status": { "type": "string", "enum": ["Active", "Inactive"] }
+      },
+      "required": ["id", "name", "status"]
+    },
+    "Section": {
+      "title": "Section",
+      "description": "Section configuration master",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "code": { "type": "string" },
+        "floorId": { "type": "string" },
+        "status": { "type": "string", "enum": ["Active", "Inactive"] }
+      },
+      "required": ["id", "name", "status"]
+    },
+    "Department": {
+      "title": "Department",
+      "description": "Department configuration master",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "code": { "type": "string" },
+        "status": { "type": "string", "enum": ["Active", "Inactive"] }
+      },
+      "required": ["id", "name", "status"]
+    },
+    "Shift": {
+      "title": "Shift",
+      "description": "Shift timing configuration master",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "startTime": { "type": "string", "description": "HH:mm format (e.g. 09:00)" },
+        "endTime": { "type": "string", "description": "HH:mm format (e.g. 17:30)" },
+        "scheduledDurationMinutes": { "type": "number", "description": "Default 510 (8h30m)" },
+        "punchInWindowStart": { "type": "string", "description": "HH:mm window start" },
+        "punchInWindowEnd": { "type": "string", "description": "HH:mm window end" },
+        "isOvernight": { "type": "boolean" },
+        "gracePeriodMinutes": { "type": "number" },
+        "status": { "type": "string", "enum": ["Active", "Inactive"] }
+      },
+      "required": ["id", "name", "startTime", "endTime", "scheduledDurationMinutes"]
+    },
+    "ShiftRoster": {
+      "title": "ShiftRoster",
+      "description": "Daily scheduled expected attendance roster",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "shiftDate": { "type": "string" },
+        "shiftId": { "type": "string" },
+        "employeeId": { "type": "string" },
+        "rosterStatus": { "type": "string", "enum": ["SCHEDULED", "LEAVE", "WEEKLY_OFF", "HOLIDAY"] },
+        "remarks": { "type": "string" }
+      },
+      "required": ["shiftDate", "shiftId", "employeeId", "rosterStatus"]
+    },
+    "PunchLog": {
+      "title": "PunchLog",
+      "description": "Raw scan and punch audit log",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "employeeId": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "action": { "type": "string", "enum": ["PUNCH_IN", "PUNCH_OUT", "REJECTED_DUPLICATE", "REJECTED_INACTIVE", "REJECTED_TOKEN", "REJECTED_SHIFT"] },
+        "rawPayload": { "type": "string" },
+        "scannerDevice": { "type": "string" },
+        "message": { "type": "string" }
+      },
+      "required": ["employeeId", "timestamp", "action"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "System event audit trail",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "action": { "type": "string" },
+        "employeeId": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "oldValue": { "type": "string" },
+        "newValue": { "type": "string" },
+        "actionSource": { "type": "string" },
+        "reason": { "type": "string" }
+      },
+      "required": ["action", "timestamp", "actionSource"]
+    },
+    "SystemSetting": {
+      "title": "SystemSetting",
+      "description": "Global application configuration",
+      "type": "object",
+      "properties": {
+        "companyName": { "type": "string" },
+        "websiteName": { "type": "string" },
+        "timezone": { "type": "string" },
+        "dateFormat": { "type": "string" },
+        "timeFormat": { "type": "string" },
+        "autoPunchOutEnabled": { "type": "boolean" },
+        "lateGraceMinutes": { "type": "number" },
+        "overtimeThresholdMinutes": { "type": "number" }
+      },
+      "required": ["companyName", "websiteName", "timezone"]
+    },
+    "UserRole": {
+      "title": "UserRole",
+      "description": "RBAC user role structure for future authentication activation",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "role": { "type": "string", "enum": ["SUPER_ADMIN", "ADMIN", "USER"] },
+        "status": { "type": "string", "enum": ["Active", "Inactive"] },
+        "modulesAllowed": { "type": "string" }
+      },
+      "required": ["id", "name", "role", "status"]
+    }
+  },
+  "firestore": {
+    "/employees/{employeeId}": {
+      "schema": "Employee",
+      "description": "Employee master records"
+    },
+    "/attendance/{attendanceId}": {
+      "schema": "Attendance",
+      "description": "Daily employee attendance records"
+    },
+    "/floors/{floorId}": {
+      "schema": "Floor",
+      "description": "Floor master records"
+    },
+    "/sections/{sectionId}": {
+      "schema": "Section",
+      "description": "Section master records"
+    },
+    "/departments/{departmentId}": {
+      "schema": "Department",
+      "description": "Department master records"
+    },
+    "/shifts/{shiftId}": {
+      "schema": "Shift",
+      "description": "Configured shift records"
+    },
+    "/shift_rosters/{rosterId}": {
+      "schema": "ShiftRoster",
+      "description": "Expected roster records"
+    },
+    "/punch_logs/{logId}": {
+      "schema": "PunchLog",
+      "description": "Raw scan punch logs"
+    },
+    "/audit_logs/{auditId}": {
+      "schema": "AuditLog",
+      "description": "System mutation audit logs"
+    },
+    "/system_settings/{settingId}": {
+      "schema": "SystemSetting",
+      "description": "Global system settings"
+    },
+    "/user_roles/{userRoleId}": {
+      "schema": "UserRole",
+      "description": "User rights and role master"
+    }
+  }
+}

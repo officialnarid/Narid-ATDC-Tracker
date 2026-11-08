@@ -1,0 +1,78 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Phase 1 (internal testing environment before active user login activation)
+    // list operations do not bind document path variables, so list is allowed directly.
+    // get, create, update, delete validate document IDs to prevent ID injection.
+
+    match /employees/{employeeId} {
+      allow list: if true;
+      allow get, create, update, delete: if isValidId(employeeId);
+    }
+
+    match /attendance/{attendanceId} {
+      allow list: if true;
+      allow get, create, update, delete: if isValidId(attendanceId);
+    }
+
+    match /lines/{lineId} {
+      allow list: if true;
+      allow get, create, update, delete: if isValidId(lineId);
+    }
+
+    match /floors/{floorId} {
+      allow list: if true;
+      allow get, create, update, delete: if isValidId(floorId);
+    }
+
+    match /sections/{sectionId} {
+      allow list: if true;
+      allow get, create, update, delete: if isValidId(sectionId);
+    }
+
+    match /departments/{departmentId} {
+      allow list: if true;
+      allow get, create, update, delete: if isValidId(departmentId);
+    }
+
+    match /shifts/{shiftId} {
+      allow list: if true;
+      allow get, create, update, delete: if isValidId(shiftId);
+    }
+
+    match /shift_rosters/{rosterId} {
+      allow list: if true;
+      allow get, create, update, delete: if isValidId(rosterId);
+    }
+
+    match /punch_logs/{logId} {
+      allow list: if true;
+      allow get, create, update, delete: if isValidId(logId);
+    }
+
+    match /audit_logs/{auditId} {
+      allow list: if true;
+      allow get, create, update, delete: if isValidId(auditId);
+    }
+
+    match /system_settings/{settingId} {
+      allow list: if true;
+      allow get, create, update, delete: if isValidId(settingId);
+    }
+
+    match /user_roles/{userRoleId} {
+      allow list: if true;
+      allow get, create, update, delete: if isValidId(userRoleId);
+    }
+
+    // Fallback deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

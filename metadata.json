@@ -1,0 +1,6 @@
+{
+  "name": "MANPOWER TRACKER",
+  "description": "Industrial Manpower Attendance Management System with QR Punch In/Out, automatic shift closing, duty and overtime calculations, and real-time production line availability.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
