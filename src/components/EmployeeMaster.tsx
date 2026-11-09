@@ -33,6 +33,8 @@ import {
   deleteEmployee 
 } from '../services/employeeService';
 import QRCode from 'qrcode';
+import { UserRoleRecord } from '../types';
+import { RolePermissionRecord, hasModulePermission } from '../services/permissionService';
 
 interface EmployeeMasterProps {
   employees: Employee[];
@@ -40,6 +42,8 @@ interface EmployeeMasterProps {
   sections: Section[];
   departments: Department[];
   onRefresh: () => void;
+  currentUserRole?: UserRoleRecord | null;
+  rolePermissions?: Record<string, RolePermissionRecord>;
 }
 
 export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
@@ -48,7 +52,13 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
   sections,
   departments,
   onRefresh,
+  currentUserRole,
+  rolePermissions,
 }) => {
+  const canAdd = hasModulePermission(currentUserRole?.role, 'employees', 'add', rolePermissions);
+  const canEdit = hasModulePermission(currentUserRole?.role, 'employees', 'edit', rolePermissions);
+  const canDelete = hasModulePermission(currentUserRole?.role, 'employees', 'delete', rolePermissions);
+
   const [searchTerm, setSearchTerm] = useState('');
   const [filterFloor, setFilterFloor] = useState('ALL');
   const [filterSection, setFilterSection] = useState('ALL');
@@ -214,13 +224,15 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
           </p>
         </div>
 
-        <button
-          onClick={handleOpenCreate}
-          className="bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs px-4 py-2 rounded flex items-center gap-1.5 transition shadow-sm self-start md:self-auto"
-        >
-          <UserPlus className="w-4 h-4" />
-          <span>Add New Employee</span>
-        </button>
+        {canAdd && (
+          <button
+            onClick={handleOpenCreate}
+            className="bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs px-4 py-2 rounded flex items-center gap-1.5 transition shadow-sm self-start md:self-auto cursor-pointer"
+          >
+            <UserPlus className="w-4 h-4" />
+            <span>Add New Employee</span>
+          </button>
+        )}
       </div>
 
       {/* Filter and Search Bar */}
@@ -381,25 +393,29 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
                       <div className="flex items-center justify-end gap-1.5">
                         <button
                           onClick={() => handleOpenBadge(emp)}
-                          className="p-1.5 rounded hover:bg-blue-50 text-blue-600 border border-slate-200"
+                          className="p-1.5 rounded hover:bg-blue-50 text-blue-600 border border-slate-200 cursor-pointer"
                           title="View ID Badge & QR Code"
                         >
                           <QrCode className="w-3.5 h-3.5" />
                         </button>
-                        <button
-                          onClick={() => handleOpenEdit(emp)}
-                          className="p-1.5 rounded hover:bg-slate-100 text-slate-700 border border-slate-200"
-                          title="Edit Employee"
-                        >
-                          <Edit3 className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          onClick={() => handleConfirmDelete(emp)}
-                          className="p-1.5 rounded hover:bg-red-50 text-red-600 border border-slate-200 transition"
-                          title="Delete Employee"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                        {canEdit && (
+                          <button
+                            onClick={() => handleOpenEdit(emp)}
+                            className="p-1.5 rounded hover:bg-slate-100 text-slate-700 border border-slate-200 cursor-pointer"
+                            title="Edit Employee"
+                          >
+                            <Edit3 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                        {canDelete && (
+                          <button
+                            onClick={() => handleConfirmDelete(emp)}
+                            className="p-1.5 rounded hover:bg-red-50 text-red-600 border border-slate-200 transition cursor-pointer"
+                            title="Delete Employee"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
                       </div>
                     </td>
                   </tr>

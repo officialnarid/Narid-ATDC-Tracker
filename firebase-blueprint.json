@@ -131,6 +131,25 @@
       },
       "required": ["employeeId", "timestamp", "action"]
     },
+    "PunchEvent": {
+      "title": "PunchEvent",
+      "description": "Individual attendance punch event (IN or OUT)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "employeeId": { "type": "string" },
+        "employeeName": { "type": "string" },
+        "eventType": { "type": "string", "enum": ["IN", "OUT"] },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "shiftDate": { "type": "string" },
+        "shiftId": { "type": "string" },
+        "scannerType": { "type": "string", "enum": ["IN", "OUT"] },
+        "scannerDevice": { "type": "string" },
+        "dutyDurationMinutes": { "type": "number" },
+        "overtimeMinutes": { "type": "number" }
+      },
+      "required": ["id", "employeeId", "eventType", "timestamp", "shiftDate"]
+    },
     "AuditLog": {
       "title": "AuditLog",
       "description": "System event audit trail",
@@ -175,6 +194,46 @@
         "modulesAllowed": { "type": "string" }
       },
       "required": ["id", "name", "role", "status"]
+    },
+    "RolePermission": {
+      "title": "RolePermission",
+      "description": "Role-based granular module permissions (View, Add, Edit, Delete)",
+      "type": "object",
+      "properties": {
+        "roleId": { "type": "string", "enum": ["super_admin", "admin", "user"] },
+        "modulePermissions": { "type": "string", "description": "JSON map of module permissions" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "updatedBy": { "type": "string", "description": "Login ID of Super Admin who updated" }
+      },
+      "required": ["roleId", "updatedAt"]
+    },
+    "Role": {
+      "title": "Role",
+      "description": "Predefined system role definitions (super_admin, admin, user)",
+      "type": "object",
+      "properties": {
+        "roleId": { "type": "string", "enum": ["super_admin", "admin", "user"] },
+        "roleName": { "type": "string" },
+        "description": { "type": "string" },
+        "defaultPermissions": { "type": "string" },
+        "isActive": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["roleId", "roleName", "description", "isActive", "updatedAt"]
+    },
+    "UserPermission": {
+      "title": "UserPermission",
+      "description": "Individual account level permission overrides",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "loginId": { "type": "string" },
+        "role": { "type": "string" },
+        "permissions": { "type": "string" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "updatedBy": { "type": "string" }
+      },
+      "required": ["userId", "loginId", "updatedAt"]
     }
   },
   "firestore": {
@@ -210,6 +269,10 @@
       "schema": "PunchLog",
       "description": "Raw scan punch logs"
     },
+    "/punch_events/{eventId}": {
+      "schema": "PunchEvent",
+      "description": "Individual punch event logs"
+    },
     "/audit_logs/{auditId}": {
       "schema": "AuditLog",
       "description": "System mutation audit logs"
@@ -221,6 +284,18 @@
     "/user_roles/{userRoleId}": {
       "schema": "UserRole",
       "description": "User rights and role master"
+    },
+    "/role_permissions/{roleId}": {
+      "schema": "RolePermission",
+      "description": "Granular role-based permissions matrix"
+    },
+    "/roles/{roleId}": {
+      "schema": "Role",
+      "description": "System role definitions and descriptions"
+    },
+    "/user_permissions/{permissionId}": {
+      "schema": "UserPermission",
+      "description": "Individual account permission overrides"
     }
   }
 }

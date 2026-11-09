@@ -17,6 +17,29 @@ export interface Employee {
 }
 
 export type PunchOutType = 'ACTUAL' | 'AUTO' | 'NONE';
+export type PunchEventType = 'IN' | 'OUT';
+export type ScannerType = 'IN' | 'OUT';
+export type CurrentAttendanceState = 'INSIDE' | 'OUTSIDE';
+
+export interface PunchEvent {
+  id: string;
+  employeeId: string;
+  employeeName: string;
+  eventType: PunchEventType;
+  timestamp: string; // ISO string
+  displayTime: string; // "09:05:22 AM"
+  shiftDate: string; // YYYY-MM-DD
+  shiftId: string;
+  shiftName: string;
+  floor: string;
+  section: string;
+  department: string;
+  scannerType: ScannerType;
+  scannerDevice: string;
+  dutyDurationMinutes?: number;
+  overtimeMinutes?: number;
+  status: string;
+}
 
 export type AttendanceStatus = 
   | 'PRESENT'
@@ -41,14 +64,21 @@ export interface AttendanceRecord {
   shiftId: string; // e.g. 'DAY' or 'NIGHT'
   shiftNameSnapshot: string;
   shiftDate: string; // YYYY-MM-DD
-  punchIn: string; // ISO string
+  punchIn: string; // ISO string (earliest punch in)
+  firstPunchIn?: string; // alias to earliest punch in
   scheduledPunchOut: string; // e.g. 17:30 or 04:30
-  actualPunchOut: string | null; // ISO string if scanned
+  actualPunchOut: string | null; // ISO string if scanned (latest punch out)
+  lastPunchOut?: string | null; // alias to latest punch out
   effectivePunchOut: string | null; // ISO string used for calculation
   punchOutType: PunchOutType;
-  regularDutyMinutes: number; // Duration in minutes (max 510 by default)
+  currentState?: CurrentAttendanceState;
+  punches?: PunchEvent[];
+  totalDutyMinutes?: number;
+  regularDutyMinutes: number; // Scheduled duty in minutes (max 510 by default)
   overtimeMinutes: number; // OT duration in minutes
   attendanceStatus: AttendanceStatus;
+  missedPunchOut?: boolean;
+  autoClosed?: boolean;
   qrTokenReference: string;
   correctionReason?: string;
   correctedBy?: string;
@@ -142,15 +172,18 @@ export interface SystemSetting {
   scannerMode: 'USB_PRIMARY' | 'CAMERA_HYBRID';
 }
 
-export type UserRoleType = 'SUPER_ADMIN' | 'ADMIN' | 'USER';
+export type UserRoleType = 'SUPER_ADMIN' | 'ADMIN' | 'USER' | 'super_admin' | 'admin' | 'user';
 
 export interface UserRoleRecord {
   id: string;
+  loginId: string; // e.g. superadmin, admin, user
   name: string;
   email: string;
   role: UserRoleType;
   status: 'Active' | 'Inactive';
   modulesAllowed: string[]; // ['dashboard', 'scanner', 'employees', 'qr', 'reports', etc.]
+  mustChangePassword?: boolean;
+  passwordLastChangedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -158,6 +191,8 @@ export interface UserRoleRecord {
 export interface ScanResult {
   success: boolean;
   action: 'PUNCH_IN' | 'PUNCH_OUT' | 'REJECTED' | 'REJECTED_DUPLICATE';
+  scannerType?: ScannerType;
+  currentState?: CurrentAttendanceState;
   message: string;
   employee?: Employee;
   attendance?: AttendanceRecord;
@@ -165,4 +200,5 @@ export interface ScanResult {
   time: string;
   dutyFormatted?: string;
   otFormatted?: string;
+  punchCount?: number;
 }

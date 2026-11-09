@@ -13,9 +13,12 @@ import {
   AlertTriangle, 
   CheckCircle2, 
   ChevronRight, 
-  X,
-  FileSpreadsheet,
-  RefreshCw
+  X, 
+  FileSpreadsheet, 
+  RefreshCw,
+  ShieldAlert,
+  Maximize2,
+  Minimize2
 } from 'lucide-react';
 import { 
   Employee, 
@@ -24,12 +27,18 @@ import {
   Floor, 
   Section, 
   Department, 
-  ShiftRoster 
+  ShiftRoster,
+  UserRoleRecord 
 } from '../types';
-import { collection, getDocs, query, where } from 'firebase/firestore';
+import { collection, doc, getDocs, onSnapshot, query, where } from 'firebase/firestore';
 import { db } from '../firebase';
 import { formatDateKey, formatMinutes } from '../services/attendanceService';
-import { generateRosterForDate, getShiftRoster } from '../services/attendanceService';
+import { generateRosterForDate } from '../services/attendanceService';
+import { 
+  DashboardCardId, 
+  isDashboardCardVisible, 
+  normalizeUserRole 
+} from '../config/dashboardCardsConfig';
 
 interface DashboardProps {
   employees: Employee[];
@@ -40,6 +49,10 @@ interface DashboardProps {
   onNavigateToScanner: () => void;
   onNavigateToReports: () => void;
   onRefreshData?: () => void;
+  currentUserRole?: UserRoleRecord | null;
+  isFullscreen?: boolean;
+  onToggleFullscreen?: () => void;
+  onExitFullscreen?: () => void;
 }
 
 export const Dashboard: React.FC<DashboardProps> = ({
@@ -51,7 +64,16 @@ export const Dashboard: React.FC<DashboardProps> = ({
   onNavigateToScanner,
   onNavigateToReports,
   onRefreshData,
+  currentUserRole,
+  isFullscreen = false,
+  onToggleFullscreen,
+  onExitFullscreen,
 }) => {
+  // Authoritative Role Resolution directly from Firestore
+  const [verifiedRole, setVerifiedRole] = useState<'SUPER_ADMIN' | 'ADMIN' | 'USER'>(() => {
+    return normalizeUserRole(currentUserRole?.role);
+  });
+
   const [selectedDate, setSelectedDate] = useState<string>(formatDateKey(new Date()));
   const [selectedShift, setSelectedShift] = useState<string>('ALL');
   const [selectedFloor, setSelectedFloor] = useState<string>('ALL');
@@ -72,27 +94,67 @@ export const Dashboard: React.FC<DashboardProps> = ({
     status: string;
   }[]>([]);
 
-  // Fetch Attendance and Roster for selected date
-  const loadData = async () => {
-    setLoading(true);
-    try {
-      // 1. Fetch attendance records for selected date
-      let attQuery = query(
-        collection(db, 'attendance'),
-        where('shiftDate', '==', selectedDate)
-      );
-      if (selectedShift !== 'ALL') {
-        attQuery = query(
-          collection(db, 'attendance'),
-          where('shiftDate', '==', selectedDate),
-          where('shiftId', '==', selectedShift)
-        );
-      }
-      const attSnap = await getDocs(attQuery);
-      const records = attSnap.docs.map(d => d.data() as AttendanceRecord);
-      setAttendanceRecords(records);
+  // 1. Authoritative Role Verification from Firestore user_roles collection
+  useEffect(() => {
+    const rawLoginId = currentUserRole?.loginId;
+    if (!rawLoginId) return;
 
-      // 2. Fetch roster records for selected date
+    const cleanLoginId = rawLoginId.trim().toLowerCase();
+    const docRef = doc(db, 'user_roles', `role_${cleanLoginId}`);
+
+    const unsubscribe = onSnapshot(docRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        const role = normalizeUserRole(data.role);
+        setVerifiedRole(role);
+        if (role === 'USER') {
+          onNavigateToScanner();
+        }
+      }
+    }, (error) => {
+      console.warn('[Dashboard] Real-time role subscription note:', error);
+    });
+
+    return () => unsubscribe();
+  }, [currentUserRole?.loginId, onNavigateToScanner]);
+
+  // Immediately redirect standard USER to Attendance Scanner
+  useEffect(() => {
+    if (verifiedRole === 'USER') {
+      onNavigateToScanner();
+    }
+  }, [verifiedRole, onNavigateToScanner]);
+
+  // 2. Real-time Attendance Stream from Firestore
+  useEffect(() => {
+    setLoading(true);
+    let attQuery = query(
+      collection(db, 'attendance'),
+      where('shiftDate', '==', selectedDate)
+    );
+    if (selectedShift !== 'ALL') {
+      attQuery = query(
+        collection(db, 'attendance'),
+        where('shiftDate', '==', selectedDate),
+        where('shiftId', '==', selectedShift)
+      );
+    }
+
+    const unsubscribe = onSnapshot(attQuery, (snapshot) => {
+      const records = snapshot.docs.map(d => d.data() as AttendanceRecord);
+      setAttendanceRecords(records);
+      setLoading(false);
+    }, (err) => {
+      console.error('[Dashboard] Real-time attendance error:', err);
+      setLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, [selectedDate, selectedShift]);
+
+  // 3. Fetch Roster records for selected date
+  const loadRosterData = async () => {
+    try {
       const rosterQuery = query(
         collection(db, 'shift_rosters'),
         where('shiftDate', '==', selectedDate)
@@ -100,28 +162,18 @@ export const Dashboard: React.FC<DashboardProps> = ({
       const rosterSnap = await getDocs(rosterQuery);
       setRosterRecords(rosterSnap.docs.map(d => d.data() as ShiftRoster));
     } catch (err) {
-      console.error('Error fetching dashboard records:', err);
-    } finally {
-      setLoading(false);
+      console.error('[Dashboard] Error fetching roster records:', err);
     }
   };
 
   useEffect(() => {
-    loadData();
-  }, [selectedDate, selectedShift]);
+    loadRosterData();
+  }, [selectedDate]);
 
-  // Handle 1-click roster generation from active employees
-  const handleGenerateRoster = async () => {
-    setIsGeneratingRoster(true);
-    try {
-      const targetShift = selectedShift === 'ALL' ? 'DAY' : selectedShift;
-      await generateRosterForDate(selectedDate, targetShift, employees);
-      await loadData();
-    } catch (err) {
-      console.error('Failed to generate roster:', err);
-    } finally {
-      setIsGeneratingRoster(false);
-    }
+  // Handle manual refresh
+  const handleManualRefresh = () => {
+    loadRosterData();
+    if (onRefreshData) onRefreshData();
   };
 
   // Filtered employees list
@@ -157,8 +209,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
     return map;
   }, [rosterRecords]);
 
-  // Calculations:
-  // Present: active records with punchIn
+  // Calculations
   const presentRecords = useMemo(() => {
     return attendanceRecords.filter(a => {
       const emp = employees.find(e => e.employeeId === a.employeeId);
@@ -171,8 +222,33 @@ export const Dashboard: React.FC<DashboardProps> = ({
     });
   }, [attendanceRecords, employees, selectedFloor, selectedSection, selectedDept, selectedType]);
 
+  // First-In Last-Out Dashboard Metrics
+  const firstInCount = useMemo(() => {
+    return presentRecords.filter(a => !!(a.firstPunchIn || a.punchIn)).length;
+  }, [presentRecords]);
+
+  const finalOutCount = useMemo(() => {
+    return presentRecords.filter(a => !!(a.lastPunchOut || a.actualPunchOut)).length;
+  }, [presentRecords]);
+
+  const currentlyInsideCount = useMemo(() => {
+    return presentRecords.filter(a => a.currentState === 'INSIDE' || (!a.actualPunchOut && a.punchOutType === 'NONE')).length;
+  }, [presentRecords]);
+
+  const currentlyOutsideCount = useMemo(() => {
+    return presentRecords.filter(a => a.currentState === 'OUTSIDE' || (!!a.actualPunchOut || a.punchOutType === 'ACTUAL')).length;
+  }, [presentRecords]);
+
   const autoClosedCount = useMemo(() => {
-    return presentRecords.filter(a => a.punchOutType === 'AUTO').length;
+    return presentRecords.filter(a => a.punchOutType === 'AUTO' || a.autoClosed).length;
+  }, [presentRecords]);
+
+  const missedPunchOutCount = useMemo(() => {
+    return presentRecords.filter(a => a.missedPunchOut || a.attendanceStatus === 'MISSED PUNCH OUT' || a.punchOutType === 'AUTO').length;
+  }, [presentRecords]);
+
+  const totalDutyMinutes = useMemo(() => {
+    return presentRecords.reduce((acc, curr) => acc + (curr.totalDutyMinutes || curr.regularDutyMinutes || 0), 0);
   }, [presentRecords]);
 
   const totalOtMinutes = useMemo(() => {
@@ -183,7 +259,6 @@ export const Dashboard: React.FC<DashboardProps> = ({
   const isRosterConfigured = rosterRecords.length > 0;
   const scheduledCount = rosterRecords.filter(r => r.rosterStatus === 'SCHEDULED').length;
   const leaveCount = rosterRecords.filter(r => r.rosterStatus === 'LEAVE').length;
-  const offCount = rosterRecords.filter(r => r.rosterStatus === 'WEEKLY_OFF' || r.rosterStatus === 'HOLIDAY').length;
 
   const expectedManpower = isRosterConfigured
     ? Math.max(0, scheduledCount)
@@ -194,11 +269,18 @@ export const Dashboard: React.FC<DashboardProps> = ({
     ? Math.max(0, expectedManpower - presentCount)
     : Math.max(0, activeEmployees.length - presentCount);
 
-  // Drilldown handler
+  // Protected Drilldown handler
   const handleOpenDrilldown = (
+    cardId: DashboardCardId,
     title: string,
     filterFn: (emp: Employee, att?: AttendanceRecord) => boolean
   ) => {
+    // Role Authorization Check: block drilldown if card is hidden for this role
+    if (!isDashboardCardVisible(verifiedRole, cardId)) {
+      console.warn(`[Security] Drilldown for ${cardId} is unauthorized for role ${verifiedRole}`);
+      return;
+    }
+
     const list = activeEmployees
       .map(emp => {
         const att = attendanceMap.get(emp.employeeId);
@@ -218,13 +300,242 @@ export const Dashboard: React.FC<DashboardProps> = ({
     setDrilldownEmployees(list);
   };
 
+  // If user role is standard USER, do not render administrative dashboard cards
+  if (verifiedRole === 'USER') {
+    return (
+      <div className="p-8 bg-slate-50 min-h-full flex flex-col items-center justify-center text-center">
+        <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm max-w-md w-full">
+          <ShieldAlert className="w-12 h-12 text-amber-500 mx-auto mb-3" />
+          <h2 className="text-lg font-bold text-slate-800">Redirecting to Attendance Scanner</h2>
+          <p className="text-xs text-slate-500 mt-1">
+            Standard user accounts have scanner access only. Redirecting now...
+          </p>
+          <button
+            onClick={onNavigateToScanner}
+            className="mt-4 w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-lg text-xs transition shadow-sm"
+          >
+            Open Attendance Scanner
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Registry of all 12 Dashboard Cards
+  const renderCard = (cardId: DashboardCardId) => {
+    switch (cardId) {
+      case 'active_total':
+        return (
+          <div 
+            key="active_total"
+            onClick={() => handleOpenDrilldown('active_total', 'Total Active Manpower', (emp) => emp.employeeStatus === 'Active')}
+            className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-2xs hover:border-blue-400 cursor-pointer transition"
+          >
+            <div className="text-[11px] font-medium text-slate-500 uppercase">Active Total</div>
+            <div className="text-2xl font-bold text-slate-900 mt-1">{activeEmployees.length}</div>
+            <div className="text-[10px] text-blue-600 font-medium mt-1 flex items-center gap-0.5">
+              View All <ChevronRight className="w-3 h-3" />
+            </div>
+          </div>
+        );
+
+      case 'total_present':
+        return (
+          <div 
+            key="total_present"
+            onClick={() => handleOpenDrilldown('total_present', 'Total Present Manpower', (emp, att) => !!att)}
+            className="bg-emerald-50/70 p-3.5 rounded-xl border border-emerald-300 shadow-2xs hover:border-emerald-500 cursor-pointer transition"
+          >
+            <div className="text-[11px] font-semibold text-emerald-800 uppercase">Total Present</div>
+            <div className="text-2xl font-bold text-emerald-700 mt-1">{presentCount}</div>
+            <div className="text-[10px] text-emerald-600 font-medium mt-1">
+              {expectedManpower > 0 ? `${Math.round((presentCount / expectedManpower) * 100)}% Avail` : '0%'}
+            </div>
+          </div>
+        );
+
+      case 'currently_inside':
+        return (
+          <div 
+            key="currently_inside"
+            onClick={() => handleOpenDrilldown('currently_inside', 'Currently Inside Factory', (emp, att) => !!att && (att.currentState === 'INSIDE' || (!att.actualPunchOut && att.punchOutType === 'NONE')))}
+            className="bg-teal-50/70 p-3.5 rounded-xl border border-teal-300 shadow-2xs hover:border-teal-500 cursor-pointer transition"
+          >
+            <div className="text-[11px] font-semibold text-teal-800 uppercase flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-teal-500 animate-pulse"></span>
+              Currently Inside
+            </div>
+            <div className="text-2xl font-bold text-teal-700 mt-1">{currentlyInsideCount}</div>
+            <div className="text-[10px] text-teal-600 font-medium mt-1">On Factory Floor</div>
+          </div>
+        );
+
+      case 'currently_outside':
+        return (
+          <div 
+            key="currently_outside"
+            onClick={() => handleOpenDrilldown('currently_outside', 'Currently Outside Factory', (emp, att) => !!att && (att.currentState === 'OUTSIDE' || !!att.actualPunchOut || att.punchOutType === 'ACTUAL'))}
+            className="bg-slate-50 p-3.5 rounded-xl border border-slate-300 shadow-2xs hover:border-slate-500 cursor-pointer transition"
+          >
+            <div className="text-[11px] font-semibold text-slate-700 uppercase">Currently Outside</div>
+            <div className="text-2xl font-bold text-slate-700 mt-1">{currentlyOutsideCount}</div>
+            <div className="text-[10px] text-slate-500 font-medium mt-1">Punched Out / Exit</div>
+          </div>
+        );
+
+      case 'absent':
+        return (
+          <div 
+            key="absent"
+            onClick={() => handleOpenDrilldown('absent', 'Absent Manpower', (emp, att) => !att)}
+            className="bg-red-50/70 p-3.5 rounded-xl border border-red-300 shadow-2xs hover:border-red-500 cursor-pointer transition"
+          >
+            <div className="text-[11px] font-semibold text-red-800 uppercase">Absent</div>
+            <div className="text-2xl font-bold text-red-700 mt-1">{absentCount}</div>
+            <div className="text-[10px] text-red-600 font-medium mt-1">No Punches</div>
+          </div>
+        );
+
+      case 'on_leave':
+        return (
+          <div 
+            key="on_leave"
+            onClick={() => handleOpenDrilldown('on_leave', 'Employees On Leave', (emp) => {
+              const r = rosterMap.get(emp.employeeId);
+              return r?.rosterStatus === 'LEAVE';
+            })}
+            className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-2xs hover:border-blue-400 cursor-pointer transition"
+          >
+            <div className="text-[11px] font-medium text-slate-500 uppercase">On Leave</div>
+            <div className="text-2xl font-bold text-slate-700 mt-1">{leaveCount}</div>
+            <div className="text-[10px] text-slate-500 mt-1">Sanctioned</div>
+          </div>
+        );
+
+      case 'first_in':
+        return (
+          <div 
+            key="first_in"
+            onClick={() => handleOpenDrilldown('first_in', 'First Punch In Recorded', (emp, att) => !!(att?.firstPunchIn || att?.punchIn))}
+            className="bg-emerald-50/50 p-3.5 rounded-xl border border-emerald-200 shadow-2xs hover:border-emerald-400 cursor-pointer transition"
+          >
+            <div className="text-[11px] font-semibold text-emerald-800 uppercase">First In</div>
+            <div className="text-2xl font-bold text-emerald-700 mt-1">{firstInCount}</div>
+            <div className="text-[10px] text-emerald-600 font-medium mt-1">Initial Entry Punch</div>
+          </div>
+        );
+
+      case 'final_out':
+        return (
+          <div 
+            key="final_out"
+            onClick={() => handleOpenDrilldown('final_out', 'Final Punch Out Recorded', (emp, att) => !!(att?.lastPunchOut || att?.actualPunchOut))}
+            className="bg-indigo-50/50 p-3.5 rounded-xl border border-indigo-200 shadow-2xs hover:border-indigo-400 cursor-pointer transition"
+          >
+            <div className="text-[11px] font-semibold text-indigo-800 uppercase">Final Out</div>
+            <div className="text-2xl font-bold text-indigo-700 mt-1">{finalOutCount}</div>
+            <div className="text-[10px] text-indigo-600 font-medium mt-1">Actual Exit Scanned</div>
+          </div>
+        );
+
+      case 'duty_hours':
+        return (
+          <div 
+            key="duty_hours"
+            onClick={() => handleOpenDrilldown('duty_hours', 'Employees with Completed Duty', (emp, att) => (att?.totalDutyMinutes || att?.regularDutyMinutes || 0) > 0)}
+            className="bg-blue-50/50 p-3.5 rounded-xl border border-blue-200 shadow-2xs hover:border-blue-400 cursor-pointer transition"
+          >
+            <div className="text-[11px] font-semibold text-blue-800 uppercase">Duty Hours</div>
+            <div className="text-2xl font-bold text-blue-700 mt-1">
+              {formatMinutes(totalDutyMinutes).replace(' Hours', '')}
+            </div>
+            <div className="text-[10px] text-blue-600 font-medium mt-1">Last Out - First In</div>
+          </div>
+        );
+
+      case 'ot_hours':
+        return (
+          <div 
+            key="ot_hours"
+            onClick={() => handleOpenDrilldown('ot_hours', 'Employees with Overtime', (emp, att) => (att?.overtimeMinutes || 0) > 0)}
+            className="bg-amber-50/50 p-3.5 rounded-xl border border-amber-200 shadow-2xs hover:border-amber-400 cursor-pointer transition"
+          >
+            <div className="text-[11px] font-semibold text-amber-800 uppercase">OT Hours</div>
+            <div className="text-2xl font-bold text-amber-700 mt-1">
+              {formatMinutes(totalOtMinutes).replace(' Hours', '')}
+            </div>
+            <div className="text-[10px] text-amber-600 font-medium mt-1">Beyond 08:30</div>
+          </div>
+        );
+
+      case 'auto_closed':
+        return (
+          <div 
+            key="auto_closed"
+            onClick={() => handleOpenDrilldown('auto_closed', 'Auto-Closed Attendance', (emp, att) => att?.punchOutType === 'AUTO' || !!att?.autoClosed)}
+            className="bg-purple-50/50 p-3.5 rounded-xl border border-purple-200 shadow-2xs hover:border-purple-400 cursor-pointer transition"
+          >
+            <div className="text-[11px] font-semibold text-purple-800 uppercase">Auto Closed</div>
+            <div className="text-2xl font-bold text-purple-700 mt-1">{autoClosedCount}</div>
+            <div className="text-[10px] text-purple-600 font-medium mt-1">Closed at Shift End</div>
+          </div>
+        );
+
+      case 'missed_punch_out':
+        return (
+          <div 
+            key="missed_punch_out"
+            onClick={() => handleOpenDrilldown('missed_punch_out', 'Missed Punch Out', (emp, att) => !!att?.missedPunchOut || att?.attendanceStatus === 'MISSED PUNCH OUT')}
+            className="bg-orange-50/50 p-3.5 rounded-xl border border-orange-200 shadow-2xs hover:border-orange-400 cursor-pointer transition"
+          >
+            <div className="text-[11px] font-semibold text-orange-800 uppercase">Missed Punch Out</div>
+            <div className="text-2xl font-bold text-orange-700 mt-1">{missedPunchOutCount}</div>
+            <div className="text-[10px] text-orange-600 font-medium mt-1">0 Overtime Flagged</div>
+          </div>
+        );
+
+      default:
+        return null;
+    }
+  };
+
   return (
-    <div className="p-6 bg-slate-50 min-h-full flex flex-col gap-6">
+    <div className="p-4 sm:p-6 bg-slate-50 min-h-full flex flex-col gap-6 transition-all duration-200 ease-in-out w-full relative">
+      {/* Floating Exit Full Screen Button in Top-Right Corner */}
+      {isFullscreen && onExitFullscreen && (
+        <div className="fixed top-3 right-4 z-50 animate-fadeIn flex items-center gap-2 drop-shadow-md">
+          <div className="hidden lg:flex items-center gap-1.5 bg-[#0a192f] text-white text-[11px] font-mono px-2.5 py-1.5 rounded-lg border border-slate-700 shadow-md">
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+            <span className="tracking-wide">FULL SCREEN MODE</span>
+          </div>
+          <button
+            type="button"
+            onClick={onExitFullscreen}
+            className="flex items-center gap-1.5 bg-red-600 hover:bg-red-700 text-white font-bold text-xs px-3.5 py-1.5 rounded-lg shadow-xl border border-red-500 transition cursor-pointer"
+            title="Exit Full Screen Mode (or press ESC)"
+          >
+            <Minimize2 className="w-3.5 h-3.5 text-white" />
+            <span>Exit Full Screen</span>
+            <kbd className="hidden sm:inline-block text-[10px] bg-red-800/80 px-1.5 py-0.2 rounded font-mono ml-0.5 font-normal">
+              ESC
+            </kbd>
+          </button>
+        </div>
+      )}
       {/* Top Controls: Title, Filter Bar, Date Selector */}
       <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-2xs flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div>
-          <h2 className="text-xl font-bold text-slate-800 tracking-tight">MANPOWER DASHBOARD</h2>
-          <p className="text-xs text-slate-500">
+          <div className="flex items-center gap-2">
+            <h2 className="text-xl font-bold text-slate-800 tracking-tight">MANPOWER DASHBOARD</h2>
+            <span className={`text-[10px] font-bold px-2 py-0.5 rounded uppercase tracking-wider ${
+              verifiedRole === 'SUPER_ADMIN' 
+                ? 'bg-red-100 text-red-700 border border-red-200' 
+                : 'bg-blue-100 text-blue-700 border border-blue-200'
+            }`}>
+              {verifiedRole === 'SUPER_ADMIN' ? 'Super Admin View (All 12 Cards)' : 'Admin View (6 Cards)'}
+            </span>
+          </div>
+          <p className="text-xs text-slate-500 mt-0.5">
             Real-time line, section and department manpower availability
           </p>
         </div>
@@ -303,12 +614,38 @@ export const Dashboard: React.FC<DashboardProps> = ({
           </select>
 
           <button
-            onClick={() => loadData()}
-            className="p-1.5 rounded bg-slate-100 hover:bg-slate-200 text-slate-600 border border-slate-300"
+            onClick={handleManualRefresh}
+            className="p-1.5 rounded bg-slate-100 hover:bg-slate-200 text-slate-600 border border-slate-300 cursor-pointer transition"
             title="Refresh records"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
           </button>
+
+          {/* Full Screen Mode Button */}
+          {onToggleFullscreen && (
+            <button
+              type="button"
+              onClick={isFullscreen ? onExitFullscreen : onToggleFullscreen}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold border transition cursor-pointer shadow-2xs ${
+                isFullscreen
+                  ? 'bg-red-50 text-red-700 border-red-300 hover:bg-red-100'
+                  : 'bg-blue-50 text-blue-700 border-blue-300 hover:bg-blue-100 hover:text-blue-800'
+              }`}
+              title={isFullscreen ? 'Exit Full Screen Mode (ESC)' : 'Full Screen Dashboard Mode (Maximize screen width)'}
+            >
+              {isFullscreen ? (
+                <>
+                  <Minimize2 className="w-3.5 h-3.5 text-red-600 shrink-0" />
+                  <span>Exit Full Screen</span>
+                </>
+              ) : (
+                <>
+                  <Maximize2 className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                  <span>Full Screen</span>
+                </>
+              )}
+            </button>
+          )}
         </div>
       </div>
 
@@ -326,99 +663,43 @@ export const Dashboard: React.FC<DashboardProps> = ({
           </span>
           <button
             onClick={onNavigateToScanner}
-            className="bg-blue-600 hover:bg-blue-700 text-white font-medium px-2.5 py-1 rounded text-xs transition flex items-center gap-1 shadow-xs"
+            className="bg-blue-600 hover:bg-blue-700 text-white font-medium px-2.5 py-1 rounded text-xs transition flex items-center gap-1 shadow-xs cursor-pointer"
           >
             Open Scanner
           </button>
         </div>
       </div>
 
-      {/* SUMMARY KPI CARDS (7 Standard Cards) */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-3">
-        {/* 1. Total Active */}
-        <div 
-          onClick={() => handleOpenDrilldown('Total Active Manpower', (emp) => emp.employeeStatus === 'Active')}
-          className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-2xs hover:border-blue-400 cursor-pointer transition"
-        >
-          <div className="text-[11px] font-medium text-slate-500 uppercase">Active Total</div>
-          <div className="text-2xl font-bold text-slate-900 mt-1">{activeEmployees.length}</div>
-          <div className="text-[10px] text-blue-600 font-medium mt-1 flex items-center gap-0.5">
-            View All <ChevronRight className="w-3 h-3" />
+      {/* 
+        ROLE-BASED DASHBOARD CARDS DISPLAY:
+        - SUPER_ADMIN: All 12 Cards in 2 rows of 6
+        - ADMIN: EXACTLY 6 Cards in 1 row of 6 (no empty gaps)
+      */}
+      {verifiedRole === 'ADMIN' ? (
+        /* ADMIN: Exact 6 Allowed Cards */
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+          {(['active_total', 'total_present', 'absent', 'ot_hours', 'auto_closed', 'missed_punch_out'] as DashboardCardId[]).map(cardId => (
+            renderCard(cardId)
+          ))}
+        </div>
+      ) : (
+        /* SUPER_ADMIN: All 12 Cards (Row 1: Manpower & Gate Status, Row 2: First-In Last-Out & Shift Duty) */
+        <div className="flex flex-col gap-3">
+          {/* Row 1: 6 Cards */}
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+            {(['active_total', 'total_present', 'currently_inside', 'currently_outside', 'absent', 'on_leave'] as DashboardCardId[]).map(cardId => (
+              renderCard(cardId)
+            ))}
+          </div>
+
+          {/* Row 2: 6 Cards */}
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+            {(['first_in', 'final_out', 'duty_hours', 'ot_hours', 'auto_closed', 'missed_punch_out'] as DashboardCardId[]).map(cardId => (
+              renderCard(cardId)
+            ))}
           </div>
         </div>
-
-        {/* 2. Expected */}
-        <div 
-          onClick={() => handleOpenDrilldown('Expected Manpower', (emp) => {
-            const r = rosterMap.get(emp.employeeId);
-            return !r || r.rosterStatus === 'SCHEDULED';
-          })}
-          className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-2xs hover:border-blue-400 cursor-pointer transition"
-        >
-          <div className="text-[11px] font-medium text-slate-500 uppercase">Expected</div>
-          <div className="text-2xl font-bold text-slate-800 mt-1">{expectedManpower}</div>
-          <div className="text-[10px] text-slate-500 mt-1">
-            {isRosterConfigured ? 'Roster Base' : 'Full Roster'}
-          </div>
-        </div>
-
-        {/* 3. Present (GREEN) */}
-        <div 
-          onClick={() => handleOpenDrilldown('Present Manpower', (emp, att) => !!att)}
-          className="bg-emerald-50/70 p-3.5 rounded-xl border border-emerald-300 shadow-2xs hover:border-emerald-500 cursor-pointer transition"
-        >
-          <div className="text-[11px] font-semibold text-emerald-800 uppercase">Present</div>
-          <div className="text-2xl font-bold text-emerald-700 mt-1">{presentCount}</div>
-          <div className="text-[10px] text-emerald-600 font-medium mt-1">
-            {expectedManpower > 0 ? `${Math.round((presentCount / expectedManpower) * 100)}% Avail` : '0%'}
-          </div>
-        </div>
-
-        {/* 4. Absent (RED) */}
-        <div 
-          onClick={() => handleOpenDrilldown('Absent Manpower', (emp, att) => !att)}
-          className="bg-red-50/70 p-3.5 rounded-xl border border-red-300 shadow-2xs hover:border-red-500 cursor-pointer transition"
-        >
-          <div className="text-[11px] font-semibold text-red-800 uppercase">Absent</div>
-          <div className="text-2xl font-bold text-red-700 mt-1">{absentCount}</div>
-          <div className="text-[10px] text-red-600 font-medium mt-1">Not Clocked</div>
-        </div>
-
-        {/* 5. On Leave */}
-        <div 
-          onClick={() => handleOpenDrilldown('Employees On Leave', (emp) => {
-            const r = rosterMap.get(emp.employeeId);
-            return r?.rosterStatus === 'LEAVE';
-          })}
-          className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-2xs hover:border-blue-400 cursor-pointer transition"
-        >
-          <div className="text-[11px] font-medium text-slate-500 uppercase">On Leave</div>
-          <div className="text-2xl font-bold text-slate-700 mt-1">{leaveCount}</div>
-          <div className="text-[10px] text-slate-500 mt-1">Sanctioned</div>
-        </div>
-
-        {/* 6. Auto-Closed Attendance */}
-        <div 
-          onClick={() => handleOpenDrilldown('Auto-Closed Attendance', (emp, att) => att?.punchOutType === 'AUTO')}
-          className="bg-amber-50/70 p-3.5 rounded-xl border border-amber-300 shadow-2xs hover:border-amber-500 cursor-pointer transition"
-        >
-          <div className="text-[11px] font-semibold text-amber-800 uppercase">Auto-Closed</div>
-          <div className="text-2xl font-bold text-amber-700 mt-1">{autoClosedCount}</div>
-          <div className="text-[10px] text-amber-600 font-medium mt-1">Missed Out</div>
-        </div>
-
-        {/* 7. Total Overtime Hours */}
-        <div 
-          onClick={() => handleOpenDrilldown('Employees with Overtime', (emp, att) => (att?.overtimeMinutes || 0) > 0)}
-          className="bg-blue-50/70 p-3.5 rounded-xl border border-blue-300 shadow-2xs hover:border-blue-500 cursor-pointer transition"
-        >
-          <div className="text-[11px] font-semibold text-blue-800 uppercase">Total OT Hours</div>
-          <div className="text-2xl font-bold text-blue-700 mt-1">
-            {formatMinutes(totalOtMinutes).replace(' Hours', '')}
-          </div>
-          <div className="text-[10px] text-blue-600 font-medium mt-1">Beyond 8h30m</div>
-        </div>
-      </div>
+      )}
 
       {/* INDUSTRIAL BREAKDOWN TABLES (Floor, Section, Department, Employee Type) */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -455,7 +736,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                   return (
                     <tr
                       key={floor.id}
-                      onClick={() => handleOpenDrilldown(`${floor.name} Line Manpower`, (emp) => emp.floor === floor.name)}
+                      onClick={() => handleOpenDrilldown('active_total', `${floor.name} Line Manpower`, (emp) => emp.floor === floor.name)}
                       className="hover:bg-blue-50/50 cursor-pointer transition font-medium"
                     >
                       <td className="py-2.5 px-3 font-semibold text-slate-800">{floor.name}</td>
@@ -511,7 +792,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                   return (
                     <tr
                       key={sec.id}
-                      onClick={() => handleOpenDrilldown(`${sec.name} Section Manpower`, (emp) => emp.section === sec.name)}
+                      onClick={() => handleOpenDrilldown('active_total', `${sec.name} Section Manpower`, (emp) => emp.section === sec.name)}
                       className="hover:bg-indigo-50/50 cursor-pointer transition font-medium"
                     >
                       <td className="py-2.5 px-3 font-semibold text-slate-800">{sec.name}</td>
@@ -567,7 +848,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                   return (
                     <tr
                       key={dept.id}
-                      onClick={() => handleOpenDrilldown(`${dept.name} Dept Manpower`, (emp) => emp.department === dept.name)}
+                      onClick={() => handleOpenDrilldown('active_total', `${dept.name} Dept Manpower`, (emp) => emp.department === dept.name)}
                       className="hover:bg-cyan-50/50 cursor-pointer transition font-medium"
                     >
                       <td className="py-2.5 px-3 font-semibold text-slate-800">{dept.name}</td>
@@ -623,7 +904,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                   return (
                     <tr
                       key={type}
-                      onClick={() => handleOpenDrilldown(`${type} Employees List`, (emp) => emp.employeeType === type)}
+                      onClick={() => handleOpenDrilldown('active_total', `${type} Employees List`, (emp) => emp.employeeType === type)}
                       className="hover:bg-purple-50/50 cursor-pointer transition font-medium"
                     >
                       <td className="py-2.5 px-3 font-semibold text-slate-800">{type}</td>
@@ -658,7 +939,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
               </div>
               <button
                 onClick={() => setDrilldownTitle(null)}
-                className="p-1 rounded hover:bg-slate-100 text-slate-500"
+                className="p-1 rounded hover:bg-slate-100 text-slate-500 cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -679,7 +960,6 @@ export const Dashboard: React.FC<DashboardProps> = ({
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {drilldownEmployees.map(({ employee, attendance, status }) => {
-                    const isPresent = !!attendance;
                     return (
                       <tr key={employee.employeeId} className="hover:bg-slate-50">
                         <td className="py-2 px-3 font-mono font-bold text-slate-800">{employee.employeeId}</td>
@@ -700,9 +980,14 @@ export const Dashboard: React.FC<DashboardProps> = ({
                         <td className="py-2 px-3 text-right font-mono text-[11px]">
                           {attendance ? (
                             <span>
-                              {formatMinutes(attendance.regularDutyMinutes).replace(' Hours', 'h')}
+                              {isDashboardCardVisible(verifiedRole, 'duty_hours') && (
+                                <span>{formatMinutes(attendance.regularDutyMinutes).replace(' Hours', 'h')}</span>
+                              )}
                               {attendance.overtimeMinutes > 0 && (
                                 <span className="text-amber-600 ml-1">+{formatMinutes(attendance.overtimeMinutes).replace(' Hours', 'h')} OT</span>
+                              )}
+                              {!isDashboardCardVisible(verifiedRole, 'duty_hours') && attendance.overtimeMinutes <= 0 && (
+                                <span className="text-slate-400">Recorded</span>
                               )}
                             </span>
                           ) : (
@@ -719,7 +1004,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
             <div className="p-3 border-t border-slate-200 bg-slate-50 flex justify-end">
               <button
                 onClick={() => setDrilldownTitle(null)}
-                className="bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs px-4 py-2 rounded font-medium"
+                className="bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs px-4 py-2 rounded font-medium cursor-pointer"
               >
                 Close
               </button>

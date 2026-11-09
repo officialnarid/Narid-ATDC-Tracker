@@ -6,7 +6,10 @@ import {
   setDoc, 
   updateDoc, 
   query, 
-  where 
+  where,
+  orderBy,
+  limit,
+  runTransaction
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType, sanitizeFirestoreData } from '../firebase';
 import { 
@@ -15,6 +18,7 @@ import {
   Shift, 
   ScanResult, 
   PunchLog, 
+  PunchEvent,
   AttendanceStatus,
   ShiftRoster
 } from '../types';
@@ -233,20 +237,59 @@ export async function recordPunchLog(log: Omit<PunchLog, 'id'>): Promise<void> {
   }
 }
 
+// Record individual punch event
+export async function recordPunchEvent(event: PunchEvent): Promise<void> {
+  try {
+    await setDoc(doc(db, 'punch_events', event.id), sanitizeFirestoreData(event));
+  } catch (e) {
+    console.error('Failed to save punch event:', e);
+  }
+}
+
+// Query punch events for an employee or date
+export async function getPunchEvents(options?: { shiftDate?: string; employeeId?: string; limitCount?: number }): Promise<PunchEvent[]> {
+  try {
+    let q = query(collection(db, 'punch_events'), orderBy('timestamp', 'desc'), limit(options?.limitCount || 200));
+    if (options?.shiftDate) {
+      q = query(collection(db, 'punch_events'), where('shiftDate', '==', options.shiftDate), orderBy('timestamp', 'desc'));
+    }
+    const snap = await getDocs(q);
+    let events = snap.docs.map(d => d.data() as PunchEvent);
+    if (options?.employeeId) {
+      events = events.filter(e => e.employeeId === options.employeeId);
+    }
+    return events;
+  } catch (err) {
+    console.error('Error fetching punch events:', err);
+    return [];
+  }
+}
+
+export interface DualScanParams {
+  rawPayload: string;
+  scannerType: 'IN' | 'OUT';
+  scannerDevice?: 'USB_SCANNER' | 'WEBCAM' | 'MANUAL' | 'SYSTEM_AUTO';
+  customScanTime?: Date;
+}
+
 /**
- * MAIN PUNCH SCAN PROCESSOR
- * Automatically identifies shift from Punch-In time.
- * Enforces:
- * - 1 Punch In & 1 Punch Out per attendance cycle (duplicate protection).
- * - Automatic shift identification without manual prompts.
- * - Overtime calculated ONLY from actual Punch Out.
- * - Auto-closed attendance has 0 OT.
+ * ADVANCED DUAL ATTENDANCE SCANNER & FIRST-IN LAST-OUT SYSTEM
+ * 
+ * MODULE 1: Dedicated Independent Punch In and Punch Out Scanners
+ * MODULE 2: Multiple Alternating In/Out Events per Workday (with Consecutive Validation)
+ * MODULE 3: First-In Last-Out Daily Summary Rule
+ * MODULE 4: Duty Hours & OT Calculation (Duty = Last Out - First In, OT = Max(0, Duty - 08:30))
+ * MODULE 5: Automatic Shift Detection & Overnight Spanning (Day: 09:00-17:30, Night: 20:00-04:30)
+ * MODULE 6: Auto-Close Missed Punch Out (Zero OT, Status: AUTO CLOSED / MISSED PUNCH OUT)
+ * MODULE 7: Data Structure Separation (attendance daily doc + punch_events collection)
+ * MODULE 9: Atomic Firestore Transactions (Zero race conditions or duplicate submissions)
  */
-export async function processAttendanceScan(
-  rawPayload: string,
-  scannerDevice: 'USB_SCANNER' | 'WEBCAM' = 'USB_SCANNER',
-  customScanTime?: Date
-): Promise<ScanResult> {
+export async function processDualAttendanceScan({
+  rawPayload,
+  scannerType,
+  scannerDevice = 'USB_SCANNER',
+  customScanTime,
+}: DualScanParams): Promise<ScanResult> {
   const now = customScanTime || new Date();
   const kolkata = getKolkataTimeParts(now);
   const timeDisplay = kolkata.timeWithSeconds;
@@ -260,11 +303,12 @@ export async function processAttendanceScan(
       action: 'REJECTED_TOKEN',
       rawPayload,
       scannerDevice,
-      message: 'Invalid QR Code payload.',
+      message: 'Invalid QR Code payload or empty Employee ID.',
     });
     return {
       success: false,
       action: 'REJECTED',
+      scannerType,
       message: 'Invalid QR Code. Employee Not Found.',
       time: timeDisplay,
     };
@@ -284,6 +328,7 @@ export async function processAttendanceScan(
     return {
       success: false,
       action: 'REJECTED',
+      scannerType,
       message: `Invalid QR Code. Employee "${employeeId}" Not Found.`,
       time: timeDisplay,
     };
@@ -303,6 +348,7 @@ export async function processAttendanceScan(
     return {
       success: false,
       action: 'REJECTED',
+      scannerType,
       employee,
       message: 'Employee Is Inactive. Attendance Cannot Be Recorded.',
       time: timeDisplay,
@@ -323,249 +369,292 @@ export async function processAttendanceScan(
     return {
       success: false,
       action: 'REJECTED',
+      scannerType,
       employee,
       message: 'QR Token Expired or Revoked. Please re-issue QR code.',
       time: timeDisplay,
     };
   }
 
-  // 4. Fetch shifts & system settings
+  // 4. Fetch shifts and settings
   const shifts = await getShifts();
   const settings = await getSystemSettings();
   const shiftsMap = new Map(shifts.map(s => [s.id, s]));
 
-  // 5. Query open attendance records for this employee
-  const attQuery = query(
-    collection(db, 'attendance'),
-    where('employeeId', '==', employee.employeeId),
-    where('punchOutType', '==', 'NONE')
+  const todayKey = kolkata.dateKey;
+  const yesterdayKey = getYesterdayKolkataDateKey(now);
+  const currentMins = kolkata.totalMinutes;
+
+  // 5. Locate existing attendance record for this employee
+  // Check both today and yesterday (for ongoing night shifts)
+  const candidateDocsSnap = await getDocs(
+    query(
+      collection(db, 'attendance'),
+      where('employeeId', '==', employee.employeeId),
+      where('shiftDate', '>=', yesterdayKey)
+    )
   );
-  const existingAttDocs = await getDocs(attQuery);
-  const openRecords = existingAttDocs.docs
-    .map(d => d.data() as AttendanceRecord)
-    .filter(a => !a.actualPunchOut && a.punchOutType === 'NONE');
 
-  // Check if there is an active OPEN attendance record
-  if (openRecords.length > 0) {
-    // Sort so most recent is first
-    openRecords.sort((a, b) => new Date(b.punchIn).getTime() - new Date(a.punchIn).getTime());
-    const openRecord = openRecords[0];
-    const openShift = shiftsMap.get(openRecord.shiftId) || shifts[0];
+  const existingRecords = candidateDocsSnap.docs.map(d => d.data() as AttendanceRecord);
 
-    // Determine scheduled end timestamp of the open shift
-    const scheduledEndIso = getShiftScheduledEndIso(openRecord.shiftDate, openShift);
-    const scheduledEndDate = new Date(scheduledEndIso);
+  // Sort by punchIn descending
+  existingRecords.sort((a, b) => new Date(b.punchIn).getTime() - new Date(a.punchIn).getTime());
 
-    // If an employee punched in just seconds ago (prevent accidental double tap)
-    const punchInDate = new Date(openRecord.punchIn);
-    const elapsedSinceInMs = now.getTime() - punchInDate.getTime();
-    if (elapsedSinceInMs < 60 * 1000) {
-      return {
-        success: false,
-        action: 'REJECTED_DUPLICATE',
-        employee,
-        attendance: openRecord,
-        shift: openShift,
-        message: `Duplicate scan prevented. Already Punched In at ${formatTimeDisplay(openRecord.punchIn)}.`,
-        time: timeDisplay,
-      };
+  // Determine active attendance record:
+  // If current time is early morning (< 09:00 AM / 540 mins), check if yesterday has an ongoing night shift
+  let activeRecord: AttendanceRecord | null = null;
+  if (currentMins < 540) {
+    const yesterdayNight = existingRecords.find(r => r.shiftDate === yesterdayKey && (r.shiftId === 'NIGHT' || (r.shiftNameSnapshot || '').toUpperCase().includes('NIGHT')));
+    if (yesterdayNight) {
+      activeRecord = yesterdayNight;
     }
+  }
 
-    // Check if the open record is already far expired (e.g. from an earlier day and missed closing)
-    // If it expired more than 16 hours ago or is from an earlier cycle, auto-close it now and evaluate new punch
-    const maxShiftLifeMs = (openShift.scheduledDurationMinutes + 720) * 60 * 1000; // scheduled + 12h
-    if (elapsedSinceInMs > maxShiftLifeMs) {
-      // Auto-close stale open record with 0 OT
-      const closedStaleRecord: AttendanceRecord = {
-        ...openRecord,
-        actualPunchOut: null,
-        effectivePunchOut: scheduledEndIso,
-        punchOutType: 'AUTO',
-        attendanceStatus: 'MISSED PUNCH OUT',
-        regularDutyMinutes: openShift.scheduledDurationMinutes || 510,
-        overtimeMinutes: 0,
-        updatedAt: now.toISOString(),
+  if (!activeRecord) {
+    // Check today's record
+    activeRecord = existingRecords.find(r => r.shiftDate === todayKey) || null;
+  }
+
+  // =========================================================================
+  // SCANNER TYPE: 'IN' (PUNCH IN SCANNER)
+  // =========================================================================
+  if (scannerType === 'IN') {
+    if (activeRecord) {
+      // Validate employee is not already inside
+      const currentState = activeRecord.currentState || (activeRecord.actualPunchOut || activeRecord.punchOutType === 'ACTUAL' ? 'OUTSIDE' : 'INSIDE');
+
+      if (currentState === 'INSIDE') {
+        // Consecutive Punch In REJECTED!
+        await recordPunchLog({
+          employeeId: employee.employeeId,
+          employeeName: employee.employeeName,
+          timestamp: now.toISOString(),
+          action: 'REJECTED_DUPLICATE',
+          rawPayload,
+          scannerDevice,
+          message: `Consecutive Punch In rejected. Employee already Punched In at ${formatTimeDisplay(activeRecord.punchIn)}.`,
+        });
+
+        return {
+          success: false,
+          action: 'REJECTED_DUPLICATE',
+          scannerType: 'IN',
+          currentState: 'INSIDE',
+          employee,
+          attendance: activeRecord,
+          message: `Consecutive Punch In rejected. Employee is already Punched In (Status: INSIDE).`,
+          time: timeDisplay,
+          punchCount: activeRecord.punches?.length || 1,
+        };
+      }
+
+      // Employee is OUTSIDE: VALID SUBSEQUENT PUNCH IN!
+      // Anti-double-tap bounce check (< 3 seconds)
+      const lastPunchTime = activeRecord.punches && activeRecord.punches.length > 0 
+        ? new Date(activeRecord.punches[activeRecord.punches.length - 1].timestamp).getTime()
+        : new Date(activeRecord.updatedAt || activeRecord.punchIn).getTime();
+      if (Math.abs(now.getTime() - lastPunchTime) < 3000) {
+        return {
+          success: false,
+          action: 'REJECTED_DUPLICATE',
+          scannerType: 'IN',
+          currentState: 'OUTSIDE',
+          employee,
+          attendance: activeRecord,
+          message: 'Duplicate scan prevented. Please wait a few seconds before scanning again.',
+          time: timeDisplay,
+        };
+      }
+
+      const shift = shiftsMap.get(activeRecord.shiftId) || shifts[0];
+      const eventId = `pe_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const punchEvent: PunchEvent = {
+        id: eventId,
+        employeeId: employee.employeeId,
+        employeeName: employee.employeeName,
+        eventType: 'IN',
+        timestamp: now.toISOString(),
+        displayTime: timeDisplay,
+        shiftDate: activeRecord.shiftDate,
+        shiftId: activeRecord.shiftId,
+        shiftName: activeRecord.shiftNameSnapshot,
+        floor: employee.floor,
+        section: employee.section,
+        department: employee.department,
+        scannerType: 'IN',
+        scannerDevice,
+        status: 'SUBSEQUENT_IN',
       };
-      await setDoc(doc(db, 'attendance', openRecord.id), sanitizeFirestoreData(closedStaleRecord));
-      // Now continue down to create a new punch in!
-    } else {
-      // THIS IS A VALID PUNCH OUT!
-      const totalDurationMins = Math.max(0, Math.floor((now.getTime() - punchInDate.getTime()) / (1000 * 60)));
-      const scheduledDuration = openShift.scheduledDurationMinutes || settings.scheduledDurationMinutes || 510;
 
-      // Regular duty and overtime (Overtime calculated ONLY from actual Punch Out)
-      const regularDutyMins = Math.min(totalDurationMins, scheduledDuration);
-      const overtimeMins = Math.max(0, totalDurationMins - scheduledDuration);
+      // Atomic transaction update on existing record
+      // CRITICAL: First Punch In is PRESERVED! Never overwrite it!
+      const docRef = doc(db, 'attendance', activeRecord.id);
+      let updatedAttendance: AttendanceRecord = activeRecord;
 
-      const updatedRecord: AttendanceRecord = {
-        ...openRecord,
-        actualPunchOut: now.toISOString(),
-        effectivePunchOut: now.toISOString(),
-        punchOutType: 'ACTUAL',
-        regularDutyMinutes: regularDutyMins,
-        overtimeMinutes: overtimeMins,
-        attendanceStatus: 'COMPLETED',
-        updatedAt: now.toISOString(),
-      };
+      await runTransaction(db, async (txn) => {
+        const snap = await txn.get(docRef);
+        const currentData = snap.exists() ? (snap.data() as AttendanceRecord) : activeRecord!;
 
-      const docRef = doc(db, 'attendance', openRecord.id);
-      await setDoc(docRef, sanitizeFirestoreData(updatedRecord));
+        const existingPunches = currentData.punches || [];
+        const newPunches = [...existingPunches, punchEvent];
+
+        updatedAttendance = {
+          ...currentData,
+          currentState: 'INSIDE',
+          punchOutType: 'NONE', // Currently inside
+          punches: newPunches,
+          updatedAt: now.toISOString(),
+        };
+
+        txn.set(docRef, sanitizeFirestoreData(updatedAttendance));
+      });
+
+      // Save individual punch event
+      await recordPunchEvent(punchEvent);
 
       await recordPunchLog({
         employeeId: employee.employeeId,
         employeeName: employee.employeeName,
         timestamp: now.toISOString(),
-        action: 'PUNCH_OUT',
+        action: 'PUNCH_IN',
         rawPayload,
         scannerDevice,
-        message: `Punch Out recorded. Duty: ${formatMinutes(regularDutyMins)}, OT: ${formatMinutes(overtimeMins)}`,
-      });
-
-      await recordAuditLog({
-        action: 'ATTENDANCE_PUNCH_OUT',
-        employeeId: employee.employeeId,
-        newValue: `Out: ${timeDisplay}, Duty: ${formatMinutes(regularDutyMins)}, OT: ${formatMinutes(overtimeMins)}`,
-        actionSource: scannerDevice,
+        message: `Subsequent Punch In (Event #${updatedAttendance.punches?.length}). Status: INSIDE.`,
       });
 
       return {
         success: true,
-        action: 'PUNCH_OUT',
-        message: 'Attendance Punch Out Successfully Recorded.',
+        action: 'PUNCH_IN',
+        scannerType: 'IN',
+        currentState: 'INSIDE',
         employee,
-        attendance: updatedRecord,
-        shift: openShift,
-        time: timeDisplay,
-        dutyFormatted: formatMinutes(regularDutyMins),
-        otFormatted: formatMinutes(overtimeMins),
-      };
-    }
-  }
-
-  // 6. NO OPEN RECORD -> THIS IS A NEW PUNCH IN!
-  // Automatically identify shift based on server-validated Punch In timestamp
-  const shiftMatch = identifyShiftForPunchIn(shifts, now);
-  if (!shiftMatch) {
-    await recordPunchLog({
-      employeeId: employee.employeeId,
-      employeeName: employee.employeeName,
-      timestamp: now.toISOString(),
-      action: 'REJECTED_SHIFT',
-      rawPayload,
-      scannerDevice,
-      message: 'No shift window matched the punch-in time.',
-    });
-    return {
-      success: false,
-      action: 'REJECTED',
-      employee,
-      message: 'No Valid Shift Found For This Punch-In Time.',
-      time: timeDisplay,
-    };
-  }
-
-  const { shift, shiftDate } = shiftMatch;
-  const attendanceId = `att_${employee.employeeId}_${shiftDate}_${shift.id}`;
-
-  // Check if attendance already completed for this cycle (Duplicate Protection)
-  const existingDoc = await getDoc(doc(db, 'attendance', attendanceId));
-  if (existingDoc.exists()) {
-    const existingData = existingDoc.data() as AttendanceRecord;
-
-    if (existingData.punchOutType === 'AUTO') {
-      return {
-        success: false,
-        action: 'REJECTED',
-        employee,
-        attendance: existingData,
+        attendance: updatedAttendance,
         shift,
-        message: `Attendance Auto-Closed At Scheduled Shift End (${shift.endTime}). Contact Supervisor.`,
+        message: `Punch In Successfully Recorded (Re-entry #${updatedAttendance.punches?.length}).`,
         time: timeDisplay,
+        punchCount: updatedAttendance.punches?.length || 2,
       };
     }
 
-    if (existingData.actualPunchOut || existingData.punchOutType === 'ACTUAL') {
+    // NO ACTIVE RECORD -> THIS IS EMPLOYEE'S FIRST PUNCH IN OF THE WORKDAY!
+    const shiftMatch = identifyShiftForPunchIn(shifts, now);
+    if (!shiftMatch) {
       await recordPunchLog({
         employeeId: employee.employeeId,
         employeeName: employee.employeeName,
         timestamp: now.toISOString(),
-        action: 'REJECTED_DUPLICATE',
+        action: 'REJECTED_SHIFT',
         rawPayload,
         scannerDevice,
-        message: `Duplicate scan: Both Punch In and Punch Out already recorded for ${shift.name}.`,
+        message: 'No shift window matched the punch-in time.',
       });
       return {
         success: false,
         action: 'REJECTED',
+        scannerType: 'IN',
         employee,
-        attendance: existingData,
-        shift,
-        message: `Attendance Already Completed for ${shift.name} (${shiftDate}). Duplicate Scan Not Allowed.`,
+        message: 'No Valid Shift Found For This Punch-In Time.',
         time: timeDisplay,
       };
     }
 
-    if (existingData.punchOutType === 'NONE') {
-      return {
-        success: false,
-        action: 'REJECTED_DUPLICATE',
-        employee,
-        attendance: existingData,
-        shift,
-        message: `Already Punched In at ${formatTimeDisplay(existingData.punchIn)}.`,
-        time: timeDisplay,
-      };
-    }
-  }
+    const { shift, shiftDate } = shiftMatch;
+    const attendanceId = `att_${employee.employeeId}_${shiftDate}_${shift.id}`;
 
-  // Calculate Late Arrival based on shift start + grace period
-  const shiftStartMins = timeStringToMinutes(shift.startTime);
-  const currentMins = kolkata.totalMinutes;
-  const grace = shift.gracePeriodMinutes ?? settings.lateGraceMinutes ?? 15;
-
-  let isLate = false;
-  if (!shift.isOvernight) {
-    // Day Shift: start 09:00 (540). Late if > 09:15 (555)
-    isLate = currentMins > (shiftStartMins + grace);
-  } else {
-    // Night Shift: start 20:00 (1200).
-    // If punched in between 20:00 and 23:59:
-    if (currentMins >= 1200) {
+    // Late arrival evaluation based on shift start + grace
+    const shiftStartMins = timeStringToMinutes(shift.startTime);
+    const grace = shift.gracePeriodMinutes ?? settings.lateGraceMinutes ?? 15;
+    let isLate = false;
+    if (!shift.isOvernight) {
       isLate = currentMins > (shiftStartMins + grace);
     } else {
-      // Punched in after midnight (00:00 - 08:59): definitively late for the overnight shift
-      isLate = true;
+      if (currentMins >= 1200) {
+        isLate = currentMins > (shiftStartMins + grace);
+      } else {
+        isLate = true; // After midnight for night shift
+      }
     }
-  }
 
-  const initialStatus: AttendanceStatus = isLate ? 'LATE' : 'PRESENT';
+    const initialStatus: AttendanceStatus = isLate ? 'LATE' : 'PRESENT';
+    const eventId = `pe_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const firstPunchEvent: PunchEvent = {
+      id: eventId,
+      employeeId: employee.employeeId,
+      employeeName: employee.employeeName,
+      eventType: 'IN',
+      timestamp: now.toISOString(),
+      displayTime: timeDisplay,
+      shiftDate,
+      shiftId: shift.id,
+      shiftName: shift.name,
+      floor: employee.floor,
+      section: employee.section,
+      department: employee.department,
+      scannerType: 'IN',
+      scannerDevice,
+      status: isLate ? 'FIRST_IN_LATE' : 'FIRST_IN',
+    };
 
-  const newAttendanceRecord: AttendanceRecord = {
-    id: attendanceId,
-    employeeId: employee.employeeId,
-    employeeNameSnapshot: employee.employeeName,
-    employeeTypeSnapshot: employee.employeeType,
-    floorIdSnapshot: employee.floor,
-    sectionIdSnapshot: employee.section,
-    departmentIdSnapshot: employee.department,
-    shiftId: shift.id,
-    shiftNameSnapshot: shift.name,
-    shiftDate: shiftDate,
-    punchIn: now.toISOString(),
-    scheduledPunchOut: shift.endTime,
-    actualPunchOut: null,
-    effectivePunchOut: null,
-    punchOutType: 'NONE',
-    regularDutyMinutes: 0,
-    overtimeMinutes: 0,
-    attendanceStatus: initialStatus,
-    qrTokenReference: employee.qrCodeToken,
-    createdAt: now.toISOString(),
-    updatedAt: now.toISOString(),
-  };
+    const newAttendanceRecord: AttendanceRecord = {
+      id: attendanceId,
+      employeeId: employee.employeeId,
+      employeeNameSnapshot: employee.employeeName,
+      employeeTypeSnapshot: employee.employeeType,
+      floorIdSnapshot: employee.floor,
+      lineIdSnapshot: employee.floor,
+      sectionIdSnapshot: employee.section,
+      departmentIdSnapshot: employee.department,
+      shiftId: shift.id,
+      shiftNameSnapshot: shift.name,
+      shiftDate,
+      punchIn: now.toISOString(),
+      firstPunchIn: now.toISOString(), // Module 3: official earliest punch in
+      scheduledPunchOut: shift.endTime,
+      actualPunchOut: null,
+      lastPunchOut: null,
+      effectivePunchOut: null,
+      punchOutType: 'NONE',
+      currentState: 'INSIDE',
+      punches: [firstPunchEvent],
+      totalDutyMinutes: 0,
+      regularDutyMinutes: 0,
+      overtimeMinutes: 0,
+      attendanceStatus: initialStatus,
+      missedPunchOut: false,
+      autoClosed: false,
+      qrTokenReference: employee.qrCodeToken || '',
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+    };
 
-  try {
-    await setDoc(doc(db, 'attendance', attendanceId), sanitizeFirestoreData(newAttendanceRecord));
+    const docRef = doc(db, 'attendance', attendanceId);
+    try {
+      await runTransaction(db, async (txn) => {
+        const existing = await txn.get(docRef);
+        if (existing.exists()) {
+          const data = existing.data() as AttendanceRecord;
+          if (data.currentState === 'INSIDE') {
+            throw new Error('CONSECUTIVE_IN');
+          }
+        }
+        txn.set(docRef, sanitizeFirestoreData(newAttendanceRecord));
+      });
+    } catch (err: any) {
+      if (err?.message === 'CONSECUTIVE_IN') {
+        return {
+          success: false,
+          action: 'REJECTED_DUPLICATE',
+          scannerType: 'IN',
+          currentState: 'INSIDE',
+          employee,
+          message: 'Consecutive Punch In rejected. Employee is already Punched In (Status: INSIDE).',
+          time: timeDisplay,
+        };
+      }
+      throw err;
+    }
+
+    await recordPunchEvent(firstPunchEvent);
 
     await recordPunchLog({
       employeeId: employee.employeeId,
@@ -574,29 +663,253 @@ export async function processAttendanceScan(
       action: 'PUNCH_IN',
       rawPayload,
       scannerDevice,
-      message: `Punch In recorded for ${shift.name} (${shiftDate}). Status: ${initialStatus}`,
-    });
-
-    await recordAuditLog({
-      action: 'ATTENDANCE_PUNCH_IN',
-      employeeId: employee.employeeId,
-      newValue: `In: ${timeDisplay}, Shift: ${shift.name}, Status: ${initialStatus}`,
-      actionSource: scannerDevice,
+      message: `First Punch In recorded for ${shift.name} (${shiftDate}). Status: ${initialStatus}.`,
     });
 
     return {
       success: true,
       action: 'PUNCH_IN',
-      message: isLate ? `Punch In Recorded for ${shift.name} (Marked LATE).` : `Punch In Recorded for ${shift.name}.`,
+      scannerType: 'IN',
+      currentState: 'INSIDE',
       employee,
       attendance: newAttendanceRecord,
       shift,
+      message: isLate ? `First Punch In Recorded for ${shift.name} (Marked LATE).` : `First Punch In Recorded for ${shift.name}.`,
       time: timeDisplay,
+      punchCount: 1,
     };
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, `attendance/${attendanceId}`);
-    throw error;
   }
+
+  // =========================================================================
+  // SCANNER TYPE: 'OUT' (PUNCH OUT SCANNER)
+  // =========================================================================
+  if (scannerType === 'OUT') {
+    // Punch Out without a previous Punch In must be rejected!
+    if (!activeRecord) {
+      await recordPunchLog({
+        employeeId: employee.employeeId,
+        employeeName: employee.employeeName,
+        timestamp: now.toISOString(),
+        action: 'REJECTED_TOKEN',
+        rawPayload,
+        scannerDevice,
+        message: 'Punch Out rejected: No valid Punch In found for employee today.',
+      });
+
+      return {
+        success: false,
+        action: 'REJECTED',
+        scannerType: 'OUT',
+        employee,
+        message: 'Punch Out rejected: No valid Punch In found for employee. Please Punch In first.',
+        time: timeDisplay,
+      };
+    }
+
+    const currentState = activeRecord.currentState || (activeRecord.actualPunchOut || activeRecord.punchOutType === 'ACTUAL' ? 'OUTSIDE' : 'INSIDE');
+
+    if (currentState === 'OUTSIDE') {
+      // Consecutive Punch Out REJECTED!
+      await recordPunchLog({
+        employeeId: employee.employeeId,
+        employeeName: employee.employeeName,
+        timestamp: now.toISOString(),
+        action: 'REJECTED_DUPLICATE',
+        rawPayload,
+        scannerDevice,
+        message: 'Consecutive Punch Out rejected. Employee has already Punched Out.',
+      });
+
+      return {
+        success: false,
+        action: 'REJECTED_DUPLICATE',
+        scannerType: 'OUT',
+        currentState: 'OUTSIDE',
+        employee,
+        attendance: activeRecord,
+        message: 'Consecutive Punch Out rejected. Employee has already Punched Out (Status: OUTSIDE).',
+        time: timeDisplay,
+        punchCount: activeRecord.punches?.length || 1,
+      };
+    }
+
+    // Anti-double-tap bounce check (< 3 seconds)
+    const lastPunchTime = activeRecord.punches && activeRecord.punches.length > 0 
+      ? new Date(activeRecord.punches[activeRecord.punches.length - 1].timestamp).getTime()
+      : new Date(activeRecord.updatedAt || activeRecord.punchIn).getTime();
+    if (Math.abs(now.getTime() - lastPunchTime) < 3000) {
+      return {
+        success: false,
+        action: 'REJECTED_DUPLICATE',
+        scannerType: 'OUT',
+        currentState: 'INSIDE',
+        employee,
+        attendance: activeRecord,
+        message: 'Duplicate scan prevented. Please wait a few seconds before scanning again.',
+        time: timeDisplay,
+      };
+    }
+
+    // VALID PUNCH OUT!
+    // MODULE 3 & 4 RULES:
+    // Earliest valid Punch In is official daily firstPunchIn.
+    // Latest valid Punch Out is official daily lastPunchOut.
+    // Duty duration = lastPunchOut - firstPunchIn.
+    // Overtime hours = max(0, Duty Duration - 08:30).
+    // Never add intermediate intervals separately; strictly derived from first IN and last OUT.
+    const firstInIso = activeRecord.firstPunchIn || activeRecord.punchIn;
+    const firstInDate = new Date(firstInIso);
+    const totalDutyMinutes = Math.max(0, Math.floor((now.getTime() - firstInDate.getTime()) / (1000 * 60)));
+    const scheduledStandardDutyMinutes = 510; // 8 hours 30 mins
+
+    const regularDutyMinutes = Math.min(totalDutyMinutes, scheduledStandardDutyMinutes);
+    const overtimeMinutes = Math.max(0, totalDutyMinutes - scheduledStandardDutyMinutes);
+
+    const shift = shiftsMap.get(activeRecord.shiftId) || shifts[0];
+    const eventId = `pe_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const outEvent: PunchEvent = {
+      id: eventId,
+      employeeId: employee.employeeId,
+      employeeName: employee.employeeName,
+      eventType: 'OUT',
+      timestamp: now.toISOString(),
+      displayTime: timeDisplay,
+      shiftDate: activeRecord.shiftDate,
+      shiftId: activeRecord.shiftId,
+      shiftName: activeRecord.shiftNameSnapshot,
+      floor: employee.floor,
+      section: employee.section,
+      department: employee.department,
+      scannerType: 'OUT',
+      scannerDevice,
+      dutyDurationMinutes: totalDutyMinutes,
+      overtimeMinutes,
+      status: 'VALID_OUT',
+    };
+
+    const docRef = doc(db, 'attendance', activeRecord.id);
+    let updatedAttendance: AttendanceRecord = activeRecord;
+
+    await runTransaction(db, async (txn) => {
+      const snap = await txn.get(docRef);
+      const currentData = snap.exists() ? (snap.data() as AttendanceRecord) : activeRecord!;
+
+      const existingPunches = currentData.punches || [];
+      const newPunches = [...existingPunches, outEvent];
+
+      updatedAttendance = {
+        ...currentData,
+        actualPunchOut: now.toISOString(),
+        lastPunchOut: now.toISOString(), // Module 3: official latest punch out
+        effectivePunchOut: now.toISOString(),
+        punchOutType: 'ACTUAL',
+        currentState: 'OUTSIDE',
+        punches: newPunches,
+        totalDutyMinutes,
+        regularDutyMinutes,
+        overtimeMinutes,
+        attendanceStatus: 'COMPLETED',
+        missedPunchOut: false,
+        autoClosed: false,
+        updatedAt: now.toISOString(),
+      };
+
+      txn.set(docRef, sanitizeFirestoreData(updatedAttendance));
+    });
+
+    await recordPunchEvent(outEvent);
+
+    await recordPunchLog({
+      employeeId: employee.employeeId,
+      employeeName: employee.employeeName,
+      timestamp: now.toISOString(),
+      action: 'PUNCH_OUT',
+      rawPayload,
+      scannerDevice,
+      message: `Punch Out recorded. Duty: ${formatMinutes(regularDutyMinutes)}, OT: ${formatMinutes(overtimeMinutes)}. Total: ${formatMinutes(totalDutyMinutes)}.`,
+    });
+
+    return {
+      success: true,
+      action: 'PUNCH_OUT',
+      scannerType: 'OUT',
+      currentState: 'OUTSIDE',
+      employee,
+      attendance: updatedAttendance,
+      shift,
+      message: 'Punch Out Successfully Recorded.',
+      time: timeDisplay,
+      dutyFormatted: formatMinutes(regularDutyMinutes),
+      otFormatted: formatMinutes(overtimeMinutes),
+      punchCount: updatedAttendance.punches?.length || 2,
+    };
+  }
+
+  // Fallback if scannerType is not recognized
+  return {
+    success: false,
+    action: 'REJECTED',
+    message: 'Unknown scanner type.',
+    time: timeDisplay,
+  };
+}
+
+/**
+ * BACKWARD COMPATIBLE PROCESS ATTENDANCE SCAN
+ * If scannerType is not explicitly supplied, automatically selects 'IN' or 'OUT'
+ * based on the employee's current attendance state.
+ */
+export async function processAttendanceScan(
+  rawPayload: string,
+  scannerDevice: 'USB_SCANNER' | 'WEBCAM' = 'USB_SCANNER',
+  customScanTime?: Date,
+  explicitScannerType?: 'IN' | 'OUT'
+): Promise<ScanResult> {
+  if (explicitScannerType) {
+    return processDualAttendanceScan({
+      rawPayload,
+      scannerType: explicitScannerType,
+      scannerDevice,
+      customScanTime,
+    });
+  }
+
+  // Auto-detect employee current state
+  const { employeeId } = parseQrPayload(rawPayload);
+  if (!employeeId) {
+    return processDualAttendanceScan({
+      rawPayload,
+      scannerType: 'IN',
+      scannerDevice,
+      customScanTime,
+    });
+  }
+
+  const now = customScanTime || new Date();
+  const kolkata = getKolkataTimeParts(now);
+  const todayKey = kolkata.dateKey;
+  const yesterdayKey = getYesterdayKolkataDateKey(now);
+
+  const snap = await getDocs(
+    query(
+      collection(db, 'attendance'),
+      where('employeeId', '==', employeeId),
+      where('shiftDate', '>=', yesterdayKey)
+    )
+  );
+
+  const records = snap.docs.map(d => d.data() as AttendanceRecord);
+  const activeRecord = records.find(r => r.shiftDate === todayKey || (r.shiftDate === yesterdayKey && (r.shiftId === 'NIGHT' || (r.shiftNameSnapshot || '').toUpperCase().includes('NIGHT'))));
+
+  const currentState = activeRecord?.currentState || (activeRecord?.actualPunchOut ? 'OUTSIDE' : (activeRecord ? 'INSIDE' : 'OUTSIDE'));
+  const targetType: 'IN' | 'OUT' = currentState === 'INSIDE' ? 'OUT' : 'IN';
+
+  return processDualAttendanceScan({
+    rawPayload,
+    scannerType: targetType,
+    scannerDevice,
+    customScanTime,
+  });
 }
 
 /**
@@ -605,8 +918,11 @@ export async function processAttendanceScan(
  * - actualPunchOut = null
  * - effectivePunchOut = scheduledEndIso (+05:30)
  * - punchOutType = 'AUTO'
+ * - currentState = 'OUTSIDE'
+ * - missedPunchOut = true
+ * - autoClosed = true
  * - overtimeMinutes = 0 (STRICTLY ZERO OT for auto-closed records)
- * - regularDutyMinutes = scheduledDuration
+ * - regularDutyMinutes = scheduledDuration (510 minutes)
  */
 export async function runAutoCloseShiftsEngine(): Promise<{ closedCount: number; closedRecords: AttendanceRecord[] }> {
   try {
@@ -646,9 +962,14 @@ export async function runAutoCloseShiftsEngine(): Promise<{ closedCount: number;
         const updatedRecord: AttendanceRecord = {
           ...record,
           actualPunchOut: null, // Left null so reports distinguish Actual vs Auto
+          lastPunchOut: null,
           effectivePunchOut: scheduledEndIso,
           punchOutType: 'AUTO',
-          attendanceStatus: 'MISSED PUNCH OUT',
+          currentState: 'OUTSIDE',
+          attendanceStatus: 'AUTO CLOSED',
+          missedPunchOut: true,
+          autoClosed: true,
+          totalDutyMinutes: scheduledDuration,
           regularDutyMinutes: scheduledDuration, // Scheduled duty
           overtimeMinutes: 0, // NEVER add overtime to auto-closed attendance!
           updatedAt: now.toISOString(),
@@ -663,7 +984,7 @@ export async function runAutoCloseShiftsEngine(): Promise<{ closedCount: number;
           action: 'AUTO_CLOSE',
           rawPayload: 'SYSTEM_CRON',
           scannerDevice: 'SYSTEM_AUTO',
-          message: `Auto-closed at scheduled shift end (${shift.endTime}). Status: MISSED PUNCH OUT. OT: 00:00.`,
+          message: `Auto-closed at scheduled shift end (${shift.endTime}). Status: AUTO CLOSED. OT: 00:00.`,
         });
 
         await recordAuditLog({

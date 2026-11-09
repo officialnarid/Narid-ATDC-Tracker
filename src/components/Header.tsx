@@ -1,15 +1,25 @@
 import React, { useState, useEffect } from 'react';
-import { Clock, Play, CheckCircle2, AlertCircle, ScanLine, ShieldAlert } from 'lucide-react';
+import { Clock, Play, CheckCircle2, AlertCircle, ScanLine, ShieldAlert, LogOut, User, Menu } from 'lucide-react';
 import { runAutoCloseShiftsEngine, getKolkataTimeParts } from '../services/attendanceService';
-import { Shift } from '../types';
+import { Shift, UserRoleRecord } from '../types';
 
 interface HeaderProps {
   shifts: Shift[];
   onOpenScanner: () => void;
   onRefreshData?: () => void;
+  currentUserRole?: UserRoleRecord | null;
+  onLogout?: () => void;
+  onToggleMobileNav?: () => void;
 }
 
-export const Header: React.FC<HeaderProps> = ({ shifts, onOpenScanner, onRefreshData }) => {
+export const Header: React.FC<HeaderProps> = ({ 
+  shifts, 
+  onOpenScanner, 
+  onRefreshData,
+  currentUserRole,
+  onLogout,
+  onToggleMobileNav
+}) => {
   const [currentTime, setCurrentTime] = useState<Date>(new Date());
   const [isRunningAutoClose, setIsRunningAutoClose] = useState(false);
   const [autoCloseMessage, setAutoCloseMessage] = useState<string | null>(null);
@@ -81,15 +91,26 @@ export const Header: React.FC<HeaderProps> = ({ shifts, onOpenScanner, onRefresh
   const formattedTime = kolkata.timeWithSeconds;
 
   return (
-    <header className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between shrink-0 shadow-xs">
-      {/* Shift status & Date */}
-      <div className="flex items-center gap-4">
+    <header className="bg-white border-b border-slate-200 px-4 sm:px-6 py-3 flex items-center justify-between shrink-0 shadow-xs">
+      {/* Shift status, Mobile Menu Toggle & Date */}
+      <div className="flex items-center gap-3">
+        {onToggleMobileNav && (
+          <button
+            type="button"
+            onClick={onToggleMobileNav}
+            className="md:hidden p-1.5 rounded-lg text-slate-600 hover:text-slate-900 hover:bg-slate-100 border border-slate-200 transition cursor-pointer"
+            title="Open navigation menu"
+          >
+            <Menu className="w-5 h-5" />
+          </button>
+        )}
+
         <div className={`px-2.5 py-1 rounded text-xs font-semibold border flex items-center gap-1.5 ${activeShiftColor}`}>
           <span className="w-2 h-2 rounded-full bg-current animate-pulse"></span>
           <span>{activeShiftLabel}</span>
         </div>
 
-        <div className="text-sm font-medium text-slate-600 border-l border-slate-200 pl-4 hidden md:block">
+        <div className="text-sm font-medium text-slate-600 border-l border-slate-200 pl-3 hidden md:block">
           {formattedDate}
         </div>
       </div>
@@ -130,6 +151,30 @@ export const Header: React.FC<HeaderProps> = ({ shifts, onOpenScanner, onRefresh
           <ScanLine className="w-4 h-4" />
           <span>Open Scanner</span>
         </button>
+
+        {/* User Profile & Logout */}
+        {currentUserRole && (
+          <div className="flex items-center gap-2 border-l border-slate-200 pl-3">
+            <div className="hidden sm:flex flex-col items-end text-right">
+              <span className="text-xs font-bold text-slate-800 leading-tight truncate max-w-[130px]">
+                {currentUserRole.name}
+              </span>
+              <span className="text-[10px] font-mono font-bold text-blue-600 uppercase tracking-wider">
+                {currentUserRole.role.replace('_', ' ').toUpperCase()}
+              </span>
+            </div>
+            {onLogout && (
+              <button
+                onClick={onLogout}
+                title="Sign Out of Narid ATDC Tracker"
+                className="p-1.5 rounded-lg text-slate-500 hover:text-red-600 hover:bg-red-50 border border-slate-200 transition flex items-center gap-1 text-xs font-medium"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span className="hidden md:inline">Sign Out</span>
+              </button>
+            )}
+          </div>
+        )}
       </div>
     </header>
   );
