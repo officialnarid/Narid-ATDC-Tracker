@@ -1,6 +1,7 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
 import { 
+  initializeFirestore,
   getFirestore, 
   doc, 
   getDocFromServer 
@@ -24,7 +25,11 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 
 // Initialize Firestore strictly with the provisioned database ID from firebase-applet-config.json
-export const db = getFirestore(app, firebaseConfigJson.firestoreDatabaseId);
+// Enable experimentalForceLongPolling to guarantee rock-solid connectivity in browser iframes,
+// Cloud Run proxies, and corporate networks without WebChannel stream disconnections.
+export const db = initializeFirestore(app, {
+  experimentalForceLongPolling: true,
+}, firebaseConfigJson.firestoreDatabaseId);
 
 // Initialize Firebase Auth
 export const auth = getAuth(app);

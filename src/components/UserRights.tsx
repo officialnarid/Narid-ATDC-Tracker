@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { 
   ShieldCheck, 
-  UserCheck, 
   Key, 
   CheckCircle2, 
   AlertCircle,
@@ -13,13 +12,14 @@ import {
   Eye,
   EyeOff,
   X,
-  Sparkles,
   Info,
   ShieldAlert,
   Save,
   Check,
   Building,
-  User
+  User,
+  CheckSquare,
+  Square
 } from 'lucide-react';
 import { RolePermissionsManagement } from './RolePermissionsManagement';
 import { onSnapshot, collection } from 'firebase/firestore';
@@ -31,30 +31,29 @@ import {
   adminSetUserPassword, 
   updateUserRolePermissions, 
   deleteUserRole,
-  sendUserPasswordReset,
   INITIAL_DEFAULT_PASSWORD
 } from '../services/authService';
+import {
+  PERMISSION_MODULES,
+  RoleRecord,
+  RolePermissionRecord,
+  UserPermissionRecord,
+  ModulePermission,
+  ModuleAction,
+  subscribeToRoles,
+  subscribeToUserPermissions,
+  subscribeToAllRolePermissions,
+  saveUserIndividualPermissions,
+  getEffectiveModulePermissions,
+  DEFAULT_SUPER_ADMIN_PERMISSIONS,
+  DEFAULT_ADMIN_PERMISSIONS,
+  DEFAULT_USER_PERMISSIONS
+} from '../services/permissionService';
 
 interface UserRightsProps {
   currentUserRole?: UserRoleRecord | null;
   onRoleProfileUpdated?: (updatedProfile: UserRoleRecord) => void;
 }
-
-const SYSTEM_MODULES = [
-  { key: 'dashboard', label: '1. Dashboard & Analytics', desc: 'Real-time headcounts, attendance %, live line status' },
-  { key: 'scanner', label: '2. Attendance Scanner', desc: 'Continuous camera QR scan for Punch In / Out' },
-  { key: 'employees', label: '3. Employee Master', desc: 'Personnel registration, biometric ID, line assignment' },
-  { key: 'excel_import', label: '4. Excel Import / Update', desc: 'Bulk import and update employee database via spreadsheet' },
-  { key: 'qr_codes', label: '5. QR Code Management', desc: 'Batch PDF card print, single QR generation' },
-  { key: 'floors', label: '6. Production Line Master', desc: 'Line creation, supervisors, capacity configuration' },
-  { key: 'sections', label: '7. Section Master', desc: 'Plant floor sub-sections and operational zones' },
-  { key: 'departments', label: '8. Department Master', desc: 'Department taxonomy, code assignment, leads' },
-  { key: 'shifts', label: '9. Shift Management', desc: 'Shift timings, grace periods, auto-punch window' },
-  { key: 'history', label: '10. Attendance History', desc: 'Search logs, audit trails, manual punch adjustments' },
-  { key: 'reports', label: '11. Reports & Data Export', desc: 'Daily muster, overtime, absenteeism, Excel exports' },
-  { key: 'user_rights', label: '12. User Rights & Authorization', desc: 'Manage login accounts, passwords, module access' },
-  { key: 'settings', label: '13. System Settings', desc: 'Camera parameters, company branding, sync interval' },
-];
 
 export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleProfileUpdated }) => {
   const [users, setUsers] = useState<UserRoleRecord[]>([]);
@@ -62,13 +61,22 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
   const [activeTab, setActiveTab] = useState<'users' | 'role_permissions' | 'matrix' | 'roles'>('users');
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
+  // Firestore Subscribed Roles & Permissions
+  const [rolesList, setRolesList] = useState<RoleRecord[]>([]);
+  const [rolePermissionsMap, setRolePermissionsMap] = useState<Record<string, RolePermissionRecord>>({});
+  const [userPermissionsMap, setUserPermissionsMap] = useState<Record<string, UserPermissionRecord>>({});
+
   // Modal States
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [isPasswordModalOpen, setIsPasswordModalOpen] = useState(false);
   const [isPermissionsModalOpen, setIsPermissionsModalOpen] = useState(false);
   const [selectedUser, setSelectedUser] = useState<UserRoleRecord | null>(null);
 
-  // Form States - Create User
+  // Deletion Confirmation Modal State (Section 1)
+  const [userToDelete, setUserToDelete] = useState<UserRoleRecord | null>(null);
+  const [isDeletingUser, setIsDeletingUser] = useState(false);
+
+  // Form States - Create User (Section 2)
   const [createFormData, setCreateFormData] = useState({
     name: '',
     loginId: '',
@@ -88,18 +96,24 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
   const [requirePasswordChange, setRequirePasswordChange] = useState(false);
   const [isSubmittingPassword, setIsSubmittingPassword] = useState(false);
 
-  // Form States - Edit Permissions
+  // Form States - Edit Permissions Modal
   const [editModulesAllowed, setEditModulesAllowed] = useState<string[]>([]);
   const [editRole, setEditRole] = useState<UserRoleType>('user');
   const [editStatus, setEditStatus] = useState<'Active' | 'Inactive'>('Active');
   const [isSubmittingPermissions, setIsSubmittingPermissions] = useState(false);
+
+  // Module Permission Matrix Tab State (Section 4)
+  const [matrixViewMode, setMatrixViewMode] = useState<'roles' | 'user'>('roles');
+  const [selectedMatrixUserId, setSelectedMatrixUserId] = useState<string>('');
+  const [workingUserPerms, setWorkingUserPerms] = useState<Record<string, ModulePermission>>({});
+  const [isSavingUserMatrix, setIsSavingUserMatrix] = useState<boolean>(false);
 
   const isSuperAdmin = currentUserRole?.role?.toUpperCase() === 'SUPER_ADMIN' || currentUserRole?.loginId === 'superadmin';
 
   // Real-time synchronization with Firestore collection 'user_roles'
   useEffect(() => {
     setIsLoadingUsers(true);
-    const unsubscribe = onSnapshot(
+    const unsubscribeUsers = onSnapshot(
       collection(db, 'user_roles'),
       (snapshot) => {
         const fetched: UserRoleRecord[] = snapshot.docs.map(doc => {
@@ -119,6 +133,12 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
         setUsers(fetched);
         setIsLoadingUsers(false);
 
+        // Update default matrix selection if not selected
+        if (!selectedMatrixUserId && fetched.length > 0) {
+          const firstNonSuper = fetched.find(u => u.role?.toLowerCase() !== 'super_admin') || fetched[0];
+          setSelectedMatrixUserId(firstNonSuper.id);
+        }
+
         // Update current session profile if matched
         if (currentUserRole) {
           const currentInDb = fetched.find(u => u.id === currentUserRole.id || u.loginId === currentUserRole.loginId);
@@ -128,13 +148,45 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
         }
       },
       (err) => {
-        console.warn('Real-time snapshot error, falling back to manual fetch:', err);
+        console.warn('Real-time user_roles error, falling back to manual fetch:', err);
         loadUsersManual();
       }
     );
 
-    return () => unsubscribe();
+    // Subscribe to Firestore roles collection (Section 3)
+    const unsubscribeRoles = subscribeToRoles((roles) => {
+      setRolesList(roles);
+    });
+
+    // Subscribe to role_permissions
+    const unsubscribeRolePerms = subscribeToAllRolePermissions((data) => {
+      setRolePermissionsMap(data);
+    });
+
+    // Subscribe to user_permissions (Section 4)
+    const unsubscribeUserPerms = subscribeToUserPermissions((data) => {
+      setUserPermissionsMap(data);
+    });
+
+    return () => {
+      unsubscribeUsers();
+      unsubscribeRoles();
+      unsubscribeRolePerms();
+      unsubscribeUserPerms();
+    };
   }, [currentUserRole?.id]);
+
+  // Update working permissions when matrix user changes
+  useEffect(() => {
+    if (!selectedMatrixUserId) return;
+    const targetUser = users.find(u => u.id === selectedMatrixUserId);
+    if (!targetUser) return;
+
+    const userOverride = userPermissionsMap[selectedMatrixUserId];
+    const roleDefault = rolePermissionsMap[targetUser.role?.toLowerCase()];
+    const effective = getEffectiveModulePermissions(targetUser.role, userOverride, roleDefault);
+    setWorkingUserPerms(JSON.parse(JSON.stringify(effective)));
+  }, [selectedMatrixUserId, userPermissionsMap, rolePermissionsMap, users]);
 
   const loadUsersManual = async () => {
     setIsLoadingUsers(true);
@@ -163,13 +215,13 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       password: INITIAL_DEFAULT_PASSWORD,
       status: 'Active',
       mustChangePassword: true,
-      modulesAllowed: ['dashboard', 'scanner', 'employees', 'history', 'reports'],
+      modulesAllowed: ['dashboard', 'scanner', 'employees', 'history', 'reports', 'qr_codes'],
     });
     setShowCreatePassword(false);
     setIsCreateModalOpen(true);
   };
 
-  // 2. SUBMIT CREATE USER
+  // 2. SUBMIT CREATE USER (Section 2)
   const handleCreateUserSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!createFormData.loginId.trim()) {
@@ -245,7 +297,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
     setEditRole(user.role);
     setEditStatus(user.status || 'Active');
     if (user.modulesAllowed?.includes('all') || user.role === 'super_admin') {
-      setEditModulesAllowed(SYSTEM_MODULES.map(m => m.key));
+      setEditModulesAllowed(PERMISSION_MODULES.map(m => m.key));
     } else {
       setEditModulesAllowed(user.modulesAllowed || []);
     }
@@ -275,23 +327,32 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
     }
   };
 
-  // 7. DELETE USER
-  const handleDeleteUser = async (user: UserRoleRecord) => {
+  // 7. OPEN DELETE CONFIRMATION MODAL (Section 1)
+  const handleOpenDeleteModal = (user: UserRoleRecord) => {
     if (user.loginId === 'superadmin' || user.id === 'role_superadmin') {
-      showToast('error', 'The primary Super Admin account cannot be deleted.');
+      showToast('error', 'The primary root Super Admin account cannot be deleted.');
       return;
     }
+    if (currentUserRole && user.loginId === currentUserRole.loginId) {
+      showToast('error', 'Administrators cannot delete their own account.');
+      return;
+    }
+    setUserToDelete(user);
+  };
 
-    const confirmed = window.confirm(
-      `Are you sure you want to delete Login ID "${user.loginId}" (${user.name})? This will immediately remove their access from Firebase.`
-    );
-    if (!confirmed) return;
+  // 8. EXECUTE ACCOUNT DELETION (Section 1)
+  const handleConfirmDeleteUser = async () => {
+    if (!userToDelete) return;
 
+    setIsDeletingUser(true);
     try {
-      await deleteUserRole(user.id);
-      showToast('success', `User "${user.loginId}" successfully deleted from Firebase.`);
+      await deleteUserRole(userToDelete.id, userToDelete.loginId);
+      showToast('success', `User "${userToDelete.loginId}" (${userToDelete.name}) successfully deleted from Firebase.`);
+      setUserToDelete(null);
     } catch (err: any) {
       showToast('error', err.message || 'Failed to delete user.');
+    } finally {
+      setIsDeletingUser(false);
     }
   };
 
@@ -304,16 +365,56 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
     }
   };
 
-  // Presets
-  const applyPreset = (preset: 'all' | 'supervisor' | 'scanner' | 'clear', setter: (val: string[]) => void) => {
-    if (preset === 'all') {
-      setter(SYSTEM_MODULES.map(m => m.key));
-    } else if (preset === 'supervisor') {
-      setter(['dashboard', 'scanner', 'employees', 'excel_import', 'qr_codes', 'floors', 'sections', 'departments', 'shifts', 'history', 'reports']);
-    } else if (preset === 'scanner') {
-      setter(['scanner']);
-    } else if (preset === 'clear') {
-      setter([]);
+  // Toggle Individual Matrix Action
+  const toggleMatrixUserAction = (moduleKey: string, action: ModuleAction) => {
+    if (!isSuperAdmin) return;
+    const targetUser = users.find(u => u.id === selectedMatrixUserId);
+    if (targetUser?.role?.toLowerCase() === 'super_admin') return;
+
+    setWorkingUserPerms(prev => {
+      const current = prev[moduleKey] || { view: false, add: false, edit: false, delete: false };
+      const nextVal = !current[action];
+      const updated = { ...current, [action]: nextVal };
+      if (nextVal && (action === 'add' || action === 'edit' || action === 'delete')) {
+        updated.view = true;
+      }
+      if (!nextVal && action === 'view') {
+        updated.add = false;
+        updated.edit = false;
+        updated.delete = false;
+      }
+      return { ...prev, [moduleKey]: updated };
+    });
+  };
+
+  // Save User Individual Matrix Overrides
+  const handleSaveUserMatrix = async () => {
+    if (!selectedMatrixUserId) return;
+    const targetUser = users.find(u => u.id === selectedMatrixUserId);
+    if (!targetUser) return;
+
+    setIsSavingUserMatrix(true);
+    try {
+      const callerId = currentUserRole?.loginId || 'superadmin';
+      // Calculate allowed module keys based on view permission
+      const allowedKeys = Object.entries(workingUserPerms)
+        .filter(([_, p]) => p.view)
+        .map(([k, _]) => k);
+
+      await saveUserIndividualPermissions(
+        callerId,
+        selectedMatrixUserId,
+        workingUserPerms,
+        allowedKeys,
+        targetUser.role,
+        targetUser.status
+      );
+
+      showToast('success', `Customized permissions for "${targetUser.loginId}" saved to Firebase!`);
+    } catch (err: any) {
+      showToast('error', err.message || 'Failed to save individual permissions.');
+    } finally {
+      setIsSavingUserMatrix(false);
     }
   };
 
@@ -336,7 +437,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                 )}
               </h2>
               <p className="text-xs text-slate-500">
-                Create Login IDs, reset passwords, grant or revoke individual module permissions with instant Firebase sync
+                Manage login accounts, passwords, role descriptions, and module permissions with instant Firebase sync
               </p>
             </div>
           </div>
@@ -351,7 +452,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
           <button
             onClick={loadUsersManual}
             disabled={isLoadingUsers}
-            className="p-2 rounded-xl border border-slate-200 hover:bg-slate-100 text-slate-600 transition"
+            className="p-2 rounded-xl border border-slate-200 hover:bg-slate-100 text-slate-600 transition cursor-pointer"
             title="Refresh Users"
           >
             <RefreshCw className={`w-4 h-4 ${isLoadingUsers ? 'animate-spin text-blue-600' : ''}`} />
@@ -360,7 +461,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
           {isSuperAdmin && (
             <button
               onClick={handleOpenCreateModal}
-              className="px-4 py-2 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white font-bold text-xs flex items-center gap-2 shadow-md hover:from-blue-700 hover:to-indigo-700 transition active:scale-95"
+              className="px-4 py-2 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white font-bold text-xs flex items-center gap-2 shadow-md hover:from-blue-700 hover:to-indigo-700 transition active:scale-95 cursor-pointer"
             >
               <UserPlus className="w-4 h-4" />
               <span>+ CREATE NEW LOGIN ID</span>
@@ -376,7 +477,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
           <div>
             <span className="font-bold">Read-Only Access: </span>
             <span>
-              You are currently viewing user authorizations in view mode. Only the <strong>Super Admin</strong> has privileges to create new Login IDs, modify passwords, and configure permissions.
+              You are currently viewing user authorizations in view mode. Only the <strong>Super Admin</strong> has privileges to create new Login IDs, delete accounts, modify passwords, and configure permissions.
             </span>
           </div>
         </div>
@@ -410,7 +511,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
           <span>Active User Directory ({users.length})</span>
         </button>
 
-        {/* NEW SUBMODULE TAB: Role Permissions Management */}
+        {/* ROLE PERMISSIONS MANAGEMENT SUBMODULE */}
         <button
           onClick={() => setActiveTab('role_permissions')}
           className={`pb-2 px-3 text-xs font-bold transition border-b-2 flex items-center gap-2 shrink-0 cursor-pointer ${
@@ -426,6 +527,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
           </span>
         </button>
 
+        {/* MODULE PERMISSION MATRIX SUBMODULE */}
         <button
           onClick={() => setActiveTab('matrix')}
           className={`pb-2 px-3 text-xs font-bold transition border-b-2 flex items-center gap-2 shrink-0 cursor-pointer ${
@@ -436,6 +538,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
           <span>Module Permission Matrix</span>
         </button>
 
+        {/* ROLE DESCRIPTIONS SUBMODULE */}
         <button
           onClick={() => setActiveTab('roles')}
           className={`pb-2 px-3 text-xs font-bold transition border-b-2 flex items-center gap-2 shrink-0 cursor-pointer ${
@@ -443,96 +546,96 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
           }`}
         >
           <Building className="w-4 h-4" />
-          <span>Role Descriptions</span>
+          <span>Role Descriptions ({rolesList.length})</span>
         </button>
       </div>
 
-      {/* TAB 1: ACTIVE USER DIRECTORY */}
+      {/* ========================================================================= */}
+      {/* TAB 1: ACTIVE USER DIRECTORY                                              */}
+      {/* ========================================================================= */}
       {activeTab === 'users' && (
         <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
           <div className="p-4 border-b border-slate-200 bg-slate-50/80 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
             <div>
               <h3 className="text-xs font-extrabold text-slate-800 uppercase tracking-wider">
-                Authorized Personnel Directory
+                Authorized Personnel Directory ({users.length} Total)
               </h3>
               <p className="text-[11px] text-slate-500">
-                Click actions on any row to change password or adjust module permissions
+                Click actions on any row to change password, customize module access, or delete account
               </p>
             </div>
-            <span className="text-xs font-mono bg-blue-50 text-blue-700 px-2.5 py-1 rounded-lg border border-blue-200">
-              Total Accounts: {users.length}
-            </span>
           </div>
 
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead className="bg-slate-50 text-slate-600 uppercase font-semibold border-b border-slate-200">
                 <tr>
-                  <th className="py-3 px-4">Login ID</th>
-                  <th className="py-3 px-4">Name / Title</th>
+                  <th className="py-3 px-4">Login ID / Username</th>
+                  <th className="py-3 px-4">Name / Designation</th>
+                  <th className="py-3 px-4">Email</th>
                   <th className="py-3 px-4">Role</th>
-                  <th className="py-3 px-4">Allowed Modules</th>
+                  <th className="py-3 px-4">Module Access</th>
                   <th className="py-3 px-4">Status</th>
                   <th className="py-3 px-4 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {users.length === 0 ? (
+                {isLoadingUsers && users.length === 0 ? (
                   <tr>
-                    <td colSpan={6} className="py-12 text-center text-slate-400">
-                      <div className="w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto mb-2" />
-                      <span>Loading accounts from Firebase Firestore...</span>
+                    <td colSpan={7} className="py-8 text-center text-slate-400">
+                      <div className="w-5 h-5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto mb-2" />
+                      Loading accounts from Firebase...
+                    </td>
+                  </tr>
+                ) : users.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="py-8 text-center text-slate-400">
+                      No user accounts found. Click "+ Create New Login ID" to provision an account.
                     </td>
                   </tr>
                 ) : (
                   users.map(u => {
-                    const isAll = u.modulesAllowed?.includes('all') || u.role?.toLowerCase() === 'super_admin';
-                    const allowedCount = isAll ? 13 : (u.modulesAllowed?.length || 0);
-
+                    const isSuper = u.role?.toLowerCase() === 'super_admin';
+                    const isAdmin = u.role?.toLowerCase() === 'admin';
                     return (
-                      <tr key={u.id} className="hover:bg-blue-50/40 transition">
+                      <tr key={u.id} className="hover:bg-slate-50 transition">
                         <td className="py-3 px-4 font-mono font-bold text-blue-700">
                           {u.loginId}
                         </td>
-                        <td className="py-3 px-4">
-                          <div className="font-semibold text-slate-900">{u.name}</div>
-                          <div className="text-[11px] font-mono text-slate-400">{u.email.replace('_auth@', '@')}</div>
+                        <td className="py-3 px-4 font-medium text-slate-800">
+                          {u.name}
+                        </td>
+                        <td className="py-3 px-4 text-slate-500 font-mono text-[11px]">
+                          {u.email}
                         </td>
                         <td className="py-3 px-4">
-                          <span className={`px-2.5 py-1 rounded-lg font-bold text-[10px] tracking-wide uppercase inline-flex items-center gap-1 ${
-                            u.role?.toLowerCase() === 'super_admin' ? 'bg-red-100 text-red-800 border border-red-200' :
-                            u.role?.toLowerCase() === 'admin' ? 'bg-blue-100 text-blue-800 border border-blue-200' :
-                            'bg-slate-100 text-slate-800 border border-slate-200'
+                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
+                            isSuper ? 'bg-red-100 text-red-800' :
+                            isAdmin ? 'bg-blue-100 text-blue-800' :
+                            'bg-slate-100 text-slate-700'
                           }`}>
-                            {u.role}
+                            {isSuper ? 'SUPER ADMIN' : isAdmin ? 'ADMIN' : 'USER'}
                           </span>
                         </td>
                         <td className="py-3 px-4">
-                          <div className="flex items-center gap-1.5 flex-wrap">
-                            <span className={`px-2 py-0.5 rounded-full font-bold text-[10px] ${
-                              isAll 
-                                ? 'bg-purple-100 text-purple-800' 
-                                : 'bg-slate-100 text-slate-700'
-                            }`}>
-                              {isAll ? 'All 13 Modules' : `${allowedCount} Modules`}
+                          {isSuper ? (
+                            <span className="text-emerald-700 font-semibold text-[11px]">All Modules (Full)</span>
+                          ) : (
+                            <span className="text-slate-600 text-[11px] font-medium">
+                              {u.modulesAllowed?.length || 0} Modules Allowed
                             </span>
-                            {!isAll && allowedCount > 0 && (
-                              <span className="text-[10px] text-slate-400 font-mono">
-                                ({u.modulesAllowed?.slice(0, 3).join(', ')}{allowedCount > 3 ? '...' : ''})
-                              </span>
-                            )}
-                          </div>
+                          )}
                         </td>
                         <td className="py-3 px-4">
-                          <div className="flex items-center gap-1.5 flex-wrap">
-                            <span className={`px-2 py-0.5 rounded-full font-bold text-[10px] ${
-                              u.status === 'Active' ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
+                          <div className="flex items-center gap-1.5">
+                            <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
+                              u.status === 'Active' ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-600'
                             }`}>
                               {u.status}
                             </span>
                             {u.mustChangePassword && (
                               <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-semibold text-[9px]">
-                                Password Change Required
+                                Password Change
                               </span>
                             )}
                           </div>
@@ -543,22 +646,22 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                               <>
                                 <button
                                   onClick={() => handleOpenPasswordModal(u)}
-                                  className="p-1.5 rounded-lg border border-slate-200 hover:border-blue-400 hover:bg-blue-50 text-slate-700 hover:text-blue-700 transition"
+                                  className="p-1.5 rounded-lg border border-slate-200 hover:border-blue-400 hover:bg-blue-50 text-slate-700 hover:text-blue-700 transition cursor-pointer"
                                   title={`Change password for ${u.loginId}`}
                                 >
                                   <Key className="w-3.5 h-3.5" />
                                 </button>
                                 <button
                                   onClick={() => handleOpenPermissionsModal(u)}
-                                  className="p-1.5 rounded-lg border border-slate-200 hover:border-indigo-400 hover:bg-indigo-50 text-slate-700 hover:text-indigo-700 transition"
+                                  className="p-1.5 rounded-lg border border-slate-200 hover:border-indigo-400 hover:bg-indigo-50 text-slate-700 hover:text-indigo-700 transition cursor-pointer"
                                   title={`Configure permissions for ${u.loginId}`}
                                 >
                                   <Sliders className="w-3.5 h-3.5" />
                                 </button>
                                 {u.loginId !== 'superadmin' && u.id !== 'role_superadmin' && (
                                   <button
-                                    onClick={() => handleDeleteUser(u)}
-                                    className="p-1.5 rounded-lg border border-slate-200 hover:border-red-400 hover:bg-red-50 text-slate-700 hover:text-red-700 transition"
+                                    onClick={() => handleOpenDeleteModal(u)}
+                                    className="p-1.5 rounded-lg border border-slate-200 hover:border-red-400 hover:bg-red-50 text-slate-700 hover:text-red-700 transition cursor-pointer"
                                     title={`Delete account ${u.loginId}`}
                                   >
                                     <Trash2 className="w-3.5 h-3.5" />
@@ -581,95 +684,262 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
         </div>
       )}
 
-      {/* TAB 2: PERMISSION MATRIX */}
+      {/* ========================================================================= */}
+      {/* TAB 2: ROLE PERMISSIONS MANAGEMENT (Section 5)                            */}
+      {/* ========================================================================= */}
+      {activeTab === 'role_permissions' && (
+        <RolePermissionsManagement currentUserRole={currentUserRole} users={users} />
+      )}
+
+      {/* ========================================================================= */}
+      {/* TAB 3: MODULE PERMISSION MATRIX (Section 4)                               */}
+      {/* ========================================================================= */}
       {activeTab === 'matrix' && (
-        <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
-          <div className="p-4 border-b border-slate-200 bg-slate-50 flex items-center justify-between">
-            <h3 className="text-xs font-extrabold text-slate-800 uppercase tracking-wider">
-              System Module Matrix & Default Role Allocations
-            </h3>
-            <span className="text-[11px] text-slate-500">Super Admin can customize permissions per user</span>
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden flex flex-col gap-4 p-5">
+          {/* Matrix Header & Mode Switcher */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-200">
+            <div>
+              <h3 className="text-sm font-extrabold text-slate-900 uppercase tracking-tight flex items-center gap-2">
+                <Sliders className="w-4 h-4 text-blue-600" />
+                Dynamic Module Permission Matrix
+              </h3>
+              <p className="text-xs text-slate-500">
+                Granular View, Add, Edit and Delete controls across all 11 plant modules with role inheritance and individual overrides
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2 bg-slate-100 p-1 rounded-xl">
+              <button
+                type="button"
+                onClick={() => setMatrixViewMode('roles')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer ${
+                  matrixViewMode === 'roles' ? 'bg-white text-blue-700 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Role-Level Defaults
+              </button>
+              <button
+                type="button"
+                onClick={() => setMatrixViewMode('user')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer ${
+                  matrixViewMode === 'user' ? 'bg-white text-blue-700 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Account-Level Overrides
+              </button>
+            </div>
           </div>
 
-          <div className="overflow-x-auto">
+          {/* Account Selector when in 'user' mode */}
+          {matrixViewMode === 'user' && (
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 rounded-xl bg-blue-50/60 border border-blue-200">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-slate-700">Select Account to Configure:</span>
+                <select
+                  value={selectedMatrixUserId}
+                  onChange={e => setSelectedMatrixUserId(e.target.value)}
+                  className="text-xs px-3 py-1.5 rounded-lg border border-slate-300 bg-white font-mono font-bold text-blue-700"
+                >
+                  {users.map(u => (
+                    <option key={u.id} value={u.id}>
+                      {u.loginId} ({u.name} - {u.role.toUpperCase()})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {isSuperAdmin && (
+                <button
+                  type="button"
+                  onClick={handleSaveUserMatrix}
+                  disabled={isSavingUserMatrix}
+                  className="px-4 py-1.5 rounded-xl bg-blue-600 text-white font-bold text-xs flex items-center gap-2 hover:bg-blue-700 transition shadow-xs cursor-pointer disabled:opacity-50"
+                >
+                  {isSavingUserMatrix ? (
+                    <>
+                      <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      <span>Saving...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Save className="w-3.5 h-3.5" />
+                      <span>Save Account Overrides</span>
+                    </>
+                  )}
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Dynamic Matrix Table */}
+          <div className="overflow-x-auto rounded-xl border border-slate-200">
             <table className="w-full text-left text-xs">
-              <thead className="bg-slate-50 text-slate-600 uppercase font-semibold border-b border-slate-200">
+              <thead className="bg-slate-50 text-slate-700 uppercase font-bold border-b border-slate-200">
                 <tr>
-                  <th className="py-3 px-4">System Module</th>
-                  <th className="py-3 px-4">Scope & Function</th>
-                  <th className="py-3 px-4 text-center">SUPER ADMIN</th>
-                  <th className="py-3 px-4 text-center">ADMIN (Supervisor)</th>
-                  <th className="py-3 px-4 text-center">USER (Operator)</th>
+                  <th className="py-3 px-4 w-1/3">Module Name</th>
+                  {matrixViewMode === 'roles' ? (
+                    <>
+                      <th className="py-3 px-4 text-center">SUPER ADMIN</th>
+                      <th className="py-3 px-4 text-center">ADMIN</th>
+                      <th className="py-3 px-4 text-center">USER</th>
+                    </>
+                  ) : (
+                    <>
+                      <th className="py-3 px-4 text-center">VIEW</th>
+                      <th className="py-3 px-4 text-center">ADD</th>
+                      <th className="py-3 px-4 text-center">EDIT</th>
+                      <th className="py-3 px-4 text-center">DELETE</th>
+                    </>
+                  )}
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {SYSTEM_MODULES.map(mod => (
-                  <tr key={mod.key} className="hover:bg-slate-50">
-                    <td className="py-3 px-4 font-bold text-slate-800">{mod.label}</td>
-                    <td className="py-3 px-4 text-slate-500 text-[11px]">{mod.desc}</td>
-                    <td className="py-3 px-4 text-center">
-                      <span className="w-5 h-5 mx-auto rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center font-bold">✓</span>
-                    </td>
-                    <td className="py-3 px-4 text-center">
-                      {mod.key !== 'user_rights' && mod.key !== 'settings' ? (
-                        <span className="w-5 h-5 mx-auto rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center font-bold">✓</span>
-                      ) : (
-                        <span className="w-5 h-5 mx-auto rounded-full bg-slate-100 text-slate-400 flex items-center justify-center">✕</span>
-                      )}
-                    </td>
-                    <td className="py-3 px-4 text-center">
-                      {mod.key === 'scanner' ? (
-                        <span className="w-5 h-5 mx-auto rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center font-bold">✓</span>
-                      ) : (
-                        <span className="w-5 h-5 mx-auto rounded-full bg-slate-100 text-slate-400 flex items-center justify-center">✕</span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                {PERMISSION_MODULES.map(mod => {
+                  if (matrixViewMode === 'roles') {
+                    const superPerm = DEFAULT_SUPER_ADMIN_PERMISSIONS[mod.key] || { view: true, add: true, edit: true, delete: true };
+                    const adminPerm = rolePermissionsMap['admin']?.modulePermissions[mod.key] || DEFAULT_ADMIN_PERMISSIONS[mod.key] || { view: false, add: false, edit: false, delete: false };
+                    const userPerm = rolePermissionsMap['user']?.modulePermissions[mod.key] || DEFAULT_USER_PERMISSIONS[mod.key] || { view: false, add: false, edit: false, delete: false };
+
+                    const renderPermPills = (p: ModulePermission) => (
+                      <div className="flex items-center justify-center gap-1">
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${p.view ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-400'}`}>V</span>
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${p.add ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-400'}`}>A</span>
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${p.edit ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-400'}`}>E</span>
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${p.delete ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-400'}`}>D</span>
+                      </div>
+                    );
+
+                    return (
+                      <tr key={mod.key} className="hover:bg-slate-50">
+                        <td className="py-3 px-4">
+                          <span className="font-bold text-slate-800 block">{mod.label}</span>
+                          <span className="text-[10px] text-slate-400">{mod.description}</span>
+                        </td>
+                        <td className="py-3 px-4 text-center">{renderPermPills(superPerm)}</td>
+                        <td className="py-3 px-4 text-center">{renderPermPills(adminPerm)}</td>
+                        <td className="py-3 px-4 text-center">{renderPermPills(userPerm)}</td>
+                      </tr>
+                    );
+                  } else {
+                    const currentPerm = workingUserPerms[mod.key] || { view: false, add: false, edit: false, delete: false };
+                    const targetUser = users.find(u => u.id === selectedMatrixUserId);
+                    const isTargetSuper = targetUser?.role?.toLowerCase() === 'super_admin';
+
+                    const renderActionCheckbox = (action: ModuleAction) => {
+                      const checked = isTargetSuper ? true : !!currentPerm[action];
+                      return (
+                        <button
+                          type="button"
+                          disabled={!isSuperAdmin || isTargetSuper}
+                          onClick={() => toggleMatrixUserAction(mod.key, action)}
+                          className={`p-1.5 rounded-lg border transition ${
+                            checked ? 'bg-blue-600 text-white border-blue-600' : 'bg-white border-slate-300 text-slate-400 hover:border-slate-400'
+                          } ${isTargetSuper ? 'opacity-70 cursor-not-allowed' : 'cursor-pointer'}`}
+                        >
+                          {checked ? <CheckSquare className="w-4 h-4" /> : <Square className="w-4 h-4" />}
+                        </button>
+                      );
+                    };
+
+                    return (
+                      <tr key={mod.key} className="hover:bg-slate-50">
+                        <td className="py-3 px-4">
+                          <span className="font-bold text-slate-800 block">{mod.label}</span>
+                          <span className="text-[10px] text-slate-400">{mod.description}</span>
+                        </td>
+                        <td className="py-3 px-4 text-center">{renderActionCheckbox('view')}</td>
+                        <td className="py-3 px-4 text-center">{renderActionCheckbox('add')}</td>
+                        <td className="py-3 px-4 text-center">{renderActionCheckbox('edit')}</td>
+                        <td className="py-3 px-4 text-center">{renderActionCheckbox('delete')}</td>
+                      </tr>
+                    );
+                  }
+                })}
               </tbody>
             </table>
           </div>
         </div>
       )}
 
-      {/* TAB 3: ROLES OVERVIEW */}
+      {/* ========================================================================= */}
+      {/* TAB 4: ROLE DESCRIPTIONS (Section 3 - Stored and Retrieved from Firestore) */}
+      {/* ========================================================================= */}
       {activeTab === 'roles' && (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
-              <h3 className="font-extrabold text-slate-900 text-sm">SUPER ADMIN</h3>
-              <span className="text-[10px] bg-red-100 text-red-800 px-2.5 py-0.5 rounded-full font-bold">Unrestricted</span>
-            </div>
-            <p className="text-xs text-slate-600 mt-3 leading-relaxed">
-              Complete administrative authority over the entire NARID ATDC platform. Holds exclusive power to create new Login IDs, reset passwords, change user module permissions, and manage plant system configuration.
-            </p>
-          </div>
+          {rolesList.map(r => {
+            const count = users.filter(u => u.role?.toLowerCase() === r.roleId).length;
+            const isSuper = r.roleId === 'super_admin';
+            const isAdmin = r.roleId === 'admin';
 
-          <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
-              <h3 className="font-extrabold text-slate-900 text-sm">ADMIN (Supervisor)</h3>
-              <span className="text-[10px] bg-blue-100 text-blue-800 px-2.5 py-0.5 rounded-full font-bold">Operations</span>
-            </div>
-            <p className="text-xs text-slate-600 mt-3 leading-relaxed">
-              Plant Floor Supervisors and Production Line Managers. Can view real-time headcount, manage employees, perform Excel imports, generate QR cards, manage lines, and export reports.
-            </p>
-          </div>
+            return (
+              <div 
+                key={r.roleId} 
+                className={`bg-white rounded-2xl border p-6 shadow-xs flex flex-col justify-between transition-all ${
+                  isSuper ? 'border-red-200 hover:border-red-300' :
+                  isAdmin ? 'border-blue-200 hover:border-blue-300' :
+                  'border-slate-200 hover:border-slate-300'
+                }`}
+              >
+                <div>
+                  <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+                    <div>
+                      <h3 className="font-black text-slate-900 text-base tracking-wide">
+                        {r.roleName}
+                      </h3>
+                      <span className="text-[10px] text-slate-400 font-mono">
+                        roles/{r.roleId}
+                      </span>
+                    </div>
 
-          <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
-              <h3 className="font-extrabold text-slate-900 text-sm">USER (Gate Operator)</h3>
-              <span className="text-[10px] bg-slate-100 text-slate-700 px-2.5 py-0.5 rounded-full font-bold">Scanner Only</span>
-            </div>
-            <p className="text-xs text-slate-600 mt-3 leading-relaxed">
-              Security Gate and Production Line Operators. Restricted exclusively to the high-speed Attendance QR Scanner for rapid employee Punch In and Punch Out.
-            </p>
-          </div>
+                    <div className="flex flex-col items-end gap-1">
+                      <span className={`text-[10px] px-2.5 py-0.5 rounded-full font-bold uppercase tracking-wider ${
+                        isSuper ? 'bg-red-100 text-red-800' :
+                        isAdmin ? 'bg-blue-100 text-blue-800' :
+                        'bg-slate-100 text-slate-700'
+                      }`}>
+                        {r.isActive ? 'Active' : 'Inactive'}
+                      </span>
+                      <span className="text-[11px] font-bold text-slate-600 bg-slate-100 px-2 py-0.5 rounded-md">
+                        {count} {count === 1 ? 'Account' : 'Accounts'}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Role Description from Firestore */}
+                  <p className="text-xs text-slate-600 mt-4 leading-relaxed font-normal">
+                    {r.description}
+                  </p>
+                </div>
+
+                <div className="mt-6 pt-4 border-t border-slate-100">
+                  <div className="text-[11px] font-bold text-slate-700 mb-1.5">
+                    Default Capabilities:
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {isSuper && (
+                      <span className="text-[10px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 px-2 py-0.5 rounded">
+                        Full Unrestricted Access
+                      </span>
+                    )}
+                    {isAdmin && (
+                      <>
+                        <span className="text-[10px] font-semibold bg-blue-50 text-blue-800 border border-blue-200 px-2 py-0.5 rounded">Dashboard</span>
+                        <span className="text-[10px] font-semibold bg-blue-50 text-blue-800 border border-blue-200 px-2 py-0.5 rounded">Scanner</span>
+                        <span className="text-[10px] font-semibold bg-blue-50 text-blue-800 border border-blue-200 px-2 py-0.5 rounded">Employee Master</span>
+                        <span className="text-[10px] font-semibold bg-blue-50 text-blue-800 border border-blue-200 px-2 py-0.5 rounded">Reports</span>
+                      </>
+                    )}
+                    {!isSuper && !isAdmin && (
+                      <span className="text-[10px] font-semibold bg-slate-50 text-slate-800 border border-slate-200 px-2 py-0.5 rounded">
+                        Attendance Scanner Only
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
         </div>
-      )}
-
-      {/* TAB: ROLE PERMISSIONS MANAGEMENT (NEW SUBMODULE) */}
-      {activeTab === 'role_permissions' && (
-        <RolePermissionsManagement currentUserRole={currentUserRole} />
       )}
 
       {/* ========================================================= */}
@@ -693,7 +963,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
               </div>
               <button
                 onClick={() => setIsCreateModalOpen(false)}
-                className="p-1 rounded-lg hover:bg-slate-200 text-slate-500 transition"
+                className="p-1 rounded-lg hover:bg-slate-200 text-slate-500 transition cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -760,174 +1030,91 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                   </select>
                 </div>
 
-                {/* Status */}
+                {/* Email */}
                 <div>
                   <label className="block text-xs font-bold text-slate-700 mb-1">
-                    Account Status
-                  </label>
-                  <select
-                    value={createFormData.status}
-                    onChange={e => setCreateFormData({ ...createFormData, status: e.target.value as any })}
-                    className="w-full text-xs px-3 py-2 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 font-semibold"
-                  >
-                    <option value="Active">Active (Permitted to log in)</option>
-                    <option value="Inactive">Inactive (Suspended)</option>
-                  </select>
-                </div>
-              </div>
-
-              {/* Password */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1">
-                    Initial Password *
-                  </label>
-                  <div className="relative">
-                    <input
-                      type={showCreatePassword ? 'text' : 'password'}
-                      required
-                      value={createFormData.password}
-                      onChange={e => setCreateFormData({ ...createFormData, password: e.target.value })}
-                      className="w-full text-xs px-3 py-2 pr-10 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowCreatePassword(!showCreatePassword)}
-                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
-                    >
-                      {showCreatePassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                    </button>
-                  </div>
-                  <span className="text-[10px] text-slate-400">Default: Narid@12345</span>
-                </div>
-
-                {/* Email (Optional) */}
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1">
-                    Email (Optional)
+                    Official Email (Optional)
                   </label>
                   <input
                     type="email"
-                    placeholder={`Optional (defaults to ${createFormData.loginId || 'id'}@narid.com)`}
+                    placeholder="e.g. rajesh@narid.com"
                     value={createFormData.email}
                     onChange={e => setCreateFormData({ ...createFormData, email: e.target.value })}
-                    className="w-full text-xs px-3 py-2 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono"
+                    className="w-full text-xs px-3 py-2 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 font-medium"
                   />
                 </div>
               </div>
 
-              {/* Require Password Change Checkbox */}
-              <label className="flex items-center gap-2 cursor-pointer bg-slate-50 p-2.5 rounded-xl border border-slate-200">
-                <input
-                  type="checkbox"
-                  checked={createFormData.mustChangePassword}
-                  onChange={e => setCreateFormData({ ...createFormData, mustChangePassword: e.target.checked })}
-                  className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 w-4 h-4"
-                />
-                <span className="text-xs text-slate-700 font-medium">
-                  Require user to set a new personal password on first login
-                </span>
-              </label>
-
-              {/* Module Permissions Selection */}
-              <div className="pt-2 border-t border-slate-200">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
-                  <div>
-                    <h4 className="text-xs font-extrabold text-slate-800 uppercase tracking-wide">
-                      Module Access Permissions (Firebase Sync)
-                    </h4>
-                    <p className="text-[11px] text-slate-500">
-                      Choose which parts of the application this user can access
-                    </p>
-                  </div>
-
-                  {/* Preset quick buttons */}
-                  <div className="flex items-center gap-1.5 flex-wrap">
-                    <button
-                      type="button"
-                      onClick={() => applyPreset('all', val => setCreateFormData({ ...createFormData, modulesAllowed: val }))}
-                      className="px-2 py-1 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 text-[10px] font-bold"
-                    >
-                      All Modules
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => applyPreset('supervisor', val => setCreateFormData({ ...createFormData, modulesAllowed: val }))}
-                      className="px-2 py-1 rounded bg-blue-50 hover:bg-blue-100 text-blue-700 text-[10px] font-bold"
-                    >
-                      Supervisor
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => applyPreset('scanner', val => setCreateFormData({ ...createFormData, modulesAllowed: val }))}
-                      className="px-2 py-1 rounded bg-emerald-50 hover:bg-emerald-100 text-emerald-700 text-[10px] font-bold"
-                    >
-                      Scanner Only
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => applyPreset('clear', val => setCreateFormData({ ...createFormData, modulesAllowed: val }))}
-                      className="px-2 py-1 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 text-[10px] font-bold"
-                    >
-                      Clear
-                    </button>
-                  </div>
+              {/* Password */}
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  Initial Password *
+                </label>
+                <div className="relative">
+                  <input
+                    type={showCreatePassword ? 'text' : 'password'}
+                    required
+                    minLength={6}
+                    value={createFormData.password}
+                    onChange={e => setCreateFormData({ ...createFormData, password: e.target.value })}
+                    className="w-full text-xs px-3 py-2 pr-10 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono font-medium"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowCreatePassword(!showCreatePassword)}
+                    className="absolute right-3 top-2.5 text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    {showCreatePassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
                 </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-48 overflow-y-auto p-1 bg-slate-50 rounded-xl border border-slate-200">
-                  {SYSTEM_MODULES.map(m => {
-                    const isChecked = createFormData.role === 'super_admin' || createFormData.modulesAllowed.includes(m.key);
-                    return (
-                      <label
-                        key={m.key}
-                        className={`flex items-start gap-2.5 p-2 rounded-lg border cursor-pointer transition ${
-                          isChecked ? 'bg-blue-50/70 border-blue-200 text-blue-900 font-semibold' : 'bg-white border-slate-200 text-slate-700'
-                        }`}
-                      >
-                        <input
-                          type="checkbox"
-                          disabled={createFormData.role === 'super_admin'}
-                          checked={isChecked}
-                          onChange={() => toggleModule(
-                            m.key, 
-                            createFormData.modulesAllowed, 
-                            val => setCreateFormData({ ...createFormData, modulesAllowed: val })
-                          )}
-                          className="mt-0.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500 w-4 h-4"
-                        />
-                        <div className="text-[11px] leading-tight">
-                          <div>{m.label}</div>
-                          <div className="text-[9px] text-slate-400 font-normal">{m.desc}</div>
-                        </div>
-                      </label>
-                    );
-                  })}
-                </div>
+                <span className="text-[10px] text-slate-400">Default is "Narid@12345" (minimum 6 characters)</span>
               </div>
 
-              {/* Submit Buttons */}
+              <div className="flex items-center gap-6 pt-1">
+                <label className="flex items-center gap-2 cursor-pointer text-xs font-medium text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={createFormData.mustChangePassword}
+                    onChange={e => setCreateFormData({ ...createFormData, mustChangePassword: e.target.checked })}
+                    className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 w-4 h-4"
+                  />
+                  <span>Require password change on first sign in</span>
+                </label>
+
+                <label className="flex items-center gap-2 cursor-pointer text-xs font-medium text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={createFormData.status === 'Active'}
+                    onChange={e => setCreateFormData({ ...createFormData, status: e.target.checked ? 'Active' : 'Inactive' })}
+                    className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500 w-4 h-4"
+                  />
+                  <span>Active (Account enabled immediately)</span>
+                </label>
+              </div>
+
+              {/* Action Buttons */}
               <div className="pt-4 border-t border-slate-100 flex items-center justify-end gap-3">
                 <button
                   type="button"
                   onClick={() => setIsCreateModalOpen(false)}
-                  className="px-4 py-2 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-100 text-xs font-semibold"
+                  className="px-4 py-2 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-100 text-xs font-semibold cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
                   disabled={isSubmittingCreate}
-                  className="px-5 py-2 rounded-xl bg-blue-600 text-white font-bold text-xs flex items-center gap-2 hover:bg-blue-700 shadow-md disabled:opacity-50"
+                  className="px-5 py-2 rounded-xl bg-blue-600 text-white font-bold text-xs flex items-center gap-2 hover:bg-blue-700 shadow-md disabled:opacity-50 cursor-pointer"
                 >
                   {isSubmittingCreate ? (
                     <>
                       <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                      <span>Creating in Firebase...</span>
+                      <span>Provisioning Firebase...</span>
                     </>
                   ) : (
                     <>
                       <Check className="w-4 h-4" />
-                      <span>Save & Provision Account</span>
+                      <span>Create Account</span>
                     </>
                   )}
                 </button>
@@ -938,7 +1125,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       )}
 
       {/* ========================================================= */}
-      {/* MODAL 2: CHANGE PASSWORD (SUPER ADMIN FOR ANY USER)       */}
+      {/* MODAL 2: CHANGE / RESET PASSWORD                          */}
       {/* ========================================================= */}
       {isPasswordModalOpen && selectedUser && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
@@ -949,15 +1136,15 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                   <Key className="w-4 h-4" />
                 </div>
                 <div>
-                  <h3 className="font-bold text-slate-900 text-base">Change Password</h3>
+                  <h3 className="font-bold text-slate-900 text-base">Change User Password</h3>
                   <p className="text-xs text-slate-500 font-mono">
-                    Login ID: <strong className="text-blue-700">{selectedUser.loginId}</strong> ({selectedUser.name})
+                    User: <strong className="text-blue-700">{selectedUser.loginId}</strong>
                   </p>
                 </div>
               </div>
               <button
                 onClick={() => setIsPasswordModalOpen(false)}
-                className="p-1 rounded-lg hover:bg-slate-200 text-slate-500 transition"
+                className="p-1 rounded-lg hover:bg-slate-200 text-slate-500 transition cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -972,46 +1159,44 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                   <input
                     type={showNewPassword ? 'text' : 'password'}
                     required
-                    placeholder="Enter new password (min. 6 chars)"
+                    minLength={6}
+                    placeholder="Enter at least 6 characters"
                     value={newPassword}
                     onChange={e => setNewPassword(e.target.value)}
-                    className="w-full text-xs px-3 py-2 pr-10 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono"
+                    className="w-full text-xs px-3 py-2 pr-10 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono font-medium"
                   />
                   <button
                     type="button"
                     onClick={() => setShowNewPassword(!showNewPassword)}
-                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                    className="absolute right-3 top-2.5 text-slate-400 hover:text-slate-600 cursor-pointer"
                   >
                     {showNewPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                   </button>
                 </div>
-                <span className="text-[10px] text-slate-400">Min. 6 characters (e.g. Narid@12345)</span>
               </div>
 
-              <label className="flex items-center gap-2 cursor-pointer bg-slate-50 p-2.5 rounded-xl border border-slate-200">
+              <label className="flex items-center gap-2 cursor-pointer text-xs font-medium text-slate-700">
                 <input
                   type="checkbox"
                   checked={requirePasswordChange}
                   onChange={e => setRequirePasswordChange(e.target.checked)}
                   className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 w-4 h-4"
                 />
-                <span className="text-xs text-slate-700 font-medium">
-                  Require user to update password on next login
-                </span>
+                <span>Prompt user to change password on their next sign in</span>
               </label>
 
               <div className="pt-3 border-t border-slate-100 flex items-center justify-end gap-3">
                 <button
                   type="button"
                   onClick={() => setIsPasswordModalOpen(false)}
-                  className="px-4 py-2 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-100 text-xs font-semibold"
+                  className="px-4 py-2 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-100 text-xs font-semibold cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
                   disabled={isSubmittingPassword}
-                  className="px-5 py-2 rounded-xl bg-blue-600 text-white font-bold text-xs flex items-center gap-2 hover:bg-blue-700 shadow-md disabled:opacity-50"
+                  className="px-5 py-2 rounded-xl bg-blue-600 text-white font-bold text-xs flex items-center gap-2 hover:bg-blue-700 shadow-md disabled:opacity-50 cursor-pointer"
                 >
                   {isSubmittingPassword ? (
                     <>
@@ -1032,7 +1217,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       )}
 
       {/* ========================================================= */}
-      {/* MODAL 3: EDIT PERMISSIONS (GRANT / REVOKE ACCESS)         */}
+      {/* MODAL 3: CONFIGURE MODULE ACCESS                          */}
       {/* ========================================================= */}
       {isPermissionsModalOpen && selectedUser && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
@@ -1043,7 +1228,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                   <Sliders className="w-4 h-4" />
                 </div>
                 <div>
-                  <h3 className="font-bold text-slate-900 text-base">Configure User Permissions</h3>
+                  <h3 className="font-bold text-slate-900 text-base">Configure User Access</h3>
                   <p className="text-xs text-slate-500 font-mono">
                     User: <strong className="text-blue-700">{selectedUser.loginId}</strong> ({selectedUser.name})
                   </p>
@@ -1051,7 +1236,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
               </div>
               <button
                 onClick={() => setIsPermissionsModalOpen(false)}
-                className="p-1 rounded-lg hover:bg-slate-200 text-slate-500 transition"
+                className="p-1 rounded-lg hover:bg-slate-200 text-slate-500 transition cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -1070,7 +1255,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                       const newRole = e.target.value as UserRoleType;
                       setEditRole(newRole);
                       if (newRole === 'super_admin') {
-                        setEditModulesAllowed(SYSTEM_MODULES.map(m => m.key));
+                        setEditModulesAllowed(PERMISSION_MODULES.map(m => m.key));
                       }
                     }}
                     className="w-full text-xs px-3 py-2 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 font-semibold"
@@ -1099,44 +1284,11 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
 
               {/* Module Checkbox Grid */}
               <div>
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-2">
-                  <label className="text-xs font-bold text-slate-700">
-                    Grant / Revoke Module Access ({editModulesAllowed.length} Selected)
-                  </label>
-                  <div className="flex items-center gap-1.5 flex-wrap">
-                    <button
-                      type="button"
-                      onClick={() => applyPreset('all', setEditModulesAllowed)}
-                      className="px-2 py-1 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 text-[10px] font-bold"
-                    >
-                      All
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => applyPreset('supervisor', setEditModulesAllowed)}
-                      className="px-2 py-1 rounded bg-blue-50 hover:bg-blue-100 text-blue-700 text-[10px] font-bold"
-                    >
-                      Supervisor
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => applyPreset('scanner', setEditModulesAllowed)}
-                      className="px-2 py-1 rounded bg-emerald-50 hover:bg-emerald-100 text-emerald-700 text-[10px] font-bold"
-                    >
-                      Scanner
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => applyPreset('clear', setEditModulesAllowed)}
-                      className="px-2 py-1 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 text-[10px] font-bold"
-                    >
-                      Clear
-                    </button>
-                  </div>
-                </div>
-
+                <label className="block text-xs font-bold text-slate-700 mb-2">
+                  Allowed Modules ({editModulesAllowed.length} Selected)
+                </label>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-56 overflow-y-auto p-1 bg-slate-50 rounded-xl border border-slate-200">
-                  {SYSTEM_MODULES.map(m => {
+                  {PERMISSION_MODULES.map(m => {
                     const isChecked = editRole === 'super_admin' || editModulesAllowed.includes(m.key);
                     return (
                       <label
@@ -1153,8 +1305,8 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                           className="mt-0.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500 w-4 h-4"
                         />
                         <div className="text-[11px] leading-tight">
-                          <div>{m.label}</div>
-                          <div className="text-[9px] text-slate-400 font-normal">{m.desc}</div>
+                          <div>{modLabelShort(m.label)}</div>
+                          <div className="text-[9px] text-slate-400 font-normal">{m.description}</div>
                         </div>
                       </label>
                     );
@@ -1166,14 +1318,14 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                 <button
                   type="button"
                   onClick={() => setIsPermissionsModalOpen(false)}
-                  className="px-4 py-2 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-100 text-xs font-semibold"
+                  className="px-4 py-2 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-100 text-xs font-semibold cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
                   disabled={isSubmittingPermissions}
-                  className="px-5 py-2 rounded-xl bg-indigo-600 text-white font-bold text-xs flex items-center gap-2 hover:bg-indigo-700 shadow-md disabled:opacity-50"
+                  className="px-5 py-2 rounded-xl bg-indigo-600 text-white font-bold text-xs flex items-center gap-2 hover:bg-indigo-700 shadow-md disabled:opacity-50 cursor-pointer"
                 >
                   {isSubmittingPermissions ? (
                     <>
@@ -1192,6 +1344,95 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
           </div>
         </div>
       )}
+
+      {/* ========================================================= */}
+      {/* MODAL 4: CONFIRM ACCOUNT DELETION (Section 1)             */}
+      {/* ========================================================= */}
+      {userToDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
+          <div className="bg-white rounded-2xl border border-red-200 shadow-2xl w-full max-w-md overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+            <div className="p-5 border-b border-red-100 bg-red-50 flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-red-600 text-white flex items-center justify-center font-bold shadow-md shadow-red-600/30">
+                  <ShieldAlert className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-extrabold text-red-950 text-base">Confirm Account Deletion</h3>
+                  <p className="text-xs text-red-700">
+                    Administrator authorization required
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setUserToDelete(null)}
+                className="p-1 rounded-lg hover:bg-red-200 text-red-600 transition cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-4">
+              <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-slate-500 font-medium">Login ID:</span>
+                  <span className="font-mono font-bold text-red-600 text-sm">{userToDelete.loginId}</span>
+                </div>
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-slate-500 font-medium">Full Name / Username:</span>
+                  <span className="font-semibold text-slate-800">{userToDelete.name}</span>
+                </div>
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-slate-500 font-medium">Assigned Role:</span>
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase bg-slate-200 text-slate-800">
+                    {userToDelete.role}
+                  </span>
+                </div>
+              </div>
+
+              <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 text-amber-900 text-xs leading-relaxed flex items-start gap-2.5">
+                <Info className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                <div>
+                  <strong>Important Security Guarantee:</strong> This action will delete the login account document and clean up individual permission overrides. Shared role definitions, attendance logs, and employee punch histories are strictly preserved.
+                </div>
+              </div>
+
+              <div className="pt-3 border-t border-slate-100 flex items-center justify-end gap-3">
+                <button
+                  type="button"
+                  onClick={() => setUserToDelete(null)}
+                  disabled={isDeletingUser}
+                  className="px-4 py-2 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-100 text-xs font-semibold cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmDeleteUser}
+                  disabled={isDeletingUser}
+                  className="px-5 py-2 rounded-xl bg-red-600 hover:bg-red-700 text-white font-bold text-xs flex items-center gap-2 shadow-md shadow-red-600/30 cursor-pointer disabled:opacity-50"
+                >
+                  {isDeletingUser ? (
+                    <>
+                      <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      <span>Deleting Account...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Trash2 className="w-4 h-4" />
+                      <span>Permanently Delete Account</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
+
+// Helper for cleaner module title
+function modLabelShort(label: string): string {
+  return label.replace(/^[0-9•\.\s]+/, '');
+}

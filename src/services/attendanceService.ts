@@ -486,28 +486,44 @@ export async function processDualAttendanceScan({
         status: 'SUBSEQUENT_IN',
       };
 
-      // Atomic transaction update on existing record
+      // Atomic transaction update on existing record with resilient direct-write fallback
       // CRITICAL: First Punch In is PRESERVED! Never overwrite it!
       const docRef = doc(db, 'attendance', activeRecord.id);
       let updatedAttendance: AttendanceRecord = activeRecord;
 
-      await runTransaction(db, async (txn) => {
-        const snap = await txn.get(docRef);
-        const currentData = snap.exists() ? (snap.data() as AttendanceRecord) : activeRecord!;
+      try {
+        await runTransaction(db, async (txn) => {
+          const snap = await txn.get(docRef);
+          const currentData = snap.exists() ? (snap.data() as AttendanceRecord) : activeRecord!;
 
+          const existingPunches = currentData.punches || [];
+          const newPunches = [...existingPunches, punchEvent];
+
+          updatedAttendance = {
+            ...currentData,
+            currentState: 'INSIDE',
+            punchOutType: 'NONE', // Currently inside
+            punches: newPunches,
+            updatedAt: now.toISOString(),
+          };
+
+          txn.set(docRef, sanitizeFirestoreData(updatedAttendance));
+        });
+      } catch (txnErr) {
+        console.warn('Subsequent punch in transaction dropped, falling back to direct write:', txnErr);
+        const snap = await getDoc(docRef);
+        const currentData = snap.exists() ? (snap.data() as AttendanceRecord) : activeRecord!;
         const existingPunches = currentData.punches || [];
         const newPunches = [...existingPunches, punchEvent];
-
         updatedAttendance = {
           ...currentData,
           currentState: 'INSIDE',
-          punchOutType: 'NONE', // Currently inside
+          punchOutType: 'NONE',
           punches: newPunches,
           updatedAt: now.toISOString(),
         };
-
-        txn.set(docRef, sanitizeFirestoreData(updatedAttendance));
-      });
+        await setDoc(docRef, sanitizeFirestoreData(updatedAttendance));
+      }
 
       // Save individual punch event
       await recordPunchEvent(punchEvent);
@@ -651,7 +667,28 @@ export async function processDualAttendanceScan({
           time: timeDisplay,
         };
       }
-      throw err;
+      console.warn('First punch in transaction dropped, falling back to direct write:', err);
+      try {
+        const existing = await getDoc(docRef);
+        if (existing.exists()) {
+          const data = existing.data() as AttendanceRecord;
+          if (data.currentState === 'INSIDE') {
+            return {
+              success: false,
+              action: 'REJECTED_DUPLICATE',
+              scannerType: 'IN',
+              currentState: 'INSIDE',
+              employee,
+              message: 'Consecutive Punch In rejected. Employee is already Punched In (Status: INSIDE).',
+              time: timeDisplay,
+            };
+          }
+        }
+        await setDoc(docRef, sanitizeFirestoreData(newAttendanceRecord));
+      } catch (writeErr: any) {
+        console.error('Direct punch in write failed:', writeErr);
+        throw writeErr;
+      }
     }
 
     await recordPunchEvent(firstPunchEvent);
@@ -790,17 +827,43 @@ export async function processDualAttendanceScan({
     const docRef = doc(db, 'attendance', activeRecord.id);
     let updatedAttendance: AttendanceRecord = activeRecord;
 
-    await runTransaction(db, async (txn) => {
-      const snap = await txn.get(docRef);
-      const currentData = snap.exists() ? (snap.data() as AttendanceRecord) : activeRecord!;
+    try {
+      await runTransaction(db, async (txn) => {
+        const snap = await txn.get(docRef);
+        const currentData = snap.exists() ? (snap.data() as AttendanceRecord) : activeRecord!;
 
+        const existingPunches = currentData.punches || [];
+        const newPunches = [...existingPunches, outEvent];
+
+        updatedAttendance = {
+          ...currentData,
+          actualPunchOut: now.toISOString(),
+          lastPunchOut: now.toISOString(), // Module 3: official latest punch out
+          effectivePunchOut: now.toISOString(),
+          punchOutType: 'ACTUAL',
+          currentState: 'OUTSIDE',
+          punches: newPunches,
+          totalDutyMinutes,
+          regularDutyMinutes,
+          overtimeMinutes,
+          attendanceStatus: 'COMPLETED',
+          missedPunchOut: false,
+          autoClosed: false,
+          updatedAt: now.toISOString(),
+        };
+
+        txn.set(docRef, sanitizeFirestoreData(updatedAttendance));
+      });
+    } catch (txnErr) {
+      console.warn('Punch out transaction dropped, falling back to direct write:', txnErr);
+      const snap = await getDoc(docRef);
+      const currentData = snap.exists() ? (snap.data() as AttendanceRecord) : activeRecord!;
       const existingPunches = currentData.punches || [];
       const newPunches = [...existingPunches, outEvent];
-
       updatedAttendance = {
         ...currentData,
         actualPunchOut: now.toISOString(),
-        lastPunchOut: now.toISOString(), // Module 3: official latest punch out
+        lastPunchOut: now.toISOString(),
         effectivePunchOut: now.toISOString(),
         punchOutType: 'ACTUAL',
         currentState: 'OUTSIDE',
@@ -813,9 +876,8 @@ export async function processDualAttendanceScan({
         autoClosed: false,
         updatedAt: now.toISOString(),
       };
-
-      txn.set(docRef, sanitizeFirestoreData(updatedAttendance));
-    });
+      await setDoc(docRef, sanitizeFirestoreData(updatedAttendance));
+    }
 
     await recordPunchEvent(outEvent);
 
