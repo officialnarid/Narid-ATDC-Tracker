@@ -157,10 +157,10 @@ export const Header: React.FC<HeaderProps> = ({
           <div className="flex items-center gap-2 border-l border-slate-200 pl-3">
             <div className="hidden sm:flex flex-col items-end text-right">
               <span className="text-xs font-bold text-slate-800 leading-tight truncate max-w-[130px]">
-                {currentUserRole.name}
+                {typeof currentUserRole.name === 'string' ? currentUserRole.name : (currentUserRole.name as any)?.name || currentUserRole.loginId}
               </span>
               <span className="text-[10px] font-mono font-bold text-blue-600 uppercase tracking-wider">
-                {currentUserRole.role.replace('_', ' ').toUpperCase()}
+                {String(currentUserRole.role || 'USER').replace('_', ' ').toUpperCase()}
               </span>
             </div>
             {onLogout && (

@@ -1,8 +1,24 @@
+# Dependencies
 node_modules/
 build/
 dist/
 coverage/
+
+# Logs and OS
 .DS_Store
 *.log
-.env*
+
+# Environment & secrets
+.env
+.env.*
 !.env.example
+.env.local
+.env.production
+.env.development
+serviceAccountKey.json
+firebase-adminsdk*.json
+*.pem
+*.key
+secrets/
+credentials/
+

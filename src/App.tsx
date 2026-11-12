@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
+import { onAuthStateChanged, signInWithEmailAndPassword, User as FirebaseUser } from 'firebase/auth';
 import { auth, testConnection } from './firebase';
 import { 
   initializeMasterData, 
@@ -16,7 +16,8 @@ import {
   logoutUser, 
   getDefaultTabForRole, 
   isModuleAllowedForUser, 
-  seedDefaultUserRoles 
+  seedDefaultUserRoles,
+  INITIAL_DEFAULT_PASSWORD
 } from './services/authService';
 import { Employee, Floor, Section, Department, Shift, UserRoleRecord } from './types';
 
@@ -38,6 +39,7 @@ import { AttendanceHistory } from './components/AttendanceHistory';
 import { Reports } from './components/Reports';
 import { UserRights } from './components/UserRights';
 import { SystemSettingsView } from './components/SystemSettings';
+import { UnauthorizedAccess } from './components/UnauthorizedAccess';
 import { RolePermissionRecord, subscribeToAllRolePermissions } from './services/permissionService';
 
 export default function App() {
@@ -56,14 +58,16 @@ export default function App() {
   const [isLoadingMasterData, setIsLoadingMasterData] = useState<boolean>(false);
   const [rolePermissions, setRolePermissions] = useState<Record<string, RolePermissionRecord>>({});
 
-  // Real-time synchronization of Role Permissions matrix
+  // Real-time synchronization of Role Permissions matrix (only when authenticated)
   useEffect(() => {
+    if (!currentUser || !auth.currentUser) return;
     const unsub = subscribeToAllRolePermissions(setRolePermissions);
     return () => unsub();
-  }, []);
+  }, [currentUser]);
 
-  // Load all master collections
+  // Load all master collections (only when authenticated in Firebase Auth)
   const loadAllMasterData = useCallback(async () => {
+    if (!auth.currentUser) return;
     setIsLoadingMasterData(true);
     try {
       await testConnection();
@@ -91,35 +95,11 @@ export default function App() {
 
   // Initialize and observe Authentication Session
   useEffect(() => {
-    // Seed default role accounts (superadmin, admin, user) if not already present
-    seedDefaultUserRoles().catch((err) => {
-      console.warn('Default user role seeding notice:', err);
-    });
+    let isMounted = true;
 
-    // 1. Check persistent active session first
-    const stored = getStoredActiveUser();
-    if (stored && stored.loginId) {
-      getUserProfileByLoginId(stored.loginId).then((profile) => {
-        if (profile && profile.status === 'Active') {
-          setCurrentUserRole(profile);
-          setCurrentUser(auth.currentUser || ({ uid: profile.id, email: profile.email } as any));
-          setCurrentTab(getDefaultTabForRole(profile.role));
-          loadAllMasterData();
-        } else {
-          logoutUser();
-          setCurrentUser(null);
-          setCurrentUserRole(null);
-        }
-        setIsAuthChecking(false);
-      }).catch(() => {
-        setIsAuthChecking(false);
-      });
-    } else {
-      setIsAuthChecking(false);
-    }
-
-    // 2. Also observe Firebase Authentication Session
     const unsubscribe = onAuthStateChanged(auth, async (fbUser) => {
+      if (!isMounted) return;
+
       if (fbUser && fbUser.email) {
         try {
           const profile = await getUserProfileByEmail(fbUser.email);
@@ -127,14 +107,57 @@ export default function App() {
             setCurrentUser(fbUser);
             setCurrentUserRole(profile);
             loadAllMasterData();
+          } else {
+            logoutUser();
+            setCurrentUser(null);
+            setCurrentUserRole(null);
           }
         } catch (err) {
           console.error('Error fetching user profile:', err);
         }
+        setIsAuthChecking(false);
+      } else {
+        // Firebase Auth is not signed in
+        const stored = getStoredActiveUser();
+        if (stored && stored.loginId) {
+          // Attempt silent session reconnect with Firebase Auth
+          const candidateEmails = [
+            stored.email,
+            `${stored.loginId}@narid.com`,
+            `${stored.loginId}_root@narid.com`
+          ].filter(Boolean);
+
+          let reconnected = false;
+          for (const em of candidateEmails) {
+            try {
+              const res = await signInWithEmailAndPassword(auth, em, INITIAL_DEFAULT_PASSWORD);
+              if (res.user) {
+                reconnected = true;
+                break;
+              }
+            } catch {
+              // Try next candidate
+            }
+          }
+
+          if (!reconnected) {
+            logoutUser();
+            setCurrentUser(null);
+            setCurrentUserRole(null);
+            setIsAuthChecking(false);
+          }
+        } else {
+          setCurrentUser(null);
+          setCurrentUserRole(null);
+          setIsAuthChecking(false);
+        }
       }
     });
 
-    return () => unsubscribe();
+    return () => {
+      isMounted = false;
+      unsubscribe();
+    };
   }, [loadAllMasterData]);
 
   // Handle successful login
@@ -144,7 +167,9 @@ export default function App() {
     setCurrentUserRole(profile);
     const destinationTab = getDefaultTabForRole(profile.role);
     setCurrentTab(destinationTab);
-    loadAllMasterData();
+    if (auth.currentUser) {
+      loadAllMasterData();
+    }
   };
 
   // Handle logout
@@ -259,12 +284,27 @@ export default function App() {
     }
   }, [currentTab, isFullscreenDashboard]);
 
-  // Enforce role guard: If user role cannot access current tab, fallback to default tab
+  // Periodic account status and session validity verification
   useEffect(() => {
-    if (currentUserRole && !isModuleAllowedForUser(currentUserRole, currentTab)) {
-      setCurrentTab(getDefaultTabForRole(currentUserRole.role));
-    }
-  }, [currentUserRole, currentTab]);
+    if (!currentUserRole?.loginId) return;
+    const checkSession = () => {
+      fetch('/api/auth/verify-session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ loginId: currentUserRole.loginId, userId: currentUserRole.id }),
+      })
+        .then(res => res.json())
+        .then(data => {
+          if (data && data.success === false) {
+            console.warn('[Session Guard] Session revoked or account deactivated.');
+            handleLogout();
+          }
+        })
+        .catch(() => {});
+    };
+    const timer = setInterval(checkSession, 30000);
+    return () => clearInterval(timer);
+  }, [currentUserRole, handleLogout]);
 
   // 1. Initial Authentication Check Loader (Instant, clean, no 5s splash screen)
   if (isAuthChecking) {
@@ -279,18 +319,24 @@ export default function App() {
   }
 
   // 2. Unauthenticated State -> Immediately show Reference Login Page
-  if (!currentUser || !currentUserRole) {
+  if (!currentUser || !currentUserRole || !auth.currentUser) {
     return <Login onLoginSuccess={handleLoginSuccess} />;
   }
 
-  // 2.1 First-Time Login Check -> Require individual password change on first login
-  if (currentUserRole.mustChangePassword) {
+  // 2.1 First-Time Login Check -> Require individual password change ONLY on first login or forced reset
+  if (currentUserRole.mustChangePassword === true) {
     return (
       <PasswordChangeModal 
         userProfile={currentUserRole}
         onPasswordChanged={(updatedProfile) => {
-          setCurrentUserRole(updatedProfile);
-          setCurrentTab(getDefaultTabForRole(updatedProfile.role));
+          const cleanProfile: UserRoleRecord = {
+            ...updatedProfile,
+            mustChangePassword: false,
+          };
+          localStorage.setItem('narid_active_user', JSON.stringify(cleanProfile));
+          sessionStorage.setItem('narid_active_user', JSON.stringify(cleanProfile));
+          setCurrentUserRole(cleanProfile);
+          setCurrentTab(getDefaultTabForRole(cleanProfile.role));
           loadAllMasterData();
         }}
         onCancelLogout={handleLogout}
@@ -343,9 +389,15 @@ export default function App() {
                 SYNCHRONIZING PRODUCTION MASTER DATA...
               </p>
             </div>
+          ) : !isModuleAllowedForUser(currentUserRole, currentTab) ? (
+            <UnauthorizedAccess 
+              currentTab={currentTab} 
+              currentUserRole={currentUserRole} 
+              onGoHome={() => setCurrentTab(getDefaultTabForRole(currentUserRole.role))} 
+            />
           ) : (
             <>
-              {currentTab === 'dashboard' && isModuleAllowedForUser(currentUserRole, 'dashboard') && (
+              {currentTab === 'dashboard' && (
                 <Dashboard
                   employees={employees}
                   shifts={shifts}

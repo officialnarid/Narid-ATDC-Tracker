@@ -2,100 +2,176 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // Helper functions for hardened ABAC
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
     function isValidId(id) {
       return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
-    // Phase 1 (internal testing environment before active user login activation)
-    // list operations do not bind document path variables, so list is allowed directly.
-    // get, create, update, delete validate document IDs to prevent ID injection.
+    function hasRoleDoc(docId) {
+      return exists(/databases/$(database)/documents/user_roles/$(docId));
+    }
 
+    function getRoleDoc(docId) {
+      return get(/databases/$(database)/documents/user_roles/$(docId)).data;
+    }
+
+    // Super Admin evaluation: Verified status and super_admin role
+    function isSuperAdmin() {
+      return isSignedIn() && (
+        (hasRoleDoc(request.auth.uid) && getRoleDoc(request.auth.uid).role == 'super_admin' && getRoleDoc(request.auth.uid).status == 'Active') ||
+        (hasRoleDoc('role_' + request.auth.uid) && getRoleDoc('role_' + request.auth.uid).role == 'super_admin' && getRoleDoc('role_' + request.auth.uid).status == 'Active') ||
+        request.auth.token.email == 'officialnarid@gmail.com' ||
+        request.auth.token.email == 'superadmin_root@narid.com' ||
+        request.auth.token.email == 'superadmin@narid.com'
+      );
+    }
+
+    // Admin evaluation: Either Super Admin or active admin
+    function isAdmin() {
+      return isSignedIn() && (
+        isSuperAdmin() ||
+        (hasRoleDoc(request.auth.uid) && getRoleDoc(request.auth.uid).role == 'admin' && getRoleDoc(request.auth.uid).status == 'Active') ||
+        (hasRoleDoc('role_' + request.auth.uid) && getRoleDoc('role_' + request.auth.uid).role == 'admin' && getRoleDoc('role_' + request.auth.uid).status == 'Active') ||
+        request.auth.token.email == 'admin_root@narid.com' ||
+        request.auth.token.email == 'admin@narid.com'
+      );
+    }
+
+    // Active User evaluation: Any active role or authorized floor operator
+    function isActiveUser() {
+      return isSignedIn() && (
+        isAdmin() ||
+        (hasRoleDoc(request.auth.uid) && getRoleDoc(request.auth.uid).status == 'Active') ||
+        (hasRoleDoc('role_' + request.auth.uid) && getRoleDoc('role_' + request.auth.uid).status == 'Active') ||
+        request.auth.token.email == 'user_root@narid.com' ||
+        request.auth.token.email == 'user@narid.com'
+      );
+    }
+
+    // 1. User Roles & Accounts Collection
+    match /user_roles/{userRoleId} {
+      // Super Admin can list/get all; individual users can only get their own account record
+      allow list: if isSuperAdmin();
+      allow get: if isSignedIn() && (isSuperAdmin() || request.auth.uid == userRoleId || ('role_' + request.auth.uid) == userRoleId);
+      // Only Super Admin can provision new accounts
+      allow create: if isSuperAdmin() && isValidId(userRoleId);
+      // Strictly only Super Admin can modify account records, passwords, roles, status, or mustChangePassword flags
+      allow update: if isSuperAdmin() && isValidId(userRoleId);
+      // Only Super Admin can delete account records
+      allow delete: if isSuperAdmin() && isValidId(userRoleId);
+    }
+
+    // 2. Shared Role Definitions Collection
+    match /roles/{roleId} {
+      allow list, get: if isSignedIn() && isActiveUser();
+      allow create, update, delete: if isSuperAdmin() && isValidId(roleId);
+    }
+
+    // 3. User Individual Permissions Collection
+    match /user_permissions/{permissionId} {
+      allow list: if isSuperAdmin();
+      allow get: if isSignedIn() && (isSuperAdmin() || request.auth.uid == permissionId || ('role_' + request.auth.uid) == permissionId);
+      allow create, update, delete: if isSuperAdmin() && isValidId(permissionId);
+    }
+
+    // 4. Role Permissions Mapping
+    match /role_permissions/{roleId} {
+      allow list, get: if isSignedIn() && isActiveUser();
+      allow create, update, delete: if isSuperAdmin() && isValidId(roleId);
+    }
+
+    // 5. Employees Master Directory
     match /employees/{employeeId} {
-      allow list: if true;
-      allow get, create, update, delete: if isValidId(employeeId);
+      allow list, get: if isSignedIn() && isActiveUser();
+      allow create, update, delete: if isAdmin() && isValidId(employeeId);
     }
 
+    // 6. Attendance Daily Records
     match /attendance/{attendanceId} {
-      allow list: if true;
-      allow get, create, update, delete: if isValidId(attendanceId);
+      allow list, get: if isSignedIn() && isActiveUser();
+      allow create, update: if isSignedIn() && isActiveUser() && isValidId(attendanceId);
+      allow delete: if isSuperAdmin() && isValidId(attendanceId);
     }
 
-    match /lines/{lineId} {
-      allow list: if true;
-      allow get, create, update, delete: if isValidId(lineId);
+    // 7. Individual Punch Events (Sub-events per scan)
+    match /punch_events/{eventId} {
+      allow list, get: if isAdmin();
+      allow create: if isSignedIn() && isActiveUser() && isValidId(eventId);
+      allow update, delete: if false; // Append-only immutable punch event records
+    }
+
+    // 8. Raw Punch Activity Logs
+    match /punch_logs/{logId} {
+      allow list, get: if isAdmin();
+      allow create: if isSignedIn() && isActiveUser() && isValidId(logId);
+      allow update, delete: if false; // Immutable audit log
+    }
+
+    // 9. Enterprise Compliance Audit Logs
+    match /audit_logs/{auditId} {
+      allow list, get: if isSuperAdmin();
+      allow create: if isSignedIn() && isActiveUser() && isValidId(auditId);
+      allow update, delete: if false; // Strictly append-only, immutable security audit trail
+    }
+
+    // 9.1 Password Reset Audit Trail (Super Admin Governance)
+    match /password_reset_logs/{logId} {
+      allow list, get: if isSuperAdmin();
+      allow create: if isSuperAdmin() && isValidId(logId);
+      allow update, delete: if false; // Immutable audit log
+    }
+
+    // 10. Organization Hierarchy (Departments, Floors, Sections, Lines)
+    match /departments/{departmentId} {
+      allow list, get: if isSignedIn() && isActiveUser();
+      allow create, update, delete: if isAdmin() && isValidId(departmentId);
     }
 
     match /floors/{floorId} {
-      allow list: if true;
-      allow get, create, update, delete: if isValidId(floorId);
+      allow list, get: if isSignedIn() && isActiveUser();
+      allow create, update, delete: if isAdmin() && isValidId(floorId);
     }
 
     match /sections/{sectionId} {
-      allow list: if true;
-      allow get, create, update, delete: if isValidId(sectionId);
+      allow list, get: if isSignedIn() && isActiveUser();
+      allow create, update, delete: if isAdmin() && isValidId(sectionId);
     }
 
-    match /departments/{departmentId} {
-      allow list: if true;
-      allow get, create, update, delete: if isValidId(departmentId);
+    match /lines/{lineId} {
+      allow list, get: if isSignedIn() && isActiveUser();
+      allow create, update, delete: if isAdmin() && isValidId(lineId);
     }
 
+    // 11. Shift Schedules & Rosters
     match /shifts/{shiftId} {
-      allow list: if true;
-      allow get, create, update, delete: if isValidId(shiftId);
+      allow list, get: if isSignedIn() && isActiveUser();
+      allow create, update, delete: if isAdmin() && isValidId(shiftId);
     }
 
     match /shift_rosters/{rosterId} {
-      allow list: if true;
-      allow get, create, update, delete: if isValidId(rosterId);
+      allow list, get: if isSignedIn() && isActiveUser();
+      allow create, update, delete: if isAdmin() && isValidId(rosterId);
     }
 
-    match /punch_logs/{logId} {
-      allow list: if true;
-      allow get, create, update, delete: if isValidId(logId);
-    }
-
-    match /punch_events/{eventId} {
-      allow list: if true;
-      allow get, create, update, delete: if isValidId(eventId);
-    }
-
-    match /audit_logs/{auditId} {
-      allow list: if true;
-      allow get, create, update, delete: if isValidId(auditId);
-    }
-
+    // 12. System Settings
     match /system_settings/{settingId} {
-      allow list: if true;
-      allow get, create, update, delete: if isValidId(settingId);
+      allow list, get: if isSignedIn() && isActiveUser();
+      allow create, update, delete: if isSuperAdmin() && isValidId(settingId);
     }
 
-    match /user_roles/{userRoleId} {
-      allow list: if true;
-      allow get, create, update, delete: if isValidId(userRoleId);
-    }
-
-    match /role_permissions/{roleId} {
-      allow list: if true;
-      allow get, create, update, delete: if isValidId(roleId);
-    }
-
-    match /roles/{roleId} {
-      allow list: if true;
-      allow get, create, update, delete: if isValidId(roleId);
-    }
-
-    match /user_permissions/{permissionId} {
-      allow list: if true;
-      allow get, create, update, delete: if isValidId(permissionId);
-    }
-
+    // 13. Users Profile Collection
     match /users/{userId} {
-      allow list: if true;
-      allow get, create, update, delete: if isValidId(userId);
+      allow list: if isSuperAdmin();
+      allow get: if isSignedIn() && (isSuperAdmin() || request.auth.uid == userId);
+      allow create, update: if isSuperAdmin() || (isSignedIn() && request.auth.uid == userId);
+      allow delete: if isSuperAdmin();
     }
 
-    // Fallback deny
+    // Default catch-all: Deny all unauthenticated or undeclared collection access
     match /{document=**} {
       allow read, write: if false;
     }

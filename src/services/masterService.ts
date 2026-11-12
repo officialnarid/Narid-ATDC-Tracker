@@ -347,7 +347,32 @@ export async function getAuditLogs(max: number = 100): Promise<AuditLog[]> {
   try {
     const q = query(collection(db, 'audit_logs'), orderBy('timestamp', 'desc'), limit(max));
     const snap = await getDocs(q);
-    return snap.docs.map(d => d.data() as AuditLog);
+    return snap.docs.map(d => {
+      const data = d.data();
+      const stringifyField = (val: any) => {
+        if (val === undefined || val === null) return undefined;
+        if (typeof val === 'object') {
+          try {
+            return JSON.stringify(val);
+          } catch {
+            return '[Object]';
+          }
+        }
+        return String(val);
+      };
+
+      return {
+        ...data,
+        id: d.id,
+        action: String(data.action || ''),
+        employeeId: stringifyField(data.employeeId),
+        timestamp: String(data.timestamp || new Date().toISOString()),
+        oldValue: stringifyField(data.oldValue || data.previousValue),
+        newValue: stringifyField(data.newValue),
+        actionSource: String(data.actionSource || 'SYSTEM'),
+        reason: stringifyField(data.reason || data.details),
+      } as AuditLog;
+    });
   } catch (error) {
     handleFirestoreError(error, OperationType.LIST, 'audit_logs');
     return [];

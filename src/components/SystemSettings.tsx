@@ -27,6 +27,18 @@ interface SystemSettingsProps {
   onRefreshData?: () => void;
 }
 
+const safeText = (val: any, fallback = '--'): string => {
+  if (val === null || val === undefined || val === '') return fallback;
+  if (typeof val === 'object') {
+    try {
+      return JSON.stringify(val);
+    } catch {
+      return '[Object]';
+    }
+  }
+  return String(val);
+};
+
 export const SystemSettingsView: React.FC<SystemSettingsProps> = ({ onRefreshData }) => {
   const [settings, setSettings] = useState<SystemSetting | null>(null);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
@@ -320,19 +332,19 @@ export const SystemSettingsView: React.FC<SystemSettingsProps> = ({ onRefreshDat
                         })}
                       </td>
                       <td className="py-2.5 px-3.5">
-                        <span className="font-bold text-slate-800">{log.action}</span>
+                        <span className="font-bold text-slate-800">{safeText(log.action)}</span>
                       </td>
                       <td className="py-2.5 px-3.5 font-mono font-bold text-blue-700">
-                        {log.employeeId || '--'}
+                        {safeText(log.employeeId)}
                       </td>
                       <td className="py-2.5 px-3.5 text-slate-600 font-mono text-[11px]">
-                        {log.actionSource}
+                        {safeText(log.actionSource)}
                       </td>
-                      <td className="py-2.5 px-3.5 text-slate-700 font-medium">
-                        {log.newValue || '--'}
+                      <td className="py-2.5 px-3.5 text-slate-700 font-medium font-mono text-[11px] max-w-[280px] truncate" title={safeText(log.newValue)}>
+                        {safeText(log.newValue)}
                       </td>
-                      <td className="py-2.5 px-3.5 text-slate-500 text-[11px]">
-                        {log.reason || '--'}
+                      <td className="py-2.5 px-3.5 text-slate-500 text-[11px] max-w-[200px] truncate" title={safeText(log.reason)}>
+                        {safeText(log.reason)}
                       </td>
                     </tr>
                   ))

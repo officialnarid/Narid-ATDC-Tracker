@@ -19,7 +19,12 @@ import {
   Building,
   User,
   CheckSquare,
-  Square
+  Square,
+  KeyRound,
+  History,
+  Sparkles,
+  Unlock,
+  RotateCcw
 } from 'lucide-react';
 import { RolePermissionsManagement } from './RolePermissionsManagement';
 import { onSnapshot, collection } from 'firebase/firestore';
@@ -29,6 +34,7 @@ import {
   getAllUserRoles, 
   createUserAccount, 
   adminSetUserPassword, 
+  fetchPasswordResetHistory,
   updateUserRolePermissions, 
   deleteUserRole,
   INITIAL_DEFAULT_PASSWORD
@@ -50,6 +56,14 @@ import {
   DEFAULT_USER_PERMISSIONS
 } from '../services/permissionService';
 
+const safeStr = (v: any, fallback = ''): string => {
+  if (v === null || v === undefined) return fallback;
+  if (typeof v === 'object') {
+    return v.name || v.loginId || v.role || v.status || v.email || JSON.stringify(v);
+  }
+  return String(v);
+};
+
 interface UserRightsProps {
   currentUserRole?: UserRoleRecord | null;
   onRoleProfileUpdated?: (updatedProfile: UserRoleRecord) => void;
@@ -58,13 +72,24 @@ interface UserRightsProps {
 export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleProfileUpdated }) => {
   const [users, setUsers] = useState<UserRoleRecord[]>([]);
   const [isLoadingUsers, setIsLoadingUsers] = useState(false);
-  const [activeTab, setActiveTab] = useState<'users' | 'role_permissions' | 'matrix' | 'roles'>('users');
+  const [activeTab, setActiveTab] = useState<'users' | 'role_permissions' | 'matrix' | 'roles' | 'passwords'>('users');
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Firestore Subscribed Roles & Permissions
   const [rolesList, setRolesList] = useState<RoleRecord[]>([]);
   const [rolePermissionsMap, setRolePermissionsMap] = useState<Record<string, RolePermissionRecord>>({});
   const [userPermissionsMap, setUserPermissionsMap] = useState<Record<string, UserPermissionRecord>>({});
+
+  // Super Admin Password Management Panel State (Section 4)
+  const [selectedResetUser, setSelectedResetUser] = useState<UserRoleRecord | null>(null);
+  const [panelNewPassword, setPanelNewPassword] = useState('');
+  const [showPanelNewPassword, setShowPanelNewPassword] = useState(false);
+  const [panelForceChange, setPanelForceChange] = useState(true);
+  const [panelUnlockAccount, setPanelUnlockAccount] = useState(true);
+  const [panelRevokeSessions, setPanelRevokeSessions] = useState(true);
+  const [isSubmittingPanelReset, setIsSubmittingPanelReset] = useState(false);
+  const [passwordHistoryList, setPasswordHistoryList] = useState<any[]>([]);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
 
   // Modal States
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
@@ -205,6 +230,72 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
     setTimeout(() => setStatusMessage(null), 5000);
   };
 
+  // Super Admin Password Management Handlers (Section 4)
+  const loadPasswordHistory = async () => {
+    if (!isSuperAdmin) return;
+    setIsLoadingHistory(true);
+    try {
+      const history = await fetchPasswordResetHistory();
+      setPasswordHistoryList(history);
+    } catch (err: any) {
+      console.warn('Failed to load password reset history:', err.message);
+    } finally {
+      setIsLoadingHistory(false);
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab === 'passwords' && isSuperAdmin) {
+      loadPasswordHistory();
+      if (!selectedResetUser && users.length > 0) {
+        const defaultTarget = users.find(u => u.loginId !== 'superadmin' && u.role !== 'super_admin') || users[0];
+        setSelectedResetUser(defaultTarget);
+      }
+    }
+  }, [activeTab, isSuperAdmin, users]);
+
+  const generateRandomPassword = () => {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let code = '';
+    for (let i = 0; i < 4; i++) {
+      code += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    setPanelNewPassword(`Narid@${code}`);
+    setShowPanelNewPassword(true);
+  };
+
+  const handlePanelResetSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedResetUser) {
+      showToast('error', 'Please select a target account to reset.');
+      return;
+    }
+    if (!panelNewPassword || panelNewPassword.length < 6) {
+      showToast('error', 'Temporary password must contain at least 6 characters.');
+      return;
+    }
+
+    setIsSubmittingPanelReset(true);
+    try {
+      await adminSetUserPassword(
+        selectedResetUser.id,
+        selectedResetUser.loginId,
+        panelNewPassword,
+        panelForceChange,
+        panelUnlockAccount,
+        panelRevokeSessions
+      );
+      showToast('success', `Password for "${selectedResetUser.loginId}" reset successfully. Force next login change: ${panelForceChange ? 'Enabled' : 'Disabled'}.`);
+      setPanelNewPassword('');
+      loadPasswordHistory();
+      loadUsersManual();
+    } catch (err: any) {
+      showToast('error', err.message || 'Failed to reset password.');
+    } finally {
+      setIsSubmittingPanelReset(false);
+    }
+  };
+
   // 1. OPEN CREATE USER MODAL
   const handleOpenCreateModal = () => {
     setCreateFormData({
@@ -280,10 +371,14 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
         selectedUser.id,
         selectedUser.loginId,
         newPassword,
-        requirePasswordChange
+        requirePasswordChange,
+        true,
+        true
       );
-      showToast('success', `Password for "${selectedUser.loginId}" successfully updated in Firebase!`);
+      showToast('success', `Password for "${selectedUser.loginId}" successfully updated in Firebase! Force next login change: ${requirePasswordChange ? 'Yes' : 'No'}.`);
       setIsPasswordModalOpen(false);
+      loadPasswordHistory();
+      loadUsersManual();
     } catch (err: any) {
       showToast('error', err.message || 'Failed to update password.');
     } finally {
@@ -548,6 +643,24 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
           <Building className="w-4 h-4" />
           <span>Role Descriptions ({rolesList.length})</span>
         </button>
+
+        {/* SUPER ADMIN PASSWORD MANAGEMENT & GOVERNANCE SUBMODULE */}
+        {isSuperAdmin && (
+          <button
+            onClick={() => setActiveTab('passwords')}
+            className={`pb-2 px-3 text-xs font-bold transition border-b-2 flex items-center gap-2 shrink-0 cursor-pointer ${
+              activeTab === 'passwords' ? 'border-amber-600 text-amber-700' : 'border-transparent text-slate-500 hover:text-slate-800'
+            }`}
+          >
+            <Key className="w-4 h-4 text-amber-600" />
+            <span>Password Governance & Reset</span>
+            <span className={`text-[10px] font-mono font-bold px-1.5 py-0.5 rounded ${
+              activeTab === 'passwords' ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-600'
+            }`}>
+              Super Admin Only
+            </span>
+          </button>
+        )}
       </div>
 
       {/* ========================================================================= */}
@@ -600,13 +713,13 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                     return (
                       <tr key={u.id} className="hover:bg-slate-50 transition">
                         <td className="py-3 px-4 font-mono font-bold text-blue-700">
-                          {u.loginId}
+                          {safeStr(u.loginId)}
                         </td>
                         <td className="py-3 px-4 font-medium text-slate-800">
-                          {u.name}
+                          {safeStr(u.name)}
                         </td>
                         <td className="py-3 px-4 text-slate-500 font-mono text-[11px]">
-                          {u.email}
+                          {safeStr(u.email)}
                         </td>
                         <td className="py-3 px-4">
                           <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
@@ -629,9 +742,9 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                         <td className="py-3 px-4">
                           <div className="flex items-center gap-1.5">
                             <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
-                              u.status === 'Active' ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-600'
+                              safeStr(u.status) === 'Active' ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-600'
                             }`}>
-                              {u.status}
+                              {safeStr(u.status, 'Active')}
                             </span>
                             {u.mustChangePassword && (
                               <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-semibold text-[9px]">
@@ -939,6 +1052,330 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* TAB 5: SUPER ADMIN PASSWORD GOVERNANCE & RESET PANEL                      */}
+      {/* ========================================================================= */}
+      {activeTab === 'passwords' && isSuperAdmin && (
+        <div className="space-y-6">
+          {/* Header Card */}
+          <div className="bg-gradient-to-r from-[#00183b] via-[#002b66] to-[#00183b] text-white p-6 rounded-2xl shadow-md border border-blue-900/50 flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div className="flex items-center gap-4">
+              <div className="w-12 h-12 rounded-2xl bg-gradient-to-tr from-amber-500 to-yellow-300 flex items-center justify-center text-slate-950 font-bold shadow-lg shadow-amber-500/20 shrink-0">
+                <KeyRound className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="text-base font-extrabold tracking-tight text-white flex items-center gap-2">
+                  <span>Super Admin Password Governance & Reset Control</span>
+                  <span className="text-[10px] font-mono uppercase bg-amber-400 text-slate-950 px-2 py-0.5 rounded-full font-bold">
+                    Super Admin Exclusive
+                  </span>
+                </h3>
+                <p className="text-xs text-blue-200/90 mt-0.5 max-w-2xl leading-relaxed">
+                  Reset account credentials, issue temporary passwords, enforce first-time password changes, clear rate-limiting lockouts, and inspect audit logs.
+                </p>
+              </div>
+            </div>
+
+            <button
+              onClick={loadPasswordHistory}
+              disabled={isLoadingHistory}
+              className="px-3.5 py-2 rounded-xl bg-white/10 hover:bg-white/20 border border-white/20 text-white text-xs font-bold flex items-center gap-2 transition cursor-pointer self-start md:self-auto shrink-0"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isLoadingHistory ? 'animate-spin' : ''}`} />
+              <span>Refresh History</span>
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            {/* Left Column: Password Reset Form (5 cols) */}
+            <div className="lg:col-span-5 bg-white rounded-2xl border border-slate-200 shadow-xs p-5">
+              <div className="flex items-center gap-2.5 pb-4 border-b border-slate-100">
+                <div className="w-8 h-8 rounded-lg bg-amber-100 text-amber-800 flex items-center justify-center font-bold">
+                  <Key className="w-4 h-4" />
+                </div>
+                <div>
+                  <h4 className="text-xs font-bold text-slate-900 uppercase tracking-wider">
+                    Reset Account Password
+                  </h4>
+                  <p className="text-[11px] text-slate-500">
+                    Target account credentials will be updated in Firebase and Firestore
+                  </p>
+                </div>
+              </div>
+
+              <form onSubmit={handlePanelResetSubmit} className="mt-5 space-y-4">
+                {/* Account Selector */}
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1.5 uppercase tracking-wider">
+                    Select Target Account *
+                  </label>
+                  <select
+                    value={selectedResetUser?.id || ''}
+                    onChange={(e) => {
+                      const user = users.find(u => u.id === e.target.value) || null;
+                      setSelectedResetUser(user);
+                    }}
+                    required
+                    className="w-full text-xs px-3.5 py-2.5 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-amber-500 font-semibold bg-slate-50/50"
+                  >
+                    <option value="" disabled>-- Select an authorized account --</option>
+                    {users.map((u) => (
+                      <option key={u.id} value={u.id}>
+                        {u.loginId} - {u.name} ({u.role?.toUpperCase()})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Target Account Info Badge */}
+                {selectedResetUser && (
+                  <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 space-y-1.5 text-xs font-mono">
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-500">Login ID:</span>
+                      <span className="font-bold text-slate-900">{selectedResetUser.loginId}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-500">System Role:</span>
+                      <span className="font-bold text-blue-700 uppercase">{selectedResetUser.role}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-500">Account Status:</span>
+                      <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                        selectedResetUser.status === 'Active' ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
+                      }`}>
+                        {selectedResetUser.status || 'Active'}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-500">Password Change Pending:</span>
+                      <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                        selectedResetUser.mustChangePassword ? 'bg-amber-100 text-amber-800' : 'bg-slate-200 text-slate-700'
+                      }`}>
+                        {selectedResetUser.mustChangePassword ? 'YES (Forced on Login)' : 'NO (Normal Access)'}
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {/* New Temporary Password Input */}
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
+                      New Temporary Password *
+                    </label>
+                    <button
+                      type="button"
+                      onClick={generateRandomPassword}
+                      className="text-[11px] font-bold text-blue-600 hover:text-blue-800 flex items-center gap-1 cursor-pointer"
+                    >
+                      <Sparkles className="w-3 h-3" />
+                      <span>Auto-Generate</span>
+                    </button>
+                  </div>
+                  <div className="relative">
+                    <input
+                      type={showPanelNewPassword ? 'text' : 'password'}
+                      required
+                      minLength={6}
+                      placeholder="e.g. Narid@2026"
+                      value={panelNewPassword}
+                      onChange={e => setPanelNewPassword(e.target.value)}
+                      className="w-full text-xs px-3.5 py-2.5 pr-10 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-amber-500 font-mono font-bold text-slate-900"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPanelNewPassword(!showPanelNewPassword)}
+                      className="absolute right-3 top-2.5 text-slate-400 hover:text-slate-600 cursor-pointer"
+                    >
+                      {showPanelNewPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                  <span className="text-[10px] text-slate-400 mt-1 block">
+                    Minimum 6 characters. Passwords are cryptographically hashed on the server.
+                  </span>
+                </div>
+
+                {/* Governance Checkboxes */}
+                <div className="space-y-2.5 pt-2 border-t border-slate-100">
+                  <label className="flex items-start gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={panelForceChange}
+                      onChange={e => setPanelForceChange(e.target.checked)}
+                      className="mt-0.5 rounded border-slate-300 text-amber-600 focus:ring-amber-500 w-4 h-4 shrink-0"
+                    />
+                    <div>
+                      <span className="font-bold text-slate-800">Force Password Change on Next Login</span>
+                      <p className="text-[11px] text-slate-500">
+                        Shows First-Time Login Security screen and requires confidential password update before allowing system access.
+                      </p>
+                    </div>
+                  </label>
+
+                  <label className="flex items-start gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={panelUnlockAccount}
+                      onChange={e => setPanelUnlockAccount(e.target.checked)}
+                      className="mt-0.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500 w-4 h-4 shrink-0"
+                    />
+                    <div>
+                      <span className="font-bold text-slate-800">Clear Rate-Limiting Lockout</span>
+                      <p className="text-[11px] text-slate-500">
+                        Immediately unlocks account if blocked by repeated failed login attempts.
+                      </p>
+                    </div>
+                  </label>
+
+                  <label className="flex items-start gap-2.5 cursor-pointer text-xs font-medium text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={panelRevokeSessions}
+                      onChange={e => setPanelRevokeSessions(e.target.checked)}
+                      className="mt-0.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 w-4 h-4 shrink-0"
+                    />
+                    <div>
+                      <span className="font-bold text-slate-800">Revoke Existing Sessions</span>
+                      <p className="text-[11px] text-slate-500">
+                        Terminates any currently open active sessions on other workstations.
+                      </p>
+                    </div>
+                  </label>
+                </div>
+
+                {/* Submit Button */}
+                <div className="pt-3 border-t border-slate-100">
+                  <button
+                    type="submit"
+                    disabled={isSubmittingPanelReset || !selectedResetUser}
+                    className="w-full py-3 px-4 rounded-xl bg-gradient-to-r from-amber-600 to-amber-700 hover:from-amber-700 hover:to-amber-800 text-white font-bold text-xs uppercase tracking-wider shadow-md shadow-amber-600/20 flex items-center justify-center gap-2 transition active:scale-[0.99] disabled:opacity-50 cursor-pointer"
+                  >
+                    {isSubmittingPanelReset ? (
+                      <>
+                        <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                        <span>Updating Firebase Credentials...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Key className="w-4 h-4" />
+                        <span>RESET PASSWORD NOW</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </form>
+            </div>
+
+            {/* Right Column: Password Reset History Audit Trail (7 cols) */}
+            <div className="lg:col-span-7 bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden flex flex-col">
+              <div className="p-4 border-b border-slate-200 bg-slate-50/80 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <History className="w-4 h-4 text-slate-700" />
+                  <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                    Password Reset Audit Log (Immutable)
+                  </h4>
+                </div>
+                <span className="text-[10px] font-mono text-slate-500">
+                  {passwordHistoryList.length} Total Resets
+                </span>
+              </div>
+
+              <div className="flex-1 overflow-x-auto max-h-[560px]">
+                <table className="w-full text-left text-xs border-collapse">
+                  <thead>
+                    <tr className="bg-slate-100/75 border-b border-slate-200 text-slate-600 font-bold uppercase text-[10px] tracking-wider">
+                      <th className="py-2.5 px-3">Target Account</th>
+                      <th className="py-2.5 px-3">Role</th>
+                      <th className="py-2.5 px-3">Reset By</th>
+                      <th className="py-2.5 px-3">Force Change</th>
+                      <th className="py-2.5 px-3">Date & Time</th>
+                      <th className="py-2.5 px-3 text-right">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 font-medium">
+                    {isLoadingHistory ? (
+                      <tr>
+                        <td colSpan={6} className="py-8 text-center text-slate-400">
+                          <div className="flex items-center justify-center gap-2">
+                            <div className="w-4 h-4 border-2 border-amber-600 border-t-transparent rounded-full animate-spin" />
+                            <span>Loading audit logs...</span>
+                          </div>
+                        </td>
+                      </tr>
+                    ) : passwordHistoryList.length === 0 ? (
+                      <tr>
+                        <td colSpan={6} className="py-10 text-center text-slate-400">
+                          <History className="w-8 h-8 mx-auto mb-2 opacity-30" />
+                          <p className="font-semibold text-slate-600">No password reset records yet</p>
+                          <p className="text-[11px] text-slate-400 mt-0.5">
+                            Any administrative password resets will be permanently recorded here.
+                          </p>
+                        </td>
+                      </tr>
+                    ) : (
+                      passwordHistoryList.map((log: any, idx: number) => {
+                        const dateFormatted = log.timestamp 
+                          ? new Date(log.timestamp).toLocaleString()
+                          : 'Recorded';
+                        return (
+                          <tr key={log.id || idx} className="hover:bg-slate-50 transition">
+                            <td className="py-2.5 px-3">
+                              <span className="font-bold text-slate-900 font-mono">
+                                {safeStr(log.targetLoginId || log.loginId)}
+                              </span>
+                              {log.targetName && (
+                                <span className="block text-[10px] text-slate-500 font-sans">
+                                  {safeStr(log.targetName)}
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-2.5 px-3">
+                              <span className="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase bg-slate-100 text-slate-700">
+                                {safeStr(log.targetRole, 'user')}
+                              </span>
+                            </td>
+                            <td className="py-2.5 px-3 font-mono text-[11px] text-blue-700 font-semibold">
+                              {safeStr(log.performedByLoginId, 'superadmin')}
+                            </td>
+                            <td className="py-2.5 px-3">
+                              {log.forcedPasswordChange ? (
+                                <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-800">
+                                  Required
+                                </span>
+                              ) : (
+                                <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-600">
+                                  Optional
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-2.5 px-3 text-[11px] text-slate-500 font-mono whitespace-nowrap">
+                              {dateFormatted}
+                            </td>
+                            <td className="py-2.5 px-3 text-right">
+                              <span className="inline-flex items-center gap-1 text-[11px] font-bold text-emerald-700">
+                                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                                <span>Verified</span>
+                              </span>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="p-3 bg-slate-50 border-t border-slate-200 text-[11px] text-slate-500 flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+                <span>
+                  Passwords are cryptographically secured using memory-hard scrypt. Plain-text credentials are never logged or stored.
+                </span>
+              </div>
+            </div>
+          </div>
         </div>
       )}
 

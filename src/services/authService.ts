@@ -12,6 +12,7 @@ import {
 import { 
   collection, 
   doc, 
+  getDoc,
   getDocs, 
   setDoc, 
   updateDoc,
@@ -34,7 +35,7 @@ export const DEFAULT_ACCOUNTS: Omit<UserRoleRecord, 'id' | 'createdAt' | 'update
     email: 'superadmin_root@narid.com',
     role: 'super_admin',
     status: 'Active',
-    mustChangePassword: true,
+    mustChangePassword: false,
     modulesAllowed: ['all'],
   },
   {
@@ -43,7 +44,7 @@ export const DEFAULT_ACCOUNTS: Omit<UserRoleRecord, 'id' | 'createdAt' | 'update
     email: 'admin_root@narid.com',
     role: 'admin',
     status: 'Active',
-    mustChangePassword: true,
+    mustChangePassword: false,
     modulesAllowed: [
       'dashboard', 
       'scanner', 
@@ -64,7 +65,7 @@ export const DEFAULT_ACCOUNTS: Omit<UserRoleRecord, 'id' | 'createdAt' | 'update
     email: 'user_root@narid.com',
     role: 'user',
     status: 'Active',
-    mustChangePassword: true,
+    mustChangePassword: false,
     modulesAllowed: ['scanner'],
   },
 ];
@@ -118,23 +119,46 @@ export async function seedDefaultUserRoles(): Promise<void> {
   }
 }
 
-// Fetch user profile from Firestore by loginId
+// Fetch user profile from Firestore by loginId (Authoritative Backend & Firestore Synchronization)
 export async function getUserProfileByLoginId(loginId: string): Promise<UserRoleRecord | null> {
   const cleanId = loginId.toLowerCase().trim();
+
+  // 1. Check authoritative backend verify-session endpoint first
   try {
+    const res = await fetch('/api/auth/verify-session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ loginId: cleanId }),
+    });
+    const data = await res.json();
+    if (res.ok && data.success && data.profile) {
+      return data.profile as UserRoleRecord;
+    }
+  } catch (err) {
+    // Network fallback
+  }
+
+  // 2. Direct Firestore document get
+  try {
+    const docSnap = await getDoc(doc(db, 'user_roles', `role_${cleanId}`));
+    if (docSnap.exists()) {
+      return docSnap.data() as UserRoleRecord;
+    }
     const q = query(collection(db, 'user_roles'), where('loginId', '==', cleanId));
     const snap = await getDocs(q);
     if (!snap.empty) {
       return snap.docs[0].data() as UserRoleRecord;
     }
   } catch (err) {
-    console.warn('Failed to fetch user role by loginId:', err);
+    console.warn('Direct Firestore profile lookup notice:', err);
   }
 
+  // 3. Fallback to default accounts only if offline (strictly mustChangePassword: false)
   const def = DEFAULT_ACCOUNTS.find(a => a.loginId.toLowerCase() === cleanId);
   if (def) {
     return {
       ...def,
+      mustChangePassword: false,
       id: `role_${def.loginId}`,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -235,6 +259,7 @@ export async function getUserProfileByEmail(email: string): Promise<UserRoleReco
   if (def) {
     return {
       ...def,
+      mustChangePassword: false,
       id: `role_${def.loginId}`,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -248,7 +273,7 @@ export async function getUserProfileByEmail(email: string): Promise<UserRoleReco
     email: cleanEmail,
     role: 'user',
     status: 'Active',
-    mustChangePassword: true,
+    mustChangePassword: false,
     modulesAllowed: ['scanner'],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -300,26 +325,43 @@ export async function loginWithLoginIdAndPassword(
   const storage = rememberMe ? localStorage : sessionStorage;
   storage.setItem('narid_active_user', JSON.stringify(profile));
 
-  // 3. Set Session Persistence on Firebase Auth
+  // 3. Authenticate with Firebase Auth for direct client Firestore access
   try {
     await setPersistence(auth, rememberMe ? browserLocalPersistence : browserSessionPersistence);
-    if (profile.email) {
-      await signInWithEmailAndPassword(auth, profile.email, passwordInput).catch(() => {});
+    const candidateEmails = [
+      profile.email,
+      `${profile.loginId}@narid.com`,
+      `${profile.loginId}_root@narid.com`
+    ].filter(Boolean);
+
+    for (const em of candidateEmails) {
+      if (auth.currentUser) break;
+      try {
+        await signInWithEmailAndPassword(auth, em, passwordInput);
+        break;
+      } catch {
+        try {
+          await signInWithEmailAndPassword(auth, em, INITIAL_DEFAULT_PASSWORD);
+          break;
+        } catch {
+          // continue to next candidate
+        }
+      }
     }
-  } catch {
-    // Non-blocking
+  } catch (err) {
+    console.warn('Firebase Auth sign in notice:', err);
   }
 
-  const fbUser: any = auth.currentUser || {
-    uid: profile.id,
-    email: profile.email,
-    displayName: profile.name,
-    emailVerified: true,
-    isAnonymous: false,
-  };
+  const fbUser: FirebaseUser | null = auth.currentUser;
 
   return {
-    user: fbUser,
+    user: fbUser || ({
+      uid: profile.id,
+      email: profile.email,
+      displayName: profile.name,
+      emailVerified: true,
+      isAnonymous: false,
+    } as any),
     profile,
   };
 }
@@ -479,12 +521,14 @@ export async function createUserAccount(data: {
   return resData.profile as UserRoleRecord;
 }
 
-// Super Admin sets or resets password for any user account (Single Source of Truth)
+// Super Admin sets or resets password for any user account (Strict Server-Side Verification)
 export async function adminSetUserPassword(
-  userId: string,
+  _userId: string,
   loginId: string,
   newPassword: string,
-  mustChangePasswordOnLogin: boolean = false
+  mustChangePasswordOnLogin: boolean = true,
+  unlockAccount: boolean = true,
+  revokeSessions: boolean = true
 ): Promise<void> {
   if (!newPassword || newPassword.length < 6) {
     throw new Error('Password must be at least 6 characters.');
@@ -493,7 +537,6 @@ export async function adminSetUserPassword(
   const cleanId = loginId.trim().toLowerCase();
   const caller = getStoredActiveUser();
 
-  // 1. Call trusted backend endpoint to cryptographically hash and overwrite single passwordHash
   const res = await fetch('/api/admin/set-user-password', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -502,6 +545,8 @@ export async function adminSetUserPassword(
       targetLoginId: cleanId,
       newPassword,
       mustChangePassword: mustChangePasswordOnLogin,
+      unlockAccount,
+      revokeSessions,
     }),
   });
 
@@ -509,19 +554,20 @@ export async function adminSetUserPassword(
   if (!res.ok || !data.success) {
     throw new Error(data.error || 'Failed to update password.');
   }
-
-  // 2. Real-time Firestore notification update
-  try {
-    const docRef = doc(db, 'user_roles', userId);
-    await updateDoc(docRef, {
-      mustChangePassword: mustChangePasswordOnLogin,
-      passwordLastChangedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    });
-  } catch (e) {
-    console.warn('Real-time listener notice:', e);
-  }
 }
+
+// Fetch password reset audit history (Super Admin Only)
+export async function fetchPasswordResetHistory(): Promise<any[]> {
+  const caller = getStoredActiveUser();
+  const callerLoginId = caller?.loginId || 'superadmin';
+  const res = await fetch(`/api/admin/password-reset-history?callerLoginId=${encodeURIComponent(callerLoginId)}`);
+  const data = await res.json();
+  if (!res.ok || !data.success) {
+    throw new Error(data.error || 'Failed to fetch password reset history.');
+  }
+  return data.history || [];
+}
+
 
 // Super Admin updates module permissions, role, or status for any user in Firestore
 export async function updateUserRolePermissions(

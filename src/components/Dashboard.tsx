@@ -31,7 +31,7 @@ import {
   UserRoleRecord 
 } from '../types';
 import { collection, doc, getDocs, onSnapshot, query, where } from 'firebase/firestore';
-import { db } from '../firebase';
+import { db, auth } from '../firebase';
 import { formatDateKey, formatMinutes } from '../services/attendanceService';
 import { generateRosterForDate } from '../services/attendanceService';
 import { 
@@ -127,6 +127,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
   // 2. Real-time Attendance Stream from Firestore
   useEffect(() => {
+    if (!auth.currentUser) return;
     setLoading(true);
     let attQuery = query(
       collection(db, 'attendance'),
@@ -154,6 +155,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
   // 3. Fetch Roster records for selected date
   const loadRosterData = async () => {
+    if (!auth.currentUser) return;
     try {
       const rosterQuery = query(
         collection(db, 'shift_rosters'),
@@ -167,7 +169,9 @@ export const Dashboard: React.FC<DashboardProps> = ({
   };
 
   useEffect(() => {
-    loadRosterData();
+    if (auth.currentUser) {
+      loadRosterData();
+    }
   }, [selectedDate]);
 
   // Handle manual refresh

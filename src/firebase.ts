@@ -34,6 +34,25 @@ export const db = initializeFirestore(app, {
 // Initialize Firebase Auth
 export const auth = getAuth(app);
 
+// Optional: Firebase App Check hook for future enterprise expansion.
+// reCAPTCHA is not required or implemented at this stage. Startup execution is disabled.
+export async function initAppCheck(customSiteKey?: string): Promise<void> {
+  if (typeof window === 'undefined') return;
+  const siteKey = customSiteKey || (import.meta as any).env?.VITE_FIREBASE_APPCHECK_KEY;
+  if (!siteKey || siteKey.trim() === '') {
+    return;
+  }
+  try {
+    const { initializeAppCheck, ReCaptchaV3Provider } = await import('firebase/app-check');
+    initializeAppCheck(app, {
+      provider: new ReCaptchaV3Provider(siteKey),
+      isTokenAutoRefreshEnabled: true,
+    });
+  } catch {
+    // App Check remains completely optional
+  }
+}
+
 export enum OperationType {
   CREATE = 'create',
   UPDATE = 'update',
