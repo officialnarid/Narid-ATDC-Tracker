@@ -81,6 +81,14 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
           message: rawMsg,
           tone: 'ratelimit',
         });
+      } else if (
+        authErr?.code === 'FIREBASE_ADMIN_PERMISSION_DENIED' ||
+        authErr?.code === 'FIREBASE_ADMIN_UNCONFIGURED'
+      ) {
+        setAlertState({
+          message: rawMsg,
+          tone: 'warning',
+        });
       } else {
         setAlertState({
           message: rawMsg,

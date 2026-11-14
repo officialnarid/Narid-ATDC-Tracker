@@ -1,3 +1,8 @@
+import {
+  apiFetchJson,
+  apiUrl,
+  isApiBaseUsableForCurrentOrigin,
+} from '../config/api';
 import { getAuthHeaders } from './auditService';
 import {
   LoginAttemptRecord,
@@ -7,12 +12,11 @@ import {
 
 export async function fetchSecurityOverview(): Promise<SecurityOverviewResponse> {
   const headers = await getAuthHeaders();
-  const res = await fetch('/api/security/overview', { headers });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to fetch security & lockout overview.');
-  }
-  return data as SecurityOverviewResponse;
+  return apiFetchJson<SecurityOverviewResponse>(
+    '/api/security/overview',
+    { headers },
+    'Failed to fetch security & lockout overview.'
+  );
 }
 
 export async function fetchLoginAttempts(
@@ -30,12 +34,12 @@ export async function fetchLoginAttempts(
     }
   });
   const headers = await getAuthHeaders();
-  const res = await fetch(`/api/security/attempts?${params.toString()}`, { headers });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to load login attempts.');
-  }
-  return (data.attempts || []) as LoginAttemptRecord[];
+  const data = await apiFetchJson<{ success: boolean; attempts?: LoginAttemptRecord[] }>(
+    `/api/security/attempts?${params.toString()}`,
+    { headers },
+    'Failed to load login attempts.'
+  );
+  return data.attempts || [];
 }
 
 export async function fetchSecurityAuditLogs(
@@ -53,12 +57,12 @@ export async function fetchSecurityAuditLogs(
     }
   });
   const headers = await getAuthHeaders();
-  const res = await fetch(`/api/security/audit-logs?${params.toString()}`, { headers });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to load security audit logs.');
-  }
-  return (data.logs || []) as SecurityAuditLogRecord[];
+  const data = await apiFetchJson<{ success: boolean; logs?: SecurityAuditLogRecord[] }>(
+    `/api/security/audit-logs?${params.toString()}`,
+    { headers },
+    'Failed to load security audit logs.'
+  );
+  return data.logs || [];
 }
 
 export async function unblockLockedAccount(payload: {
@@ -74,16 +78,15 @@ export async function unblockLockedAccount(payload: {
   unblockedAt: string;
 }> {
   const headers = await getAuthHeaders();
-  const res = await fetch('/api/security/unblock-account', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to unblock account.');
-  }
-  return data;
+  return apiFetchJson(
+    '/api/security/unblock-account',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    },
+    'Failed to unblock account.'
+  );
 }
 
 export async function generateTemporaryPasswordForAccount(payload: {
@@ -102,23 +105,21 @@ export async function generateTemporaryPasswordForAccount(payload: {
   message: string;
 }> {
   const headers = await getAuthHeaders();
-  const res = await fetch('/api/security/generate-temp-password', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    const err: any = new Error(data.error || 'Failed to generate temporary password.');
-    err.requiresFreshAuth = Boolean(data.requiresFreshAuth);
-    throw err;
-  }
-  return data;
+  return apiFetchJson(
+    '/api/security/generate-temp-password',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    },
+    'Failed to generate temporary password.'
+  );
 }
 
 export async function reportFirebaseThrottleSignal(loginId: string): Promise<void> {
+  if (!isApiBaseUsableForCurrentOrigin()) return;
   try {
-    await fetch('/api/auth/firebase-throttle-signal', {
+    await fetch(apiUrl('/api/auth/firebase-throttle-signal'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ loginId }),
@@ -158,11 +159,10 @@ export interface FirebaseAdminStatusResponse {
 
 export async function fetchFirebaseAdminStatus(): Promise<FirebaseAdminStatusResponse> {
   const headers = await getAuthHeaders();
-  const res = await fetch('/api/security/firebase-admin-status', { headers });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to inspect Firebase Admin SDK status.');
-  }
-  return data as FirebaseAdminStatusResponse;
+  return apiFetchJson<FirebaseAdminStatusResponse>(
+    '/api/security/firebase-admin-status',
+    { headers },
+    'Failed to inspect Firebase Admin SDK status.'
+  );
 }
 

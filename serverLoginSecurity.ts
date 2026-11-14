@@ -1,26 +1,22 @@
 import express, { Request, Response } from 'express';
 import crypto from 'crypto';
-import fs from 'fs';
 import { z } from 'zod';
 import {
-  Firestore,
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  setDoc,
-  updateDoc,
-  query,
-  where,
-  runTransaction,
-} from 'firebase/firestore';
+  getFirebaseAdminContext,
+  isFirestorePermissionDeniedError,
+  formatAdminPermissionDeniedError,
+  TARGET_DATABASE_ID,
+} from './serverFirebaseAdmin.ts';
 import {
+  AdminAuthLike,
+  AdminFirestoreLike,
   VerifiedCaller,
   extractTrustedClientIp,
   parseUserAgent,
   resolveIpGeoLocation,
   recordEnterpriseAuditEvent,
   recordLoginHistoryEntry,
+  syncUserUidIndex,
   GeoLocationInfo,
   UserAgentMeta,
 } from './serverSecurityAudit.ts';
@@ -30,7 +26,8 @@ export const LOCKED_ACCOUNT_MESSAGE =
   'Your account has been temporarily blocked. Please contact Super Admin.';
 
 // ============================================================================
-// 1. Concurrency Mutex per Login ID (Prevents Simultaneous Lock-Bypass Races)
+// 1. Concurrency Mutex per Login ID (Serializes In-Instance Concurrent Bursts)
+//    Combined with Firestore runTransaction() for Cross-Instance Atomicity
 // ============================================================================
 const loginMutexQueues = new Map<string, Promise<unknown>>();
 
@@ -58,18 +55,22 @@ export async function withLoginIdLock<T>(loginId: string, task: () => Promise<T>
 }
 
 // ============================================================================
-// 2. IP & Abuse Rate Limiter with Progressive Cooldowns (No Retry Bypass)
+// 2. Distributed Firestore-Backed IP & Abuse Rate Limiter
+//    Persists progressive cooldowns across restarts & multiple Cloud Run pods
 // ============================================================================
-interface IpRateRecord {
+export interface IpRateRecord {
+  scopeKey: string;
+  ip: string;
+  loginScope: string;
   failures: number;
   unknownIdFailures: number;
   lockedHits: number;
   windowStart: number;
   cooldownUntil: number;
   strikes: number;
+  updatedAt: string;
 }
 
-const ipRateStore = new Map<string, IpRateRecord>();
 const IP_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 const PROGRESSIVE_COOLDOWNS_MS = [30 * 1000, 2 * 60 * 1000, 5 * 60 * 1000, 15 * 60 * 1000];
 
@@ -79,101 +80,159 @@ function getIpScopeKey(ip: string, loginId?: string): string {
   return `${cleanIp}::${cleanLogin}`;
 }
 
-function getOrResetIpRecord(scopeKey: string, now: number): IpRateRecord {
-  let rec = ipRateStore.get(scopeKey);
-  if (!rec || (now - rec.windowStart > IP_WINDOW_MS && rec.cooldownUntil <= now)) {
-    rec = {
-      failures: 0,
-      unknownIdFailures: 0,
-      lockedHits: 0,
-      windowStart: now,
-      cooldownUntil: 0,
-      strikes: 0,
-    };
-    ipRateStore.set(scopeKey, rec);
-  }
-  return rec;
+function getIpRateDocId(scopeKey: string): string {
+  return `ip_${crypto.createHash('sha256').update(scopeKey).digest('hex').slice(0, 32)}`;
 }
 
-export function checkIpProgressiveRateLimit(
+export async function checkIpProgressiveRateLimitPersistent(
+  db: AdminFirestoreLike,
   ip: string,
   loginId?: string
-): {
+): Promise<{
   allowed: boolean;
   cooldownSeconds?: number;
   reason?: string;
-} {
+}> {
   const now = Date.now();
-  // Check per-account IP scope first, then unknown-enumeration IP flood scope
   const keysToCheck = [
     ...(loginId ? [getIpScopeKey(ip, loginId)] : []),
     getIpScopeKey(ip, '__unknown_probe__'),
   ];
 
-  for (const k of keysToCheck) {
-    const rec = ipRateStore.get(k);
-    if (rec && rec.cooldownUntil > now) {
-      const cooldownSeconds = Math.max(1, Math.ceil((rec.cooldownUntil - now) / 1000));
-      return {
-        allowed: false,
-        cooldownSeconds,
-        reason: `Rate limit cooldown active (${cooldownSeconds}s remaining).`,
-      };
+  for (const scopeKey of keysToCheck) {
+    const docId = getIpRateDocId(scopeKey);
+    const snap = await db.collection('ip_rate_limits').doc(docId).get();
+    if (snap.exists) {
+      const rec = snap.data() as IpRateRecord;
+      if (rec && Number(rec.cooldownUntil || 0) > now) {
+        const cooldownSeconds = Math.max(1, Math.ceil((Number(rec.cooldownUntil) - now) / 1000));
+        return {
+          allowed: false,
+          cooldownSeconds,
+          reason: `Rate limit cooldown active (${cooldownSeconds}s remaining).`,
+        };
+      }
     }
   }
 
   return { allowed: true };
 }
 
-export function recordIpFailure(
+export async function recordIpFailurePersistent(
+  db: AdminFirestoreLike,
   ip: string,
   kind: 'password' | 'unknown_id' | 'locked_hit' | 'firebase_throttle',
   loginId?: string
-): { triggeredCooldown: boolean; cooldownSeconds: number } {
+): Promise<{ triggeredCooldown: boolean; cooldownSeconds: number }> {
   const now = Date.now();
-  const scopeKey =
-    kind === 'unknown_id'
-      ? getIpScopeKey(ip, '__unknown_probe__')
-      : getIpScopeKey(ip, loginId || '__global__');
+  const nowIso = new Date(now).toISOString();
+  const cleanLogin = kind === 'unknown_id' ? '__unknown_probe__' : (loginId || '__global__').trim().toLowerCase();
+  const scopeKey = getIpScopeKey(ip, cleanLogin);
+  const ref = db.collection('ip_rate_limits').doc(getIpRateDocId(scopeKey));
 
-  const rec = getOrResetIpRecord(scopeKey, now);
-  rec.failures += 1;
-  if (kind === 'unknown_id') rec.unknownIdFailures += 1;
-  if (kind === 'locked_hit') rec.lockedHits += 1;
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    let rec: IpRateRecord;
+    if (!snap.exists) {
+      rec = {
+        scopeKey,
+        ip: (ip || '127.0.0.1').trim(),
+        loginScope: cleanLogin,
+        failures: 0,
+        unknownIdFailures: 0,
+        lockedHits: 0,
+        windowStart: now,
+        cooldownUntil: 0,
+        strikes: 0,
+        updatedAt: nowIso,
+      };
+    } else {
+      const data = snap.data() as IpRateRecord;
+      const expired = now - Number(data.windowStart || 0) > IP_WINDOW_MS && Number(data.cooldownUntil || 0) <= now;
+      rec = expired
+        ? {
+            scopeKey,
+            ip: (ip || '127.0.0.1').trim(),
+            loginScope: cleanLogin,
+            failures: 0,
+            unknownIdFailures: 0,
+            lockedHits: 0,
+            windowStart: now,
+            cooldownUntil: 0,
+            strikes: 0,
+            updatedAt: nowIso,
+          }
+        : {
+            ...data,
+            scopeKey,
+            ip: (ip || '127.0.0.1').trim(),
+            loginScope: cleanLogin,
+            failures: Number(data.failures || 0),
+            unknownIdFailures: Number(data.unknownIdFailures || 0),
+            lockedHits: Number(data.lockedHits || 0),
+            windowStart: Number(data.windowStart || now),
+            cooldownUntil: Number(data.cooldownUntil || 0),
+            strikes: Number(data.strikes || 0),
+            updatedAt: nowIso,
+          };
+    }
 
-  // Per-account progressive cooldowns:
-  // - Never let IP throttling on one account block valid credentials for another account
-  // - Unknown-account enumeration brute force throttled after >= 10 probes
-  // - Locked-account hammering throttled after >= 5 attempts against that account
-  // - Firebase TOO_MANY_ATTEMPTS_TRY_LATER throttled per ip+loginId for short progressive backoff
-  const shouldThrottle =
-    kind === 'firebase_throttle' ||
-    rec.unknownIdFailures >= 10 ||
-    rec.lockedHits >= 5 ||
-    rec.failures >= 15;
+    rec.failures += 1;
+    if (kind === 'unknown_id') rec.unknownIdFailures += 1;
+    if (kind === 'locked_hit') rec.lockedHits += 1;
 
-  if (shouldThrottle) {
-    const idx = Math.min(rec.strikes, PROGRESSIVE_COOLDOWNS_MS.length - 1);
-    const delayMs = PROGRESSIVE_COOLDOWNS_MS[idx];
-    rec.cooldownUntil = now + delayMs;
-    rec.strikes += 1;
-    return { triggeredCooldown: true, cooldownSeconds: Math.ceil(delayMs / 1000) };
-  }
+    const shouldThrottle =
+      kind === 'firebase_throttle' ||
+      rec.unknownIdFailures >= 10 ||
+      rec.lockedHits >= 5 ||
+      rec.failures >= 15;
 
-  return { triggeredCooldown: false, cooldownSeconds: 0 };
+    let triggeredCooldown = false;
+    let cooldownSeconds = 0;
+
+    if (shouldThrottle) {
+      const idx = Math.min(rec.strikes, PROGRESSIVE_COOLDOWNS_MS.length - 1);
+      const delayMs = PROGRESSIVE_COOLDOWNS_MS[idx];
+      rec.cooldownUntil = now + delayMs;
+      rec.strikes += 1;
+      triggeredCooldown = true;
+      cooldownSeconds = Math.ceil(delayMs / 1000);
+    }
+
+    rec.updatedAt = nowIso;
+    tx.set(ref, rec, { merge: true });
+    return { triggeredCooldown, cooldownSeconds };
+  });
 }
 
-export function clearIpCooldown(ip?: string, loginId?: string): void {
-  if (!ip) return;
-  if (loginId) {
-    ipRateStore.delete(getIpScopeKey(ip, loginId));
-    return;
-  }
-  const prefix = `${ip.trim()}::`;
-  for (const k of ipRateStore.keys()) {
-    if (k.startsWith(prefix)) {
-      ipRateStore.delete(k);
+export async function clearIpCooldownPersistent(
+  db: AdminFirestoreLike,
+  ip?: string,
+  loginId?: string
+): Promise<void> {
+  try {
+    if (ip && loginId) {
+      const scopeKey = getIpScopeKey(ip, loginId);
+      await db.collection('ip_rate_limits').doc(getIpRateDocId(scopeKey)).delete();
+      return;
     }
+    if (loginId) {
+      const cleanLogin = loginId.trim().toLowerCase();
+      const snap = await db.collection('ip_rate_limits').where('loginScope', '==', cleanLogin).get();
+      await Promise.all(
+        snap.docs.map((d) => db.collection('ip_rate_limits').doc(d.id).delete())
+      );
+      return;
+    }
+    if (ip) {
+      const cleanIp = ip.trim();
+      const snap = await db.collection('ip_rate_limits').where('ip', '==', cleanIp).get();
+      await Promise.all(
+        snap.docs.map((d) => db.collection('ip_rate_limits').doc(d.id).delete())
+      );
+    }
+  } catch {
+    // non-fatal cleanup
   }
 }
 
@@ -198,7 +257,6 @@ export function generateStrongTemporaryPassword(length = 14): string {
     chars.push(all[crypto.randomInt(0, all.length)]);
   }
 
-  // Fisher-Yates shuffle using crypto.randomInt
   for (let i = chars.length - 1; i > 0; i--) {
     const j = crypto.randomInt(0, i + 1);
     const tmp = chars[i];
@@ -209,116 +267,43 @@ export function generateStrongTemporaryPassword(length = 14): string {
   return chars.join('');
 }
 
-const adminAppCache = new Map<string, any>();
-
-function parseServiceAccountFromSource(raw: string): Record<string, any> | null {
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-
-  // Support file path
-  if (!trimmed.startsWith('{') && fs.existsSync(trimmed)) {
-    const fileContent = fs.readFileSync(trimmed, 'utf8');
-    return JSON.parse(fileContent);
-  }
-
-  // Support raw JSON
-  if (trimmed.startsWith('{')) {
-    return JSON.parse(trimmed);
-  }
-
-  // Support base64-encoded JSON
-  try {
-    const decoded = Buffer.from(trimmed, 'base64').toString('utf8').trim();
-    if (decoded.startsWith('{')) {
-      return JSON.parse(decoded);
-    }
-  } catch {
-    // ignore invalid base64
-  }
-
-  return null;
-}
-
-export async function getAdminAuthContext(projectId: string): Promise<{
+export async function getAdminAuthContext(
+  _projectId: string,
+  injectedAuth?: AdminAuthLike | null
+): Promise<{
   available: boolean;
-  adminAuth?: any;
+  adminAuth?: AdminAuthLike;
   credentialSource?: string;
   serviceAccountEmail?: string;
   reason?: string;
 }> {
-  const candidates: Array<{ name: string; value?: string }> = [
-    { name: 'FIREBASE_SERVICE_ACCOUNT_KEY', value: process.env.FIREBASE_SERVICE_ACCOUNT_KEY },
-    { name: 'FIREBASE_SERVICE_ACCOUNT_JSON', value: process.env.FIREBASE_SERVICE_ACCOUNT_JSON },
-    { name: 'GOOGLE_APPLICATION_CREDENTIALS', value: process.env.GOOGLE_APPLICATION_CREDENTIALS },
-  ];
-
-  let parsedCred: Record<string, any> | null = null;
-  let sourceName = '';
-  let parseError = '';
-
-  for (const cand of candidates) {
-    if (!cand.value || !cand.value.trim()) continue;
-    try {
-      const parsed = parseServiceAccountFromSource(cand.value);
-      if (parsed && parsed.client_email && parsed.private_key) {
-        if (parsed.project_id && parsed.project_id !== projectId) {
-          parseError = `${cand.name} belongs to project "${parsed.project_id}", expected "${projectId}".`;
-          continue;
-        }
-        parsedCred = parsed;
-        sourceName = cand.name;
-        break;
-      }
-    } catch (e: any) {
-      parseError = `${cand.name} invalid JSON/file: ${e?.message || e}`;
-    }
-  }
-
-  if (!parsedCred) {
-    // Never fall back to sandbox ADC (which resolves to host project 356936239657, not narid-atdc-tracker)
-    return {
-      available: false,
-      reason:
-        parseError ||
-        `Firebase Admin SDK Service Account credentials for project "${projectId}" are not configured (set FIREBASE_SERVICE_ACCOUNT_KEY or FIREBASE_SERVICE_ACCOUNT_JSON). Container default credentials resolve to host sandbox project 356936239657.`,
-    };
-  }
-
-  try {
-    const { initializeApp, getApps, cert } = await import('firebase-admin/app');
-    const { getAuth } = await import('firebase-admin/auth');
-
-    const appName = `narid-admin-${projectId}`;
-    let adminApp = adminAppCache.get(appName) || getApps().find((a) => a.name === appName);
-    if (!adminApp) {
-      adminApp = initializeApp(
-        {
-          credential: cert(parsedCred as any),
-          projectId,
-        },
-        appName
-      );
-      adminAppCache.set(appName, adminApp);
-    }
-
+  if (injectedAuth) {
     return {
       available: true,
-      adminAuth: getAuth(adminApp),
-      credentialSource: sourceName,
-      serviceAccountEmail: String(parsedCred.client_email || ''),
-    };
-  } catch (err: any) {
-    return {
-      available: false,
-      reason: String(err?.message || err || 'Failed to initialize Firebase Admin SDK.'),
+      adminAuth: injectedAuth,
+      credentialSource: 'INJECTED_ADMIN_AUTH',
     };
   }
+  const ctx = getFirebaseAdminContext();
+  if (!ctx.auth) {
+    return {
+      available: false,
+      reason: ctx.error || 'Firebase Admin Auth is not initialized.',
+    };
+  }
+  return {
+    available: true,
+    adminAuth: ctx.auth as unknown as AdminAuthLike,
+    credentialSource: ctx.credentialSource,
+    serviceAccountEmail: ctx.serviceAccountEmail,
+  };
 }
 
 export async function tryAdminAuthUpdatePassword(
   projectId: string,
   targetUid: string,
-  newPassword: string
+  newPassword: string,
+  injectedAuth?: AdminAuthLike | null
 ): Promise<{
   updated: boolean;
   adminSdkAvailable: boolean;
@@ -334,7 +319,7 @@ export async function tryAdminAuthUpdatePassword(
     };
   }
 
-  const ctx = await getAdminAuthContext(projectId);
+  const ctx = await getAdminAuthContext(projectId, injectedAuth);
   if (!ctx.available || !ctx.adminAuth) {
     return {
       updated: false,
@@ -344,7 +329,6 @@ export async function tryAdminAuthUpdatePassword(
   }
 
   try {
-    // Strictly inspect existing user first — never create a replacement user or alter email
     const existingUser = await ctx.adminAuth.getUser(targetUid);
     await ctx.adminAuth.updateUser(existingUser.uid, { password: newPassword });
     await ctx.adminAuth.revokeRefreshTokens(existingUser.uid);
@@ -365,13 +349,13 @@ export async function tryAdminAuthUpdatePassword(
 
 export async function inspectFirebaseAuthStatus(
   projectId: string,
-  db: Firestore
+  db: AdminFirestoreLike,
+  injectedAuth?: AdminAuthLike | null
 ): Promise<{
   adminSdkConfigured: boolean;
   projectId: string;
   credentialSource?: string;
   serviceAccountEmail?: string;
-  adcSandboxProject: string;
   reason?: string;
   authUsers: Array<{
     uid: string;
@@ -392,8 +376,8 @@ export async function inspectFirebaseAuthStatus(
     mappingConflict?: boolean;
   }>;
 }> {
-  const ctx = await getAdminAuthContext(projectId);
-  const usersSnap = await getDocs(collection(db, 'user_roles'));
+  const ctx = await getAdminAuthContext(projectId, injectedAuth);
+  const usersSnap = await db.collection('user_roles').get();
 
   let authUsers: Array<{
     uid: string;
@@ -402,22 +386,28 @@ export async function inspectFirebaseAuthStatus(
     creationTime?: string;
     lastSignInTime?: string;
   }> = [];
+  let authListError = '';
 
   if (ctx.available && ctx.adminAuth) {
-    const listRes = await ctx.adminAuth.listUsers(100);
-    authUsers = (listRes.users || []).map((u: any) => ({
-      uid: u.uid,
-      email: u.email || null,
-      disabled: Boolean(u.disabled),
-      creationTime: u.metadata?.creationTime,
-      lastSignInTime: u.metadata?.lastSignInTime,
-    }));
+    try {
+      const listRes = await ctx.adminAuth.listUsers(100);
+      authUsers = (listRes.users || []).map((u: any) => ({
+        uid: u.uid,
+        email: u.email || null,
+        disabled: Boolean(u.disabled),
+        creationTime: u.metadata?.creationTime,
+        lastSignInTime: u.metadata?.lastSignInTime,
+      }));
+    } catch (listErr: any) {
+      authListError = String(listErr?.message || listErr || 'listUsers failed');
+    }
   }
 
   const byUid = new Map(authUsers.map((u) => [u.uid, u]));
   const byEmail = new Map(
     authUsers.filter((u) => u.email).map((u) => [String(u.email).toLowerCase(), u])
   );
+  const authListed = ctx.available && !authListError;
 
   const firestoreMappings = usersSnap.docs.map((d) => {
     const data = d.data() || {};
@@ -429,7 +419,7 @@ export async function inspectFirebaseAuthStatus(
     let matchedEmail: string | null = null;
     let conflict = false;
 
-    if (ctx.available) {
+    if (authListed) {
       const uidUser = fsUid ? byUid.get(fsUid) : undefined;
       const emailUser = fsEmail ? byEmail.get(fsEmail) : undefined;
       if (uidUser) {
@@ -464,12 +454,11 @@ export async function inspectFirebaseAuthStatus(
   });
 
   return {
-    adminSdkConfigured: ctx.available,
+    adminSdkConfigured: authListed,
     projectId,
     credentialSource: ctx.credentialSource,
     serviceAccountEmail: ctx.serviceAccountEmail,
-    adcSandboxProject: '356936239657',
-    reason: ctx.reason,
+    reason: authListError || ctx.reason,
     authUsers,
     firestoreMappings,
   };
@@ -484,13 +473,13 @@ export interface AttemptTelemetryContext {
   uaMeta: UserAgentMeta;
 }
 
-export async function captureTelemetryContext(db: Firestore, req: Request): Promise<AttemptTelemetryContext> {
+export async function captureTelemetryContext(db: AdminFirestoreLike, req: Request): Promise<AttemptTelemetryContext> {
   const ipAddress = extractTrustedClientIp(req);
   const uaMeta = parseUserAgent(req.headers['user-agent']);
   let captureGeo = true;
   try {
-    const settingsSnap = await getDoc(doc(db, 'system_settings', 'global'));
-    if (settingsSnap.exists() && settingsSnap.data()?.captureGeoLocation === false) {
+    const settingsSnap = await db.collection('system_settings').doc('global').get();
+    if (settingsSnap.exists && settingsSnap.data()?.captureGeoLocation === false) {
       captureGeo = false;
     }
   } catch {
@@ -501,7 +490,7 @@ export async function captureTelemetryContext(db: Firestore, req: Request): Prom
 }
 
 export async function recordLoginAttemptDoc(
-  db: Firestore,
+  db: AdminFirestoreLike,
   params: {
     loginId: string;
     role: string;
@@ -535,7 +524,7 @@ export async function recordLoginAttemptDoc(
   const now = nowDate.toISOString();
   const attemptId = `att_${nowDate.getTime()}_${crypto.randomBytes(4).toString('hex')}`;
 
-  await setDoc(doc(db, 'login_attempts', attemptId), {
+  await db.collection('login_attempts').doc(attemptId).set({
     id: attemptId,
     loginId: params.loginId.trim().toLowerCase(),
     role: String(params.role || 'UNKNOWN').toUpperCase(),
@@ -562,7 +551,7 @@ export async function recordLoginAttemptDoc(
 }
 
 export async function recordSecurityAuditLogDoc(
-  db: Firestore,
+  db: AdminFirestoreLike,
   params: {
     action:
       | 'LOGIN_ATTEMPT_FAILED'
@@ -595,7 +584,6 @@ export async function recordSecurityAuditLogDoc(
   const now = nowDate.toISOString();
   const logId = `saud_${nowDate.getTime()}_${crypto.randomBytes(4).toString('hex')}`;
 
-  // Guarantee zero sensitive credential leakage in metadata
   const safeMeta: Record<string, any> = {};
   if (params.metadata) {
     for (const [k, v] of Object.entries(params.metadata)) {
@@ -604,7 +592,7 @@ export async function recordSecurityAuditLogDoc(
     }
   }
 
-  await setDoc(doc(db, 'security_audit_logs', logId), {
+  await db.collection('security_audit_logs').doc(logId).set({
     id: logId,
     action: params.action,
     severity: params.severity,
@@ -632,24 +620,36 @@ export async function recordSecurityAuditLogDoc(
 }
 
 // ============================================================================
-// 5. Bootstrap / Ensure account_security Documents for Existing Accounts
+// 5. Bootstrap / Ensure account_security & user_uid_index for Existing Accounts
+//    (Never creates auth users, never overwrites authUid/email/passwordHash)
 // ============================================================================
-export async function seedAccountSecurityRecords(db: Firestore): Promise<void> {
+export async function seedAccountSecurityRecords(db: AdminFirestoreLike): Promise<void> {
   try {
-    const usersSnap = await getDocs(collection(db, 'user_roles'));
+    const usersSnap = await db.collection('user_roles').get();
     const now = new Date().toISOString();
 
     for (const uDoc of usersSnap.docs) {
-      const uData = uDoc.data();
+      const uData = uDoc.data() || {};
       const loginId = String(uData.loginId || uDoc.id.replace(/^role_/, '')).trim().toLowerCase();
       if (!loginId) continue;
 
-      const secId = `sec_${loginId}`;
-      const secRef = doc(db, 'account_security', secId);
-      const secSnap = await getDoc(secRef);
+      if (uData.authUid) {
+        await syncUserUidIndex(db, {
+          uid: String(uData.authUid),
+          roleDocId: uDoc.id,
+          role: String(uData.role || 'user'),
+          status: String(uData.status || 'Active'),
+          lockStatus: uData.isLocked || uData.lockStatus === 'LOCKED' ? 'LOCKED' : 'ACTIVE',
+          loginId,
+        });
+      }
 
-      if (!secSnap.exists()) {
-        await setDoc(secRef, {
+      const secId = `sec_${loginId}`;
+      const secRef = db.collection('account_security').doc(secId);
+      const secSnap = await secRef.get();
+
+      if (!secSnap.exists) {
+        await secRef.set({
           id: secId,
           loginId,
           role: String(uData.role || 'USER').toUpperCase(),
@@ -683,7 +683,7 @@ export async function seedAccountSecurityRecords(db: Firestore): Promise<void> {
           updatedAt: now,
         });
       } else {
-        const sData = secSnap.data();
+        const sData = secSnap.data() || {};
         const updates: Record<string, any> = {};
         if (uData.email && sData.email !== uData.email) {
           updates.email = uData.email;
@@ -693,7 +693,7 @@ export async function seedAccountSecurityRecords(db: Firestore): Promise<void> {
         }
         if (Object.keys(updates).length > 0) {
           updates.updatedAt = now;
-          await updateDoc(secRef, updates);
+          await secRef.update(updates);
         }
       }
     }
@@ -706,7 +706,8 @@ export async function seedAccountSecurityRecords(db: Firestore): Promise<void> {
 // 6. Atomic Concurrency-Safe Login Verification Engine
 // ============================================================================
 export interface LoginSecurityDeps {
-  db: Firestore;
+  db: AdminFirestoreLike;
+  auth: AdminAuthLike | null;
   projectId: string;
   verifyPassword: (password: string, storedHash: string) => boolean;
   hashPassword: (password: string) => string;
@@ -715,7 +716,7 @@ export interface LoginSecurityDeps {
     targetUid: string,
     newPassword: string,
     knownCurrentPassword?: string
-  ) => Promise<{ success: boolean; uid?: string; error?: string }>;
+  ) => Promise<{ success: boolean; uid?: string; error?: string; rateLimited?: boolean }>;
   requireVerifiedCaller: (
     req: Request,
     res: Response,
@@ -739,6 +740,7 @@ const GenerateTempPasswordSchema = z.object({
 export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSecurityDeps) {
   const {
     db,
+    auth,
     projectId,
     verifyPassword,
     hashPassword,
@@ -746,9 +748,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
     requireVerifiedCaller,
   } = deps;
 
-  // --------------------------------------------------------------------------
-  // A. Hardened POST /api/auth/login (Atomic 3-Strike Lockout + IP Rate Limit)
-  // --------------------------------------------------------------------------
+  // A. Hardened POST /api/auth/login (Atomic 3-Strike Lockout + Persistent IP Rate Limit)
   app.post('/api/auth/login', async (req: Request, res: Response) => {
     try {
       const loginIdRaw = typeof req.body?.loginId === 'string' ? req.body.loginId.trim() : '';
@@ -764,8 +764,8 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
       const cleanId = loginIdRaw.toLowerCase();
       const telemetry = await captureTelemetryContext(db, req);
 
-      // 1. Check Per-Account + Unknown-Probe IP Progressive Cooldown Rate Limit
-      const ipCheck = checkIpProgressiveRateLimit(telemetry.ipAddress, cleanId);
+      // 1. Check Persistent Distributed IP Rate Limit
+      const ipCheck = await checkIpProgressiveRateLimitPersistent(db, telemetry.ipAddress, cleanId);
       if (!ipCheck.allowed) {
         await recordLoginAttemptDoc(db, {
           loginId: cleanId,
@@ -793,25 +793,22 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
         });
       }
 
-      // Small constant jitter to normalize timing
-      await new Promise((r) => setTimeout(r, 35));
+      await new Promise((r) => setTimeout(r, 25));
 
       // 2. Serialize all login verification & counter mutations per Login ID
       const result = await withLoginIdLock(cleanId, async () => {
         const docId = `role_${cleanId}`;
-        let userDoc = await getDoc(doc(db, 'user_roles', docId));
+        let userDoc = await db.collection('user_roles').doc(docId).get();
 
-        if (!userDoc.exists()) {
-          const q = query(collection(db, 'user_roles'), where('loginId', '==', cleanId));
-          const snap = await getDocs(q);
+        if (!userDoc.exists) {
+          const snap = await db.collection('user_roles').where('loginId', '==', cleanId).limit(1).get();
           if (!snap.empty) {
             userDoc = snap.docs[0];
           }
         }
 
-        // Unknown Login ID
-        if (!userDoc || !userDoc.exists()) {
-          const ipRes = recordIpFailure(telemetry.ipAddress, 'unknown_id');
+        if (!userDoc || !userDoc.exists) {
+          const ipRes = await recordIpFailurePersistent(db, telemetry.ipAddress, 'unknown_id');
           await recordLoginAttemptDoc(db, {
             loginId: cleanId,
             role: 'UNKNOWN',
@@ -862,10 +859,9 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
         const userData = userDoc.data() || {};
         const roleUpper = String(userData.role || 'USER').toUpperCase();
         const firebaseUid = String(userData.authUid || userDoc.id);
-        const secRef = doc(db, 'account_security', `sec_${cleanId}`);
-        const userRef = doc(db, 'user_roles', userDoc.id);
+        const secRef = db.collection('account_security').doc(`sec_${cleanId}`);
+        const userRef = db.collection('user_roles').doc(userDoc.id);
 
-        // 3. Account Inactive Guard (before password verification)
         if (userData.status === 'Inactive') {
           await recordLoginAttemptDoc(db, {
             loginId: cleanId,
@@ -896,7 +892,6 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
           };
         }
 
-        // 4. Atomic Transaction: Check Lock Status FIRST, then verify password & update counters
         const now = new Date().toISOString();
         const deviceSummary = {
           browser: telemetry.uaMeta.browser,
@@ -904,10 +899,10 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
           deviceType: telemetry.uaMeta.deviceType,
         };
 
-        const txOutcome = await runTransaction(db, async (tx) => {
+        const txOutcome = await db.runTransaction(async (tx) => {
           const secSnap = await tx.get(secRef);
-          const curSec = secSnap.exists()
-            ? secSnap.data()
+          const curSec: Record<string, any> = secSnap.exists
+            ? (secSnap.data() || {})
             : {
                 id: `sec_${cleanId}`,
                 loginId: cleanId,
@@ -930,7 +925,6 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
             userData.lockStatus === 'LOCKED' ||
             userData.isLocked === true;
 
-          // Step 4a: Strictly enforce lock BEFORE checking password
           if (isCurrentlyLocked) {
             tx.set(
               secRef,
@@ -956,14 +950,10 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
             };
           }
 
-          // Step 4b: Verify password against server scrypt passwordHash
-          let isPasswordValid = false;
-          if (userData.passwordHash) {
-            isPasswordValid = verifyPassword(password, userData.passwordHash);
-          } else if (password === 'Narid@12345') {
-            isPasswordValid = true;
-            tx.update(userRef, { passwordHash: hashPassword(password) });
-          }
+          // Strictly verify against stored scrypt hash ONLY (no hardcoded fallback password)
+          const isPasswordValid = userData.passwordHash
+            ? verifyPassword(password, String(userData.passwordHash))
+            : false;
 
           if (!isPasswordValid) {
             const nextConsecutive = Number(curSec.consecutiveFailedAttempts || 0) + 1;
@@ -1012,7 +1002,6 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
             };
           }
 
-          // Step 4c: Password Valid -> Reset consecutive failed attempts to 0 (NEVER reset mustChangePassword)
           const mustChange =
             userData.mustChangePassword === true || curSec.forcePasswordChange === true;
 
@@ -1054,9 +1043,16 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
           };
         });
 
-        // 5. Post-Transaction Telemetry, Audit Trail & Response
         if (txOutcome.kind === 'LOCKED_REJECT') {
-          const ipRes = recordIpFailure(telemetry.ipAddress, 'locked_hit', cleanId);
+          await syncUserUidIndex(db, {
+            uid: userData.authUid || null,
+            roleDocId: userDoc.id,
+            role: String(userData.role || 'user'),
+            status: String(userData.status || 'Active'),
+            lockStatus: 'LOCKED',
+            loginId: cleanId,
+          });
+          const ipRes = await recordIpFailurePersistent(db, telemetry.ipAddress, 'locked_hit', cleanId);
           await Promise.all([
             recordLoginAttemptDoc(db, {
               loginId: cleanId,
@@ -1129,7 +1125,15 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
         }
 
         if (txOutcome.kind === 'NOW_LOCKED') {
-          recordIpFailure(telemetry.ipAddress, 'password', cleanId);
+          await syncUserUidIndex(db, {
+            uid: userData.authUid || null,
+            roleDocId: userDoc.id,
+            role: String(userData.role || 'user'),
+            status: String(userData.status || 'Active'),
+            lockStatus: 'LOCKED',
+            loginId: cleanId,
+          });
+          await recordIpFailurePersistent(db, telemetry.ipAddress, 'password', cleanId);
           await Promise.all([
             recordLoginAttemptDoc(db, {
               loginId: cleanId,
@@ -1194,7 +1198,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
         }
 
         if (txOutcome.kind === 'FAILED_PASSWORD') {
-          recordIpFailure(telemetry.ipAddress, 'password', cleanId);
+          await recordIpFailurePersistent(db, telemetry.ipAddress, 'password', cleanId);
           const isSecondWarning = txOutcome.attemptNumber === 2;
 
           await Promise.all([
@@ -1278,8 +1282,17 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
           };
         }
 
-        // SUCCESSFUL LOGIN -> Clear any per-account IP cooldown
-        clearIpCooldown(telemetry.ipAddress, cleanId);
+        // SUCCESSFUL LOGIN -> Clear persistent IP cooldown and sync UID index
+        await clearIpCooldownPersistent(db, telemetry.ipAddress, cleanId);
+        await syncUserUidIndex(db, {
+          uid: userData.authUid || null,
+          roleDocId: userDoc.id,
+          role: String(userData.role || 'user'),
+          status: String(userData.status || 'Active'),
+          lockStatus: 'ACTIVE',
+          loginId: cleanId,
+        });
+
         const sessionId = `sess_${crypto.randomBytes(10).toString('hex')}`;
         const sessionToken = crypto.randomBytes(32).toString('hex');
 
@@ -1288,11 +1301,6 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
           if (!effectiveModules.includes('dashboard')) {
             effectiveModules = ['dashboard', ...effectiveModules];
           }
-          updateDoc(userRef, {
-            modulesAllowed: effectiveModules,
-            dashboardAccessMigratedV1: true,
-            updatedAt: now,
-          }).catch(() => {});
         }
 
         await Promise.all([
@@ -1368,6 +1376,15 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
 
       return res.status(result.status).json(result.body);
     } catch (err: any) {
+      if (isFirestorePermissionDeniedError(err)) {
+        const msg = formatAdminPermissionDeniedError(projectId, TARGET_DATABASE_ID);
+        console.warn('[Enterprise Login Security] Firestore IAM notice:', msg);
+        return res.status(503).json({
+          success: false,
+          code: 'FIREBASE_ADMIN_PERMISSION_DENIED',
+          error: msg,
+        });
+      }
       console.error('[Enterprise Login Security] Error:', err);
       return res.status(500).json({
         success: false,
@@ -1376,10 +1393,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
     }
   });
 
-  // --------------------------------------------------------------------------
-  // B. Record Firebase Auth Native Abuse Protection Signal (TOO_MANY_ATTEMPTS_TRY_LATER)
-  //    Strictly observational telemetry — never bypasses or resets lock state
-  // --------------------------------------------------------------------------
+  // B. Record Firebase Auth Native Abuse Protection Signal
   app.post('/api/auth/firebase-throttle-signal', async (req: Request, res: Response) => {
     try {
       const cleanId =
@@ -1387,7 +1401,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
           ? req.body.loginId.trim().toLowerCase().slice(0, 64)
           : 'unknown';
       const telemetry = await captureTelemetryContext(db, req);
-      const ipRes = recordIpFailure(telemetry.ipAddress, 'firebase_throttle', cleanId);
+      const ipRes = await recordIpFailurePersistent(db, telemetry.ipAddress, 'firebase_throttle', cleanId);
 
       await Promise.all([
         recordLoginAttemptDoc(db, {
@@ -1416,9 +1430,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
     }
   });
 
-  // --------------------------------------------------------------------------
   // C. Super Admin Security Dashboard Overview (Strictly SUPER_ADMIN Only)
-  // --------------------------------------------------------------------------
   app.get('/api/security/overview', async (req: Request, res: Response) => {
     try {
       const caller = await requireVerifiedCaller(
@@ -1430,35 +1442,33 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
       if (!caller) return;
 
       const [usersSnap, secSnap, attemptsSnap, secLogsSnap] = await Promise.all([
-        getDocs(collection(db, 'user_roles')),
-        getDocs(collection(db, 'account_security')),
-        getDocs(collection(db, 'login_attempts')),
-        getDocs(collection(db, 'security_audit_logs')),
+        db.collection('user_roles').get(),
+        db.collection('account_security').get(),
+        db.collection('login_attempts').get(),
+        db.collection('security_audit_logs').get(),
       ]);
 
       const secByLoginId = new Map<string, any>();
       secSnap.docs.forEach((d) => {
-        const data = d.data();
+        const data = d.data() || {};
         const key = String(data.loginId || d.id.replace(/^sec_/, '')).trim().toLowerCase();
         secByLoginId.set(key, { id: d.id, ...data });
       });
 
       const attempts = attemptsSnap.docs
-        .map((d) => ({ id: d.id, ...d.data() } as any))
+        .map((d) => ({ id: d.id, ...(d.data() || {}) } as any))
         .sort((a, b) => (b.timestampMs || 0) - (a.timestampMs || 0));
 
       const securityLogs = secLogsSnap.docs
-        .map((d) => ({ id: d.id, ...d.data() } as any))
+        .map((d) => ({ id: d.id, ...(d.data() || {}) } as any))
         .sort((a, b) => (b.timestampMs || 0) - (a.timestampMs || 0));
 
-      // Aggregate unique accounts from user_roles joined with account_security
       const accountMap = new Map<string, any>();
       usersSnap.docs.forEach((uDoc) => {
-        const uData = uDoc.data();
+        const uData = uDoc.data() || {};
         const loginId = String(uData.loginId || uDoc.id.replace(/^role_/, '')).trim().toLowerCase();
         if (!loginId) return;
 
-        // Deduplicate preferring canonical role_ doc
         if (accountMap.has(loginId) && uDoc.id !== `role_${loginId}`) {
           return;
         }
@@ -1543,6 +1553,10 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
         recentSecurityLogs: securityLogs.slice(0, 150),
       });
     } catch (err: any) {
+      if (isFirestorePermissionDeniedError(err)) {
+        const msg = formatAdminPermissionDeniedError(projectId, TARGET_DATABASE_ID);
+        return res.status(503).json({ success: false, code: 'FIREBASE_ADMIN_PERMISSION_DENIED', error: msg });
+      }
       console.error('[Security Overview API] Error:', err);
       return res.status(500).json({
         success: false,
@@ -1551,9 +1565,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
     }
   });
 
-  // --------------------------------------------------------------------------
   // D. Filterable Login Attempts History (Strictly SUPER_ADMIN Only)
-  // --------------------------------------------------------------------------
   app.get('/api/security/attempts', async (req: Request, res: Response) => {
     try {
       const caller = await requireVerifiedCaller(
@@ -1571,9 +1583,9 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
         limit = '250',
       } = req.query as Record<string, string>;
 
-      const snap = await getDocs(collection(db, 'login_attempts'));
+      const snap = await db.collection('login_attempts').get();
       let rows = snap.docs
-        .map((d) => ({ id: d.id, ...d.data() } as any))
+        .map((d) => ({ id: d.id, ...(d.data() || {}) } as any))
         .sort((a, b) => (b.timestampMs || 0) - (a.timestampMs || 0));
 
       const q = search.trim().toLowerCase();
@@ -1596,14 +1608,16 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
       const maxLimit = Math.min(500, Math.max(10, parseInt(limit, 10) || 250));
       return res.json({ success: true, attempts: rows.slice(0, maxLimit) });
     } catch (err: any) {
+      if (isFirestorePermissionDeniedError(err)) {
+        const msg = formatAdminPermissionDeniedError(projectId, TARGET_DATABASE_ID);
+        return res.status(503).json({ success: false, code: 'FIREBASE_ADMIN_PERMISSION_DENIED', error: msg });
+      }
       console.error('[Security Attempts API] Error:', err);
       return res.status(500).json({ success: false, error: 'Failed to load login attempts.' });
     }
   });
 
-  // --------------------------------------------------------------------------
   // E. Security Governance Audit Logs (Strictly SUPER_ADMIN Only)
-  // --------------------------------------------------------------------------
   app.get('/api/security/audit-logs', async (req: Request, res: Response) => {
     try {
       const caller = await requireVerifiedCaller(
@@ -1621,9 +1635,9 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
         search = '',
       } = req.query as Record<string, string>;
 
-      const snap = await getDocs(collection(db, 'security_audit_logs'));
+      const snap = await db.collection('security_audit_logs').get();
       let rows = snap.docs
-        .map((d) => ({ id: d.id, ...d.data() } as any))
+        .map((d) => ({ id: d.id, ...(d.data() || {}) } as any))
         .sort((a, b) => (b.timestampMs || 0) - (a.timestampMs || 0));
 
       const q = search.trim().toLowerCase();
@@ -1642,14 +1656,16 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
 
       return res.json({ success: true, logs: rows.slice(0, 300) });
     } catch (err: any) {
+      if (isFirestorePermissionDeniedError(err)) {
+        const msg = formatAdminPermissionDeniedError(projectId, TARGET_DATABASE_ID);
+        return res.status(503).json({ success: false, code: 'FIREBASE_ADMIN_PERMISSION_DENIED', error: msg });
+      }
       console.error('[Security Audit Logs API] Error:', err);
       return res.status(500).json({ success: false, error: 'Failed to load security audit logs.' });
     }
   });
 
-  // --------------------------------------------------------------------------
-  // F. Super Admin Account Unblock Workflow (Atomic Transaction + Audit)
-  // --------------------------------------------------------------------------
+  // F. Super Admin Account Unblock Workflow (Atomic Transaction + Persistent Cooldown Clear)
   app.post('/api/security/unblock-account', async (req: Request, res: Response) => {
     try {
       const caller = await requireVerifiedCaller(
@@ -1674,29 +1690,28 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
 
       const unblockResult = await withLoginIdLock(cleanTargetId, async () => {
         const docId = `role_${cleanTargetId}`;
-        let userDoc = await getDoc(doc(db, 'user_roles', docId));
-        if (!userDoc.exists()) {
-          const q = query(collection(db, 'user_roles'), where('loginId', '==', cleanTargetId));
-          const snap = await getDocs(q);
+        let userDoc = await db.collection('user_roles').doc(docId).get();
+        if (!userDoc.exists) {
+          const snap = await db.collection('user_roles').where('loginId', '==', cleanTargetId).limit(1).get();
           if (!snap.empty) userDoc = snap.docs[0];
         }
 
-        if (!userDoc || !userDoc.exists()) {
+        if (!userDoc || !userDoc.exists) {
           return { notFound: true as const };
         }
 
         const userData = userDoc.data() || {};
         const targetRole = String(userData.role || 'USER').toUpperCase();
         const firebaseUid = String(userData.authUid || userDoc.id);
-        const secRef = doc(db, 'account_security', `sec_${cleanTargetId}`);
-        const userRef = doc(db, 'user_roles', userDoc.id);
+        const secRef = db.collection('account_security').doc(`sec_${cleanTargetId}`);
+        const userRef = db.collection('user_roles').doc(userDoc.id);
         const now = new Date().toISOString();
 
         let previousState: any = {};
 
-        await runTransaction(db, async (tx) => {
+        await db.runTransaction(async (tx) => {
           const secSnap = await tx.get(secRef);
-          const curSec = secSnap.exists() ? secSnap.data() : {};
+          const curSec = secSnap.exists ? (secSnap.data() || {}) : {};
           previousState = {
             lockStatus: curSec.lockStatus || userData.lockStatus || 'ACTIVE',
             consecutiveFailedAttempts: Number(
@@ -1739,8 +1754,16 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
           });
         });
 
-        // Clear per-account IP cooldown on unblock
-        clearIpCooldown(telemetry.ipAddress, cleanTargetId);
+        await syncUserUidIndex(db, {
+          uid: userData.authUid || null,
+          roleDocId: userDoc.id,
+          role: String(userData.role || 'user'),
+          status: String(userData.status || 'Active'),
+          lockStatus: 'ACTIVE',
+          loginId: cleanTargetId,
+        });
+
+        await clearIpCooldownPersistent(db, undefined, cleanTargetId);
 
         await Promise.all([
           recordSecurityAuditLogDoc(db, {
@@ -1805,9 +1828,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
     }
   });
 
-  // --------------------------------------------------------------------------
   // G. Super Admin Firebase Admin SDK Live Inspection Status (Read-Only)
-  // --------------------------------------------------------------------------
   app.get('/api/security/firebase-admin-status', async (req: Request, res: Response) => {
     try {
       const caller = await requireVerifiedCaller(
@@ -1818,7 +1839,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
       );
       if (!caller) return;
 
-      const status = await inspectFirebaseAuthStatus(projectId, db);
+      const status = await inspectFirebaseAuthStatus(projectId, db, auth);
       return res.json({
         success: true,
         ...status,
@@ -1832,11 +1853,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
     }
   });
 
-  // --------------------------------------------------------------------------
-  // H. Super Admin Temporary Password Generation (Fresh Auth Check + Force Change)
-  //    Updates existing Firebase UID in place. Never substitutes Firestore passwordHash
-  //    when Firebase Auth update fails, and never creates a new Firebase user.
-  // --------------------------------------------------------------------------
+  // H. Super Admin Temporary Password Generation
   app.post('/api/security/generate-temp-password', async (req: Request, res: Response) => {
     try {
       const caller = await requireVerifiedCaller(
@@ -1860,16 +1877,15 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
       const freshPassword = parsed.data.freshSuperAdminPassword;
       const telemetry = await captureTelemetryContext(db, req);
 
-      // Fresh Super Admin Authentication Verification (auth_time <= 5 min OR verified Super Admin password)
       const nowSec = Math.floor(Date.now() / 1000);
       const isRecentTokenAuth =
         typeof caller.authTime === 'number' && nowSec - caller.authTime <= 300;
 
       let freshAuthVerified = false;
       if (freshPassword && freshPassword.length > 0) {
-        const callerDoc = await getDoc(doc(db, 'user_roles', caller.profileDocId));
-        const callerHash = callerDoc.exists() ? callerDoc.data()?.passwordHash : null;
-        if (callerHash && verifyPassword(freshPassword, callerHash)) {
+        const callerDoc = await db.collection('user_roles').doc(caller.profileDocId).get();
+        const callerHash = callerDoc.exists ? callerDoc.data()?.passwordHash : null;
+        if (callerHash && verifyPassword(freshPassword, String(callerHash))) {
           freshAuthVerified = true;
         } else {
           await recordSecurityAuditLogDoc(db, {
@@ -1902,20 +1918,18 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
         });
       }
 
-      // Generate strong random temporary password in memory only
       const temporaryPassword = generateStrongTemporaryPassword(14);
       const newHash = hashPassword(temporaryPassword);
 
       const result = await withLoginIdLock(cleanTargetId, async () => {
         const docId = `role_${cleanTargetId}`;
-        let userDoc = await getDoc(doc(db, 'user_roles', docId));
-        if (!userDoc.exists()) {
-          const q = query(collection(db, 'user_roles'), where('loginId', '==', cleanTargetId));
-          const snap = await getDocs(q);
+        let userDoc = await db.collection('user_roles').doc(docId).get();
+        if (!userDoc.exists) {
+          const snap = await db.collection('user_roles').where('loginId', '==', cleanTargetId).limit(1).get();
           if (!snap.empty) userDoc = snap.docs[0];
         }
 
-        if (!userDoc || !userDoc.exists()) {
+        if (!userDoc || !userDoc.exists) {
           return { notFound: true as const };
         }
 
@@ -1932,14 +1946,12 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
         const targetUid = String(userData.authUid || userData.uid || userDoc.id);
         const now = new Date().toISOString();
 
-        // Update existing Firebase Auth UID in-place FIRST (Admin SDK first, Identity Toolkit fallback)
-        // Strictly NEVER creates a new user, NEVER alters email, and NEVER substitutes Firestore passwordHash if Auth fails.
         let firebaseAuthSynced = false;
         let syncErrorReason = '';
         let adminSdkAvailable = false;
         let rateLimited = false;
 
-        const adminAttempt = await tryAdminAuthUpdatePassword(projectId, targetUid, temporaryPassword);
+        const adminAttempt = await tryAdminAuthUpdatePassword(projectId, targetUid, temporaryPassword, auth);
         adminSdkAvailable = adminAttempt.adminSdkAvailable;
         if (adminAttempt.updated) {
           firebaseAuthSynced = true;
@@ -1954,7 +1966,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
             if (syncRes.success) {
               firebaseAuthSynced = true;
             } else {
-              rateLimited = Boolean((syncRes as any).rateLimited);
+              rateLimited = Boolean(syncRes.rateLimited);
               if (syncRes.error) {
                 syncErrorReason = syncRes.error;
               }
@@ -1992,21 +2004,16 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
             error:
               rateLimited
                 ? 'Firebase Auth rate limit (TOO_MANY_ATTEMPTS_TRY_LATER) blocked in-place sync. Firestore passwordHash was kept unchanged.'
-                : `Firebase Authentication password update failed for "${targetEmail}" (UID: ${targetUid}). Firestore passwordHash was NOT modified to prevent mismatch. ${
-                    !adminSdkAvailable
-                      ? 'Configure FIREBASE_SERVICE_ACCOUNT_KEY for project "narid-atdc-tracker" to allow Admin SDK password resets without knowing the current password.'
-                      : syncErrorReason
-                  }`.trim(),
+                : `Firebase Authentication password update failed for "${targetEmail}" (UID: ${targetUid}). Firestore passwordHash was NOT modified to prevent mismatch. ${syncErrorReason}`.trim(),
           };
         }
 
-        // Update Firestore hash + forcePasswordChange + mustChangePassword ONLY AFTER Firebase Auth succeeded
-        const userRef = doc(db, 'user_roles', userDoc.id);
-        const secRef = doc(db, 'account_security', `sec_${cleanTargetId}`);
+        const userRef = db.collection('user_roles').doc(userDoc.id);
+        const secRef = db.collection('account_security').doc(`sec_${cleanTargetId}`);
 
-        await runTransaction(db, async (tx) => {
+        await db.runTransaction(async (tx) => {
           const secSnap = await tx.get(secRef);
-          const curSec = secSnap.exists() ? secSnap.data() : {};
+          const curSec = secSnap.exists ? (secSnap.data() || {}) : {};
 
           tx.update(userRef, {
             passwordHash: newHash,
@@ -2040,7 +2047,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
 
         const resetLogId = `reset_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
         await Promise.all([
-          setDoc(doc(db, 'password_reset_logs', resetLogId), {
+          db.collection('password_reset_logs').doc(resetLogId).set({
             id: resetLogId,
             targetLoginId: cleanTargetId,
             targetName: userData.name || cleanTargetId,
@@ -2123,7 +2130,6 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
         });
       }
 
-      // One-time temporary password returned over response only (never persisted anywhere)
       return res.json({
         success: true,
         targetLoginId: result.targetLoginId,
@@ -2136,6 +2142,10 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
         message: `One-time temporary password generated for "${result.targetLoginId}" and synced in Firebase Auth (UID: ${result.firebaseUid}). Password change is mandatory on next login.`,
       });
     } catch (err: any) {
+      if (isFirestorePermissionDeniedError(err)) {
+        const msg = formatAdminPermissionDeniedError(projectId, TARGET_DATABASE_ID);
+        return res.status(503).json({ success: false, code: 'FIREBASE_ADMIN_PERMISSION_DENIED', error: msg });
+      }
       console.error('[Security Generate Temp Password API] Error:', err);
       return res.status(500).json({
         success: false,

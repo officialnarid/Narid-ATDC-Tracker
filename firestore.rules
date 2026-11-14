@@ -2,200 +2,211 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Helper functions for hardened ABAC
+    // =========================================================================
+    // Strict Zero-Trust UID-Based RBAC Helpers (Zero Email Bypasses)
+    // =========================================================================
     function isSignedIn() {
       return request.auth != null;
     }
 
     function isValidId(id) {
-      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-\\.]+$');
     }
 
-    function hasRoleDoc(docId) {
-      return exists(/databases/$(database)/documents/user_roles/$(docId));
+    function hasUidIndex() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/user_uid_index/$(request.auth.uid));
     }
 
-    function getRoleDoc(docId) {
-      return get(/databases/$(database)/documents/user_roles/$(docId)).data;
+    function uidIndex() {
+      return get(/databases/$(database)/documents/user_uid_index/$(request.auth.uid)).data;
     }
 
-    // Super Admin evaluation: Verified status and super_admin role
+    function hasDirectUidRole() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/user_roles/$(request.auth.uid));
+    }
+
+    function directUidRole() {
+      return get(/databases/$(database)/documents/user_roles/$(request.auth.uid)).data;
+    }
+
+    function isNotLocked() {
+      return (!hasUidIndex() || uidIndex().lockStatus != 'LOCKED') &&
+        (!hasDirectUidRole() || (directUidRole().lockStatus != 'LOCKED' && directUidRole().isLocked != true));
+    }
+
     function isSuperAdmin() {
-      return isSignedIn() && (
-        (hasRoleDoc(request.auth.uid) && getRoleDoc(request.auth.uid).role == 'super_admin' && getRoleDoc(request.auth.uid).status == 'Active') ||
-        (hasRoleDoc('role_' + request.auth.uid) && getRoleDoc('role_' + request.auth.uid).role == 'super_admin' && getRoleDoc('role_' + request.auth.uid).status == 'Active') ||
-        request.auth.token.email == 'officialnarid@gmail.com' ||
-        request.auth.token.email == 'superadmin_root@narid.com' ||
-        request.auth.token.email == 'superadmin@narid.com'
+      return isSignedIn() && isNotLocked() && (
+        (hasUidIndex() &&
+          uidIndex().status == 'Active' &&
+          uidIndex().role == 'super_admin') ||
+        (hasDirectUidRole() &&
+          directUidRole().status == 'Active' &&
+          directUidRole().role == 'super_admin')
       );
     }
 
-    // Admin evaluation: Either Super Admin or active admin
     function isAdmin() {
-      return isSignedIn() && (
+      return isSignedIn() && isNotLocked() && (
         isSuperAdmin() ||
-        (hasRoleDoc(request.auth.uid) && getRoleDoc(request.auth.uid).role == 'admin' && getRoleDoc(request.auth.uid).status == 'Active') ||
-        (hasRoleDoc('role_' + request.auth.uid) && getRoleDoc('role_' + request.auth.uid).role == 'admin' && getRoleDoc('role_' + request.auth.uid).status == 'Active') ||
-        request.auth.token.email == 'admin_root@narid.com' ||
-        request.auth.token.email == 'admin@narid.com'
+        (hasUidIndex() &&
+          uidIndex().status == 'Active' &&
+          uidIndex().role == 'admin') ||
+        (hasDirectUidRole() &&
+          directUidRole().status == 'Active' &&
+          directUidRole().role == 'admin')
       );
     }
 
-    // Active User evaluation: Any active role or authorized floor operator
     function isActiveUser() {
-      return isSignedIn() && (
+      return isSignedIn() && isNotLocked() && (
         isAdmin() ||
-        (hasRoleDoc(request.auth.uid) && getRoleDoc(request.auth.uid).status == 'Active') ||
-        (hasRoleDoc('role_' + request.auth.uid) && getRoleDoc(request.auth.uid).status == 'Active') ||
-        request.auth.token.email == 'user_root@narid.com' ||
-        request.auth.token.email == 'user@narid.com'
+        (hasUidIndex() && uidIndex().status == 'Active') ||
+        (hasDirectUidRole() && directUidRole().status == 'Active')
       );
     }
 
-    // 1. User Roles & Accounts Collection
+    function isOwnerByUidIndex(docId) {
+      return isSignedIn() && (
+        request.auth.uid == docId ||
+        (hasUidIndex() && uidIndex().roleDocId == docId)
+      );
+    }
+
+    // 0. Server-Maintained UID-to-Role Index (Admin SDK Only Writes)
+    match /user_uid_index/{uid} {
+      allow get: if isSignedIn() && request.auth.uid == uid;
+      allow list: if isSuperAdmin();
+      allow create, update, delete: if false; // Strictly Firebase Admin SDK only
+    }
+
+    // 1. User Roles & Accounts Directory (Admin SDK Only Writes)
     match /user_roles/{userRoleId} {
       allow list: if isSuperAdmin();
       allow get: if isSignedIn() && (
         isSuperAdmin() ||
-        request.auth.uid == userRoleId ||
-        ('role_' + request.auth.uid) == userRoleId ||
-        (resource != null && (
-          resource.data.authUid == request.auth.uid ||
-          (resource.data.email != null && resource.data.email == request.auth.token.email)
-        )) ||
-        (userRoleId == 'role_admin' && (request.auth.token.email == 'admin@narid.com' || request.auth.token.email == 'admin_root@narid.com')) ||
-        (userRoleId == 'role_user' && (request.auth.token.email == 'user@narid.com' || request.auth.token.email == 'user_root@narid.com'))
+        isOwnerByUidIndex(userRoleId) ||
+        (resource != null && resource.data.authUid == request.auth.uid)
       );
-      allow create, update, delete: if isSuperAdmin() && isValidId(userRoleId);
+      allow create, update, delete: if false; // Strictly Firebase Admin SDK only
     }
 
-    // 2. Shared Role Definitions Collection
+    // 2. Shared Role Definitions (Admin SDK Only Writes)
     match /roles/{roleId} {
-      allow list, get: if isSignedIn() && isActiveUser();
-      allow create, update, delete: if isSuperAdmin() && isValidId(roleId);
+      allow list, get: if isActiveUser();
+      allow create, update, delete: if false; // Strictly Firebase Admin SDK only
     }
 
-    // 3. User Individual Permissions Collection
+    // 3. Individual User Permissions (Admin SDK Only Writes)
     match /user_permissions/{permissionId} {
       allow list: if isSuperAdmin();
       allow get: if isSignedIn() && (
         isSuperAdmin() ||
-        request.auth.uid == permissionId ||
-        ('role_' + request.auth.uid) == permissionId ||
-        (resource != null && resource.data.loginId != null && (
-          (resource.data.loginId == 'admin' && (request.auth.token.email == 'admin@narid.com' || request.auth.token.email == 'admin_root@narid.com')) ||
-          (resource.data.loginId == 'user' && (request.auth.token.email == 'user@narid.com' || request.auth.token.email == 'user_root@narid.com'))
-        ))
+        isOwnerByUidIndex(permissionId)
       );
-      allow create, update, delete: if isSuperAdmin() && isValidId(permissionId);
+      allow create, update, delete: if false; // Strictly Firebase Admin SDK only
     }
 
-    // 4. Role Permissions Mapping
+    // 4. Role Permissions Mapping (Admin SDK Only Writes)
     match /role_permissions/{roleId} {
-      allow list, get: if isSignedIn() && isActiveUser();
-      allow create, update, delete: if isSuperAdmin() && isValidId(roleId);
+      allow list, get: if isActiveUser();
+      allow create, update, delete: if false; // Strictly Firebase Admin SDK only
     }
 
     // 5. Employees Master Directory
     match /employees/{employeeId} {
-      allow list, get: if isSignedIn() && isActiveUser();
-      allow create, update, delete: if isAdmin() && isValidId(employeeId);
+      allow list, get: if isActiveUser();
+      allow create, update: if isAdmin() && isValidId(employeeId) &&
+        request.resource.data.employeeId is string &&
+        request.resource.data.employeeName is string &&
+        request.resource.data.employeeStatus in ['Active', 'Inactive'];
+      allow delete: if isAdmin() && isValidId(employeeId);
     }
 
-    // 6. Attendance Daily Records
+    // 6. Attendance Daily Records (Server-Authoritative Backend API Only Writes)
     match /attendance/{attendanceId} {
-      allow list, get: if isSignedIn() && isActiveUser();
-      allow create, update: if isSignedIn() && isActiveUser() && isValidId(attendanceId);
-      allow delete: if isSuperAdmin() && isValidId(attendanceId);
+      allow list, get: if isActiveUser();
+      allow create, update, delete: if false; // Strictly via authenticated backend API (Admin SDK)
     }
 
-    // 7. Individual Punch Events (Sub-events per scan)
+    // 7. Individual Punch Events (Server-Authoritative Backend API Only Writes)
     match /punch_events/{eventId} {
       allow list, get: if isAdmin();
-      allow create: if isSignedIn() && isActiveUser() && isValidId(eventId);
-      allow update, delete: if false; // Append-only immutable punch event records
+      allow create, update, delete: if false; // Strictly via authenticated backend API (Admin SDK)
     }
 
-    // 8. Raw Punch Activity Logs
+    // 8. Raw Punch Activity Logs (Server-Authoritative Backend API Only Writes)
     match /punch_logs/{logId} {
       allow list, get: if isAdmin();
-      allow create: if isSignedIn() && isActiveUser() && isValidId(logId);
-      allow update, delete: if false; // Immutable audit log
+      allow create, update, delete: if false; // Strictly via authenticated backend API (Admin SDK)
     }
 
-    // 9. Enterprise Compliance Audit Logs (Server-verified creation; protected records immutable)
+    // 9. Enterprise Compliance Audit Logs (Admin SDK Only Writes)
     match /audit_logs/{auditId} {
       allow list, get: if isSuperAdmin();
-      allow create, update: if isSuperAdmin() && isValidId(auditId);
-      allow delete: if isSuperAdmin() && isValidId(auditId) &&
-        resource.data.isProtected != true &&
-        resource.data.isImportant != true &&
-        resource.data.severity != 'CRITICAL';
+      allow create, update, delete: if false; // Strictly Firebase Admin SDK only
     }
 
-    // 9.1 Login History & IP / Geo / Device Telemetry (Immutable)
+    // 9.1 Login History & Telemetry (Admin SDK Only)
     match /login_history/{historyId} {
       allow list, get: if isSuperAdmin();
-      allow create: if isSuperAdmin() && isValidId(historyId);
-      allow update, delete: if false;
+      allow create, update, delete: if false;
     }
 
-    // 9.2 Long-Term Audit Archives (Permanent compliance archive)
+    // 9.2 Long-Term Audit Archives (Admin SDK Only)
     match /audit_archives/{archiveId} {
       allow list, get: if isSuperAdmin();
-      allow create, update: if isSuperAdmin() && isValidId(archiveId);
-      allow delete: if false;
+      allow create, update, delete: if false;
     }
 
-    // 9.3 Permanent Controlled Audit Deletion Ledger (Immutable)
+    // 9.3 Permanent Controlled Audit Deletion Ledger (Admin SDK Only)
     match /audit_log_deletions/{deletionId} {
       allow list, get: if isSuperAdmin();
-      allow create: if isSuperAdmin() && isValidId(deletionId);
-      allow update, delete: if false;
+      allow create, update, delete: if false;
     }
 
-    // 9.4 Password Reset Audit Trail (Super Admin Governance)
+    // 9.4 Password Reset Audit Trail (Admin SDK Only)
     match /password_reset_logs/{logId} {
       allow list, get: if isSuperAdmin();
-      allow create: if isSuperAdmin() && isValidId(logId);
-      allow update, delete: if false; // Immutable audit log
+      allow create, update, delete: if false;
     }
 
-    // 10. Organization Hierarchy (Departments, Floors, Sections, Lines)
+    // 10. Organization Hierarchy (Departments, Floors/Lines, Sections, Lines)
     match /departments/{departmentId} {
-      allow list, get: if isSignedIn() && isActiveUser();
+      allow list, get: if isActiveUser();
       allow create, update, delete: if isAdmin() && isValidId(departmentId);
     }
 
     match /floors/{floorId} {
-      allow list, get: if isSignedIn() && isActiveUser();
+      allow list, get: if isActiveUser();
       allow create, update, delete: if isAdmin() && isValidId(floorId);
     }
 
     match /sections/{sectionId} {
-      allow list, get: if isSignedIn() && isActiveUser();
+      allow list, get: if isActiveUser();
       allow create, update, delete: if isAdmin() && isValidId(sectionId);
     }
 
     match /lines/{lineId} {
-      allow list, get: if isSignedIn() && isActiveUser();
+      allow list, get: if isActiveUser();
       allow create, update, delete: if isAdmin() && isValidId(lineId);
     }
 
-    // 11. Shift Schedules & Rosters
+    // 11. Shift Schedules & Server-Managed Rosters
     match /shifts/{shiftId} {
-      allow list, get: if isSignedIn() && isActiveUser();
+      allow list, get: if isActiveUser();
       allow create, update, delete: if isAdmin() && isValidId(shiftId);
     }
 
     match /shift_rosters/{rosterId} {
-      allow list, get: if isSignedIn() && isActiveUser();
-      allow create, update, delete: if isAdmin() && isValidId(rosterId);
+      allow list, get: if isActiveUser();
+      allow create, update, delete: if false; // Strictly via authenticated backend API (Admin SDK)
     }
 
     // 12. System Settings
     match /system_settings/{settingId} {
-      allow list, get: if isSignedIn() && isActiveUser();
+      allow list, get: if isActiveUser();
       allow create, update, delete: if isSuperAdmin() && isValidId(settingId);
     }
 
@@ -207,28 +218,30 @@ service cloud.firestore {
       allow delete: if isSuperAdmin() && isValidId(userId);
     }
 
-    // 14. Account Security & Lockout State (Super Admin & Trusted Server Principal Only; ADMIN/USER strictly denied)
+    // 14. Account Security & Lockout State (Admin SDK Only Writes)
     match /account_security/{secId} {
       allow list, get: if isSuperAdmin();
-      allow create, update: if isSuperAdmin() && isValidId(secId);
-      allow delete: if false; // Never delete security records
+      allow create, update, delete: if false;
     }
 
-    // 15. Login Attempts Immutable Ledger (Super Admin & Trusted Server Principal Only; append-only)
+    // 15. Login Attempts Immutable Ledger (Admin SDK Only Writes)
     match /login_attempts/{attemptId} {
       allow list, get: if isSuperAdmin();
-      allow create: if isSuperAdmin() && isValidId(attemptId);
-      allow update, delete: if false; // Strictly immutable history
+      allow create, update, delete: if false;
     }
 
-    // 16. Security Governance Audit Logs (Super Admin & Trusted Server Principal Only; append-only)
+    // 16. Security Governance Audit Logs (Admin SDK Only Writes)
     match /security_audit_logs/{logId} {
       allow list, get: if isSuperAdmin();
-      allow create: if isSuperAdmin() && isValidId(logId);
-      allow update, delete: if false; // Strictly immutable governance trail
+      allow create, update, delete: if false;
     }
 
-    // Default catch-all: Deny all unauthenticated or undeclared collection access
+    // 17. Distributed IP Rate Limits (Backend Admin SDK Only — Zero Client Access)
+    match /ip_rate_limits/{limitId} {
+      allow read, write: if false;
+    }
+
+    // Default catch-all deny
     match /{document=**} {
       allow read, write: if false;
     }

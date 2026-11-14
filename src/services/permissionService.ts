@@ -1,12 +1,10 @@
 import { 
   collection, 
-  doc, 
-  getDoc, 
   getDocs, 
-  setDoc, 
   onSnapshot 
 } from 'firebase/firestore';
 import { db } from '../firebase';
+import { apiFetchJson } from '../config/api';
 import { UserRoleRecord, UserRoleType } from '../types';
 import { getAuthHeaders } from './auditService';
 
@@ -209,33 +207,11 @@ export const DEFAULT_USER_PERMISSIONS: Record<string, ModulePermission> = {
 };
 
 /**
- * Initialize role permissions in Firestore if not already seeded
+ * Role permissions are seeded server-side via Firebase Admin SDK.
+ * Retained as a safe read-only helper for component compatibility.
  */
 export async function seedInitialRolePermissions(): Promise<void> {
-  try {
-    const roles: { id: 'super_admin' | 'admin' | 'user'; name: string; perms: Record<string, ModulePermission> }[] = [
-      { id: 'super_admin', name: 'Super Admin', perms: DEFAULT_SUPER_ADMIN_PERMISSIONS },
-      { id: 'admin', name: 'Admin', perms: DEFAULT_ADMIN_PERMISSIONS },
-      { id: 'user', name: 'User', perms: DEFAULT_USER_PERMISSIONS },
-    ];
-
-    const now = new Date().toISOString();
-    for (const r of roles) {
-      const docRef = doc(db, 'role_permissions', r.id);
-      const snap = await getDoc(docRef);
-      if (!snap.exists()) {
-        await setDoc(docRef, {
-          roleId: r.id,
-          roleName: r.name,
-          modulePermissions: r.perms,
-          updatedAt: now,
-          updatedBy: 'system_bootstrap',
-        });
-      }
-    }
-  } catch (err) {
-    console.warn('[PermissionService] Seed initial role permissions notice:', err);
-  }
+  await getAllRolePermissions();
 }
 
 /**
@@ -352,35 +328,19 @@ export async function saveRolePermissions(
   modulePermissions: Record<string, ModulePermission>
 ): Promise<void> {
   const headers = await getAuthHeaders();
-  // 1. Call trusted backend endpoint
-  const res = await fetch('/api/admin/role-permissions', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      callerLoginId,
-      roleId: targetRoleId,
-      modulePermissions,
-    }),
-  });
-
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to update role permissions.');
-  }
-
-  // 2. Real-time Firestore write for instantaneous client synchronization
-  try {
-    const docRef = doc(db, 'role_permissions', targetRoleId);
-    await setDoc(docRef, {
-      roleId: targetRoleId,
-      roleName: targetRoleId === 'admin' ? 'Admin' : 'User',
-      modulePermissions,
-      updatedAt: new Date().toISOString(),
-      updatedBy: callerLoginId,
-    }, { merge: true });
-  } catch (err) {
-    console.warn('[PermissionService] Firestore client sync notice:', err);
-  }
+  await apiFetchJson(
+    '/api/admin/role-permissions',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        callerLoginId,
+        roleId: targetRoleId,
+        modulePermissions,
+      }),
+    },
+    'Failed to update role permissions.'
+  );
 }
 
 /**
@@ -495,36 +455,22 @@ export async function saveUserIndividualPermissions(
   status?: 'Active' | 'Inactive'
 ): Promise<void> {
   const headers = await getAuthHeaders();
-  const res = await fetch('/api/admin/set-user-permissions', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      callerLoginId,
-      targetId: targetUserId,
-      permissions,
-      modulesAllowed,
-      role,
-      status,
-    }),
-  });
-
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to update user permissions.');
-  }
-
-  // Also sync locally to Firestore for instant reactive listener update
-  try {
-    await setDoc(doc(db, 'user_permissions', targetUserId), {
-      id: targetUserId,
-      userId: targetUserId,
-      permissions,
-      updatedAt: new Date().toISOString(),
-      updatedBy: callerLoginId,
-    }, { merge: true });
-  } catch (err) {
-    console.warn('[PermissionService] Local user_permissions sync notice:', err);
-  }
+  await apiFetchJson(
+    '/api/admin/set-user-permissions',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        callerLoginId,
+        targetId: targetUserId,
+        permissions,
+        modulesAllowed,
+        role,
+        status,
+      }),
+    },
+    'Failed to update user permissions.'
+  );
 }
 
 /**

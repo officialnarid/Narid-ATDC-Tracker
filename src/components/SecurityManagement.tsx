@@ -67,9 +67,7 @@ const formatGeo = (geo?: { country?: string; region?: string; city?: string; sta
 };
 
 export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentUserRole }) => {
-  const isSuperAdmin =
-    currentUserRole?.role?.toUpperCase() === 'SUPER_ADMIN' ||
-    currentUserRole?.loginId?.toLowerCase() === 'superadmin';
+  const isSuperAdmin = currentUserRole?.role?.toUpperCase() === 'SUPER_ADMIN';
 
   const [subTab, setSubTab] = useState<'accounts' | 'attempts' | 'audit_logs'>('accounts');
   const [overview, setOverview] = useState<SecurityOverviewResponse | null>(null);

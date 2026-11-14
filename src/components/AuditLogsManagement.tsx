@@ -87,9 +87,7 @@ function formatJsonPreview(raw?: string): string {
 }
 
 export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ currentUserRole }) => {
-  const isSuperAdmin =
-    currentUserRole?.role?.toUpperCase() === 'SUPER_ADMIN' ||
-    currentUserRole?.loginId?.toLowerCase() === 'superadmin';
+  const isSuperAdmin = currentUserRole?.role?.toUpperCase() === 'SUPER_ADMIN';
 
   const [subTab, setSubTab] = useState<SubTab>('trail');
   const [banner, setBanner] = useState<{ type: 'success' | 'error'; text: string } | null>(null);

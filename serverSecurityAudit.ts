@@ -1,17 +1,87 @@
 import express, { Request, Response } from 'express';
 import crypto from 'crypto';
-import {
-  Firestore,
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  setDoc,
-  updateDoc,
-  deleteDoc,
-  query,
-  where,
-} from 'firebase/firestore';
+
+// ============================================================================
+// Admin SDK Structural Interfaces (Compatible with firebase-admin & test doubles)
+// ============================================================================
+export interface AdminDocSnapLike {
+  id: string;
+  exists: boolean;
+  data(): Record<string, any> | undefined;
+}
+
+export interface AdminQuerySnapLike {
+  empty: boolean;
+  size: number;
+  docs: AdminDocSnapLike[];
+}
+
+export interface AdminDocRefLike {
+  id: string;
+  get(): Promise<AdminDocSnapLike>;
+  set(data: Record<string, any>, options?: { merge?: boolean }): Promise<any>;
+  update(data: Record<string, any>): Promise<any>;
+  delete(): Promise<any>;
+}
+
+export interface AdminQueryLike {
+  where(field: string, opStr: string, value: any): AdminQueryLike;
+  limit(n: number): AdminQueryLike;
+  orderBy?(field: string, dir?: 'asc' | 'desc'): AdminQueryLike;
+  get(): Promise<AdminQuerySnapLike>;
+}
+
+export interface AdminCollectionRefLike extends AdminQueryLike {
+  doc(id: string): AdminDocRefLike;
+}
+
+export interface AdminTransactionLike {
+  get(ref: AdminDocRefLike): Promise<AdminDocSnapLike>;
+  set(ref: AdminDocRefLike, data: Record<string, any>, options?: { merge?: boolean }): any;
+  update(ref: AdminDocRefLike, data: Record<string, any>): any;
+  delete(ref: AdminDocRefLike): any;
+}
+
+export interface AdminWriteBatchLike {
+  set(ref: AdminDocRefLike, data: Record<string, any>, options?: { merge?: boolean }): any;
+  update(ref: AdminDocRefLike, data: Record<string, any>): any;
+  delete(ref: AdminDocRefLike): any;
+  commit(): Promise<any>;
+}
+
+export interface AdminFirestoreLike {
+  collection(path: string): AdminCollectionRefLike;
+  runTransaction<T>(updateFunction: (transaction: AdminTransactionLike) => Promise<T>): Promise<T>;
+  batch?(): AdminWriteBatchLike;
+}
+
+export interface AdminDecodedTokenLike {
+  uid: string;
+  email?: string;
+  auth_time?: number;
+  [key: string]: any;
+}
+
+export interface AdminUserRecordLike {
+  uid: string;
+  email?: string;
+  disabled?: boolean;
+  metadata?: {
+    creationTime?: string;
+    lastSignInTime?: string;
+  };
+}
+
+export interface AdminAuthLike {
+  verifyIdToken(token: string, checkRevoked?: boolean): Promise<AdminDecodedTokenLike>;
+  getUser(uid: string): Promise<AdminUserRecordLike>;
+  getUserByEmail?(email: string): Promise<AdminUserRecordLike>;
+  createUser(properties: { email: string; password: string; displayName?: string; disabled?: boolean }): Promise<AdminUserRecordLike>;
+  updateUser(uid: string, properties: { password?: string; disabled?: boolean; displayName?: string }): Promise<AdminUserRecordLike>;
+  deleteUser(uid: string): Promise<void>;
+  revokeRefreshTokens(uid: string): Promise<void>;
+  listUsers(maxResults?: number): Promise<{ users: AdminUserRecordLike[] }>;
+}
 
 export interface VerifiedCaller {
   uid: string;
@@ -50,104 +120,68 @@ export const CRITICAL_PROTECTED_ACTIONS = new Set([
   'audit_controlled_deleted',
 ]);
 
+export function normalizeRoleValue(rawRole: unknown): 'super_admin' | 'admin' | 'user' {
+  const r = String(rawRole || 'user').trim().toLowerCase();
+  if (r === 'super_admin' || r === 'superadmin') return 'super_admin';
+  if (r === 'admin') return 'admin';
+  return 'user';
+}
+
 // ============================================================================
-// 1. Cryptographic Firebase ID Token Verifier (Zero-Config Google x509 + Optional Admin SDK)
+// 0. Server-Maintained UID Index Sync (Supports Strict UID-Only Firestore Rules)
 // ============================================================================
-let cachedCerts: Record<string, string> = {};
-let certsExpiresAt = 0;
-
-async function getFirebasePublicCerts(): Promise<Record<string, string>> {
-  const now = Date.now();
-  if (now < certsExpiresAt && Object.keys(cachedCerts).length > 0) {
-    return cachedCerts;
+export async function syncUserUidIndex(
+  db: AdminFirestoreLike,
+  params: {
+    uid?: string | null;
+    roleDocId: string;
+    role: string;
+    status?: string;
+    loginId?: string;
+    lockStatus?: string;
   }
-
-  const res = await fetch(
-    'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com',
-    { signal: AbortSignal.timeout(4000) }
-  );
-  if (!res.ok) {
-    throw new Error(`Failed to fetch Firebase public certificates (${res.status})`);
+): Promise<void> {
+  const uid = String(params.uid || '').trim();
+  if (!uid || uid.startsWith('role_') || uid.startsWith('LEGACY_') || uid.startsWith('GCP_')) {
+    return;
   }
-  const cacheControl = res.headers.get('cache-control') || '';
-  const maxAgeMatch = cacheControl.match(/max-age=(\d+)/);
-  const maxAgeSec = maxAgeMatch ? parseInt(maxAgeMatch[1], 10) : 3600;
-  cachedCerts = (await res.json()) as Record<string, string>;
-  certsExpiresAt = now + Math.max(60, maxAgeSec) * 1000;
-  return cachedCerts;
+  const now = new Date().toISOString();
+  await db
+    .collection('user_uid_index')
+    .doc(uid)
+    .set(
+      {
+        uid,
+        roleDocId: params.roleDocId,
+        role: normalizeRoleValue(params.role),
+        status: params.status || 'Active',
+        lockStatus: params.lockStatus || 'ACTIVE',
+        loginId: String(params.loginId || '').trim().toLowerCase(),
+        updatedAt: now,
+      },
+      { merge: true }
+    );
 }
 
-function decodeBase64Url(str: string): Buffer {
-  const normalized = str.replace(/-/g, '+').replace(/_/g, '/');
-  const padLen = (4 - (normalized.length % 4)) % 4;
-  return Buffer.from(normalized + '='.repeat(padLen), 'base64');
+export async function removeUserUidIndex(db: AdminFirestoreLike, uid?: string | null): Promise<void> {
+  const clean = String(uid || '').trim();
+  if (!clean) return;
+  try {
+    await db.collection('user_uid_index').doc(clean).delete();
+  } catch {
+    // non-fatal cleanup
+  }
 }
 
-export async function verifyFirebaseJwtToken(
-  token: string,
-  projectId: string
-): Promise<{ uid: string; email: string; authTime?: number }> {
-  const parts = token.split('.');
-  if (parts.length !== 3) {
-    throw new Error('Malformed Firebase ID token.');
-  }
-
-  const [headerB64, payloadB64, sigB64] = parts;
-  const header = JSON.parse(decodeBase64Url(headerB64).toString('utf8'));
-  const payload = JSON.parse(decodeBase64Url(payloadB64).toString('utf8'));
-
-  if (header.alg !== 'RS256' || !header.kid) {
-    throw new Error('Unsupported Firebase token algorithm or missing key ID.');
-  }
-
-  const certs = await getFirebasePublicCerts();
-  const certPem = certs[header.kid];
-  if (!certPem) {
-    // Refresh certs once in case Google rotated keys
-    certsExpiresAt = 0;
-    const freshCerts = await getFirebasePublicCerts();
-    if (!freshCerts[header.kid]) {
-      throw new Error('Firebase token signing key not recognized.');
-    }
-  }
-
-  const verifiedCert = certs[header.kid] || cachedCerts[header.kid];
-  const verifier = crypto.createVerify('RSA-SHA256');
-  verifier.update(`${headerB64}.${payloadB64}`);
-  verifier.end();
-  const signature = decodeBase64Url(sigB64);
-  if (!verifier.verify(verifiedCert, signature)) {
-    throw new Error('Invalid Firebase ID token signature.');
-  }
-
-  const nowSec = Math.floor(Date.now() / 1000);
-  if (payload.aud !== projectId) {
-    throw new Error('Firebase token audience mismatch.');
-  }
-  if (payload.iss !== `https://securetoken.google.com/${projectId}`) {
-    throw new Error('Firebase token issuer mismatch.');
-  }
-  if (typeof payload.exp !== 'number' || payload.exp <= nowSec) {
-    throw new Error('Firebase token has expired.');
-  }
-  if (typeof payload.iat !== 'number' || payload.iat > nowSec + 300) {
-    throw new Error('Firebase token issued-at timestamp invalid.');
-  }
-  if (typeof payload.sub !== 'string' || !payload.sub.trim()) {
-    throw new Error('Firebase token subject UID missing.');
-  }
-
-  return {
-    uid: payload.sub,
-    email: String(payload.email || '').toLowerCase(),
-    authTime: typeof payload.auth_time === 'number' ? payload.auth_time : undefined,
-  };
-}
-
+// ============================================================================
+// 1. Cryptographic Firebase Admin ID Token Verifier + Strictly UID-Based RBAC
+//    (Zero Email Bypasses, Zero Prefixes, Revocation Enforced)
+// ============================================================================
 export async function verifyCallerIdentity(
   req: Request,
-  db: Firestore,
-  projectId: string
+  db: AdminFirestoreLike,
+  auth: AdminAuthLike | null,
+  _projectId?: string
 ): Promise<VerifiedCaller | null> {
   const authHeader = req.headers.authorization || '';
   if (!authHeader.startsWith('Bearer ')) {
@@ -158,50 +192,91 @@ export async function verifyCallerIdentity(
     return null;
   }
 
-  const decoded = await verifyFirebaseJwtToken(token, projectId);
-  const emailLower = decoded.email.toLowerCase();
-
-  // Owner identity protection
-  if (emailLower === 'officialnarid@gmail.com') {
-    return {
-      uid: decoded.uid,
-      email: emailLower,
-      loginId: 'officialnarid',
-      role: 'super_admin',
-      profileDocId: 'role_superadmin',
-      authTime: decoded.authTime,
-    };
+  if (!auth) {
+    const err: any = new Error('Firebase Admin Authentication service is not initialized.');
+    err.statusCode = 503;
+    throw err;
   }
 
-  // Authoritative Firestore RBAC lookup (never trust client-asserted role)
-  const snap = await getDocs(collection(db, 'user_roles'));
-  let matchedDoc: { id: string; data: any } | null = null;
+  let decoded: AdminDecodedTokenLike;
+  try {
+    // Strictly checkRevoked = true via Firebase Admin SDK
+    decoded = await auth.verifyIdToken(token, true);
+  } catch (verifyErr: any) {
+    const msg = String(verifyErr?.message || verifyErr?.code || 'Invalid or revoked Firebase ID token.');
+    const err: any = new Error(
+      msg.toLowerCase().includes('revoked')
+        ? 'Firebase ID token has been revoked. Please sign in again.'
+        : msg
+    );
+    err.statusCode = 401;
+    throw err;
+  }
 
-  for (const d of snap.docs) {
-    const data = d.data();
-    const docEmail = String(data.email || '').toLowerCase();
-    const aliases: string[] = Array.isArray(data.emailAliases)
-      ? data.emailAliases.map((e: any) => String(e).toLowerCase())
-      : [];
-    const linkedUids: string[] = Array.isArray(data.linkedAuthUids) ? data.linkedAuthUids : [];
+  if (!decoded || typeof decoded.uid !== 'string' || !decoded.uid.trim()) {
+    const err: any = new Error('Verified Firebase token missing subject UID.');
+    err.statusCode = 401;
+    throw err;
+  }
 
-    if (
-      data.authUid === decoded.uid ||
-      linkedUids.includes(decoded.uid) ||
-      (emailLower && docEmail === emailLower) ||
-      (emailLower && aliases.includes(emailLower))
-    ) {
-      matchedDoc = { id: d.id, data };
-      break;
+  const verifiedUid = decoded.uid.trim();
+  const decodedEmail = String(decoded.email || '').toLowerCase();
+
+  // Strictly UID-based RBAC lookup (zero hardcoded emails or @narid.com prefix guessing)
+  let matchedDoc: { id: string; data: Record<string, any> } | null = null;
+
+  // 1. Fast direct lookup via user_uid_index/{uid}
+  const idxSnap = await db.collection('user_uid_index').doc(verifiedUid).get();
+  if (idxSnap.exists) {
+    const idxData = idxSnap.data() || {};
+    if (idxData.roleDocId) {
+      const roleDocSnap = await db.collection('user_roles').doc(String(idxData.roleDocId)).get();
+      if (roleDocSnap.exists) {
+        const d = roleDocSnap.data() || {};
+        const linked: string[] = Array.isArray(d.linkedAuthUids) ? d.linkedAuthUids : [];
+        if (
+          d.authUid === verifiedUid ||
+          d.uid === verifiedUid ||
+          roleDocSnap.id === verifiedUid ||
+          linked.includes(verifiedUid)
+        ) {
+          matchedDoc = { id: roleDocSnap.id, data: d };
+        }
+      }
     }
   }
 
-  // Fallback mapping by canonical/root loginId prefix if doc exists
-  if (!matchedDoc && emailLower.includes('@narid.com')) {
-    const prefix = emailLower.split('@')[0].replace(/_root$/, '');
-    const direct = await getDoc(doc(db, 'user_roles', `role_${prefix}`));
-    if (direct.exists()) {
-      matchedDoc = { id: direct.id, data: direct.data() };
+  // 2. Direct document ID match user_roles/{uid}
+  if (!matchedDoc) {
+    const directSnap = await db.collection('user_roles').doc(verifiedUid).get();
+    if (directSnap.exists) {
+      matchedDoc = { id: directSnap.id, data: directSnap.data() || {} };
+    }
+  }
+
+  // 3. Query by authUid == decoded.uid
+  if (!matchedDoc) {
+    const byAuthUidSnap = await db
+      .collection('user_roles')
+      .where('authUid', '==', verifiedUid)
+      .limit(1)
+      .get();
+    if (!byAuthUidSnap.empty) {
+      const first = byAuthUidSnap.docs[0];
+      matchedDoc = { id: first.id, data: first.data() || {} };
+    }
+  }
+
+  // 4. Query by linkedAuthUids array-contains decoded.uid
+  if (!matchedDoc) {
+    const byLinkedSnap = await db
+      .collection('user_roles')
+      .where('linkedAuthUids', 'array-contains', verifiedUid)
+      .limit(1)
+      .get();
+    if (!byLinkedSnap.empty) {
+      const first = byLinkedSnap.docs[0];
+      matchedDoc = { id: first.id, data: first.data() || {} };
     }
   }
 
@@ -215,31 +290,58 @@ export async function verifyCallerIdentity(
     throw err;
   }
 
+  if (matchedDoc.data.lockStatus === 'LOCKED' || matchedDoc.data.isLocked === true) {
+    const err: any = new Error('Your account has been temporarily blocked. Please contact Super Admin.');
+    err.statusCode = 403;
+    throw err;
+  }
+
+  const authTime = typeof decoded.auth_time === 'number' ? decoded.auth_time : undefined;
+
   // Check session revocation timestamp against token auth_time
-  if (matchedDoc.data.sessionRevokedAt && decoded.authTime) {
+  if (matchedDoc.data.sessionRevokedAt && authTime) {
     const revokedSec = Math.floor(new Date(matchedDoc.data.sessionRevokedAt).getTime() / 1000);
-    if (decoded.authTime + 2 < revokedSec) {
+    if (authTime + 2 < revokedSec) {
       const err: any = new Error('Session has been revoked. Please sign in again.');
       err.statusCode = 401;
       throw err;
     }
   }
 
-  const rawRole = String(matchedDoc.data.role || 'user').toLowerCase();
-  const normalizedRole: 'super_admin' | 'admin' | 'user' =
-    rawRole === 'super_admin' || rawRole === 'superadmin'
-      ? 'super_admin'
-      : rawRole === 'admin'
-      ? 'admin'
-      : 'user';
+  const normalizedRole = normalizeRoleValue(matchedDoc.data.role);
+  const resolvedLoginId = String(
+    matchedDoc.data.loginId || matchedDoc.id.replace(/^role_/, '')
+  ).toLowerCase();
+
+  // Keep user_uid_index synchronized synchronously when missing or drifted so serverless handlers never drop writes
+  const targetStatus = String(matchedDoc.data.status || 'Active');
+  const targetLockStatus = String(matchedDoc.data.lockStatus || 'ACTIVE');
+  const idxData = idxSnap.exists ? idxSnap.data() || {} : null;
+  if (
+    !idxData ||
+    idxData.roleDocId !== matchedDoc.id ||
+    idxData.role !== normalizedRole ||
+    idxData.status !== targetStatus ||
+    idxData.lockStatus !== targetLockStatus ||
+    idxData.loginId !== resolvedLoginId
+  ) {
+    await syncUserUidIndex(db, {
+      uid: verifiedUid,
+      roleDocId: matchedDoc.id,
+      role: normalizedRole,
+      status: targetStatus,
+      lockStatus: targetLockStatus,
+      loginId: resolvedLoginId,
+    });
+  }
 
   return {
-    uid: decoded.uid,
-    email: emailLower || String(matchedDoc.data.email || ''),
-    loginId: String(matchedDoc.data.loginId || matchedDoc.id.replace(/^role_/, '')).toLowerCase(),
+    uid: verifiedUid,
+    email: decodedEmail || String(matchedDoc.data.email || ''),
+    loginId: resolvedLoginId,
     role: normalizedRole,
     profileDocId: matchedDoc.id,
-    authTime: decoded.authTime,
+    authTime,
   };
 }
 
@@ -261,13 +363,11 @@ export function extractTrustedClientIp(req: Request): string {
     candidate = req.socket?.remoteAddress || '127.0.0.1';
   }
 
-  // Strip IPv6-mapped IPv4 prefix and brackets/ports
   candidate = candidate.replace(/^::ffff:/i, '').replace(/^\[|\]$/g, '');
   if (/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(candidate)) {
     candidate = candidate.split(':')[0];
   }
 
-  // Validate basic IPv4 / IPv6 character safety
   if (!/^[a-fA-F0-9:.]{3,45}$/.test(candidate)) {
     return 'unavailable';
   }
@@ -381,7 +481,6 @@ export function redactSensitiveData(value: any, depth = 0): any {
   if (depth > 5) return '[Truncated]';
 
   if (typeof value === 'string') {
-    // Mask inline bearer tokens or scrypt hashes
     if (value.startsWith('Bearer ') || /^[0-9a-f]{32}:[0-9a-f]{128}$/i.test(value)) {
       return '[REDACTED]';
     }
@@ -554,17 +653,14 @@ export function normalizeAuditLogRecord(id: string, raw: any): any {
   };
 }
 
-// 2-second operational event deduplicator
 const recentAuditEvents = new Map<string, number>();
 
 export function shouldDeduplicateEvent(key: string, action: string): boolean {
   const actLower = action.toLowerCase();
-  // Never suppress distinct auth/security attempts
   if (actLower.includes('login') || actLower.includes('unauthorized') || actLower.includes('password') || actLower.includes('delete')) {
     return false;
   }
   const now = Date.now();
-  // Periodic pruning
   if (recentAuditEvents.size > 500) {
     for (const [k, exp] of recentAuditEvents.entries()) {
       if (exp < now) recentAuditEvents.delete(k);
@@ -579,10 +675,10 @@ export function shouldDeduplicateEvent(key: string, action: string): boolean {
 }
 
 // ============================================================================
-// 4. Unified Enterprise Audit & Login History Writer
+// 4. Unified Enterprise Audit & Login History Writer (Admin SDK)
 // ============================================================================
 export async function recordEnterpriseAuditEvent(
-  db: Firestore,
+  db: AdminFirestoreLike,
   params: {
     req?: Request;
     action: string;
@@ -670,7 +766,7 @@ export async function recordEnterpriseAuditEvent(
       createdAt: now,
     };
 
-    await setDoc(doc(db, 'audit_logs', logId), docPayload);
+    await db.collection('audit_logs').doc(logId).set(docPayload);
     return logId;
   } catch (err: any) {
     console.warn('[Enterprise Audit] Failed to persist audit log:', err?.message || err);
@@ -679,7 +775,7 @@ export async function recordEnterpriseAuditEvent(
 }
 
 export async function recordLoginHistoryEntry(
-  db: Firestore,
+  db: AdminFirestoreLike,
   params: {
     req: Request;
     eventType: 'LOGIN_SUCCESS' | 'LOGIN_FAILED' | 'LOGIN_LOCKED' | 'LOGOUT' | 'SESSION_EXPIRED';
@@ -700,7 +796,7 @@ export async function recordLoginHistoryEntry(
     const uaMeta = parseUserAgent(params.req.headers['user-agent']);
     const geoLocation = await resolveIpGeoLocation(ipAddress, params.captureGeo !== false);
 
-    await setDoc(doc(db, 'login_history', historyId), {
+    await db.collection('login_history').doc(historyId).set({
       id: historyId,
       eventType: params.eventType,
       loginId: params.loginId.trim().toLowerCase(),
@@ -727,13 +823,13 @@ export async function recordLoginHistoryEntry(
 // ============================================================================
 export function registerSecurityAuditRoutes(
   app: express.Express,
-  db: Firestore,
+  db: AdminFirestoreLike,
+  auth: AdminAuthLike | null,
   projectId: string
 ) {
-  // Helper: Require valid verified Firebase ID Token
   async function requireAuth(req: Request, res: Response): Promise<VerifiedCaller | null> {
     try {
-      const caller = await verifyCallerIdentity(req, db, projectId);
+      const caller = await verifyCallerIdentity(req, db, auth, projectId);
       if (!caller) {
         res.status(401).json({
           success: false,
@@ -751,7 +847,6 @@ export function registerSecurityAuditRoutes(
     }
   }
 
-  // Helper: Require strictly verified Super Admin
   async function requireSuperAdmin(req: Request, res: Response): Promise<VerifiedCaller | null> {
     const caller = await requireAuth(req, res);
     if (!caller) return null;
@@ -777,9 +872,7 @@ export function registerSecurityAuditRoutes(
     return caller;
   }
 
-  // --------------------------------------------------------------------------
-  // A. Ingest Operational / Lifecycle Client Activity Events (Server-Enriched)
-  // --------------------------------------------------------------------------
+  // A. Ingest Operational / Lifecycle Client Activity Events
   app.post('/api/audit/event', async (req: Request, res: Response) => {
     try {
       const caller = await requireAuth(req, res);
@@ -807,11 +900,10 @@ export function registerSecurityAuditRoutes(
       const cleanAction = action.trim().slice(0, 100);
       const actLower = cleanAction.toLowerCase();
 
-      // Check global captureGeoLocation setting
       let captureGeo = true;
       try {
-        const settingsSnap = await getDoc(doc(db, 'system_settings', 'global'));
-        if (settingsSnap.exists() && settingsSnap.data()?.captureGeoLocation === false) {
+        const settingsSnap = await db.collection('system_settings').doc('global').get();
+        if (settingsSnap.exists && settingsSnap.data()?.captureGeoLocation === false) {
           captureGeo = false;
         }
       } catch {}
@@ -857,9 +949,7 @@ export function registerSecurityAuditRoutes(
     }
   });
 
-  // --------------------------------------------------------------------------
   // B. Query Audit Logs + Compute 9 KPI Metrics + Retention Queue (Super Admin)
-  // --------------------------------------------------------------------------
   app.get('/api/audit/logs', async (req: Request, res: Response) => {
     try {
       const caller = await requireSuperAdmin(req, res);
@@ -881,15 +971,15 @@ export function registerSecurityAuditRoutes(
         pageSize = '25',
       } = req.query as Record<string, string>;
 
-      const settingsSnap = await getDoc(doc(db, 'system_settings', 'global'));
-      const settingsData = settingsSnap.exists() ? settingsSnap.data() : {};
+      const settingsSnap = await db.collection('system_settings').doc('global').get();
+      const settingsData = settingsSnap.exists ? (settingsSnap.data() || {}) : {};
       const retentionDays = Number(settingsData.auditRetentionDays || 90);
       const retentionCutoffMs = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
 
       const [activeSnap, archiveSnap, deletionsSnap] = await Promise.all([
-        getDocs(collection(db, 'audit_logs')),
-        getDocs(collection(db, 'audit_archives')),
-        getDocs(collection(db, 'audit_log_deletions')),
+        db.collection('audit_logs').get(),
+        db.collection('audit_archives').get(),
+        db.collection('audit_log_deletions').get(),
       ]);
 
       const activeLogs = activeSnap.docs.map(d => normalizeAuditLogRecord(d.id, d.data()));
@@ -898,7 +988,6 @@ export function registerSecurityAuditRoutes(
         archived: true,
       }));
 
-      // Deduplicate if an archived ID also remains flagged archived in active collection
       const archivedMap = new Map<string, any>();
       archivedLogsList.forEach(l => archivedMap.set(l.id, l));
       activeLogs.forEach(l => {
@@ -907,7 +996,6 @@ export function registerSecurityAuditRoutes(
       const allArchived = Array.from(archivedMap.values());
       const activeOnly = activeLogs.filter(l => !l.archived);
 
-      // Compute Today boundary in Asia/Kolkata
       const kolkataToday = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
 
       const allCombined = [...activeOnly, ...allArchived];
@@ -931,13 +1019,11 @@ export function registerSecurityAuditRoutes(
         permanentDeletionsCount: deletionsSnap.size,
       };
 
-      // Choose lifecycle pool
       let pool = activeOnly;
       if (lifecycle === 'archived') pool = allArchived;
       else if (lifecycle === 'pending_review') pool = activeOnly.filter(l => !l.isProtected && !l.isImportant && l.timestampMs < retentionCutoffMs);
       else if (lifecycle === 'all') pool = allCombined;
 
-      // Apply filters
       const qSearch = search.trim().toLowerCase();
       const qIp = ip.trim().toLowerCase();
       const fromMs = from ? new Date(`${from}T00:00:00+05:30`).getTime() : 0;
@@ -971,7 +1057,6 @@ export function registerSecurityAuditRoutes(
       const safePage = Math.min(p, totalPages);
       const paginated = filtered.slice((safePage - 1) * size, safePage * size);
 
-      // Unique filter facets
       const availableActions = Array.from(new Set(allCombined.map(l => l.action))).sort();
       const availableActors = Array.from(new Set(allCombined.map(l => l.actorLoginId))).sort();
 
@@ -997,17 +1082,15 @@ export function registerSecurityAuditRoutes(
     }
   });
 
-  // --------------------------------------------------------------------------
   // C. Login History & IP / Geo / Device Telemetry (Super Admin Only)
-  // --------------------------------------------------------------------------
   app.get('/api/audit/login-history', async (req: Request, res: Response) => {
     try {
       const caller = await requireSuperAdmin(req, res);
       if (!caller) return;
 
       const { loginId = 'ALL', eventType = 'ALL', status = 'ALL', search = '' } = req.query as Record<string, string>;
-      const snap = await getDocs(collection(db, 'login_history'));
-      let entries = snap.docs.map(d => ({ id: d.id, ...d.data() } as any));
+      const snap = await db.collection('login_history').get();
+      let entries = snap.docs.map(d => ({ id: d.id, ...(d.data() || {}) } as any));
 
       const q = search.trim().toLowerCase();
       entries = entries.filter(e => {
@@ -1030,17 +1113,15 @@ export function registerSecurityAuditRoutes(
     }
   });
 
-  // --------------------------------------------------------------------------
   // D. Immutable Controlled Deletion Ledger (Super Admin Only)
-  // --------------------------------------------------------------------------
   app.get('/api/audit/deletions', async (req: Request, res: Response) => {
     try {
       const caller = await requireSuperAdmin(req, res);
       if (!caller) return;
 
-      const snap = await getDocs(collection(db, 'audit_log_deletions'));
+      const snap = await db.collection('audit_log_deletions').get();
       const deletions = snap.docs
-        .map(d => ({ id: d.id, ...d.data() } as any))
+        .map(d => ({ id: d.id, ...(d.data() || {}) } as any))
         .sort((a, b) => new Date(b.deletedAt).getTime() - new Date(a.deletedAt).getTime());
 
       return res.json({ success: true, deletions });
@@ -1050,9 +1131,7 @@ export function registerSecurityAuditRoutes(
     }
   });
 
-  // --------------------------------------------------------------------------
   // E. Mark / Unmark Important & Archive Log (Super Admin Only)
-  // --------------------------------------------------------------------------
   app.post('/api/audit/logs/:id/important', async (req: Request, res: Response) => {
     try {
       const caller = await requireSuperAdmin(req, res);
@@ -1060,15 +1139,15 @@ export function registerSecurityAuditRoutes(
 
       const logId = req.params.id;
       const { isImportant, reviewNote } = req.body || {};
-      const logRef = doc(db, 'audit_logs', logId);
-      const snap = await getDoc(logRef);
-      if (!snap.exists()) {
+      const logRef = db.collection('audit_logs').doc(logId);
+      const snap = await logRef.get();
+      if (!snap.exists) {
         return res.status(404).json({ success: false, error: 'Audit log not found.' });
       }
 
       const now = new Date().toISOString();
       const nextVal = Boolean(isImportant);
-      await updateDoc(logRef, {
+      await logRef.update({
         isImportant: nextVal,
         reviewedBy: caller.loginId,
         reviewedAt: now,
@@ -1104,13 +1183,13 @@ export function registerSecurityAuditRoutes(
 
       const logId = req.params.id;
       const { reviewNote } = req.body || {};
-      const logRef = doc(db, 'audit_logs', logId);
-      const snap = await getDoc(logRef);
-      if (!snap.exists()) {
+      const logRef = db.collection('audit_logs').doc(logId);
+      const snap = await logRef.get();
+      if (!snap.exists) {
         return res.status(404).json({ success: false, error: 'Active audit log not found.' });
       }
 
-      const raw = snap.data();
+      const raw = snap.data() || {};
       const now = new Date().toISOString();
       const archiveRecord = {
         ...raw,
@@ -1123,8 +1202,8 @@ export function registerSecurityAuditRoutes(
         reviewNote: reviewNote ? String(reviewNote).slice(0, 500) : 'Reviewed and archived by Super Admin',
       };
 
-      await setDoc(doc(db, 'audit_archives', logId), archiveRecord);
-      await updateDoc(logRef, {
+      await db.collection('audit_archives').doc(logId).set(archiveRecord);
+      await logRef.update({
         archived: true,
         archivedAt: now,
         archivedBy: caller.loginId,
@@ -1153,44 +1232,41 @@ export function registerSecurityAuditRoutes(
     }
   });
 
-  // --------------------------------------------------------------------------
   // F. Mandatory Pre-Deletion Dependency Review & Controlled Delete (Super Admin Only)
-  // --------------------------------------------------------------------------
   app.get('/api/audit/logs/:id/review-dependencies', async (req: Request, res: Response) => {
     try {
       const caller = await requireSuperAdmin(req, res);
       if (!caller) return;
 
       const logId = req.params.id;
-      const snap = await getDoc(doc(db, 'audit_logs', logId));
-      if (!snap.exists()) {
+      const snap = await db.collection('audit_logs').doc(logId).get();
+      if (!snap.exists) {
         return res.status(404).json({ success: false, error: 'Audit log not found in active logs.' });
       }
 
       const normalized = normalizeAuditLogRecord(snap.id, snap.data());
       const protectedFlag = isAuditLogProtected(normalized);
 
-      const settingsSnap = await getDoc(doc(db, 'system_settings', 'global'));
-      const retentionDays = Number(settingsSnap.exists() ? settingsSnap.data()?.auditRetentionDays || 90 : 90);
+      const settingsSnap = await db.collection('system_settings').doc('global').get();
+      const retentionDays = Number(settingsSnap.exists ? settingsSnap.data()?.auditRetentionDays || 90 : 90);
       const ageDays = Math.max(0, Math.floor((Date.now() - normalized.timestampMs) / (1000 * 60 * 60 * 24)));
 
-      // Check linked records across collections
       const linkedRecords: string[] = [];
       if (normalized.employeeId) {
-        const empSnap = await getDoc(doc(db, 'employees', normalized.employeeId));
-        if (empSnap.exists()) {
+        const empSnap = await db.collection('employees').doc(normalized.employeeId).get();
+        if (empSnap.exists) {
           linkedRecords.push(`employees/${normalized.employeeId} (${empSnap.data()?.employeeName || 'Active'})`);
         }
       }
       if (normalized.actorLoginId && normalized.actorLoginId !== 'system') {
-        const roleSnap = await getDoc(doc(db, 'user_roles', `role_${normalized.actorLoginId}`));
-        if (roleSnap.exists()) {
+        const roleSnap = await db.collection('user_roles').doc(`role_${normalized.actorLoginId}`).get();
+        if (roleSnap.exists) {
           linkedRecords.push(`user_roles/role_${normalized.actorLoginId} (${roleSnap.data()?.role || 'USER'})`);
         }
       }
       if (normalized.targetId && normalized.targetId !== normalized.employeeId) {
-        const targetRoleSnap = await getDoc(doc(db, 'user_roles', normalized.targetId));
-        if (targetRoleSnap.exists()) {
+        const targetRoleSnap = await db.collection('user_roles').doc(normalized.targetId).get();
+        if (targetRoleSnap.exists) {
           linkedRecords.push(`user_roles/${normalized.targetId}`);
         }
       }
@@ -1243,15 +1319,14 @@ export function registerSecurityAuditRoutes(
         return res.status(400).json({ success: false, error: 'A detailed deletion reason (at least 10 characters) is mandatory.' });
       }
 
-      const logRef = doc(db, 'audit_logs', logId);
-      const snap = await getDoc(logRef);
-      if (!snap.exists()) {
+      const logRef = db.collection('audit_logs').doc(logId);
+      const snap = await logRef.get();
+      if (!snap.exists) {
         return res.status(404).json({ success: false, error: 'Audit log not found.' });
       }
 
       const normalized = normalizeAuditLogRecord(snap.id, snap.data());
 
-      // Strict Protection Guard: Critical/Important/Security/Account-deletion logs CANNOT be deleted
       if (isAuditLogProtected(normalized)) {
         await recordEnterpriseAuditEvent(db, {
           req,
@@ -1273,9 +1348,8 @@ export function registerSecurityAuditRoutes(
         });
       }
 
-      // Retention Window Guard: Non-critical logs must meet configured retention days (default 90 days)
-      const settingsSnap = await getDoc(doc(db, 'system_settings', 'global'));
-      const retentionDays = Number(settingsSnap.exists() ? settingsSnap.data()?.auditRetentionDays || 90 : 90);
+      const settingsSnap = await db.collection('system_settings').doc('global').get();
+      const retentionDays = Number(settingsSnap.exists ? settingsSnap.data()?.auditRetentionDays || 90 : 90);
       const ageDays = Math.max(0, Math.floor((Date.now() - normalized.timestampMs) / (1000 * 60 * 60 * 24)));
       if (ageDays < retentionDays) {
         return res.status(403).json({
@@ -1293,8 +1367,7 @@ export function registerSecurityAuditRoutes(
       if (normalized.actorLoginId) linkedRecordsChecked.push(`actor:${normalized.actorLoginId}`);
       if (normalized.targetId) linkedRecordsChecked.push(`target:${normalized.targetId}`);
 
-      // 1. Write permanent immutable deletion history record FIRST
-      await setDoc(doc(db, 'audit_log_deletions', deletionId), {
+      await db.collection('audit_log_deletions').doc(deletionId).set({
         id: deletionId,
         deletedLogId: logId,
         deletedAction: normalized.action,
@@ -1310,10 +1383,8 @@ export function registerSecurityAuditRoutes(
         ipAddress,
       });
 
-      // 2. Delete the non-critical log from active audit_logs
-      await deleteDoc(logRef);
+      await logRef.delete();
 
-      // 3. Record protected audit_controlled_deleted event
       await recordEnterpriseAuditEvent(db, {
         req,
         action: 'audit_controlled_deleted',
@@ -1343,9 +1414,7 @@ export function registerSecurityAuditRoutes(
     }
   });
 
-  // --------------------------------------------------------------------------
-  // G. Firebase Authentication 10-Account Dependency Audit & Safe Cleanup Governance
-  // --------------------------------------------------------------------------
+  // G. Firebase Authentication Account Dependency Audit & Safe Cleanup Governance
   const ALL_CHECKED_COLLECTIONS = [
     'user_roles',
     'roles',
@@ -1368,7 +1437,6 @@ export function registerSecurityAuditRoutes(
     'system_settings',
   ];
 
-  // Canonical 12 Nov accounts kept per Super Admin policy (*@narid.com)
   const ACCOUNT_REGISTRY = [
     {
       key: 'superadmin_canonical',
@@ -1501,7 +1569,7 @@ export function registerSecurityAuditRoutes(
       await Promise.all(
         ALL_CHECKED_COLLECTIONS.map(async (colName) => {
           try {
-            const snap = await getDocs(collection(db, colName));
+            const snap = await db.collection(colName).get();
             collectionSnapshots[colName] = snap.docs.map(d => ({
               docId: d.id,
               data: d.data(),
@@ -1513,9 +1581,8 @@ export function registerSecurityAuditRoutes(
         })
       );
 
-      // Load stored Super Admin approval states
-      const approvalSnap = await getDoc(doc(db, 'system_settings', 'account_cleanup_approvals'));
-      const approvals: Record<string, any> = approvalSnap.exists() ? (approvalSnap.data()?.approvals || {}) : {};
+      const approvalSnap = await db.collection('system_settings').doc('account_cleanup_approvals').get();
+      const approvals: Record<string, any> = approvalSnap.exists ? (approvalSnap.data()?.approvals || {}) : {};
 
       const accountsReport = ACCOUNT_REGISTRY.map((acc) => {
         const emailLower = acc.email.toLowerCase();
@@ -1531,7 +1598,6 @@ export function registerSecurityAuditRoutes(
             const matchesUid = !uidLower.includes('legacy_') && !uidLower.includes('gcp_') && d.rawText.includes(uidLower);
             const matchesEmail = d.rawText.includes(emailLower);
             const matchesDocId = d.docId.toLowerCase() === `role_${loginLower}`;
-            // For audit/historical logs only count explicit text/UID matches
             return matchesUid || matchesEmail || matchesDocId;
           });
 
@@ -1558,7 +1624,7 @@ export function registerSecurityAuditRoutes(
           approvalState,
           canApproveForCleanup,
           consoleCleanupCommand: canApproveForCleanup
-            ? `# Review & delete in Firebase Console -> Authentication -> Users -> filter "${acc.email}" (UID: ${acc.firebaseUid})\n# Or via Firebase Admin/CLI script after UID confirmation:\nfirebase auth:export auth-backup.json --project ${projectId}`
+            ? `# Review & delete in Firebase Console -> Authentication -> Users -> filter "${acc.email}" (UID: ${acc.firebaseUid})\nfirebase auth:export auth-backup.json --project ${projectId}`
             : null,
           recommendation: acc.isProtected
             ? acc.accountType === 'GOOGLE_OWNER'
@@ -1613,7 +1679,6 @@ export function registerSecurityAuditRoutes(
 
       const now = new Date().toISOString();
 
-      // Safely promote user_roles canonical emails to *@narid.com before retiring *_root@narid.com
       const migratedDocs: string[] = [];
       if (migrateCanonicalEmails) {
         const canonicalMap: Record<string, { roleDocId: string; email: string; uid: string; legacyEmail: string }> = {
@@ -1623,17 +1688,20 @@ export function registerSecurityAuditRoutes(
         };
         const m = canonicalMap[target.key];
         if (m) {
-          const ref = doc(db, 'user_roles', m.roleDocId);
-          const snap = await getDoc(ref);
-          if (snap.exists()) {
-            const cur = snap.data();
+          const ref = db.collection('user_roles').doc(m.roleDocId);
+          const snap = await ref.get();
+          if (snap.exists) {
+            const cur = snap.data() || {};
             const aliases = new Set<string>(Array.isArray(cur.emailAliases) ? cur.emailAliases : []);
             aliases.add(m.legacyEmail);
             const uids = new Set<string>(Array.isArray(cur.linkedAuthUids) ? cur.linkedAuthUids : []);
+            if (cur.authUid) uids.add(String(cur.authUid));
             uids.add(m.uid);
-            await updateDoc(ref, {
-              email: m.email,
-              authUid: m.uid,
+            // Preserve existing authUid if already set
+            const resolvedUid = cur.authUid ? String(cur.authUid) : m.uid;
+            await ref.update({
+              email: cur.email || m.email,
+              authUid: resolvedUid,
               emailAliases: Array.from(aliases),
               linkedAuthUids: Array.from(uids),
               updatedAt: now,
@@ -1643,10 +1711,9 @@ export function registerSecurityAuditRoutes(
         }
       }
 
-      // Record approval status
-      const approvalRef = doc(db, 'system_settings', 'account_cleanup_approvals');
-      const existingApprovalSnap = await getDoc(approvalRef);
-      const existingApprovals = existingApprovalSnap.exists() ? (existingApprovalSnap.data()?.approvals || {}) : {};
+      const approvalRef = db.collection('system_settings').doc('account_cleanup_approvals');
+      const existingApprovalSnap = await approvalRef.get();
+      const existingApprovals = existingApprovalSnap.exists ? (existingApprovalSnap.data()?.approvals || {}) : {};
       existingApprovals[target.key] = {
         approved: true,
         approvedBy: caller.loginId,
@@ -1656,7 +1723,7 @@ export function registerSecurityAuditRoutes(
         targetUid: target.firebaseUid,
         migratedDocs,
       };
-      await setDoc(approvalRef, { id: 'account_cleanup_approvals', approvals: existingApprovals, updatedAt: now }, { merge: true });
+      await approvalRef.set({ id: 'account_cleanup_approvals', approvals: existingApprovals, updatedAt: now }, { merge: true });
 
       await recordEnterpriseAuditEvent(db, {
         req,
@@ -1678,7 +1745,7 @@ export function registerSecurityAuditRoutes(
 
       return res.json({
         success: true,
-        message: `Super Admin approval recorded for ${target.email}. Canonical Firestore references ${migratedDocs.length > 0 ? `(${migratedDocs.join(', ')}) migrated to *@narid.com` : 'verified clean'}.`,
+        message: `Super Admin approval recorded for ${target.email}. Canonical Firestore references ${migratedDocs.length > 0 ? `(${migratedDocs.join(', ')}) verified` : 'verified clean'}.`,
         cliSnippet,
         consoleUrl: `https://console.firebase.google.com/project/${projectId}/authentication/users`,
       });

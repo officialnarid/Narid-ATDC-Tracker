@@ -49,9 +49,7 @@ export const SystemSettingsView: React.FC<SystemSettingsProps> = ({
   currentUserRole,
   onOpenAuditConsole,
 }) => {
-  const isSuperAdmin =
-    currentUserRole?.role?.toUpperCase() === 'SUPER_ADMIN' ||
-    currentUserRole?.loginId?.toLowerCase() === 'superadmin';
+  const isSuperAdmin = currentUserRole?.role?.toUpperCase() === 'SUPER_ADMIN';
 
   const [settings, setSettings] = useState<SystemSetting | null>(null);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
@@ -60,6 +58,8 @@ export const SystemSettingsView: React.FC<SystemSettingsProps> = ({
   const [isSaving, setIsSaving] = useState(false);
   const [isSeeding, setIsSeeding] = useState(false);
   const [isClearing, setIsClearing] = useState(false);
+  const [showClearModal, setShowClearModal] = useState(false);
+  const [clearConfirmPhrase, setClearConfirmPhrase] = useState('');
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
@@ -135,17 +135,26 @@ export const SystemSettingsView: React.FC<SystemSettingsProps> = ({
     }
   };
 
-  const handleClearAttendance = async () => {
-    if (!confirm('Are you sure you want to remove all attendance and punch logs? This will leave your Employee Master intact and reset the attendance board to 0 for real live scanning.')) return;
+  const handleClearAttendance = () => {
+    if (!isSuperAdmin) return;
+    setClearConfirmPhrase('');
+    setShowClearModal(true);
+  };
+
+  const confirmClearAttendance = async () => {
+    if (!isSuperAdmin || clearConfirmPhrase.trim() !== 'CLEAR_ALL_ATTENDANCE') return;
     setIsClearing(true);
     setActionError(null);
     try {
-      const res = await clearAllAttendanceRecords();
+      const res = await clearAllAttendanceRecords('CLEAR_ALL_ATTENDANCE');
+      setShowClearModal(false);
+      setClearConfirmPhrase('');
       setActionNotice(`Cleared ${res.deletedAttendance} attendance records and ${res.deletedLogs} punch logs. Ready for real scanning!`);
       setTimeout(() => setActionNotice(null), 5000);
       onRefreshData?.();
       await loadData();
     } catch (err: any) {
+      setShowClearModal(false);
       setActionError(`Clear failed: ${err.message}`);
     } finally {
       setIsClearing(false);
@@ -172,16 +181,17 @@ export const SystemSettingsView: React.FC<SystemSettingsProps> = ({
 
         {/* Database Controls */}
         <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
-          {/* Wipe Test Attendance */}
-          <button
-            onClick={handleClearAttendance}
-            disabled={isClearing}
-            title="Wipe test attendance & raw logs for a clean production day"
-            className="bg-slate-100 hover:bg-red-50 text-slate-700 hover:text-red-700 border border-slate-300 hover:border-red-300 font-medium text-xs px-3 py-2 rounded flex items-center gap-1.5 transition disabled:opacity-50"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-            <span>{isClearing ? 'Clearing...' : 'Clear Attendance Records'}</span>
-          </button>
+          {isSuperAdmin && (
+            <button
+              onClick={handleClearAttendance}
+              disabled={isClearing}
+              title="Wipe test attendance & raw logs (blocked in production unless ALLOW_ATTENDANCE_CLEAR=true)"
+              className="bg-slate-100 hover:bg-red-50 text-slate-700 hover:text-red-700 border border-slate-300 hover:border-red-300 font-medium text-xs px-3 py-2 rounded flex items-center gap-1.5 transition disabled:opacity-50"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>{isClearing ? 'Clearing...' : 'Clear Attendance Records'}</span>
+            </button>
+          )}
 
           {/* Load Authentic Manpower */}
           <button
@@ -517,6 +527,51 @@ export const SystemSettingsView: React.FC<SystemSettingsProps> = ({
                   )}
                 </tbody>
               </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showClearModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4">
+          <div className="bg-white rounded-xl border border-red-200 shadow-2xl max-w-md w-full p-5 space-y-4">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
+              <div>
+                <h3 className="text-sm font-bold text-slate-900">Confirm Attendance Data Reset</h3>
+                <p className="text-xs text-slate-600 mt-1">
+                  This permanently deletes all attendance records, punch logs, and shift rosters. Type{' '}
+                  <span className="font-mono font-bold text-red-700">CLEAR_ALL_ATTENDANCE</span> to proceed.
+                </p>
+              </div>
+            </div>
+            <input
+              type="text"
+              value={clearConfirmPhrase}
+              onChange={(e) => setClearConfirmPhrase(e.target.value)}
+              placeholder="Type CLEAR_ALL_ATTENDANCE"
+              className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded focus:outline-none focus:ring-2 focus:ring-red-500"
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowClearModal(false);
+                  setClearConfirmPhrase('');
+                }}
+                disabled={isClearing}
+                className="px-3 py-1.5 text-xs font-medium text-slate-600 bg-slate-100 hover:bg-slate-200 rounded"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={confirmClearAttendance}
+                disabled={isClearing || clearConfirmPhrase.trim() !== 'CLEAR_ALL_ATTENDANCE'}
+                className="px-3 py-1.5 text-xs font-bold text-white bg-red-600 hover:bg-red-700 rounded disabled:opacity-40"
+              >
+                {isClearing ? 'Clearing...' : 'Confirm Wipe'}
+              </button>
             </div>
           </div>
         </div>

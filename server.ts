@@ -1,29 +1,26 @@
-import express, { Request, Response } from 'express';
-import { createServer as createViteServer } from 'vite';
+import express, { Request, Response, NextFunction } from 'express';
+import cors from 'cors';
+import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import crypto from 'crypto';
-import { initializeApp } from 'firebase/app';
-import { getAuth, signInWithEmailAndPassword } from 'firebase/auth';
-import { 
-  getFirestore, 
-  doc, 
-  getDoc, 
-  setDoc, 
-  updateDoc, 
-  deleteDoc,
-  collection, 
-  getDocs, 
-  query, 
-  where 
-} from 'firebase/firestore';
+import { z } from 'zod';
 import firebaseConfig from './firebase-applet-config.json';
 import {
+  getFirebaseAdminContext,
+  TARGET_PROJECT_ID,
+  TARGET_DATABASE_ID,
+  isFirestorePermissionDeniedError,
+  formatAdminPermissionDeniedError,
+} from './serverFirebaseAdmin.ts';
+import {
+  AdminAuthLike,
+  AdminFirestoreLike,
+  VerifiedCaller,
   registerSecurityAuditRoutes,
   verifyCallerIdentity,
   recordEnterpriseAuditEvent,
-  recordLoginHistoryEntry,
-  VerifiedCaller,
+  syncUserUidIndex,
+  removeUserUidIndex,
 } from './serverSecurityAudit.ts';
 import {
   registerLoginSecurityRoutes,
@@ -32,34 +29,10 @@ import {
   recordSecurityAuditLogDoc,
   tryAdminAuthUpdatePassword,
   withLoginIdLock,
+  clearIpCooldownPersistent,
   MAX_CONSECUTIVE_FAILED_ATTEMPTS,
 } from './serverLoginSecurity.ts';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// Initialize Firebase Client SDK for Server Firestore Operations
-const firebaseApp = initializeApp(firebaseConfig);
-const serverAuth = getAuth(firebaseApp);
-const db = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
-
-export async function ensureServerAuthenticated() {
-  if (serverAuth.currentUser) return;
-  const candidates = [
-    { email: 'superadmin@narid.com', password: process.env.NARID_SERVER_PASSWORD || 'Narid@12345' },
-    { email: 'superadmin_root@narid.com', password: process.env.NARID_SERVER_PASSWORD || 'Narid@12345' },
-  ];
-  for (const credInfo of candidates) {
-    try {
-      const cred = await signInWithEmailAndPassword(serverAuth, credInfo.email, credInfo.password);
-      console.log(`[Server Security] Server backend authenticated as Super Admin (${credInfo.email}):`, cred.user.uid);
-      return;
-    } catch {
-      // try next principal
-    }
-  }
-  console.warn('[Server Security] Server auth notice: Unable to authenticate server principal.');
-}
+import { registerAttendanceRoutes } from './serverAttendance.ts';
 
 // ============================================================================
 // Cryptographic Password Hashing (Single Source of Truth - Scrypt memory-hard)
@@ -82,195 +55,109 @@ export function verifyPassword(password: string, storedHash: string): boolean {
 }
 
 // ============================================================================
-// Secure In-Place Firebase Authentication Password Synchronizer
-// (Guaranteed Zero-Account-Creation: Updates existing permanent UID only)
+// In-Place Firebase Authentication Password Synchronizer (Requires Explicit Current Password)
+// Used only when Admin SDK credentials are unavailable and current password is supplied.
+// Zero hardcoded passwords, zero new account creation, strict UID preservation.
 // ============================================================================
 export async function syncExistingFirebaseAuthPassword(
-  email: string, 
-  targetUid: string, 
+  email: string,
+  targetUid: string,
   newPassword: string,
   knownCurrentPassword?: string
 ): Promise<{ success: boolean; uid?: string; matchedEmail?: string; rateLimited?: boolean; error?: string }> {
+  if (typeof knownCurrentPassword !== 'string' || knownCurrentPassword.length === 0) {
+    return {
+      success: false,
+      error: 'Firebase Admin SDK credentials (ADC or Service Account) or current password are required for password synchronization.',
+    };
+  }
+
   try {
-    const candidatePasswords =
-      typeof knownCurrentPassword === 'string' && knownCurrentPassword.length > 0
-        ? [knownCurrentPassword]
-        : ['Narid@12345'];
-
-    let idToken: string | null = null;
-    let lastErrorMessage = '';
-    for (const pwd of candidatePasswords) {
-      try {
-        const res = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${firebaseConfig.apiKey}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email, password: pwd, returnSecureToken: true }),
-        });
-        const data = await res.json();
-        const errMsg = String(data?.error?.message || '');
-        if (errMsg) {
-          lastErrorMessage = errMsg;
-        }
-        if (errMsg.includes('TOO_MANY_ATTEMPTS_TRY_LATER')) {
-          console.warn(`[Auth Sync] Firebase rate limit TOO_MANY_ATTEMPTS_TRY_LATER encountered for "${email}". Stopping immediately without retry.`);
-          return {
-            success: false,
-            rateLimited: true,
-            error: 'TOO_MANY_ATTEMPTS_TRY_LATER',
-          };
-        }
-        if (data.idToken && data.localId === targetUid) {
-          idToken = data.idToken;
-          break;
-        } else if (data.idToken && data.localId !== targetUid) {
-          lastErrorMessage = `Email "${email}" belongs to UID "${data.localId}", expected UID "${targetUid}".`;
-          console.error(`[Auth Sync] UID mismatch detected for ${email}: ${lastErrorMessage}`);
-        }
-      } catch (e: any) {
-        lastErrorMessage = String(e?.message || e || 'Network error');
+    const res = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${firebaseConfig.apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password: knownCurrentPassword, returnSecureToken: true }),
       }
-    }
+    );
+    const data: any = await res.json();
+    const errMsg = String(data?.error?.message || '');
 
-    if (!idToken) {
-      console.warn(`[Auth Sync] Target Firebase Auth user "${email}" (UID: ${targetUid}) could not be pre-authenticated (${lastErrorMessage}). Preserving existing account without creating replacement.`);
+    if (errMsg.includes('TOO_MANY_ATTEMPTS_TRY_LATER')) {
+      return { success: false, rateLimited: true, error: 'TOO_MANY_ATTEMPTS_TRY_LATER' };
+    }
+    if (!data?.idToken) {
       return {
         success: false,
-        error: lastErrorMessage
-          ? `Firebase Auth rejected verification for "${email}" (${lastErrorMessage}).`
-          : `Could not verify existing Firebase Auth account for "${email}".`,
+        error: errMsg || `Firebase Auth rejected verification for "${email}".`,
+      };
+    }
+    if (data.localId !== targetUid) {
+      return {
+        success: false,
+        error: `Email "${email}" belongs to UID "${data.localId}", expected UID "${targetUid}".`,
       };
     }
 
-    // In-place update password on the exact existing UID (never creates new user)
-    const updateRes = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:update?key=${firebaseConfig.apiKey}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ idToken, password: newPassword, returnSecureToken: true }),
-    });
+    const updateRes = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:update?key=${firebaseConfig.apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken: data.idToken, password: newPassword, returnSecureToken: true }),
+      }
+    );
 
-    const updateData = await updateRes.json();
+    const updateData: any = await updateRes.json();
     const updateErr = String(updateData?.error?.message || '');
     if (updateErr.includes('TOO_MANY_ATTEMPTS_TRY_LATER')) {
       return { success: false, rateLimited: true, error: 'TOO_MANY_ATTEMPTS_TRY_LATER' };
     }
     if (updateData.localId === targetUid) {
-      console.log(`[Auth Sync] In-place updated Firebase Auth password for UID: ${targetUid} (${email}). UID preserved 100%.`);
       return { success: true, uid: targetUid, matchedEmail: email };
-    } else {
-      console.error(`[Auth Sync] Unexpected update response for ${email}:`, updateData);
-      return { success: false, error: updateData.error?.message || 'Failed to update Firebase Auth password' };
     }
+    return {
+      success: false,
+      error: updateData.error?.message || 'Failed to update Firebase Auth password.',
+    };
   } catch (err: any) {
-    console.error(`[Auth Sync] Error syncing Firebase Auth password for ${email}:`, err);
-    return { success: false, error: err.message || 'Firebase Auth sync error' };
+    return { success: false, error: err?.message || 'Firebase Auth sync error.' };
   }
-}
-
-// ============================================================================
-// Enterprise Rate Limiter (Brute-Force & Credential Stuffing Protection)
-// ============================================================================
-interface RateLimitRecord {
-  attempts: number;
-  firstAttemptAt: number;
-  lockedUntil: number;
-}
-
-const loginRateLimitStore = new Map<string, RateLimitRecord>();
-const MAX_LOGIN_ATTEMPTS = 5;
-const LOCKOUT_DURATION_MS = 15 * 60 * 1000; // 15 minutes lockout
-const WINDOW_DURATION_MS = 15 * 60 * 1000;  // 15-minute sliding window
-
-function getRateLimitKey(req: Request, loginId: string): string {
-  const forwarded = req.headers['x-forwarded-for'];
-  const ip = typeof forwarded === 'string' ? forwarded.split(',')[0].trim() : (req.socket.remoteAddress || '127.0.0.1');
-  return `${ip}::${loginId.trim().toLowerCase()}`;
-}
-
-function checkLoginRateLimit(key: string): { allowed: boolean; remainingMinutes?: number } {
-  const now = Date.now();
-  const record = loginRateLimitStore.get(key);
-  if (!record) return { allowed: true };
-
-  if (record.lockedUntil > now) {
-    const remainingMinutes = Math.max(1, Math.ceil((record.lockedUntil - now) / 60000));
-    return { allowed: false, remainingMinutes };
-  }
-
-  // Sliding window expiration check
-  if (now - record.firstAttemptAt > WINDOW_DURATION_MS) {
-    loginRateLimitStore.delete(key);
-    return { allowed: true };
-  }
-
-  if (record.attempts >= MAX_LOGIN_ATTEMPTS) {
-    record.lockedUntil = now + LOCKOUT_DURATION_MS;
-    const remainingMinutes = Math.max(1, Math.ceil((record.lockedUntil - now) / 60000));
-    return { allowed: false, remainingMinutes };
-  }
-
-  return { allowed: true };
-}
-
-function recordFailedLogin(key: string): number {
-  const now = Date.now();
-  const record = loginRateLimitStore.get(key);
-  if (!record || (now - record.firstAttemptAt > WINDOW_DURATION_MS && record.lockedUntil < now)) {
-    loginRateLimitStore.set(key, {
-      attempts: 1,
-      firstAttemptAt: now,
-      lockedUntil: 0,
-    });
-    return 1;
-  }
-  record.attempts += 1;
-  if (record.attempts >= MAX_LOGIN_ATTEMPTS) {
-    record.lockedUntil = now + LOCKOUT_DURATION_MS;
-  }
-  return record.attempts;
-}
-
-function clearLoginRateLimit(key: string): void {
-  loginRateLimitStore.delete(key);
 }
 
 // ============================================================================
 // Enterprise Input Validation Schemas (Zod)
 // ============================================================================
-import { z } from 'zod';
-
-const LoginInputSchema = z.object({
-  loginId: z.string().trim().min(1, 'Please enter your Login ID.').max(64),
-  password: z.string().min(1, 'Please enter your password.').max(128),
-});
-
 const VerifySessionInputSchema = z.object({
   loginId: z.string().trim().min(1).max(64).optional(),
   userId: z.string().trim().min(1).max(128).optional(),
 });
 
-const ChangePasswordInputSchema = z.object({
-  loginId: z.string().trim().min(1).max(64),
-  currentPassword: z.string().optional(),
-  newPassword: z.string().min(6, 'Password must be at least 6 characters.').max(128),
-});
-
 const AdminSetPasswordInputSchema = z.object({
-  callerLoginId: z.string().trim().min(1).max(64).optional(),
-  targetLoginId: z.string().trim().min(1).max(64).optional(),
-  targetId: z.string().trim().min(1).max(128).optional(),
+  targetLoginId: z.string().trim().min(1, 'targetLoginId is required.').max(64),
   newPassword: z.string().min(6, 'Password must be at least 6 characters.').max(128),
   mustChangePassword: z.boolean().optional(),
+  unlockAccount: z.boolean().optional(),
+  revokeSessions: z.boolean().optional(),
+  currentTargetPassword: z.string().optional(),
 });
 
 const CreateUserInputSchema = z.object({
   callerLoginId: z.string().trim().min(1).max(64).optional(),
-  loginId: z.string().trim().min(2, 'Login ID must be at least 2 characters.').max(64).regex(/^[a-zA-Z0-9_.-]+$/, 'Login ID can only contain letters, numbers, hyphens, and underscores.'),
+  loginId: z
+    .string()
+    .trim()
+    .min(2, 'Login ID must be at least 2 characters.')
+    .max(64)
+    .regex(/^[a-zA-Z0-9_.-]+$/, 'Login ID can only contain letters, numbers, hyphens, underscores, and dots.'),
   name: z.string().trim().min(1, 'Name is required.').max(128),
   email: z.string().trim().email('Valid email is required.').max(128),
   role: z.enum(['super_admin', 'admin', 'user']),
-  password: z.string().min(6, 'Password must be at least 6 characters.').max(128).optional(),
+  password: z.string().min(6, 'Password must be at least 6 characters.').max(128),
   modulesAllowed: z.array(z.string().max(64)).optional(),
   status: z.enum(['Active', 'Inactive']).default('Active'),
+  mustChangePassword: z.boolean().optional(),
 });
 
 const DeleteUserInputSchema = z.object({
@@ -285,33 +172,42 @@ const SetUserPermissionsInputSchema = z.object({
   role: z.enum(['super_admin', 'admin', 'user']).optional(),
   status: z.enum(['Active', 'Inactive']).optional(),
   modulesAllowed: z.array(z.string().max(64)).optional(),
-  permissions: z.record(z.string(), z.object({
-    view: z.boolean().optional(),
-    add: z.boolean().optional(),
-    edit: z.boolean().optional(),
-    delete: z.boolean().optional(),
-  })).optional(),
+  permissions: z
+    .record(
+      z.string(),
+      z.object({
+        view: z.boolean().optional(),
+        add: z.boolean().optional(),
+        edit: z.boolean().optional(),
+        delete: z.boolean().optional(),
+      })
+    )
+    .optional(),
 });
 
 const RolePermissionsInputSchema = z.object({
   callerLoginId: z.string().trim().min(1).max(64).optional(),
   roleId: z.enum(['super_admin', 'admin', 'user']),
-  modulePermissions: z.record(z.string(), z.object({
-    view: z.boolean().optional(),
-    add: z.boolean().optional(),
-    edit: z.boolean().optional(),
-    delete: z.boolean().optional(),
-  })),
+  modulePermissions: z.record(
+    z.string(),
+    z.object({
+      view: z.boolean().optional(),
+      add: z.boolean().optional(),
+      edit: z.boolean().optional(),
+      delete: z.boolean().optional(),
+    })
+  ),
 });
 
-const AttendanceScanInputSchema = z.object({
-  rawPayload: z.string().trim().min(1, 'Scan payload cannot be empty.').max(256),
-  scannerType: z.enum(['IN', 'OUT']),
-  scannerDevice: z.enum(['USB_SCANNER', 'WEBCAM', 'MANUAL', 'SYSTEM_AUTO']).optional(),
-  customScanTime: z.string().datetime().optional(),
-});
+// Canonical Protected Auth UIDs (Data Preservation Guard)
+const CANONICAL_PROTECTED_UIDS = new Set([
+  'oX2vdSx5jGcoUDxyA0SIYN3SEig2', // superadmin@narid.com
+  '2RpEv6mvyXYswYH9KPIGV6evtgY2', // admin@narid.com
+  'vXPvgrp3i6cS2frqDa3ZoU9h9gc2', // user@narid.com
+  'UNGneXk4pURTrQVXbVPAKPYtRvH3', // legacy superadmin_root@narid.com
+  'vsz6j6kcbtSiCbecmJYVIRgbacJ2', // legacy admin_root@narid.com
+]);
 
-// Initial Industrial Accounts Specification (Canonical *@narid.com kept active)
 const INITIAL_ACCOUNTS = [
   {
     loginId: 'superadmin',
@@ -330,17 +226,17 @@ const INITIAL_ACCOUNTS = [
     authUid: '2RpEv6mvyXYswYH9KPIGV6evtgY2',
     role: 'admin',
     modulesAllowed: [
-      'dashboard', 
-      'scanner', 
-      'employees', 
-      'excel_import', 
-      'qr_codes', 
-      'floors', 
-      'sections', 
-      'departments', 
-      'shifts', 
-      'history', 
-      'reports'
+      'dashboard',
+      'scanner',
+      'employees',
+      'excel_import',
+      'qr_codes',
+      'floors',
+      'sections',
+      'departments',
+      'shifts',
+      'history',
+      'reports',
     ],
   },
   {
@@ -354,8 +250,10 @@ const INITIAL_ACCOUNTS = [
   },
 ];
 
-// Predefined Module Action Permissions by Role
-const DEFAULT_ROLE_PERMISSIONS: Record<string, Record<string, { view: boolean; add: boolean; edit: boolean; delete: boolean }>> = {
+const DEFAULT_ROLE_PERMISSIONS: Record<
+  string,
+  Record<string, { view: boolean; add: boolean; edit: boolean; delete: boolean }>
+> = {
   super_admin: {
     dashboard: { view: true, add: true, edit: true, delete: true },
     scanner: { view: true, add: true, edit: true, delete: true },
@@ -412,61 +310,70 @@ const DEFAULT_ROLE_PERMISSIONS: Record<string, Record<string, { view: boolean; a
   },
 };
 
-// Exactly 3 Predefined System Roles per Specification
 const PREDEFINED_ROLES = [
   {
     roleId: 'super_admin',
     roleName: 'SUPER_ADMIN',
-    description: 'Complete access to all application modules, account management, role permissions, system settings and administrative controls.',
+    description:
+      'Complete access to all application modules, account management, role permissions, system settings and administrative controls.',
     defaultPermissions: DEFAULT_ROLE_PERMISSIONS.super_admin,
     isActive: true,
   },
   {
     roleId: 'admin',
     roleName: 'ADMIN',
-    description: 'Operational dashboard, attendance management, employee records, reports and other specifically authorized modules.',
+    description:
+      'Operational dashboard, attendance management, employee records, reports and other specifically authorized modules.',
     defaultPermissions: DEFAULT_ROLE_PERMISSIONS.admin,
     isActive: true,
   },
   {
     roleId: 'user',
     roleName: 'USER',
-    description: 'Read-only Dashboard monitoring and Attendance Scanner access, according to assigned permissions.',
+    description:
+      'Read-only Dashboard monitoring and Attendance Scanner access, according to assigned permissions.',
     defaultPermissions: DEFAULT_ROLE_PERMISSIONS.user,
     isActive: true,
   },
 ];
 
-async function seedPredefinedRoles() {
+// ============================================================================
+// Admin SDK Bootstrap Seeders (Data Preservation Enforced)
+// ============================================================================
+async function seedPredefinedRoles(db: AdminFirestoreLike) {
   const now = new Date().toISOString();
   for (const roleDef of PREDEFINED_ROLES) {
     try {
-      const snap = await getDoc(doc(db, 'roles', roleDef.roleId));
-      if (!snap.exists()) {
-        await setDoc(doc(db, 'roles', roleDef.roleId), {
+      const roleRef = db.collection('roles').doc(roleDef.roleId);
+      const snap = await roleRef.get();
+      if (!snap.exists) {
+        await roleRef.set({
           ...roleDef,
           dashboardAccessMigratedV1: true,
           updatedAt: now,
         });
-        console.log(`[Roles Boot] Provisioned role definition "${roleDef.roleId}" in Firestore`);
       } else if (roleDef.roleId === 'user') {
-        const rData = snap.data();
-        if (!rData?.dashboardAccessMigratedV1) {
-          const existingPerms = rData?.defaultPermissions || {};
-          await setDoc(doc(db, 'roles', 'user'), {
-            description: roleDef.description,
-            defaultPermissions: {
-              ...existingPerms,
-              dashboard: { view: true, add: false, edit: false, delete: false },
+        const rData = snap.data() || {};
+        if (!rData.dashboardAccessMigratedV1) {
+          await roleRef.set(
+            {
+              description: roleDef.description,
+              defaultPermissions: {
+                ...(rData.defaultPermissions || {}),
+                dashboard: { view: true, add: false, edit: false, delete: false },
+              },
+              dashboardAccessMigratedV1: true,
+              updatedAt: now,
             },
-            dashboardAccessMigratedV1: true,
-            updatedAt: now,
-          }, { merge: true });
+            { merge: true }
+          );
         }
       }
-      const permSnap = await getDoc(doc(db, 'role_permissions', roleDef.roleId));
-      if (!permSnap.exists()) {
-        await setDoc(doc(db, 'role_permissions', roleDef.roleId), {
+
+      const permRef = db.collection('role_permissions').doc(roleDef.roleId);
+      const permSnap = await permRef.get();
+      if (!permSnap.exists) {
+        await permRef.set({
           roleId: roleDef.roleId,
           roleName: roleDef.roleName,
           modulePermissions: roleDef.defaultPermissions,
@@ -475,68 +382,39 @@ async function seedPredefinedRoles() {
           updatedBy: 'system',
         });
       } else if (roleDef.roleId === 'user') {
-        const pData = permSnap.data();
-        if (!pData?.dashboardAccessMigratedV1) {
-          const existingModPerms = pData?.modulePermissions || {};
-          await setDoc(doc(db, 'role_permissions', 'user'), {
-            modulePermissions: {
-              ...existingModPerms,
-              dashboard: { view: true, add: false, edit: false, delete: false },
+        const pData = permSnap.data() || {};
+        if (!pData.dashboardAccessMigratedV1) {
+          await permRef.set(
+            {
+              modulePermissions: {
+                ...(pData.modulePermissions || {}),
+                dashboard: { view: true, add: false, edit: false, delete: false },
+              },
+              dashboardAccessMigratedV1: true,
+              updatedAt: now,
+              updatedBy: 'system_migration',
             },
-            dashboardAccessMigratedV1: true,
-            updatedAt: now,
-            updatedBy: 'system_migration',
-          }, { merge: true });
-          console.log('[Roles Boot] Migrated USER role_permissions to allow read-only Dashboard view');
+            { merge: true }
+          );
         }
       }
     } catch (e: any) {
-      console.warn(`[Roles Boot] Warning for role ${roleDef.roleId}:`, e.message);
+      console.warn(`[Roles Boot] Warning for role ${roleDef.roleId}:`, e?.message || e);
     }
   }
 }
 
-// Unified Enterprise Audit Logger wrapper
-async function logAuditEvent(params: {
-  req?: Request;
-  action: string;
-  targetUid?: string;
-  loginId: string;
-  performedByUid?: string;
-  performedByLoginId?: string;
-  performedByRole?: string;
-  previousValue?: any;
-  newValue?: any;
-  details?: string;
-  success?: boolean;
-  sessionId?: string;
-  actionSource?: string;
-}) {
-  await recordEnterpriseAuditEvent(db, {
-    req: params.req,
-    action: params.action,
-    actorUid: params.performedByUid || 'system',
-    actorLoginId: params.performedByLoginId || params.loginId || 'system',
-    actorRole: params.performedByRole || 'SYSTEM',
-    targetId: params.targetUid || params.loginId,
-    oldValue: params.previousValue,
-    newValue: params.newValue,
-    actionSource: params.actionSource || 'SERVER_API',
-    description: params.details || '',
-    success: params.success,
-    sessionId: params.sessionId,
-  });
-}
-
-async function seedInitialAccounts() {
+async function seedInitialAccounts(db: AdminFirestoreLike) {
   const now = new Date().toISOString();
   for (const acc of INITIAL_ACCOUNTS) {
     const docId = `role_${acc.loginId}`;
     try {
-      const snap = await getDoc(doc(db, 'user_roles', docId));
-      if (!snap.exists()) {
-        const passwordHash = hashPassword('Narid@12345');
-        await setDoc(doc(db, 'user_roles', docId), {
+      const userRef = db.collection('user_roles').doc(docId);
+      const snap = await userRef.get();
+      if (!snap.exists) {
+        // Only provision if missing in an empty database; never assigns a hardcoded known password
+        const randomInitialHash = hashPassword(crypto.randomBytes(24).toString('hex'));
+        await userRef.set({
           id: docId,
           loginId: acc.loginId,
           name: acc.name,
@@ -547,65 +425,67 @@ async function seedInitialAccounts() {
           role: acc.role,
           status: 'Active',
           modulesAllowed: acc.modulesAllowed,
-          passwordHash,
-          mustChangePassword: false,
+          passwordHash: randomInitialHash,
+          mustChangePassword: true,
+          dashboardAccessMigratedV1: true,
           createdAt: now,
           updatedAt: now,
         });
-        console.log(`[Auth Boot] Provisioned ${acc.loginId} with initial single-source passwordHash`);
+        await syncUserUidIndex(db, {
+          uid: acc.authUid,
+          roleDocId: docId,
+          role: acc.role,
+          status: 'Active',
+          lockStatus: 'ACTIVE',
+          loginId: acc.loginId,
+        });
       } else {
-        const data = snap.data();
+        // Strictly preserve existing authUid, email, and passwordHash!
+        const data = snap.data() || {};
         const updates: Record<string, any> = {};
-        if (!data.passwordHash) {
-          updates.passwordHash = hashPassword('Narid@12345');
-          console.log(`[Auth Boot] Upgraded ${acc.loginId} to cryptographic passwordHash`);
-        }
-        // Ensure canonical primary email & permanent Firebase UID match active Firebase Auth user
-        if (data.email !== acc.email) {
-          updates.email = acc.email;
-          console.log(`[Auth Boot] Repaired canonical primary email for ${acc.loginId}: ${data.email} -> ${acc.email}`);
-        }
-        if (data.authUid !== acc.authUid) {
-          updates.authUid = acc.authUid;
-        }
-        const existingAliases = new Set<string>(Array.isArray(data.emailAliases) ? data.emailAliases : []);
-        const prevAliasSize = existingAliases.size;
-        existingAliases.add(acc.email);
-        acc.emailAliases.forEach(a => existingAliases.add(a));
-        if (existingAliases.size > prevAliasSize) {
-          updates.emailAliases = Array.from(existingAliases);
-        }
+
         if (acc.loginId === 'user' && !data.dashboardAccessMigratedV1) {
           const existingModules = Array.isArray(data.modulesAllowed) ? data.modulesAllowed : ['scanner'];
           if (!existingModules.includes('dashboard')) {
             updates.modulesAllowed = ['dashboard', ...existingModules];
           }
           updates.dashboardAccessMigratedV1 = true;
-          console.log('[Auth Boot] Migrated role_user modulesAllowed to include read-only dashboard');
         }
+
         if (Object.keys(updates).length > 0) {
           updates.updatedAt = now;
-          await updateDoc(doc(db, 'user_roles', docId), updates);
+          await userRef.update(updates);
+        }
+
+        const effectiveUid = String(data.authUid || acc.authUid || '').trim();
+        if (effectiveUid) {
+          await syncUserUidIndex(db, {
+            uid: effectiveUid,
+            roleDocId: docId,
+            role: String(data.role || acc.role),
+            status: String(data.status || 'Active'),
+            lockStatus: data.isLocked || data.lockStatus === 'LOCKED' ? 'LOCKED' : 'ACTIVE',
+            loginId: String(data.loginId || acc.loginId),
+          });
         }
       }
     } catch (e: any) {
-      console.warn(`[Auth Boot] Could not verify account ${acc.loginId}:`, e.message);
+      console.warn(`[Auth Boot] Verification notice for ${acc.loginId}:`, e?.message || e);
     }
   }
 
-  // Ensure security retention defaults exist on system_settings/global
   try {
-    const settingsRef = doc(db, 'system_settings', 'global');
-    const settingsSnap = await getDoc(settingsRef);
-    if (settingsSnap.exists()) {
-      const sData = settingsSnap.data();
+    const settingsRef = db.collection('system_settings').doc('global');
+    const settingsSnap = await settingsRef.get();
+    if (settingsSnap.exists) {
+      const sData = settingsSnap.data() || {};
       const sUpdates: Record<string, any> = {};
       if (sData.auditRetentionDays === undefined) sUpdates.auditRetentionDays = 90;
       if (sData.protectCriticalLogs === undefined) sUpdates.protectCriticalLogs = true;
       if (sData.captureGeoLocation === undefined) sUpdates.captureGeoLocation = true;
       if (sData.failedLoginAlertThreshold === undefined) sUpdates.failedLoginAlertThreshold = 5;
       if (Object.keys(sUpdates).length > 0) {
-        await updateDoc(settingsRef, sUpdates);
+        await settingsRef.update(sUpdates);
       }
     }
   } catch (e: any) {
@@ -613,43 +493,222 @@ async function seedInitialAccounts() {
   }
 }
 
-async function startServer() {
-  const app = express();
-  const PORT = 3000;
+// ============================================================================
+// CORS Origin Allowlist Helper
+// ============================================================================
+export function buildAllowedOriginsSet(explicitOverride?: string[]): Set<string> {
+  const allowed = new Set<string>();
 
-  app.set('trust proxy', 1);
-  app.use(express.json());
-
-  // Ensure server backend is authenticated as Super Admin before seeding or serving
-  await ensureServerAuthenticated();
-
-  // Assurance middleware for persistent backend Super Admin authorization
-  app.use(async (_req, _res, next) => {
-    if (!serverAuth.currentUser) {
-      await ensureServerAuthenticated();
-    }
-    next();
-  });
-
-  // Bootstrap initial accounts, predefined roles & security tracking docs in background
-  seedInitialAccounts()
-    .then(() => seedAccountSecurityRecords(db))
-    .catch((err) => {
-      console.warn('[Auth Boot] Seeding warning:', err.message);
+  if (Array.isArray(explicitOverride)) {
+    explicitOverride.forEach((o) => {
+      const clean = o.trim().replace(/\/+$/, '');
+      if (clean) allowed.add(clean);
     });
-  seedPredefinedRoles().catch((err) => {
-    console.warn('[Roles Boot] Seeding warning:', err.message);
+    return allowed;
+  }
+
+  const rawEnv = process.env.ALLOWED_ORIGINS || '';
+  rawEnv
+    .split(',')
+    .map((s) => s.trim().replace(/\/+$/, ''))
+    .filter(Boolean)
+    .forEach((o) => allowed.add(o));
+
+  for (const singleUrl of [process.env.APP_URL, process.env.FRONTEND_URL]) {
+    const clean = (singleUrl || '').trim().replace(/\/+$/, '');
+    if (clean && clean !== 'MY_APP_URL' && /^https?:\/\//i.test(clean)) {
+      allowed.add(clean);
+    }
+  }
+
+  for (const vercelHost of [
+    process.env.VERCEL_URL,
+    process.env.VERCEL_BRANCH_URL,
+    process.env.VERCEL_PROJECT_PRODUCTION_URL,
+  ]) {
+    const cleanHost = (vercelHost || '').trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+    if (cleanHost) {
+      allowed.add(`https://${cleanHost}`);
+    }
+  }
+
+  if (process.env.NODE_ENV !== 'production') {
+    allowed.add('http://localhost:3000');
+    allowed.add('http://127.0.0.1:3000');
+    allowed.add('http://localhost:5173');
+    allowed.add('http://127.0.0.1:5173');
+  }
+
+  return allowed;
+}
+
+// ============================================================================
+// Application Factory (Injectable for Isolated Testing & Vercel Serverless)
+// ============================================================================
+export interface ServerAppOptions {
+  db?: AdminFirestoreLike;
+  auth?: AdminAuthLike | null;
+  projectId?: string;
+  databaseId?: string;
+  credentialMode?: 'SERVICE_ACCOUNT_ENV' | 'ADC' | 'UNCONFIGURED';
+  allowedOrigins?: string[];
+  disableBackgroundBoot?: boolean;
+}
+
+export function createApp(options: ServerAppOptions = {}) {
+  const adminCtx = options.db ? null : getFirebaseAdminContext();
+  const db = (options.db || adminCtx?.db) as AdminFirestoreLike | null;
+  const auth = (options.auth !== undefined ? options.auth : adminCtx?.auth || null) as AdminAuthLike | null;
+  const projectId = options.projectId || adminCtx?.projectId || TARGET_PROJECT_ID;
+  const databaseId = options.databaseId || adminCtx?.databaseId || TARGET_DATABASE_ID;
+  const credentialMode = options.credentialMode || adminCtx?.credentialMode || 'UNCONFIGURED';
+
+  const app = express();
+  app.set('trust proxy', 1);
+
+  // Strict CORS Allowlist Middleware
+  const allowedOrigins = buildAllowedOriginsSet(options.allowedOrigins);
+  const useStrictExplicitCors = Array.isArray(options.allowedOrigins);
+
+  const isOriginPermitted = (origin: string | undefined, req: Request): boolean => {
+    if (!origin) return true; // Non-browser / same-origin fetch without Origin header
+    const cleanOrigin = origin.trim().replace(/\/+$/, '');
+    if (allowedOrigins.has(cleanOrigin)) return true;
+
+    // Allow exact same-origin requests against active host / forwarded host unless tests explicitly locked allowedOrigins
+    if (!useStrictExplicitCors) {
+      const candidateHosts = [
+        req.get('x-forwarded-host')?.split(',')[0]?.trim(),
+        req.get('host'),
+      ].filter((h): h is string => Boolean(h));
+
+      const proto = req.get('x-forwarded-proto')?.split(',')[0]?.trim() || req.protocol || 'http';
+      for (const host of candidateHosts) {
+        if (cleanOrigin === `${proto}://${host}` || cleanOrigin === `https://${host}`) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    const origin = req.headers.origin;
+    if (origin && !isOriginPermitted(origin, req)) {
+      return res.status(403).json({
+        success: false,
+        code: 'CORS_ORIGIN_FORBIDDEN',
+        error: 'Origin not allowed by CORS policy.',
+      });
+    }
+    return next();
   });
 
-  // Health check
+  app.use(
+    cors({
+      origin: (origin, callback) => {
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.has(origin.trim().replace(/\/+$/, ''))) {
+          return callback(null, true);
+        }
+        return callback(null, true); // Host same-origin already vetted by middleware above
+      },
+      credentials: true,
+      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'Authorization'],
+    })
+  );
+
+  app.use(express.json({ limit: '2mb' }));
+
+  let runtimeFirestoreAccessError: string | null = null;
+  const noteRuntimeFirestoreError = (err: unknown): boolean => {
+    if (isFirestorePermissionDeniedError(err)) {
+      runtimeFirestoreAccessError = formatAdminPermissionDeniedError(projectId, databaseId);
+      return true;
+    }
+    return false;
+  };
+
+  // Health Check (Before DB dependency check so Cloud Run readiness probes always inspect status)
   app.get('/api/health', (_req: Request, res: Response) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString(), project: firebaseConfig.projectId });
+    const effectiveWarning = runtimeFirestoreAccessError || adminCtx?.error;
+    res.json({
+      status: db && !runtimeFirestoreAccessError ? 'ok' : 'degraded',
+      timestamp: new Date().toISOString(),
+      projectId,
+      databaseId,
+      adminSdkInitialized: Boolean(db && auth),
+      firestoreAccess: runtimeFirestoreAccessError ? 'permission_denied' : db ? 'ok' : 'unconfigured',
+      credentialMode,
+      ...(effectiveWarning ? { initWarning: effectiveWarning } : {}),
+    });
   });
 
-  // Register Enterprise Security, Audit Trail, Login History & Account Cleanup Routes
-  registerSecurityAuditRoutes(app, db, firebaseConfig.projectId);
+  if (!db) {
+    app.use('/api', (_req: Request, res: Response) => {
+      res.status(503).json({
+        success: false,
+        code: 'FIREBASE_ADMIN_UNCONFIGURED',
+        error:
+          adminCtx?.error ||
+          'Firebase Admin SDK is not initialized. Configure FIREBASE_SERVICE_ACCOUNT_KEY (or FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY) on the server.',
+      });
+    });
+    return { app, db: null, auth: null, projectId, databaseId, credentialMode };
+  }
 
-  // Reusable cryptographic token + RBAC verification helper
+  const adminDb = db;
+
+  if (!options.disableBackgroundBoot) {
+    seedInitialAccounts(adminDb)
+      .then(() => seedAccountSecurityRecords(adminDb))
+      .catch((err) => {
+        if (noteRuntimeFirestoreError(err)) {
+          console.warn(`[Auth Boot] Firestore IAM notice: ${runtimeFirestoreAccessError}`);
+        } else {
+          console.warn('[Auth Boot] Seeding warning:', err?.message || err);
+        }
+      });
+    seedPredefinedRoles(adminDb).catch((err) => {
+      if (!noteRuntimeFirestoreError(err)) {
+        console.warn('[Roles Boot] Seeding warning:', err?.message || err);
+      }
+    });
+  }
+
+  async function logAuditEvent(params: {
+    req?: Request;
+    action: string;
+    targetUid?: string;
+    loginId: string;
+    performedByUid?: string;
+    performedByLoginId?: string;
+    performedByRole?: string;
+    previousValue?: any;
+    newValue?: any;
+    details?: string;
+    success?: boolean;
+    sessionId?: string;
+    actionSource?: string;
+  }) {
+    await recordEnterpriseAuditEvent(adminDb, {
+      req: params.req,
+      action: params.action,
+      actorUid: params.performedByUid || 'system',
+      actorLoginId: params.performedByLoginId || params.loginId || 'system',
+      actorRole: params.performedByRole || 'SYSTEM',
+      targetId: params.targetUid || params.loginId,
+      oldValue: params.previousValue,
+      newValue: params.newValue,
+      actionSource: params.actionSource || 'SERVER_API',
+      description: params.details || '',
+      success: params.success,
+      sessionId: params.sessionId,
+    });
+  }
+
+  // Reusable Cryptographic Token + Strictly UID-Based RBAC Verification Helper
   async function requireVerifiedCaller(
     req: Request,
     res: Response,
@@ -657,7 +716,7 @@ async function startServer() {
     actionLabel: string
   ): Promise<VerifiedCaller | null> {
     try {
-      const caller = await verifyCallerIdentity(req, db, firebaseConfig.projectId);
+      const caller = await verifyCallerIdentity(req, adminDb, auth, projectId);
       if (!caller) {
         await logAuditEvent({
           req,
@@ -669,7 +728,10 @@ async function startServer() {
           success: false,
           details: `Unauthenticated request blocked on ${actionLabel} (${req.method} ${req.path}).`,
         });
-        res.status(401).json({ success: false, error: 'Authentication required: Missing or invalid Firebase ID token.' });
+        res.status(401).json({
+          success: false,
+          error: 'Authentication required: Missing or invalid Firebase ID token.',
+        });
         return null;
       }
       if (!allowedRoles.includes(caller.role)) {
@@ -692,6 +754,14 @@ async function startServer() {
       }
       return caller;
     } catch (err: any) {
+      if (noteRuntimeFirestoreError(err)) {
+        res.status(503).json({
+          success: false,
+          code: 'FIREBASE_ADMIN_PERMISSION_DENIED',
+          error: runtimeFirestoreAccessError,
+        });
+        return null;
+      }
       res.status(err?.statusCode || 401).json({
         success: false,
         error: err?.message || 'Session authentication verification failed.',
@@ -700,77 +770,91 @@ async function startServer() {
     }
   }
 
-  // ============================================================================
-  // 1. Enterprise Login Attempt Monitoring, 3-Strike Lockout & Security Control
-  // ============================================================================
+  // Register Security, Audit, Login Rate-Limiting & Attendance Routes
+  registerSecurityAuditRoutes(app, adminDb, auth, projectId);
+
   registerLoginSecurityRoutes(app, {
-    db,
-    projectId: firebaseConfig.projectId,
+    db: adminDb,
+    auth,
+    projectId,
     verifyPassword,
     hashPassword,
     syncExistingFirebaseAuthPassword,
     requireVerifiedCaller,
   });
 
+  registerAttendanceRoutes(app, {
+    db: adminDb,
+    requireVerifiedCaller,
+  });
+
   // ============================================================================
-  // 1.1 Secure Session Validity & Deactivation Guard
+  // 1.1 Secure Authenticated Session Validity & Deactivation Guard
   // ============================================================================
   app.post('/api/auth/verify-session', async (req: Request, res: Response) => {
     try {
-      const parsed = VerifySessionInputSchema.safeParse(req.body);
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        ['super_admin', 'admin', 'user'],
+        'Verify Active Session'
+      );
+      if (!caller) return;
+
+      const parsed = VerifySessionInputSchema.safeParse(req.body || {});
       if (!parsed.success) {
         return res.status(400).json({ success: false, active: false, error: 'Invalid session payload.' });
       }
 
-      // If Bearer token is attached, verify token & revocation first
-      if (req.headers.authorization?.startsWith('Bearer ')) {
-        try {
-          const verified = await verifyCallerIdentity(req, db, firebaseConfig.projectId);
-          if (!verified) {
-            return res.status(401).json({ success: false, active: false, error: 'Invalid session token.' });
-          }
-        } catch (tokenErr: any) {
-          return res.status(tokenErr?.statusCode || 401).json({
-            success: false,
-            active: false,
-            error: tokenErr?.message || 'Session revoked or expired.',
-          });
-        }
-      }
-
       const { loginId, userId } = parsed.data;
-      if (!loginId && !userId) {
-        return res.status(400).json({ success: false, active: false, error: 'loginId or userId is required.' });
+      if (
+        caller.role !== 'super_admin' &&
+        ((loginId && loginId.toLowerCase() !== caller.loginId) ||
+          (userId && userId !== caller.profileDocId && userId !== caller.uid))
+      ) {
+        return res.status(403).json({
+          success: false,
+          active: false,
+          error: 'Forbidden: Cannot verify session status for another account.',
+        });
       }
 
-      let userDoc = null;
-      if (userId) {
-        userDoc = await getDoc(doc(db, 'user_roles', userId));
-      }
-      if ((!userDoc || !userDoc.exists()) && loginId) {
+      const targetDocId = userId || caller.profileDocId;
+      let userDoc = await adminDb.collection('user_roles').doc(targetDocId).get();
+
+      if (!userDoc.exists && loginId) {
         const cleanId = loginId.trim().toLowerCase();
-        userDoc = await getDoc(doc(db, 'user_roles', `role_${cleanId}`));
-        if (!userDoc.exists()) {
-          const q = query(collection(db, 'user_roles'), where('loginId', '==', cleanId));
-          const snap = await getDocs(q);
+        userDoc = await adminDb.collection('user_roles').doc(`role_${cleanId}`).get();
+        if (!userDoc.exists) {
+          const snap = await adminDb
+            .collection('user_roles')
+            .where('loginId', '==', cleanId)
+            .limit(1)
+            .get();
           if (!snap.empty) {
             userDoc = snap.docs[0];
           }
         }
       }
 
-      if (!userDoc || !userDoc.exists()) {
+      if (!userDoc.exists) {
         return res.status(401).json({ success: false, active: false, error: 'Account not found.' });
       }
 
-      const userData = userDoc.data();
+      const userData = userDoc.data() || {};
       if (userData.status === 'Inactive') {
-        return res.status(401).json({ success: false, active: false, error: 'Account Deactivated. Please contact system administrator.' });
+        return res.status(401).json({
+          success: false,
+          active: false,
+          error: 'Account Deactivated. Please contact system administrator.',
+        });
       }
 
-      const resolvedLoginId = String(userData.loginId || userDoc.id.replace(/^role_/, '')).trim().toLowerCase();
-      const secSnap = await getDoc(doc(db, 'account_security', `sec_${resolvedLoginId}`));
-      const secData = secSnap.exists() ? secSnap.data() : null;
+      const resolvedLoginId = String(userData.loginId || userDoc.id.replace(/^role_/, ''))
+        .trim()
+        .toLowerCase();
+      const secSnap = await adminDb.collection('account_security').doc(`sec_${resolvedLoginId}`).get();
+      const secData = secSnap.exists ? secSnap.data() || {} : null;
       const isLocked =
         secData?.lockStatus === 'LOCKED' ||
         userData.lockStatus === 'LOCKED' ||
@@ -790,11 +874,6 @@ async function startServer() {
         if (!effectiveModules.includes('dashboard')) {
           effectiveModules = ['dashboard', ...effectiveModules];
         }
-        updateDoc(doc(db, 'user_roles', userDoc.id), {
-          modulesAllowed: effectiveModules,
-          dashboardAccessMigratedV1: true,
-          updatedAt: new Date().toISOString(),
-        }).catch(() => {});
       }
 
       const forceChange = userData.mustChangePassword === true || secData?.forcePasswordChange === true;
@@ -830,6 +909,14 @@ async function startServer() {
       const caller = await requireVerifiedCaller(req, res, ['super_admin'], 'Password Governance Reset');
       if (!caller) return;
 
+      const parsed = AdminSetPasswordInputSchema.safeParse(req.body || {});
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || 'targetLoginId and newPassword are required.',
+        });
+      }
+
       const {
         targetLoginId,
         newPassword,
@@ -837,16 +924,10 @@ async function startServer() {
         unlockAccount,
         revokeSessions,
         currentTargetPassword,
-      } = req.body;
-      if (!targetLoginId || !newPassword) {
-        return res.status(400).json({ success: false, error: 'targetLoginId and newPassword are required.' });
-      }
-      if (newPassword.length < 6) {
-        return res.status(400).json({ success: false, error: 'Password must be at least 6 characters.' });
-      }
+      } = parsed.data;
 
       const cleanCallerId = caller.loginId;
-      const cleanTargetId = String(targetLoginId).trim().toLowerCase();
+      const cleanTargetId = targetLoginId.trim().toLowerCase();
       const providedCurrentPwd =
         typeof currentTargetPassword === 'string' && currentTargetPassword.length > 0
           ? currentTargetPassword
@@ -854,11 +935,14 @@ async function startServer() {
 
       const outcome = await withLoginIdLock(cleanTargetId, async () => {
         const docId = `role_${cleanTargetId}`;
-        let targetDoc = await getDoc(doc(db, 'user_roles', docId));
+        let targetDoc = await adminDb.collection('user_roles').doc(docId).get();
 
-        if (!targetDoc.exists()) {
-          const q = query(collection(db, 'user_roles'), where('loginId', '==', cleanTargetId));
-          const snap = await getDocs(q);
+        if (!targetDoc.exists) {
+          const snap = await adminDb
+            .collection('user_roles')
+            .where('loginId', '==', cleanTargetId)
+            .limit(1)
+            .get();
           if (snap.empty) {
             return { status: 404, body: { success: false, error: `User with Login ID "${targetLoginId}" not found.` } };
           }
@@ -869,7 +953,7 @@ async function startServer() {
         if (!targetData) {
           return { status: 404, body: { success: false, error: 'Target user record not found.' } };
         }
-        const targetRole = targetData.role || 'user';
+        const targetRole = String(targetData.role || 'user');
         const canonicalEmail = `${cleanTargetId}@narid.com`;
         const rawEmail = String(targetData.email || canonicalEmail).trim().toLowerCase();
         const targetEmail =
@@ -880,19 +964,13 @@ async function startServer() {
             : rawEmail;
         const targetUid = String(targetData.authUid || targetData.uid || targetDoc.id);
 
-        // 1. Update Firebase Authentication FIRST on the exact existing UID
-        //    NEVER substitutes Firestore passwordHash if Firebase Auth fails, NEVER creates new account.
         let firebaseAuthSynced = false;
         let adminSdkAvailable = false;
         let rateLimited = false;
         let syncErrorReason = '';
         let matchedFirebaseEmail: string | null = null;
 
-        const adminAttempt = await tryAdminAuthUpdatePassword(
-          firebaseConfig.projectId,
-          targetUid,
-          newPassword
-        );
+        const adminAttempt = await tryAdminAuthUpdatePassword(projectId, targetUid, newPassword, auth);
         adminSdkAvailable = adminAttempt.adminSdkAvailable;
 
         if (adminAttempt.updated) {
@@ -900,7 +978,7 @@ async function startServer() {
           matchedFirebaseEmail = adminAttempt.email || targetEmail;
         } else {
           syncErrorReason = adminAttempt.reason || '';
-          if (targetUid && !targetUid.startsWith('role_')) {
+          if (providedCurrentPwd && targetUid && !targetUid.startsWith('role_')) {
             const syncRes = await syncExistingFirebaseAuthPassword(
               targetEmail,
               targetUid,
@@ -915,40 +993,11 @@ async function startServer() {
               if (syncRes.error) {
                 syncErrorReason = syncRes.error;
               }
-
-              // If Super Admin explicitly entered the user's current password and primary email failed,
-              // check verified aliases ONLY against the exact existing targetUid (no guessing, no new account).
-              if (
-                providedCurrentPwd &&
-                !rateLimited &&
-                Array.isArray(targetData.emailAliases)
-              ) {
-                for (const aliasRaw of targetData.emailAliases) {
-                  const alias = String(aliasRaw || '').trim().toLowerCase();
-                  if (!alias || alias === targetEmail) continue;
-                  const aliasRes = await syncExistingFirebaseAuthPassword(
-                    alias,
-                    targetUid,
-                    newPassword,
-                    providedCurrentPwd
-                  );
-                  if (aliasRes.rateLimited) {
-                    rateLimited = true;
-                    syncErrorReason = aliasRes.error || 'TOO_MANY_ATTEMPTS_TRY_LATER';
-                    break;
-                  }
-                  if (aliasRes.success) {
-                    firebaseAuthSynced = true;
-                    matchedFirebaseEmail = alias;
-                    break;
-                  }
-                }
-              }
             }
           }
         }
 
-        const telemetry = await captureTelemetryContext(db, req);
+        const telemetry = await captureTelemetryContext(adminDb, req);
 
         if (!firebaseAuthSynced) {
           await Promise.all([
@@ -962,13 +1011,13 @@ async function startServer() {
               performedByRole: 'SUPER_ADMIN',
               actionSource: 'USER_RIGHTS_GOVERNANCE',
               success: false,
-              details: `Aborted password reset for "${cleanTargetId}" (UID: ${targetUid}, email: ${targetEmail}) because Firebase Auth update did not succeed. Firestore passwordHash was left unchanged. Reason: ${syncErrorReason}`,
+              details: `Aborted password reset for "${cleanTargetId}" (UID: ${targetUid}, email: ${targetEmail}) because Firebase Auth update did not succeed. Firestore passwordHash left unchanged. Reason: ${syncErrorReason}`,
             }),
-            recordSecurityAuditLogDoc(db, {
+            recordSecurityAuditLogDoc(adminDb, {
               action: 'PASSWORD_RESET_SYNC_FAILED',
               severity: 'CRITICAL',
               targetLoginId: cleanTargetId,
-              targetRole: String(targetRole).toUpperCase(),
+              targetRole: targetRole.toUpperCase(),
               targetUid,
               actorUid: caller.uid,
               actorLoginId: cleanCallerId,
@@ -981,7 +1030,7 @@ async function startServer() {
           ]);
 
           return {
-            status: rateLimited ? 429 : 422,
+            status: rateLimited ? 429 : adminSdkAvailable ? 422 : 503,
             body: {
               success: false,
               code: rateLimited ? 'FIREBASE_TOO_MANY_ATTEMPTS' : 'FIREBASE_AUTH_SYNC_FAILED',
@@ -991,16 +1040,11 @@ async function startServer() {
               targetEmail,
               error: rateLimited
                 ? `Firebase Authentication rate limit active (TOO_MANY_ATTEMPTS_TRY_LATER). Firestore passwordHash for "${cleanTargetId}" was NOT modified.`
-                : `Firebase Authentication could not update password for "${targetEmail}" (UID: ${targetUid}). Firestore passwordHash was NOT modified to prevent credential mismatch. ${
-                    !adminSdkAvailable
-                      ? 'Either mount FIREBASE_SERVICE_ACCOUNT_KEY for project "narid-atdc-tracker" on the backend OR enter the account\'s current Firebase password to authorize in-place UID sync.'
-                      : syncErrorReason
-                  }`.trim(),
+                : `Firebase Authentication could not update password for "${targetEmail}" (UID: ${targetUid}). Firestore passwordHash was NOT modified to prevent credential mismatch. ${syncErrorReason}`.trim(),
             },
           };
         }
 
-        // 2. Only AFTER Firebase Auth succeeded on targetUid, persist scrypt hash & governance flags
         const newHash = hashPassword(newPassword);
         const now = new Date().toISOString();
         const forceChange = mustChangePassword !== undefined ? !!mustChangePassword : true;
@@ -1012,7 +1056,7 @@ async function startServer() {
           passwordLastChangedAt: now,
           passwordResetBy: cleanCallerId,
           passwordResetAt: now,
-          sessionRevokedAt: revokeSessions ? now : (targetData.sessionRevokedAt || null),
+          sessionRevokedAt: revokeSessions ? now : targetData.sessionRevokedAt || null,
           updatedAt: now,
         };
         if (unlockAccount) {
@@ -1023,20 +1067,22 @@ async function startServer() {
           targetUpdates.lockReason = null;
         }
 
-        await updateDoc(doc(db, 'user_roles', targetDoc.id), targetUpdates);
+        await adminDb.collection('user_roles').doc(targetDoc.id).update(targetUpdates);
 
-        const qMatching = query(collection(db, 'user_roles'), where('loginId', '==', cleanTargetId));
-        const snapMatching = await getDocs(qMatching);
+        const snapMatching = await adminDb
+          .collection('user_roles')
+          .where('loginId', '==', cleanTargetId)
+          .get();
         for (const mDoc of snapMatching.docs) {
           if (mDoc.id !== targetDoc.id) {
-            await updateDoc(doc(db, 'user_roles', mDoc.id), targetUpdates);
+            await adminDb.collection('user_roles').doc(mDoc.id).update(targetUpdates);
           }
         }
 
         const secUpdate: Record<string, any> = {
           id: `sec_${cleanTargetId}`,
           loginId: cleanTargetId,
-          role: String(targetRole).toUpperCase(),
+          role: targetRole.toUpperCase(),
           firebaseUid: targetUid,
           forcePasswordChange: forceChange,
           tempPasswordResetByUid: caller.uid,
@@ -1054,14 +1100,20 @@ async function startServer() {
           secUpdate.unblockedByLoginId = cleanCallerId;
           secUpdate.unblockedAt = now;
           secUpdate.unblockReason = 'Unlocked during Super Admin password reset';
-          clearLoginRateLimit(`127.0.0.1::${cleanTargetId}`);
-          for (const key of loginRateLimitStore.keys()) {
-            if (key.endsWith(`::${cleanTargetId}`)) {
-              loginRateLimitStore.delete(key);
-            }
+          await clearIpCooldownPersistent(adminDb, undefined, cleanTargetId);
+          if (targetData.authUid) {
+            await syncUserUidIndex(adminDb, {
+              uid: String(targetData.authUid),
+              roleDocId: targetDoc.id,
+              role: targetRole,
+              status: String(targetData.status || 'Active'),
+              lockStatus: 'ACTIVE',
+              loginId: cleanTargetId,
+            });
           }
         }
-        await setDoc(doc(db, 'account_security', `sec_${cleanTargetId}`), secUpdate, { merge: true });
+
+        await adminDb.collection('account_security').doc(`sec_${cleanTargetId}`).set(secUpdate, { merge: true });
 
         await logAuditEvent({
           req,
@@ -1085,8 +1137,8 @@ async function startServer() {
           details: `Password reset by Super Admin "${cleanCallerId}" for "${cleanTargetId}" (${targetRole}, UID: ${targetUid}, email: ${matchedFirebaseEmail}). Force next login change: ${forceChange}.`,
         });
 
-        const resetLogId = `reset_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-        await setDoc(doc(db, 'password_reset_logs', resetLogId), {
+        const resetLogId = `reset_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+        await adminDb.collection('password_reset_logs').doc(resetLogId).set({
           id: resetLogId,
           targetLoginId: cleanTargetId,
           targetName: targetData.name || cleanTargetId,
@@ -1100,7 +1152,6 @@ async function startServer() {
           firebaseUid: targetUid,
         });
 
-        console.log(`[Super Admin Password Reset] Synchronized Firebase Auth UID "${targetUid}" (${matchedFirebaseEmail}) and Firestore for "${cleanTargetId}" by "${cleanCallerId}".`);
         return {
           status: 200,
           body: {
@@ -1118,7 +1169,7 @@ async function startServer() {
       return res.status(outcome.status).json(outcome.body);
     } catch (err: any) {
       console.error('[Admin Password Change] Error:', err);
-      return res.status(500).json({ success: false, error: err.message || 'Failed to update password.' });
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to update password.' });
     }
   });
 
@@ -1130,10 +1181,13 @@ async function startServer() {
       const caller = await requireVerifiedCaller(req, res, ['super_admin'], 'Password Reset History');
       if (!caller) return;
 
-      const snap = await getDocs(collection(db, 'password_reset_logs'));
+      const snap = await adminDb.collection('password_reset_logs').get();
       const history = snap.docs
-        .map(d => d.data())
-        .sort((a: any, b: any) => new Date(b.timestamp || b.createdAt).getTime() - new Date(a.timestamp || a.createdAt).getTime());
+        .map((d) => d.data())
+        .sort(
+          (a: any, b: any) =>
+            new Date(b.timestamp || b.createdAt).getTime() - new Date(a.timestamp || a.createdAt).getTime()
+        );
 
       return res.json({ success: true, history });
     } catch (err: any) {
@@ -1147,18 +1201,23 @@ async function startServer() {
   // ============================================================================
   app.post('/api/auth/change-password', async (req: Request, res: Response) => {
     try {
-      const caller = await requireVerifiedCaller(req, res, ['super_admin', 'admin', 'user'], 'First-Time Password Change');
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        ['super_admin', 'admin', 'user'],
+        'First-Time Password Change'
+      );
       if (!caller) return;
 
-      const { loginId, currentPassword, newPassword, firebaseAuthUpdatedByClient } = req.body;
+      const { loginId, currentPassword, newPassword, firebaseAuthUpdatedByClient } = req.body || {};
       if (!loginId || !newPassword) {
         return res.status(400).json({ success: false, error: 'loginId and newPassword are required.' });
       }
-      if (newPassword.length < 6) {
+      if (typeof newPassword !== 'string' || newPassword.length < 6) {
         return res.status(400).json({ success: false, error: 'New password must be at least 6 characters.' });
       }
 
-      const cleanId = loginId.trim().toLowerCase();
+      const cleanId = String(loginId).trim().toLowerCase();
       if (caller.role !== 'super_admin' && caller.loginId !== cleanId) {
         await logAuditEvent({
           req,
@@ -1171,15 +1230,20 @@ async function startServer() {
           success: false,
           details: `Blocked attempt by "${caller.loginId}" to change password for "${cleanId}".`,
         });
-        return res.status(403).json({ success: false, error: 'Forbidden: You cannot modify another account password.' });
+        return res
+          .status(403)
+          .json({ success: false, error: 'Forbidden: You cannot modify another account password.' });
       }
 
       const docId = `role_${cleanId}`;
-      let userDoc = await getDoc(doc(db, 'user_roles', docId));
+      let userDoc = await adminDb.collection('user_roles').doc(docId).get();
 
-      if (!userDoc.exists()) {
-        const q = query(collection(db, 'user_roles'), where('loginId', '==', cleanId));
-        const snap = await getDocs(q);
+      if (!userDoc.exists) {
+        const snap = await adminDb
+          .collection('user_roles')
+          .where('loginId', '==', cleanId)
+          .limit(1)
+          .get();
         if (snap.empty) {
           return res.status(404).json({ success: false, error: 'User not found.' });
         }
@@ -1191,9 +1255,9 @@ async function startServer() {
         return res.status(404).json({ success: false, error: 'User data not found.' });
       }
 
-      const secRef = doc(db, 'account_security', `sec_${cleanId}`);
-      const secSnap = await getDoc(secRef);
-      const secData = secSnap.exists() ? secSnap.data() : null;
+      const secRef = adminDb.collection('account_security').doc(`sec_${cleanId}`);
+      const secSnap = await secRef.get();
+      const secData = secSnap.exists ? secSnap.data() : null;
       const mustChangeActive = userData.mustChangePassword === true || secData?.forcePasswordChange === true;
 
       const isSuperAdmin = caller.role === 'super_admin';
@@ -1217,7 +1281,7 @@ async function startServer() {
       }
 
       if (currentPassword && userData.passwordHash) {
-        if (!verifyPassword(currentPassword, userData.passwordHash)) {
+        if (!verifyPassword(String(currentPassword), String(userData.passwordHash))) {
           return res.status(401).json({ success: false, error: 'Invalid password, check again' });
         }
       }
@@ -1232,15 +1296,10 @@ async function startServer() {
           : rawTargetEmail;
       const targetUid = String(userData.authUid || userData.uid || userDoc.id);
 
-      // Verify Firebase Authentication update FIRST before touching Firestore passwordHash
       let firebaseAuthSynced = caller.uid === targetUid && firebaseAuthUpdatedByClient === true;
       let syncErr = '';
       if (!firebaseAuthSynced && targetUid && !targetUid.startsWith('role_')) {
-        const adminAttempt = await tryAdminAuthUpdatePassword(
-          firebaseConfig.projectId,
-          targetUid,
-          newPassword
-        );
+        const adminAttempt = await tryAdminAuthUpdatePassword(projectId, targetUid, newPassword, auth);
         if (adminAttempt.updated) {
           firebaseAuthSynced = true;
         } else {
@@ -1249,7 +1308,7 @@ async function startServer() {
             targetEmail,
             targetUid,
             newPassword,
-            currentPassword
+            typeof currentPassword === 'string' ? currentPassword : undefined
           );
           if (syncRes.success) {
             firebaseAuthSynced = true;
@@ -1264,8 +1323,7 @@ async function startServer() {
           success: false,
           code: 'FIREBASE_AUTH_SYNC_FAILED',
           firebaseAuthSynced: false,
-          error:
-            `Firebase Authentication password could not be synchronized for "${targetEmail}" (UID: ${targetUid}). Firestore passwordHash was left unchanged. ${syncErr}`.trim(),
+          error: `Firebase Authentication password could not be synchronized for "${targetEmail}" (UID: ${targetUid}). Firestore passwordHash was left unchanged. ${syncErr}`.trim(),
         });
       }
 
@@ -1280,9 +1338,8 @@ async function startServer() {
         updatedAt: now,
       };
 
-      await updateDoc(doc(db, 'user_roles', userDoc.id), passUpdates);
-      await setDoc(
-        secRef,
+      await adminDb.collection('user_roles').doc(userDoc.id).update(passUpdates);
+      await secRef.set(
         {
           id: `sec_${cleanId}`,
           loginId: cleanId,
@@ -1294,15 +1351,17 @@ async function startServer() {
         { merge: true }
       );
 
-      const qPassMatching = query(collection(db, 'user_roles'), where('loginId', '==', cleanId));
-      const snapPassMatching = await getDocs(qPassMatching);
+      const snapPassMatching = await adminDb
+        .collection('user_roles')
+        .where('loginId', '==', cleanId)
+        .get();
       for (const mDoc of snapPassMatching.docs) {
         if (mDoc.id !== userDoc.id) {
-          await updateDoc(doc(db, 'user_roles', mDoc.id), passUpdates);
+          await adminDb.collection('user_roles').doc(mDoc.id).update(passUpdates);
         }
       }
 
-      const telemetry = await captureTelemetryContext(db, req);
+      const telemetry = await captureTelemetryContext(adminDb, req);
       await Promise.all([
         logAuditEvent({
           req,
@@ -1315,12 +1374,12 @@ async function startServer() {
           actionSource: 'FIRST_TIME_PASSWORD_MODAL',
           details: `Mandatory password change completed for account "${cleanId}" (UID: ${targetUid}). mustChangePassword and forcePasswordChange cleared to false.`,
         }),
-        recordSecurityAuditLogDoc(db, {
+        recordSecurityAuditLogDoc(adminDb, {
           action: 'MANDATORY_PASSWORD_CHANGED',
           severity: 'INFO',
           targetLoginId: cleanId,
           targetRole: String(userData.role || 'USER').toUpperCase(),
-          targetUid: targetUid,
+          targetUid,
           actorUid: caller.uid,
           actorLoginId: caller.loginId,
           actorRole: caller.role.toUpperCase(),
@@ -1330,8 +1389,8 @@ async function startServer() {
         }),
       ]);
 
-      return res.json({ 
-        success: true, 
+      return res.json({
+        success: true,
         message: 'Password updated successfully in Firebase Authentication and Firestore. Access granted.',
         mustChangePassword: false,
         forcePasswordChange: false,
@@ -1339,146 +1398,223 @@ async function startServer() {
       });
     } catch (err: any) {
       console.error('[First-Time Password Change] Error:', err);
-      return res.status(500).json({ success: false, error: err.message || 'Failed to update password.' });
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to update password.' });
     }
   });
 
   // ============================================================================
-  // 4. Create User Account with Strict Server-Side Validation & Role Guards
+  // 4. Create User Account via Firebase Admin SDK (Explicit Password, Real UID)
   // ============================================================================
   app.post('/api/admin/create-user', async (req: Request, res: Response) => {
     try {
       const caller = await requireVerifiedCaller(req, res, ['super_admin'], 'Create User Account');
       if (!caller) return;
 
-      const parsed = CreateUserInputSchema.safeParse(req.body);
+      const parsed = CreateUserInputSchema.safeParse(req.body || {});
       if (!parsed.success) {
-        return res.status(400).json({ success: false, error: parsed.error.issues[0]?.message || 'Invalid user data.' });
+        return res
+          .status(400)
+          .json({ success: false, error: parsed.error.issues[0]?.message || 'Invalid user data.' });
       }
 
-      const { name, loginId, email, role, password, status, modulesAllowed } = parsed.data;
-      const cleanCallerId = caller.loginId;
+      if (!auth) {
+        return res.status(503).json({
+          success: false,
+          error: 'Firebase Admin SDK Auth is not configured on backend; cannot create Firebase user.',
+        });
+      }
 
+      const { name, loginId, email, role, password, status, modulesAllowed, mustChangePassword } = parsed.data;
+      const cleanCallerId = caller.loginId;
       const cleanId = loginId.trim().toLowerCase();
+      const cleanEmail = email.trim().toLowerCase();
       const docId = `role_${cleanId}`;
 
-      const existingDoc = await getDoc(doc(db, 'user_roles', docId));
-      if (existingDoc.exists()) {
+      const [existingDoc, existingSnap, emailSnap] = await Promise.all([
+        adminDb.collection('user_roles').doc(docId).get(),
+        adminDb.collection('user_roles').where('loginId', '==', cleanId).limit(1).get(),
+        adminDb.collection('user_roles').where('email', '==', cleanEmail).limit(1).get(),
+      ]);
+
+      if (existingDoc.exists || !existingSnap.empty) {
         return res.status(400).json({ success: false, error: `Login ID "${cleanId}" already exists.` });
       }
-
-      const qExisting = query(collection(db, 'user_roles'), where('loginId', '==', cleanId));
-      const existingSnap = await getDocs(qExisting);
-      if (!existingSnap.empty) {
-        return res.status(400).json({ success: false, error: `Login ID "${cleanId}" already exists.` });
-      }
-
-      const cleanEmail = email.trim().toLowerCase();
-      const qEmail = query(collection(db, 'user_roles'), where('email', '==', cleanEmail));
-      const emailSnap = await getDocs(qEmail);
       if (!emailSnap.empty) {
-        return res.status(400).json({ success: false, error: `Email address "${cleanEmail}" is already registered to another account.` });
+        return res
+          .status(400)
+          .json({ success: false, error: `Email address "${cleanEmail}" is already registered to another account.` });
       }
 
-      const assignedRole = role.toLowerCase();
+      const assignedRole = role.toLowerCase() as 'super_admin' | 'admin' | 'user';
       const now = new Date().toISOString();
-      const passwordHash = hashPassword(password || 'Narid@12345');
+      const passwordHash = hashPassword(password);
+      const upperName = name.trim().toUpperCase();
 
-      let finalModules = modulesAllowed;
-      if (!finalModules || finalModules.length === 0) {
-        if (assignedRole === 'super_admin') finalModules = ['all'];
-        else if (assignedRole === 'admin') finalModules = ['dashboard', 'scanner', 'employees', 'excel_import', 'qr_codes', 'floors', 'sections', 'departments', 'shifts', 'history', 'reports'];
-        else finalModules = ['dashboard', 'scanner'];
-      }
-
-      const newRecord = {
-        id: docId,
-        uid: docId,
-        loginId: cleanId,
-        name: name.trim().toUpperCase(),
-        displayName: name.trim().toUpperCase(),
+      // Create real Firebase Auth user first to bind a real Firebase UID
+      const fbUser = await auth.createUser({
         email: cleanEmail,
-        role: assignedRole,
-        status: status || 'Active',
-        modulesAllowed: finalModules,
-        passwordHash,
-        mustChangePassword: true,
-        createdBy: cleanCallerId,
-        createdAt: now,
-        updatedAt: now,
-      };
-
-      // 1. Save account in user_roles
-      await setDoc(doc(db, 'user_roles', docId), newRecord);
-
-      // 2. Assign default module permissions in user_permissions
-      const defaultRolePerms = DEFAULT_ROLE_PERMISSIONS[assignedRole] || DEFAULT_ROLE_PERMISSIONS.user;
-      await setDoc(doc(db, 'user_permissions', docId), {
-        id: docId,
-        userId: docId,
-        loginId: cleanId,
-        role: assignedRole,
-        permissions: defaultRolePerms,
-        updatedAt: now,
-        updatedBy: cleanCallerId,
+        password,
+        displayName: upperName,
+        disabled: status === 'Inactive',
       });
 
-      // 3. Write audit log
-      await logAuditEvent({
-        req,
-        action: 'account_created',
-        targetUid: docId,
-        loginId: cleanId,
-        performedByUid: caller.uid,
-        performedByLoginId: cleanCallerId,
-        performedByRole: 'SUPER_ADMIN',
-        actionSource: 'USER_RIGHTS_CREATE',
-        newValue: {
+      try {
+        let finalModules = modulesAllowed;
+        if (!finalModules || finalModules.length === 0) {
+          if (assignedRole === 'super_admin') finalModules = ['all'];
+          else if (assignedRole === 'admin') {
+            finalModules = [
+              'dashboard',
+              'scanner',
+              'employees',
+              'excel_import',
+              'qr_codes',
+              'floors',
+              'sections',
+              'departments',
+              'shifts',
+              'history',
+              'reports',
+            ];
+          } else {
+            finalModules = ['dashboard', 'scanner'];
+          }
+        }
+
+        const forceChange = mustChangePassword !== undefined ? Boolean(mustChangePassword) : true;
+        const newRecord = {
+          id: docId,
+          uid: fbUser.uid,
+          authUid: fbUser.uid,
+          linkedAuthUids: [fbUser.uid],
+          loginId: cleanId,
+          name: upperName,
+          displayName: upperName,
+          email: cleanEmail,
+          role: assignedRole,
+          status: status || 'Active',
+          modulesAllowed: finalModules,
+          passwordHash,
+          mustChangePassword: forceChange,
+          forcePasswordChange: forceChange,
+          isLocked: false,
+          lockStatus: 'ACTIVE',
+          consecutiveFailedAttempts: 0,
+          createdBy: cleanCallerId,
+          createdAt: now,
+          updatedAt: now,
+        };
+
+        await adminDb.collection('user_roles').doc(docId).set(newRecord);
+
+        const defaultRolePerms = DEFAULT_ROLE_PERMISSIONS[assignedRole] || DEFAULT_ROLE_PERMISSIONS.user;
+        await adminDb.collection('user_permissions').doc(docId).set({
+          id: docId,
+          userId: docId,
           loginId: cleanId,
           role: assignedRole,
-          name: newRecord.name,
-          email: cleanEmail,
-          status: newRecord.status,
-        },
-        details: `Created new login ID "${cleanId}" with role ${assignedRole.toUpperCase()}`,
-      });
+          permissions: defaultRolePerms,
+          updatedAt: now,
+          updatedBy: cleanCallerId,
+        });
 
-      console.log(`[Admin Account Created] Successfully provisioned "${cleanId}" (${assignedRole})`);
-      const { passwordHash: _, ...sanitized } = newRecord;
-      return res.json({ success: true, profile: sanitized });
+        await adminDb.collection('account_security').doc(`sec_${cleanId}`).set({
+          id: `sec_${cleanId}`,
+          loginId: cleanId,
+          role: assignedRole.toUpperCase(),
+          firebaseUid: fbUser.uid,
+          email: cleanEmail,
+          lockStatus: 'ACTIVE',
+          consecutiveFailedAttempts: 0,
+          maxAttemptsAllowed: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
+          totalLoginAttempts: 0,
+          totalSuccessfulLogins: 0,
+          totalFailedLogins: 0,
+          forcePasswordChange: forceChange,
+          updatedAt: now,
+        });
+
+        await syncUserUidIndex(adminDb, {
+          uid: fbUser.uid,
+          roleDocId: docId,
+          role: assignedRole,
+          status: status || 'Active',
+          lockStatus: 'ACTIVE',
+          loginId: cleanId,
+        });
+
+        await logAuditEvent({
+          req,
+          action: 'account_created',
+          targetUid: fbUser.uid,
+          loginId: cleanId,
+          performedByUid: caller.uid,
+          performedByLoginId: cleanCallerId,
+          performedByRole: 'SUPER_ADMIN',
+          actionSource: 'USER_RIGHTS_CREATE',
+          newValue: {
+            loginId: cleanId,
+            authUid: fbUser.uid,
+            role: assignedRole,
+            name: upperName,
+            email: cleanEmail,
+            status: newRecord.status,
+          },
+          details: `Created new login ID "${cleanId}" (Firebase UID: ${fbUser.uid}) with role ${assignedRole.toUpperCase()}.`,
+        });
+
+        const { passwordHash: _, ...sanitized } = newRecord;
+        return res.json({ success: true, profile: sanitized });
+      } catch (persistErr: any) {
+        // Atomic rollback of Firebase Auth user if Firestore persistence fails
+        await auth.deleteUser(fbUser.uid).catch(() => {});
+        throw persistErr;
+      }
     } catch (err: any) {
       console.error('[Create User] Error:', err);
-      return res.status(500).json({ success: false, error: err.message || 'Failed to create user.' });
+      const code = String(err?.code || '');
+      if (code.includes('email-already-exists')) {
+        return res.status(400).json({
+          success: false,
+          error: 'Email address is already registered in Firebase Authentication.',
+        });
+      }
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to create user.' });
     }
   });
 
   // ============================================================================
-  // 5. Secure Account Deletion (Super Admin Only with strict guards)
+  // 5. Secure Account Deletion (Super Admin Only with Canonical UID Protection)
   // ============================================================================
   app.post('/api/admin/delete-user', async (req: Request, res: Response) => {
     try {
       const caller = await requireVerifiedCaller(req, res, ['super_admin'], 'Delete User Account');
       if (!caller) return;
 
-      const { targetId, targetLoginId } = req.body;
-      if (!targetId && !targetLoginId) {
+      const parsed = DeleteUserInputSchema.safeParse(req.body || {});
+      if (!parsed.success || (!parsed.data.targetId && !parsed.data.targetLoginId)) {
         return res.status(400).json({ success: false, error: 'targetId or targetLoginId is required.' });
       }
 
+      const { targetId, targetLoginId } = parsed.data;
       const cleanCallerId = caller.loginId;
 
-      // 2. Resolve target document
-      let targetDocId = targetId;
-      let targetDocSnap = targetDocId ? await getDoc(doc(db, 'user_roles', targetDocId)) : null;
+      let targetDocId = targetId || '';
+      let targetDocSnap = targetDocId
+        ? await adminDb.collection('user_roles').doc(targetDocId).get()
+        : null;
 
-      if (!targetDocSnap || !targetDocSnap.exists()) {
+      if (!targetDocSnap || !targetDocSnap.exists) {
         const cleanTargetLoginId = (targetLoginId || '').trim().toLowerCase();
         if (cleanTargetLoginId) {
           targetDocId = `role_${cleanTargetLoginId}`;
-          targetDocSnap = await getDoc(doc(db, 'user_roles', targetDocId));
-          if (!targetDocSnap.exists()) {
-            const q = query(collection(db, 'user_roles'), where('loginId', '==', cleanTargetLoginId));
-            const snap = await getDocs(q);
+          targetDocSnap = await adminDb.collection('user_roles').doc(targetDocId).get();
+          if (!targetDocSnap.exists) {
+            const snap = await adminDb
+              .collection('user_roles')
+              .where('loginId', '==', cleanTargetLoginId)
+              .limit(1)
+              .get();
             if (!snap.empty) {
               targetDocSnap = snap.docs[0];
               targetDocId = targetDocSnap.id;
@@ -1487,47 +1623,52 @@ async function startServer() {
         }
       }
 
-      if (!targetDocSnap || !targetDocSnap.exists()) {
+      if (!targetDocSnap || !targetDocSnap.exists) {
         return res.status(404).json({ success: false, error: 'User account not found.' });
       }
 
-      const targetData = targetDocSnap.data();
-      const targetLogin = (targetData?.loginId || targetLoginId || '').trim().toLowerCase();
+      const targetData = targetDocSnap.data() || {};
+      const targetLogin = String(targetData.loginId || targetLoginId || '').trim().toLowerCase();
+      const targetUid = String(targetData.authUid || targetData.uid || '');
 
-      // Guard 1: Cannot delete self
       if (cleanCallerId === targetLogin) {
-        return res.status(400).json({ success: false, error: 'Action denied: Administrators cannot delete their own active account.' });
-      }
-
-      // Guard 2: Cannot delete root superadmin
-      if (targetLogin === 'superadmin' || targetDocId === 'role_superadmin') {
-        return res.status(400).json({ success: false, error: 'Action denied: The primary root Super Admin account cannot be deleted.' });
-      }
-
-      // Guard 3: Cannot delete the last active Super Admin
-      if (targetData?.role?.toLowerCase() === 'super_admin') {
-        const allUsersSnap = await getDocs(collection(db, 'user_roles'));
-        const activeSuperAdmins = allUsersSnap.docs.filter(d => {
-          const data = d.data();
-          return data.role?.toLowerCase() === 'super_admin' && data.status !== 'Inactive';
+        return res.status(400).json({
+          success: false,
+          error: 'Action denied: Administrators cannot delete their own active account.',
         });
+      }
 
+      if (targetLogin === 'superadmin' || targetDocId === 'role_superadmin' || CANONICAL_PROTECTED_UIDS.has(targetUid)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Action denied: Protected canonical system accounts cannot be deleted.',
+        });
+      }
+
+      if (String(targetData.role || '').toLowerCase() === 'super_admin') {
+        const allUsersSnap = await adminDb.collection('user_roles').get();
+        const activeSuperAdmins = allUsersSnap.docs.filter((d) => {
+          const data = d.data() || {};
+          return String(data.role || '').toLowerCase() === 'super_admin' && data.status !== 'Inactive';
+        });
         if (activeSuperAdmins.length <= 1) {
-          return res.status(400).json({ success: false, error: 'Action denied: Cannot delete the last remaining active Super Admin.' });
+          return res.status(400).json({
+            success: false,
+            error: 'Action denied: Cannot delete the last remaining active Super Admin.',
+          });
         }
       }
 
-      // 3. Delete the account document from user_roles
-      await deleteDoc(doc(db, 'user_roles', targetDocId));
-
-      // 4. Delete associated individual permissions from user_permissions
-      try {
-        await deleteDoc(doc(db, 'user_permissions', targetDocId));
-      } catch (err) {
-        console.warn('[Delete User] Permission cleanup note:', err);
+      await adminDb.collection('user_roles').doc(targetDocId).delete();
+      await adminDb.collection('user_permissions').doc(targetDocId).delete().catch(() => {});
+      if (targetUid && !targetUid.startsWith('role_')) {
+        await removeUserUidIndex(adminDb, targetUid);
+        if (auth) {
+          await auth.revokeRefreshTokens(targetUid).catch(() => {});
+          await auth.deleteUser(targetUid).catch(() => {});
+        }
       }
 
-      // 5. Write audit log
       await logAuditEvent({
         req,
         action: 'account_deleted',
@@ -1540,47 +1681,48 @@ async function startServer() {
         previousValue: {
           id: targetDocId,
           loginId: targetLogin,
-          name: targetData?.name,
-          role: targetData?.role,
-          status: targetData?.status,
+          name: targetData.name,
+          role: targetData.role,
+          status: targetData.status,
         },
-        details: `Deleted user account "${targetLogin}" (${targetData?.role})`,
+        details: `Deleted user account "${targetLogin}" (${targetData.role})`,
       });
 
-      console.log(`[Admin Delete User] Successfully deleted account "${targetLogin}" (${targetDocId}) by ${cleanCallerId}`);
       return res.json({
         success: true,
         message: `User account "${targetLogin}" successfully deleted from Firebase.`,
       });
     } catch (err: any) {
       console.error('[Delete User] Error:', err);
-      return res.status(500).json({ success: false, error: err.message || 'Failed to delete user account.' });
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to delete user account.' });
     }
   });
 
   // ============================================================================
-  // 6. Update User Module Permissions (Individual overrides)
+  // 6. Update User Module Permissions (Admin SDK + UID Index Sync)
   // ============================================================================
   app.post('/api/admin/set-user-permissions', async (req: Request, res: Response) => {
     try {
       const caller = await requireVerifiedCaller(req, res, ['super_admin'], 'Update User Permissions');
       if (!caller) return;
 
-      const parsed = SetUserPermissionsInputSchema.safeParse(req.body);
+      const parsed = SetUserPermissionsInputSchema.safeParse(req.body || {});
       if (!parsed.success) {
-        return res.status(400).json({ success: false, error: parsed.error.issues[0]?.message || 'Invalid permissions request.' });
+        return res
+          .status(400)
+          .json({ success: false, error: parsed.error.issues[0]?.message || 'Invalid permissions request.' });
       }
 
       const { targetId, permissions, modulesAllowed, role, status } = parsed.data;
       const cleanCallerId = caller.loginId;
 
-      const targetDocRef = doc(db, 'user_roles', targetId);
-      const targetSnap = await getDoc(targetDocRef);
-      if (!targetSnap.exists()) {
+      const targetDocRef = adminDb.collection('user_roles').doc(targetId);
+      const targetSnap = await targetDocRef.get();
+      if (!targetSnap.exists) {
         return res.status(404).json({ success: false, error: 'User account not found.' });
       }
 
-      const oldData = targetSnap.data();
+      const oldData = targetSnap.data() || {};
       const now = new Date().toISOString();
 
       const effectiveRole = String(role || oldData.role || 'user').toLowerCase();
@@ -1590,14 +1732,29 @@ async function startServer() {
           ? modulesAllowed
           : modulesAllowed?.filter((m) => !restrictedMods.has(m));
 
-      // Update user_roles
-      const updatePayload: any = { updatedAt: now };
+      const updatePayload: Record<string, any> = { updatedAt: now };
       if (safeModules) updatePayload.modulesAllowed = safeModules;
       if (role) updatePayload.role = role;
       if (status) updatePayload.status = status;
-      await updateDoc(targetDocRef, updatePayload);
+      await targetDocRef.update(updatePayload);
 
-      // Update user_permissions if permissions map provided
+      if (oldData.authUid) {
+        await syncUserUidIndex(adminDb, {
+          uid: String(oldData.authUid),
+          roleDocId: targetId,
+          role: role || String(oldData.role || 'user'),
+          status: status || String(oldData.status || 'Active'),
+          lockStatus: oldData.isLocked || oldData.lockStatus === 'LOCKED' ? 'LOCKED' : 'ACTIVE',
+          loginId: String(oldData.loginId || ''),
+        });
+        if (auth && status) {
+          await auth.updateUser(String(oldData.authUid), { disabled: status === 'Inactive' }).catch(() => {});
+          if (status === 'Inactive') {
+            await auth.revokeRefreshTokens(String(oldData.authUid)).catch(() => {});
+          }
+        }
+      }
+
       if (permissions) {
         const sanitizedPerms = { ...permissions };
         if (effectiveRole !== 'super_admin') {
@@ -1605,23 +1762,25 @@ async function startServer() {
           sanitizedPerms.audit_logs = { view: false, add: false, edit: false, delete: false };
           sanitizedPerms.user_rights = { view: false, add: false, edit: false, delete: false };
         }
-        await setDoc(doc(db, 'user_permissions', targetId), {
-          id: targetId,
-          userId: targetId,
-          loginId: oldData.loginId || '',
-          role: role || oldData.role || 'user',
-          permissions: sanitizedPerms,
-          updatedAt: now,
-          updatedBy: cleanCallerId,
-        }, { merge: true });
+        await adminDb.collection('user_permissions').doc(targetId).set(
+          {
+            id: targetId,
+            userId: targetId,
+            loginId: oldData.loginId || '',
+            role: role || oldData.role || 'user',
+            permissions: sanitizedPerms,
+            updatedAt: now,
+            updatedBy: cleanCallerId,
+          },
+          { merge: true }
+        );
       }
 
-      // Write audit log
       await logAuditEvent({
         req,
         action: 'permission_updated',
         targetUid: targetId,
-        loginId: oldData.loginId || '',
+        loginId: String(oldData.loginId || ''),
         performedByUid: caller.uid,
         performedByLoginId: cleanCallerId,
         performedByRole: 'SUPER_ADMIN',
@@ -1633,7 +1792,7 @@ async function startServer() {
         },
         newValue: {
           role: role || oldData.role,
-          modulesAllowed: modulesAllowed || oldData.modulesAllowed,
+          modulesAllowed: safeModules || oldData.modulesAllowed,
           status: status || oldData.status,
         },
         details: `Updated permissions and role for user "${oldData.loginId}"`,
@@ -1642,7 +1801,7 @@ async function startServer() {
       return res.json({ success: true, message: `Permissions for "${oldData.loginId}" updated successfully.` });
     } catch (err: any) {
       console.error('[Set User Permissions] Error:', err);
-      return res.status(500).json({ success: false, error: err.message || 'Failed to update user permissions.' });
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to update user permissions.' });
     }
   });
 
@@ -1654,9 +1813,11 @@ async function startServer() {
       const caller = await requireVerifiedCaller(req, res, ['super_admin'], 'Save Role Permissions');
       if (!caller) return;
 
-      const parsed = RolePermissionsInputSchema.safeParse(req.body);
+      const parsed = RolePermissionsInputSchema.safeParse(req.body || {});
       if (!parsed.success) {
-        return res.status(400).json({ success: false, error: parsed.error.issues[0]?.message || 'Invalid role permissions request.' });
+        return res
+          .status(400)
+          .json({ success: false, error: parsed.error.issues[0]?.message || 'Invalid role permissions request.' });
       }
 
       const { roleId, modulePermissions } = parsed.data;
@@ -1673,28 +1834,33 @@ async function startServer() {
         user_rights: { view: false, add: false, edit: false, delete: false },
       };
 
-      await setDoc(doc(db, 'role_permissions', roleId), {
-        roleId,
-        roleName: roleId === 'admin' ? 'Admin' : 'User',
-        modulePermissions: sanitizedModulePermissions,
-        updatedAt: now,
-        updatedBy: cleanCallerId,
-      }, { merge: true });
+      await adminDb.collection('role_permissions').doc(roleId).set(
+        {
+          roleId,
+          roleName: roleId === 'admin' ? 'Admin' : 'User',
+          modulePermissions: sanitizedModulePermissions,
+          updatedAt: now,
+          updatedBy: cleanCallerId,
+        },
+        { merge: true }
+      );
 
-      await setDoc(doc(db, 'roles', roleId), {
-        defaultPermissions: sanitizedModulePermissions,
-        updatedAt: now,
-      }, { merge: true });
+      await adminDb.collection('roles').doc(roleId).set(
+        {
+          defaultPermissions: sanitizedModulePermissions,
+          updatedAt: now,
+        },
+        { merge: true }
+      );
 
-      // Synchronize modulesAllowed on users with this role
       const allowedModules: string[] = [];
       Object.entries(sanitizedModulePermissions).forEach(([modKey, perms]: [string, any]) => {
         if (perms?.view) allowedModules.push(modKey);
       });
-      const usersSnap = await getDocs(query(collection(db, 'user_roles'), where('role', '==', roleId)));
+      const usersSnap = await adminDb.collection('user_roles').where('role', '==', roleId).get();
       await Promise.all(
-        usersSnap.docs.map(uDoc =>
-          updateDoc(doc(db, 'user_roles', uDoc.id), {
+        usersSnap.docs.map((uDoc) =>
+          adminDb.collection('user_roles').doc(uDoc.id).update({
             modulesAllowed: allowedModules,
             updatedAt: now,
           })
@@ -1714,10 +1880,14 @@ async function startServer() {
         details: `Updated default role permissions for role "${roleId.toUpperCase()}"`,
       });
 
-      return res.json({ success: true, message: `Role permissions for ${roleId.toUpperCase()} saved successfully.`, updatedAt: now });
+      return res.json({
+        success: true,
+        message: `Role permissions for ${roleId.toUpperCase()} saved successfully.`,
+        updatedAt: now,
+      });
     } catch (err: any) {
       console.error('[Save Role Permissions] Error:', err);
-      return res.status(500).json({ success: false, error: err.message || 'Failed to save role permissions.' });
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to save role permissions.' });
     }
   });
 
@@ -1729,14 +1899,15 @@ async function startServer() {
       const caller = await requireVerifiedCaller(req, res, ['super_admin'], 'Duplicate Accounts Report');
       if (!caller) return;
 
-      const userRolesSnap = await getDocs(collection(db, 'user_roles'));
-      const auditSnap = await getDocs(collection(db, 'audit_logs'));
+      const [userRolesSnap, auditSnap] = await Promise.all([
+        adminDb.collection('user_roles').get(),
+        adminDb.collection('audit_logs').get(),
+      ]);
 
-      // Group by normalized loginId
       const groups: Record<string, any[]> = {};
-      userRolesSnap.docs.forEach(d => {
-        const data = d.data();
-        const loginId = (data.loginId || d.id.replace(/^role_/, '')).trim().toLowerCase();
+      userRolesSnap.docs.forEach((d) => {
+        const data = d.data() || {};
+        const loginId = String(data.loginId || d.id.replace(/^role_/, '')).trim().toLowerCase();
         if (!groups[loginId]) groups[loginId] = [];
         groups[loginId].push({ docId: d.id, ...data });
       });
@@ -1746,9 +1917,8 @@ async function startServer() {
 
       for (const [loginId, docs] of Object.entries(groups)) {
         const hasDuplicates = docs.length > 1;
-        if (hasDuplicates) totalDuplicates += (docs.length - 1);
+        if (hasDuplicates) totalDuplicates += docs.length - 1;
 
-        // Sort: Canonical doc (`role_${loginId}`) first, or the one with passwordHash and earliest createdAt
         docs.sort((a, b) => {
           if (a.docId === `role_${loginId}`) return -1;
           if (b.docId === `role_${loginId}`) return 1;
@@ -1758,9 +1928,8 @@ async function startServer() {
         });
 
         const primaryDoc = docs[0];
-
         const docDetails = docs.map((d) => {
-          const auditCount = auditSnap.docs.filter(a => {
+          const auditCount = auditSnap.docs.filter((a) => {
             const str = JSON.stringify(a.data());
             return str.includes(d.docId) || (d.uid && str.includes(d.uid));
           }).length;
@@ -1768,7 +1937,8 @@ async function startServer() {
           const isPrimary = d.docId === primaryDoc.docId;
           return {
             docId: d.docId,
-            firebaseUid: d.uid || d.authUid || (d.docId.length > 20 && !d.docId.startsWith('role_') ? d.docId : null),
+            firebaseUid:
+              d.uid || d.authUid || (d.docId.length > 20 && !d.docId.startsWith('role_') ? d.docId : null),
             loginId: d.loginId || loginId,
             name: d.name || d.displayName || 'N/A',
             email: d.email || 'N/A',
@@ -1778,7 +1948,7 @@ async function startServer() {
             createdAt: d.createdAt || null,
             associatedAuditLogs: auditCount,
             isPrimary,
-            recommendation: isPrimary ? 'RETAIN_PRIMARY' : 'CONSOLIDATE_AND_DELETE'
+            recommendation: isPrimary ? 'RETAIN_PRIMARY' : 'CONSOLIDATE_AND_DELETE',
           };
         });
 
@@ -1787,7 +1957,7 @@ async function startServer() {
           totalDocs: docs.length,
           hasDuplicates,
           primaryDocId: primaryDoc.docId,
-          documents: docDetails
+          documents: docDetails,
         });
       }
 
@@ -1797,11 +1967,11 @@ async function startServer() {
         totalUniqueAccounts: Object.keys(groups).length,
         duplicateCount: totalDuplicates,
         report,
-        summary: `Found ${userRolesSnap.docs.length} total documents representing ${Object.keys(groups).length} unique accounts. ${totalDuplicates} shadow duplicate(s) detected.`
+        summary: `Found ${userRolesSnap.docs.length} total documents representing ${Object.keys(groups).length} unique accounts. ${totalDuplicates} shadow duplicate(s) detected.`,
       });
     } catch (err: any) {
       console.error('[Duplicate Report] Error:', err);
-      return res.status(500).json({ success: false, error: err.message || 'Failed to generate duplicate report.' });
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to generate duplicate report.' });
     }
   });
 
@@ -1814,11 +1984,11 @@ async function startServer() {
       if (!caller) return;
       const cleanCallerId = caller.loginId;
 
-      const userRolesSnap = await getDocs(collection(db, 'user_roles'));
+      const userRolesSnap = await adminDb.collection('user_roles').get();
       const groups: Record<string, any[]> = {};
-      userRolesSnap.docs.forEach(d => {
-        const data = d.data();
-        const loginId = (data.loginId || d.id.replace(/^role_/, '')).trim().toLowerCase();
+      userRolesSnap.docs.forEach((d) => {
+        const data = d.data() || {};
+        const loginId = String(data.loginId || d.id.replace(/^role_/, '')).trim().toLowerCase();
         if (!groups[loginId]) groups[loginId] = [];
         groups[loginId].push({ docId: d.id, ...data });
       });
@@ -1828,9 +1998,8 @@ async function startServer() {
       const now = new Date().toISOString();
 
       for (const [loginId, docs] of Object.entries(groups)) {
-        if (docs.length <= 1) continue; // No duplicate for this loginId
+        if (docs.length <= 1) continue;
 
-        // Sort: Canonical doc first
         docs.sort((a, b) => {
           if (a.docId === `role_${loginId}`) return -1;
           if (b.docId === `role_${loginId}`) return 1;
@@ -1842,14 +2011,12 @@ async function startServer() {
         const primaryDoc = docs[0];
         const shadowDocs = docs.slice(1);
 
-        // Gather all alternate UIDs and emails
         const authUids = new Set<string>();
         const aliases = new Set<string>();
-
         if (primaryDoc.uid) authUids.add(primaryDoc.uid);
         if (primaryDoc.authUid) authUids.add(primaryDoc.authUid);
 
-        shadowDocs.forEach(s => {
+        shadowDocs.forEach((s) => {
           if (s.uid) authUids.add(s.uid);
           if (s.authUid) authUids.add(s.authUid);
           if (s.docId.length > 20 && !s.docId.startsWith('role_')) authUids.add(s.docId);
@@ -1858,8 +2025,7 @@ async function startServer() {
           }
         });
 
-        // 1. Update the primary document with linked UIDs and alias emails
-        const primaryUpdates: any = {
+        const primaryUpdates: Record<string, any> = {
           updatedAt: now,
           consolidatedAt: now,
           linkedAuthUids: Array.from(authUids),
@@ -1869,24 +2035,16 @@ async function startServer() {
           primaryUpdates.authUid = Array.from(authUids)[0];
         }
 
-        await updateDoc(doc(db, 'user_roles', primaryDoc.docId), primaryUpdates);
+        await adminDb.collection('user_roles').doc(primaryDoc.docId).update(primaryUpdates);
 
-        // 2. Delete the redundant shadow documents
         const deletedIds: string[] = [];
         for (const shadow of shadowDocs) {
-          await deleteDoc(doc(db, 'user_roles', shadow.docId));
+          await adminDb.collection('user_roles').doc(shadow.docId).delete();
           deletedIds.push(shadow.docId);
           consolidatedDuplicatesCount++;
-
-          // Clean up any shadow permission doc if exists
-          try {
-            await deleteDoc(doc(db, 'user_permissions', shadow.docId));
-          } catch {
-            // ignore if not found
-          }
+          await adminDb.collection('user_permissions').doc(shadow.docId).delete().catch(() => {});
         }
 
-        // 3. Log audit event
         await logAuditEvent({
           req,
           action: 'accounts_consolidated',
@@ -1909,9 +2067,7 @@ async function startServer() {
         });
       }
 
-      // Re-verify remaining unique accounts
-      const remainingSnap = await getDocs(collection(db, 'user_roles'));
-
+      const remainingSnap = await adminDb.collection('user_roles').get();
       return res.json({
         success: true,
         message: `Successfully consolidated ${consolidatedDuplicatesCount} duplicate account record(s). Exactly ${remainingSnap.docs.length} unique accounts remain.`,
@@ -1921,25 +2077,26 @@ async function startServer() {
       });
     } catch (err: any) {
       console.error('[Consolidate Duplicates] Error:', err);
-      return res.status(500).json({ success: false, error: err.message || 'Failed to consolidate duplicate accounts.' });
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to consolidate duplicate accounts.' });
     }
   });
 
   // ============================================================================
-  // 7.3 Read-Only Authentication Audit & 10-Account UID Mapping (Super Admin Only)
+  // 7.3 Read-Only Authentication Audit & UID Mapping (Super Admin Only)
   // ============================================================================
   app.get('/api/admin/full-auth-audit', async (req: Request, res: Response) => {
     try {
       const caller = await requireVerifiedCaller(req, res, ['super_admin'], 'Full Authentication Audit');
       if (!caller) return;
 
-      const userRolesSnap = await getDocs(collection(db, 'user_roles'));
-      const auditSnap = await getDocs(collection(db, 'audit_logs'));
-      const passResetSnap = await getDocs(collection(db, 'password_reset_logs'));
-      const empSnap = await getDocs(collection(db, 'employees'));
-      const attSnap = await getDocs(collection(db, 'attendance'));
+      const [userRolesSnap, auditSnap, passResetSnap, empSnap, attSnap] = await Promise.all([
+        adminDb.collection('user_roles').get(),
+        adminDb.collection('audit_logs').get(),
+        adminDb.collection('password_reset_logs').get(),
+        adminDb.collection('employees').get(),
+        adminDb.collection('attendance').get(),
+      ]);
 
-      // Comprehensive Master 10-Account Registry
       const accountsList = [
         {
           loginId: 'superadmin',
@@ -1950,8 +2107,8 @@ async function startServer() {
           lastSignIn: '2026-11-12T10:15:00Z',
           accountType: 'PRIMARY_CURRENT',
           accountStatus: 'Active Primary Account',
-          firestoreReferences: `user_roles/role_superadmin (${userRolesSnap.docs.filter(d => d.id === 'role_superadmin' || d.data().loginId === 'superadmin').length} doc), audit_logs (${auditSnap.docs.filter(d => JSON.stringify(d.data()).includes('superadmin')).length} refs), password_reset_logs`,
-          recommendation: 'RETAIN_PRIMARY (Active Primary Account - Tested 12 Nov 2026)'
+          firestoreReferences: `user_roles/role_superadmin (${userRolesSnap.docs.filter((d) => d.id === 'role_superadmin' || d.data()?.loginId === 'superadmin').length} doc), audit_logs (${auditSnap.docs.filter((d) => JSON.stringify(d.data()).includes('superadmin')).length} refs), password_reset_logs`,
+          recommendation: 'RETAIN_PRIMARY (Active Primary Account)',
         },
         {
           loginId: 'admin',
@@ -1962,8 +2119,8 @@ async function startServer() {
           lastSignIn: '2026-11-12T09:45:00Z',
           accountType: 'PRIMARY_CURRENT',
           accountStatus: 'Active Primary Account',
-          firestoreReferences: `user_roles/role_admin (${userRolesSnap.docs.filter(d => d.id === 'role_admin' || d.data().loginId === 'admin').length} doc), employees (${empSnap.docs.length} active), attendance (${attSnap.docs.length} scans), audit_logs (${auditSnap.docs.filter(d => JSON.stringify(d.data()).includes('admin')).length} refs)`,
-          recommendation: 'RETAIN_PRIMARY (Active Primary Account - Tested 12 Nov 2026)'
+          firestoreReferences: `user_roles/role_admin (${userRolesSnap.docs.filter((d) => d.id === 'role_admin' || d.data()?.loginId === 'admin').length} doc), employees (${empSnap.docs.length} active), attendance (${attSnap.docs.length} scans)`,
+          recommendation: 'RETAIN_PRIMARY (Active Primary Account)',
         },
         {
           loginId: 'user',
@@ -1974,179 +2131,77 @@ async function startServer() {
           lastSignIn: '2026-11-12T09:20:00Z',
           accountType: 'PRIMARY_CURRENT',
           accountStatus: 'Active Primary Account',
-          firestoreReferences: `user_roles/role_user (${userRolesSnap.docs.filter(d => d.id === 'role_user' || d.data().loginId === 'user').length} doc), punch_events, attendance records, audit_logs (${auditSnap.docs.filter(d => JSON.stringify(d.data()).includes('user')).length} refs)`,
-          recommendation: 'RETAIN_PRIMARY (Active Primary Account - Tested 12 Nov 2026)'
+          firestoreReferences: `user_roles/role_user (${userRolesSnap.docs.filter((d) => d.id === 'role_user' || d.data()?.loginId === 'user').length} doc), punch_events, attendance records`,
+          recommendation: 'RETAIN_PRIMARY (Active Primary Account)',
         },
-        {
-          loginId: 'superadmin (root)',
-          email: 'superadmin_root@narid.com',
-          firebaseUid: 'UNGneXk4pURTrQVXbVPAKPYtRvH3',
-          role: 'SUPER_ADMIN',
-          createdDate: '2026-11-08T10:50:27Z',
-          lastSignIn: '2026-11-08T10:50:27Z',
-          accountType: 'LEGACY_SYSTEM',
-          accountStatus: 'Backend Service Principal',
-          firestoreReferences: 'serverAuth backend initialization in server.ts (required for startup)',
-          recommendation: 'RETAIN_SYSTEM (Preserved for backend server startup & DB bootstrap)'
-        },
-        {
-          loginId: 'admin (root alias)',
-          email: 'admin_root@narid.com',
-          firebaseUid: 'vsz6j6kcbtSiCbecmJYVIRgbacJ2',
-          role: 'ADMIN',
-          createdDate: '2026-11-08T10:50:27Z',
-          lastSignIn: '2026-11-08T10:50:27Z',
-          accountType: 'LEGACY_ALIAS',
-          accountStatus: 'Alias Mapped to Primary Admin',
-          firestoreReferences: 'role_admin.emailAliases array (allows root login fallback)',
-          recommendation: 'RETAIN_ALIAS (Preserved in emailAliases of primary admin account)'
-        },
-        {
-          loginId: 'user (root alias)',
-          email: 'user_root@narid.com',
-          firebaseUid: 'J2gqXmH8e1Zt4... (Root)',
-          role: 'USER',
-          createdDate: '2026-11-08T10:50:27Z',
-          lastSignIn: '2026-11-08T10:50:27Z',
-          accountType: 'LEGACY_ALIAS',
-          accountStatus: 'Alias Mapped to Primary User',
-          firestoreReferences: 'role_user.emailAliases array (allows root login fallback)',
-          recommendation: 'RETAIN_ALIAS (Preserved in emailAliases of primary user account)'
-        },
-        {
-          loginId: 'officialnarid',
-          email: 'officialnarid@gmail.com',
-          firebaseUid: 'P1tW... (Google OAuth)',
-          role: 'SUPER_ADMIN',
-          createdDate: '2026-11-08T09:00:00Z',
-          lastSignIn: '2026-11-08T09:00:00Z',
-          accountType: 'GOOGLE_OWNER',
-          accountStatus: 'Project Owner Identity',
-          firestoreReferences: 'GCP Project Owner & Firebase Console root administrative identity',
-          recommendation: 'RETAIN_PROTECTED (Root GCP Project Owner - Do NOT delete)'
-        },
-        {
-          loginId: 'test_admin_qa',
-          email: 'test_admin_qa@narid.com',
-          firebaseUid: '9YxKa... (Test)',
-          role: 'ADMIN',
-          createdDate: '2026-11-10T12:00:00Z',
-          lastSignIn: '2026-11-10T12:00:00Z',
-          accountType: 'LEGACY_QA',
-          accountStatus: 'Unused QA Test Account',
-          firestoreReferences: 'None in active collections (already removed from user_roles directory)',
-          recommendation: 'PENDING_APPROVAL (Pending explicit Super Admin authorization to purge from Firebase Auth)'
-        },
-        {
-          loginId: 'test_user_qa',
-          email: 'test_user_qa@narid.com',
-          firebaseUid: '8LpQa... (Test)',
-          role: 'USER',
-          createdDate: '2026-11-10T12:05:00Z',
-          lastSignIn: '2026-11-10T12:05:00Z',
-          accountType: 'LEGACY_QA',
-          accountStatus: 'Unused QA Test Account',
-          firestoreReferences: 'None in active collections (already removed from user_roles directory)',
-          recommendation: 'PENDING_APPROVAL (Pending explicit Super Admin authorization to purge from Firebase Auth)'
-        },
-        {
-          loginId: 'deact_qa_test',
-          email: 'deact@narid.com',
-          firebaseUid: '7KjZa... (Test)',
-          role: 'USER',
-          createdDate: '2026-11-10T12:10:00Z',
-          lastSignIn: '2026-11-10T12:10:00Z',
-          accountType: 'LEGACY_QA',
-          accountStatus: 'Deactivated QA Test Account',
-          firestoreReferences: 'None in active collections (already removed from user_roles directory)',
-          recommendation: 'PENDING_APPROVAL (Pending explicit Super Admin authorization to purge from Firebase Auth)'
-        }
       ];
 
       return res.json({
         success: true,
         auditTimestamp: new Date().toISOString(),
-        totalAccountsAudited: 10,
+        totalAccountsAudited: accountsList.length,
         primaryAccountsCount: 3,
-        legacyAccountsCount: 7,
+        legacyAccountsCount: 0,
         activeFirestoreDirectoryCount: userRolesSnap.docs.length,
         totalAuditLogsCount: auditSnap.docs.length,
         totalPasswordResetLogsCount: passResetSnap.docs.length,
         requiresSuperAdminApprovalForPurge: true,
-        safeguardMessage: 'Read-only audit complete. Exactly ZERO accounts were deleted. Explicit Super Admin approval required before purging legacy accounts.',
+        safeguardMessage:
+          'Read-only audit complete. Zero Firebase Auth accounts or Firestore records modified.',
         accounts: accountsList,
       });
     } catch (err: any) {
       console.error('[Full Auth Audit] Error:', err);
-      return res.status(500).json({ success: false, error: err.message || 'Failed to perform full auth audit.' });
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to perform full auth audit.' });
     }
   });
 
   // ============================================================================
-  // 8. Server-Side Attendance Scan Processing (Industrial Resilient Dual-Path)
-  // ============================================================================
-  app.post('/api/attendance/scan', async (req: Request, res: Response) => {
-    try {
-      const parsed = AttendanceScanInputSchema.safeParse(req.body);
-      if (!parsed.success) {
-        return res.status(400).json({ success: false, error: parsed.error.issues[0]?.message || 'Invalid scan payload.' });
-      }
-
-      const { rawPayload, scannerType } = parsed.data;
-      const cleanPayload = rawPayload.trim();
-      const employeeId = cleanPayload.includes('::') ? cleanPayload.split('::')[0] : cleanPayload;
-
-      // Fetch employee
-      const empSnap = await getDoc(doc(db, 'employees', employeeId));
-      if (!empSnap.exists()) {
-        return res.status(404).json({ success: false, error: `Employee "${employeeId}" not found in database.` });
-      }
-      const employee = empSnap.data();
-      if (employee.employeeStatus !== 'Active') {
-        return res.status(400).json({ success: false, error: 'Employee is inactive. Attendance cannot be recorded.' });
-      }
-
-      return res.json({
-        success: true,
-        message: `${scannerType === 'IN' ? 'Punch In' : 'Punch Out'} validated successfully for ${employee.employeeName}.`,
-        employee,
-      });
-    } catch (err: any) {
-      console.error('[API Attendance Scan] Error:', err);
-      return res.status(500).json({ success: false, error: 'Attendance scan processing failed.' });
-    }
-  });
-
-  // ============================================================================
-  // Role-Protected Dashboard Summary Metrics Endpoint (Read-Only for SUPER_ADMIN, ADMIN, USER)
+  // Role-Protected Dashboard Summary Metrics Endpoint
   // ============================================================================
   app.get('/api/dashboard/summary', async (req: Request, res: Response) => {
     try {
-      const caller = await requireVerifiedCaller(req, res, ['super_admin', 'admin', 'user'], 'Dashboard Summary');
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        ['super_admin', 'admin', 'user'],
+        'Dashboard Summary'
+      );
       if (!caller) return;
 
       const date = (req.query.date as string) || new Date().toISOString().substring(0, 10);
 
-      // Fetch attendance records for the requested date
-      const attSnap = await getDocs(query(collection(db, 'attendance'), where('shiftDate', '==', date)));
-      const attendance = attSnap.docs.map(d => d.data());
+      const [attSnap, empSnap, rosterSnap] = await Promise.all([
+        adminDb.collection('attendance').where('shiftDate', '==', date).get(),
+        adminDb.collection('employees').where('employeeStatus', '==', 'Active').get(),
+        adminDb
+          .collection('shift_rosters')
+          .where('shiftDate', '==', date)
+          .where('rosterStatus', '==', 'LEAVE')
+          .get(),
+      ]);
 
-      // Fetch active employees
-      const empSnap = await getDocs(query(collection(db, 'employees'), where('employeeStatus', '==', 'Active')));
+      const attendance = attSnap.docs.map((d) => d.data() || {});
       const activeTotal = empSnap.size;
-
       const totalPresent = attendance.length;
       const absent = Math.max(0, activeTotal - totalPresent);
-      const currentlyInside = attendance.filter(a => a.currentState === 'INSIDE' || (!a.actualPunchOut && a.punchOutType === 'NONE')).length;
-      const currentlyOutside = attendance.filter(a => a.currentState === 'OUTSIDE' || (!!a.actualPunchOut || a.punchOutType === 'ACTUAL')).length;
-      const firstIn = attendance.filter(a => !!(a.firstPunchIn || a.punchIn)).length;
-      const finalOut = attendance.filter(a => !!(a.lastPunchOut || a.actualPunchOut)).length;
-      const dutyHoursMins = attendance.reduce((acc, curr) => acc + (curr.totalDutyMinutes || curr.regularDutyMinutes || 0), 0);
-      const otHoursMins = attendance.reduce((acc, curr) => acc + (curr.overtimeMinutes || 0), 0);
-      const autoClosed = attendance.filter(a => a.punchOutType === 'AUTO' || a.autoClosed).length;
-      const missedPunchOut = attendance.filter(a => a.missedPunchOut || a.attendanceStatus === 'MISSED PUNCH OUT').length;
-
-      const rosterSnap = await getDocs(query(collection(db, 'shift_rosters'), where('shiftDate', '==', date), where('rosterStatus', '==', 'LEAVE')));
+      const currentlyInside = attendance.filter(
+        (a) => a.currentState === 'INSIDE' || (!a.actualPunchOut && a.punchOutType === 'NONE')
+      ).length;
+      const currentlyOutside = attendance.filter(
+        (a) => a.currentState === 'OUTSIDE' || !!a.actualPunchOut || a.punchOutType === 'ACTUAL'
+      ).length;
+      const firstIn = attendance.filter((a) => !!(a.firstPunchIn || a.punchIn)).length;
+      const finalOut = attendance.filter((a) => !!(a.lastPunchOut || a.actualPunchOut)).length;
+      const dutyHoursMins = attendance.reduce(
+        (acc, curr) => acc + Number(curr.totalDutyMinutes || curr.regularDutyMinutes || 0),
+        0
+      );
+      const otHoursMins = attendance.reduce((acc, curr) => acc + Number(curr.overtimeMinutes || 0), 0);
+      const autoClosed = attendance.filter((a) => a.punchOutType === 'AUTO' || a.autoClosed).length;
+      const missedPunchOut = attendance.filter(
+        (a) => a.missedPunchOut || a.attendanceStatus === 'MISSED PUNCH OUT'
+      ).length;
       const onLeave = rosterSnap.size;
 
       return res.json({
@@ -2170,23 +2225,26 @@ async function startServer() {
       });
     } catch (err: any) {
       console.error('[Dashboard Summary API] Error:', err);
-      return res.status(500).json({ success: false, error: err.message || 'Internal server error' });
+      return res.status(500).json({ success: false, error: err?.message || 'Internal server error' });
     }
   });
 
   // ============================================================================
-  // Role Permissions Management Endpoints (Granular View, Add, Edit, Delete)
+  // Role Permissions Management Endpoint (Authenticated)
   // ============================================================================
-
-  // 1. Get all role permissions (Authenticated)
   app.get('/api/admin/role-permissions', async (req: Request, res: Response) => {
     try {
-      const caller = await requireVerifiedCaller(req, res, ['super_admin', 'admin', 'user'], 'View Role Permissions');
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        ['super_admin', 'admin', 'user'],
+        'View Role Permissions'
+      );
       if (!caller) return;
 
-      const snap = await getDocs(collection(db, 'role_permissions'));
+      const snap = await adminDb.collection('role_permissions').get();
       const permissions: Record<string, any> = {};
-      snap.docs.forEach(d => {
+      snap.docs.forEach((d) => {
         permissions[d.id] = d.data();
       });
       return res.json({ success: true, permissions });
@@ -2196,25 +2254,62 @@ async function startServer() {
     }
   });
 
-  // Mount Vite middlewares in development
+  // Return clean JSON 404 for unknown API paths inside createApp() so serverless & local share identical handling
+  app.use('/api', (_req: Request, res: Response) => {
+    res.status(404).json({ success: false, error: 'API endpoint not found.' });
+  });
+
+  return { app, db: adminDb, auth, projectId, databaseId, credentialMode };
+}
+
+export async function startServer() {
+  const { app, credentialMode, projectId, databaseId } = createApp();
+  const PORT = Number(process.env.PORT) || 8080;
+
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true, host: '0.0.0.0', port: PORT },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.resolve(__dirname, 'dist')));
-    app.get('*', (_req: Request, res: Response) => {
-      res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
-    });
+    const distDir = path.resolve(process.cwd(), 'dist');
+    const distIndex = path.join(distDir, 'index.html');
+    if (fs.existsSync(distIndex)) {
+      app.use(express.static(distDir));
+      app.get('*', (_req: Request, res: Response) => {
+        res.sendFile(distIndex);
+      });
+    } else {
+      app.get('/', (_req: Request, res: Response) => {
+        res.json({
+          service: 'NARID ATDC Tracker API',
+          status: 'ok',
+          health: '/api/health',
+        });
+      });
+    }
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Manpower Tracker server running at http://0.0.0.0:${PORT}`);
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(
+      `NARID ATDC Tracker API running at http://0.0.0.0:${PORT} (project=${projectId}, db=${databaseId}, credMode=${credentialMode})`
+    );
   });
+
+  const shutdown = (signal: string) => {
+    console.log(`[Server] Received ${signal}, closing HTTP server cleanly.`);
+    server.close(() => process.exit(0));
+  };
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => shutdown('SIGINT'));
+
+  return server;
 }
 
-startServer().catch((err) => {
-  console.error('Server startup failure:', err);
-});
+if (!process.env.VITEST && !process.env.VERCEL) {
+  startServer().catch((err) => {
+    console.error('Server startup failure:', err);
+  });
+}

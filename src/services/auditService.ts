@@ -1,4 +1,5 @@
 import { auth } from '../firebase';
+import { apiFetchJson, apiUrl, isApiBaseUsableForCurrentOrigin } from '../config/api';
 import { AuditDeletionRecord, AuditLog, LoginHistoryEntry } from '../types';
 
 export async function getAuthHeaders(extraHeaders?: Record<string, string>): Promise<Record<string, string>> {
@@ -46,11 +47,11 @@ export interface ServerAuditEventPayload {
 }
 
 export async function sendServerAuditEvent(payload: ServerAuditEventPayload): Promise<void> {
-  if (!auth.currentUser) return;
+  if (!auth.currentUser || !isApiBaseUsableForCurrentOrigin()) return;
   try {
     const headers = await getAuthHeaders();
     if (!headers.Authorization) return;
-    await fetch('/api/audit/event', {
+    await fetch(apiUrl('/api/audit/event'), {
       method: 'POST',
       headers,
       body: JSON.stringify({
@@ -117,12 +118,11 @@ export async function fetchAuditLogs(filters: AuditQueryFilters = {}): Promise<A
     }
   });
   const headers = await getAuthHeaders();
-  const res = await fetch(`/api/audit/logs?${params.toString()}`, { headers });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to fetch enterprise audit logs.');
-  }
-  return data as AuditLogsResponse;
+  return apiFetchJson<AuditLogsResponse>(
+    `/api/audit/logs?${params.toString()}`,
+    { headers },
+    'Failed to fetch enterprise audit logs.'
+  );
 }
 
 export async function fetchLoginHistory(filters: {
@@ -138,22 +138,22 @@ export async function fetchLoginHistory(filters: {
     }
   });
   const headers = await getAuthHeaders();
-  const res = await fetch(`/api/audit/login-history?${params.toString()}`, { headers });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to load login history.');
-  }
-  return (data.entries || []) as LoginHistoryEntry[];
+  const data = await apiFetchJson<{ success: boolean; entries?: LoginHistoryEntry[] }>(
+    `/api/audit/login-history?${params.toString()}`,
+    { headers },
+    'Failed to load login history.'
+  );
+  return data.entries || [];
 }
 
 export async function fetchAuditDeletions(): Promise<AuditDeletionRecord[]> {
   const headers = await getAuthHeaders();
-  const res = await fetch('/api/audit/deletions', { headers });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to load permanent deletion ledger.');
-  }
-  return (data.deletions || []) as AuditDeletionRecord[];
+  const data = await apiFetchJson<{ success: boolean; deletions?: AuditDeletionRecord[] }>(
+    '/api/audit/deletions',
+    { headers },
+    'Failed to load permanent deletion ledger.'
+  );
+  return data.deletions || [];
 }
 
 export async function toggleAuditImportant(
@@ -162,28 +162,28 @@ export async function toggleAuditImportant(
   reviewNote?: string
 ): Promise<void> {
   const headers = await getAuthHeaders();
-  const res = await fetch(`/api/audit/logs/${encodeURIComponent(id)}/important`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ isImportant, reviewNote }),
-  });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to update importance status.');
-  }
+  await apiFetchJson(
+    `/api/audit/logs/${encodeURIComponent(id)}/important`,
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ isImportant, reviewNote }),
+    },
+    'Failed to update importance status.'
+  );
 }
 
 export async function archiveAuditLog(id: string, reviewNote?: string): Promise<void> {
   const headers = await getAuthHeaders();
-  const res = await fetch(`/api/audit/logs/${encodeURIComponent(id)}/archive`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ reviewNote }),
-  });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to archive audit log.');
-  }
+  await apiFetchJson(
+    `/api/audit/logs/${encodeURIComponent(id)}/archive`,
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ reviewNote }),
+    },
+    'Failed to archive audit log.'
+  );
 }
 
 export interface LogDependencyReview {
@@ -200,12 +200,11 @@ export interface LogDependencyReview {
 
 export async function reviewAuditLogDependencies(id: string): Promise<LogDependencyReview> {
   const headers = await getAuthHeaders();
-  const res = await fetch(`/api/audit/logs/${encodeURIComponent(id)}/review-dependencies`, { headers });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to review audit log dependencies.');
-  }
-  return data as LogDependencyReview;
+  return apiFetchJson<LogDependencyReview>(
+    `/api/audit/logs/${encodeURIComponent(id)}/review-dependencies`,
+    { headers },
+    'Failed to review audit log dependencies.'
+  );
 }
 
 export async function controlledDeleteAuditLog(
@@ -213,16 +212,15 @@ export async function controlledDeleteAuditLog(
   payload: { reason: string; confirmLogId: string; superAdminConfirmed: boolean }
 ): Promise<{ deletionId: string; message: string }> {
   const headers = await getAuthHeaders();
-  const res = await fetch(`/api/audit/logs/${encodeURIComponent(id)}/controlled-delete`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to execute controlled deletion.');
-  }
-  return data;
+  return apiFetchJson<{ deletionId: string; message: string }>(
+    `/api/audit/logs/${encodeURIComponent(id)}/controlled-delete`,
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    },
+    'Failed to execute controlled deletion.'
+  );
 }
 
 export interface CleanupAccountDependency {
@@ -267,12 +265,11 @@ export interface AccountCleanupAuditResponse {
 
 export async function fetchAccountCleanupAudit(): Promise<AccountCleanupAuditResponse> {
   const headers = await getAuthHeaders();
-  const res = await fetch('/api/admin/account-cleanup-audit', { headers });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to run cross-collection account cleanup audit.');
-  }
-  return data as AccountCleanupAuditResponse;
+  return apiFetchJson<AccountCleanupAuditResponse>(
+    '/api/admin/account-cleanup-audit',
+    { headers },
+    'Failed to run cross-collection account cleanup audit.'
+  );
 }
 
 export async function approveAccountCleanup(payload: {
@@ -281,14 +278,13 @@ export async function approveAccountCleanup(payload: {
   confirmEmail: string;
 }): Promise<{ success: boolean; message: string; cliSnippet: string; consoleUrl: string }> {
   const headers = await getAuthHeaders();
-  const res = await fetch('/api/admin/account-cleanup/approve', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to approve account cleanup.');
-  }
-  return data;
+  return apiFetchJson(
+    '/api/admin/account-cleanup/approve',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    },
+    'Failed to approve account cleanup.'
+  );
 }

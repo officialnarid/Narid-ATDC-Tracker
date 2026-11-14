@@ -11,13 +11,13 @@ import {
 import { getEmployees } from './services/employeeService';
 import { 
   getUserProfileByEmail, 
-  getUserProfileByLoginId,
   getStoredActiveUser,
   logoutUser, 
   getDefaultTabForRole, 
   isModuleAllowedForUser, 
-  seedDefaultUserRoles
 } from './services/authService';
+import { apiUrl, isApiBaseUsableForCurrentOrigin, safeParseJsonResponse } from './config/api';
+import { getAuthHeaders } from './services/auditService';
 import { Employee, Floor, Section, Department, Shift, UserRoleRecord } from './types';
 
 // Components
@@ -353,21 +353,32 @@ export default function App() {
 
   // Periodic account status and session validity verification
   useEffect(() => {
-    if (!currentUserRole?.loginId) return;
-    const checkSession = () => {
-      fetch('/api/auth/verify-session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ loginId: currentUserRole.loginId, userId: currentUserRole.id }),
-      })
-        .then(res => res.json())
-        .then(data => {
-          if (data && data.success === false) {
-            console.warn('[Session Guard] Session revoked or account deactivated.');
-            handleLogout('session_expired');
-          }
-        })
-        .catch(() => {});
+    if (!currentUserRole?.loginId || !auth.currentUser) return;
+    const checkSession = async () => {
+      if (!auth.currentUser || !isApiBaseUsableForCurrentOrigin()) return;
+      try {
+        const headers = await getAuthHeaders();
+        const res = await fetch(apiUrl('/api/auth/verify-session'), {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ loginId: currentUserRole.loginId, userId: currentUserRole.id }),
+        });
+        if (res.status === 401) {
+          console.warn('[Session Guard] Token rejected or revoked.');
+          handleLogout('session_expired');
+          return;
+        }
+        const parsed = await safeParseJsonResponse<{ success?: boolean }>(
+          res,
+          'POST /api/auth/verify-session'
+        );
+        if (!parsed.isHtmlOrNonJson && parsed.data && parsed.data.success === false) {
+          console.warn('[Session Guard] Session revoked or account deactivated.');
+          handleLogout('session_expired');
+        }
+      } catch {
+        // Transient network hiccup ignored until next check
+      }
     };
     const timer = setInterval(checkSession, 30000);
     return () => clearInterval(timer);
@@ -590,7 +601,7 @@ export default function App() {
               )}
 
               {currentTab === 'audit_logs' && isModuleAllowedForUser(currentUserRole, 'audit_logs') && (
-                (currentUserRole.role?.toUpperCase() === 'SUPER_ADMIN' || currentUserRole.loginId?.toLowerCase() === 'superadmin') ? (
+                currentUserRole.role?.toUpperCase() === 'SUPER_ADMIN' ? (
                   <AuditLogsManagement currentUserRole={currentUserRole} />
                 ) : (
                   <UnauthorizedAccess
@@ -602,7 +613,7 @@ export default function App() {
               )}
 
               {currentTab === 'security_management' && isModuleAllowedForUser(currentUserRole, 'security_management') && (
-                (currentUserRole.role?.toUpperCase() === 'SUPER_ADMIN' || currentUserRole.loginId?.toLowerCase() === 'superadmin') ? (
+                currentUserRole.role?.toUpperCase() === 'SUPER_ADMIN' ? (
                   <SecurityManagement currentUserRole={currentUserRole} />
                 ) : (
                   <UnauthorizedAccess

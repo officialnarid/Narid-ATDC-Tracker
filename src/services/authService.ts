@@ -8,19 +8,24 @@ import {
   browserSessionPersistence,
   User as FirebaseUser
 } from 'firebase/auth';
-import { 
-  collection, 
-  doc, 
+import {
+  collection,
+  doc,
   getDoc,
-  getDocs, 
-  setDoc, 
-  updateDoc,
-  deleteDoc,
-  query, 
-  where 
+  getDocs,
+  query,
+  where,
 } from 'firebase/firestore';
-import { auth, db, sanitizeFirestoreData } from '../firebase';
-import firebaseConfig from '../../firebase-applet-config.json';
+import { auth, db } from '../firebase';
+import {
+  API_BASE_URL,
+  apiFetchJson,
+  apiUrl,
+  assertApiBaseConfigured,
+  executeApiFetch,
+  isApiBaseUsableForCurrentOrigin,
+  safeParseJsonResponse,
+} from '../config/api';
 import { UserRoleRecord, UserRoleType } from '../types';
 import { NavItem } from '../components/Sidebar';
 import { getAuthHeaders, sendServerAuditEvent } from './auditService';
@@ -36,8 +41,6 @@ export interface LoginAuthError extends Error {
   cooldownSeconds?: number;
   firebaseAbuseProtection?: boolean;
 }
-
-export const INITIAL_DEFAULT_PASSWORD = 'Narid@12345';
 
 // Default initial industrial user accounts (canonical *@narid.com kept active)
 export const DEFAULT_ACCOUNTS: Omit<UserRoleRecord, 'id' | 'createdAt' | 'updatedAt'>[] = [
@@ -85,76 +88,34 @@ export const DEFAULT_ACCOUNTS: Omit<UserRoleRecord, 'id' | 'createdAt' | 'update
   },
 ];
 
-// Seed default role records into Firestore and securely ensure accounts exist
+// Backend Admin SDK handles authoritative user_roles initialization on startup.
 export async function seedDefaultUserRoles(): Promise<void> {
-  try {
-    // 1. Trigger backend Admin SDK provisioning if available
-    try {
-      fetch('/api/admin/provision-accounts', { method: 'POST' }).catch(() => {});
-    } catch {
-      // Backend provisioning optional if running client-only
-    }
-
-    // 2. Synchronize Firestore user_roles documents strictly onto canonical IDs
-    const now = new Date().toISOString();
-
-    for (const acc of DEFAULT_ACCOUNTS) {
-      const id = `role_${acc.loginId}`;
-      const docRef = doc(db, 'user_roles', id);
-      const snap = await getDoc(docRef);
-
-      if (!snap.exists()) {
-        const record: UserRoleRecord = {
-          ...acc,
-          id,
-          createdAt: now,
-          updatedAt: now,
-        };
-        await setDoc(docRef, sanitizeFirestoreData(record));
-      } else {
-        const existing = snap.data() as UserRoleRecord & { dashboardAccessMigratedV1?: boolean };
-        const existingModules = Array.isArray(existing.modulesAllowed) ? existing.modulesAllowed : acc.modulesAllowed;
-        const nextModules =
-          acc.loginId === 'user' && !existing.dashboardAccessMigratedV1 && !existingModules.includes('dashboard')
-            ? ['dashboard', ...existingModules]
-            : existingModules;
-
-        const updatePayload: Record<string, any> = {
-          loginId: acc.loginId,
-          role: acc.role,
-          name: existing.name || acc.name,
-          status: existing.status || 'Active',
-          modulesAllowed: nextModules,
-          updatedAt: now,
-        };
-        if (acc.loginId === 'user' && !existing.dashboardAccessMigratedV1) {
-          updatePayload.dashboardAccessMigratedV1 = true;
-        }
-        await setDoc(docRef, updatePayload, { merge: true });
-      }
-    }
-  } catch (error) {
-    console.warn('Could not seed default user roles:', error);
-  }
+  return Promise.resolve();
 }
 
 // Fetch user profile from Firestore by loginId (Authoritative Backend & Firestore Synchronization)
 export async function getUserProfileByLoginId(loginId: string): Promise<UserRoleRecord | null> {
   const cleanId = loginId.toLowerCase().trim();
 
-  // 1. Check authoritative backend verify-session endpoint first
-  try {
-    const res = await fetch('/api/auth/verify-session', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ loginId: cleanId }),
-    });
-    const data = await res.json();
-    if (res.ok && data.success && data.profile) {
-      return data.profile as UserRoleRecord;
+  // 1. Check authoritative backend verify-session endpoint when Firebase session exists
+  if (auth.currentUser && isApiBaseUsableForCurrentOrigin()) {
+    try {
+      const headers = await getAuthHeaders();
+      const res = await fetch(apiUrl('/api/auth/verify-session'), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ loginId: cleanId }),
+      });
+      const parsed = await safeParseJsonResponse<{ success?: boolean; profile?: UserRoleRecord }>(
+        res,
+        'POST /api/auth/verify-session'
+      );
+      if (parsed.ok && parsed.data?.profile) {
+        return parsed.data.profile;
+      }
+    } catch {
+      // Fall through to Firestore read lookup
     }
-  } catch (err) {
-    // Network fallback
   }
 
   // 2. Direct Firestore document get
@@ -172,17 +133,6 @@ export async function getUserProfileByLoginId(loginId: string): Promise<UserRole
     console.warn('Direct Firestore profile lookup notice:', err);
   }
 
-  // 3. Fallback to default accounts only if offline (strictly mustChangePassword: false)
-  const def = DEFAULT_ACCOUNTS.find(a => a.loginId.toLowerCase() === cleanId);
-  if (def) {
-    return {
-      ...def,
-      mustChangePassword: false,
-      id: `role_${def.loginId}`,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-  }
   return null;
 }
 
@@ -207,13 +157,7 @@ export async function getAllUserRoles(): Promise<UserRoleRecord[]> {
     console.warn('Error fetching all user roles:', error);
   }
 
-  // Fallback to default accounts
-  return DEFAULT_ACCOUNTS.map(acc => ({
-    ...acc,
-    id: `role_${acc.loginId}`,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  }));
+  return [];
 }
 
 // Resolve Login ID or Email to the single active email in Firestore
@@ -249,29 +193,41 @@ export async function resolveCandidateEmails(input: string): Promise<{ candidate
   return { candidates: [`${lower}@narid.com`] };
 }
 
-// Fetch user profile from Firestore by email
+// Fetch authoritative user profile for signed-in session (strictly UID-verified, zero synthetic fallbacks)
 export async function getUserProfileByEmail(email: string): Promise<UserRoleRecord | null> {
   const cleanEmail = email.toLowerCase().trim();
 
-  // Try extracting login ID from email format (e.g. user_auth123@narid.com or user@narid.com)
-  const extractedLoginId = cleanEmail.split('@')[0].split('_auth')[0];
-  if (extractedLoginId) {
-    const profileByLogin = await getUserProfileByLoginId(extractedLoginId);
-    if (profileByLogin) return profileByLogin;
-  }
+  // 1. Always prefer authoritative backend UID-verified session profile when authenticated
+  if (auth.currentUser) {
+    if (isApiBaseUsableForCurrentOrigin()) {
+      try {
+        const headers = await getAuthHeaders();
+        const res = await fetch(apiUrl('/api/auth/verify-session'), {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({}),
+        });
+        const parsed = await safeParseJsonResponse<{ success?: boolean; profile?: UserRoleRecord }>(
+          res,
+          'POST /api/auth/verify-session'
+        );
+        if (parsed.ok && parsed.data?.profile) {
+          return parsed.data.profile;
+        }
+      } catch {
+        // Fall through to UID-matched Firestore lookup
+      }
+    }
 
-  // Handle aliases
-  if (cleanEmail.includes('superadmin')) {
-    const profile = await getUserProfileByLoginId('superadmin');
-    if (profile) return profile;
-  }
-  if (cleanEmail.includes('admin') && !cleanEmail.includes('superadmin')) {
-    const profile = await getUserProfileByLoginId('admin');
-    if (profile) return profile;
-  }
-  if (cleanEmail.includes('user') || cleanEmail.includes('operator')) {
-    const profile = await getUserProfileByLoginId('user');
-    if (profile) return profile;
+    try {
+      const uidQuery = query(collection(db, 'user_roles'), where('authUid', '==', auth.currentUser.uid));
+      const uidSnap = await getDocs(uidQuery);
+      if (!uidSnap.empty) {
+        return uidSnap.docs[0].data() as UserRoleRecord;
+      }
+    } catch (err) {
+      console.warn('UID-based Firestore profile lookup notice:', err);
+    }
   }
 
   try {
@@ -284,29 +240,7 @@ export async function getUserProfileByEmail(email: string): Promise<UserRoleReco
     console.warn('Failed to fetch user role by email:', err);
   }
 
-  const def = DEFAULT_ACCOUNTS.find(a => a.email.toLowerCase() === cleanEmail);
-  if (def) {
-    return {
-      ...def,
-      mustChangePassword: false,
-      id: `role_${def.loginId}`,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-  }
-
-  return {
-    id: `role_user_${Date.now()}`,
-    loginId: cleanEmail.split('@')[0],
-    name: cleanEmail.split('@')[0].toUpperCase(),
-    email: cleanEmail,
-    role: 'user',
-    status: 'Active',
-    mustChangePassword: false,
-    modulesAllowed: ['dashboard', 'scanner'],
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  };
+  return null;
 }
 
 // Session Persistence Helper
@@ -336,19 +270,27 @@ export async function loginWithLoginIdAndPassword(
 
   // 1. Authenticate against single-source-of-truth backend (Atomic 3-Strike & Rate Limit Guard)
   // Note: passwordInput is sent verbatim without trimming or transformation.
-  const res = await fetch('/api/auth/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      loginId: normalizedLoginId,
-      password: passwordInput,
-    }),
-  });
+  assertApiBaseConfigured();
+  const res = await executeApiFetch(
+    `${API_BASE_URL}/api/auth/login`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        loginId: normalizedLoginId,
+        password: passwordInput,
+      }),
+    },
+    'POST /api/auth/login'
+  );
 
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    const authErr: LoginAuthError = new Error(data.error || 'Invalid password, check again');
-    authErr.code = data.code;
+  const parsed = await safeParseJsonResponse<any>(res, 'POST /api/auth/login');
+  const data = parsed.data || {};
+  if (!parsed.ok) {
+    const authErr: LoginAuthError = new Error(
+      parsed.errorMessage || data.error || 'Invalid password, check again'
+    );
+    authErr.code = data.code || (parsed.isHtmlOrNonJson ? `HTTP_${res.status}_NON_JSON` : undefined);
     authErr.locked = Boolean(data.locked || res.status === 423);
     authErr.warning = Boolean(data.warning);
     authErr.attemptNumber = data.attemptNumber;
@@ -454,21 +396,20 @@ export async function changeInitialPassword(newPassword: string, currentPassword
 
   const headers = await getAuthHeaders();
 
-  const res = await fetch('/api/auth/change-password', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      loginId,
-      currentPassword,
-      newPassword,
-      firebaseAuthUpdatedByClient,
-    }),
-  });
-
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to update password.');
-  }
+  await apiFetchJson(
+    '/api/auth/change-password',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        loginId,
+        currentPassword,
+        newPassword,
+        firebaseAuthUpdatedByClient,
+      }),
+    },
+    'Failed to update password.'
+  );
 
   if (storedUser) {
     storedUser.mustChangePassword = false;
@@ -598,28 +539,27 @@ export async function createUserAccount(data: {
   const headers = await getAuthHeaders();
 
   // Provision through trusted backend single source of truth
-  const res = await fetch('/api/admin/create-user', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      callerLoginId: caller?.loginId || 'superadmin',
-      name: data.name,
-      loginId: cleanId,
-      email: data.email,
-      password: data.password,
-      role: data.role,
-      status: data.status,
-      modulesAllowed: data.modulesAllowed,
-      mustChangePassword: data.mustChangePassword,
-    }),
-  });
+  const resData = await apiFetchJson<{ success: boolean; profile: UserRoleRecord }>(
+    '/api/admin/create-user',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        callerLoginId: caller?.loginId || 'superadmin',
+        name: data.name,
+        loginId: cleanId,
+        email: data.email,
+        password: data.password,
+        role: data.role,
+        status: data.status,
+        modulesAllowed: data.modulesAllowed,
+        mustChangePassword: data.mustChangePassword,
+      }),
+    },
+    'Failed to create user account.'
+  );
 
-  const resData = await res.json();
-  if (!res.ok || !resData.success) {
-    throw new Error(resData.error || 'Failed to create user account.');
-  }
-
-  return resData.profile as UserRoleRecord;
+  return resData.profile;
 }
 
 // Super Admin sets or resets password for any user account (Strict Server-Side Verification)
@@ -646,23 +586,29 @@ export async function adminSetUserPassword(
   const caller = getStoredActiveUser();
   const headers = await getAuthHeaders();
 
-  const res = await fetch('/api/admin/set-user-password', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      callerLoginId: caller?.loginId || 'superadmin',
-      targetLoginId: cleanId,
-      newPassword,
-      mustChangePassword: mustChangePasswordOnLogin,
-      unlockAccount,
-      revokeSessions,
-      ...(currentTargetPassword ? { currentTargetPassword } : {}),
-    }),
-  });
+  assertApiBaseConfigured();
+  const res = await executeApiFetch(
+    apiUrl('/api/admin/set-user-password'),
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        callerLoginId: caller?.loginId || 'superadmin',
+        targetLoginId: cleanId,
+        newPassword,
+        mustChangePassword: mustChangePasswordOnLogin,
+        unlockAccount,
+        revokeSessions,
+        ...(currentTargetPassword ? { currentTargetPassword } : {}),
+      }),
+    },
+    'POST /api/admin/set-user-password'
+  );
 
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    const err: any = new Error(data.error || 'Failed to update password.');
+  const parsed = await safeParseJsonResponse<any>(res, 'POST /api/admin/set-user-password');
+  const data = parsed.data || {};
+  if (!parsed.ok) {
+    const err: any = new Error(parsed.errorMessage || data.error || 'Failed to update password.');
     err.code = data.code;
     err.firebaseAuthSynced = Boolean(data.firebaseAuthSynced);
     err.adminSdkConfigured = data.adminSdkConfigured;
@@ -677,40 +623,38 @@ export async function fetchPasswordResetHistory(): Promise<any[]> {
   const caller = getStoredActiveUser();
   const callerLoginId = caller?.loginId || 'superadmin';
   const headers = await getAuthHeaders();
-  const res = await fetch(`/api/admin/password-reset-history?callerLoginId=${encodeURIComponent(callerLoginId)}`, { headers });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to fetch password reset history.');
-  }
+  const data = await apiFetchJson<{ success: boolean; history?: any[] }>(
+    `/api/admin/password-reset-history?callerLoginId=${encodeURIComponent(callerLoginId)}`,
+    { headers },
+    'Failed to fetch password reset history.'
+  );
   return data.history || [];
 }
 
-
-// Super Admin updates module permissions, role, or status for any user in Firestore
+// Super Admin updates module permissions, role, or status via Admin SDK backend
 export async function updateUserRolePermissions(
   userId: string,
   modulesAllowed: string[],
   role?: UserRoleType,
   status?: 'Active' | 'Inactive'
 ): Promise<void> {
-  const docRef = doc(db, 'user_roles', userId);
-  const payload: any = {
-    modulesAllowed,
-    updatedAt: new Date().toISOString(),
-  };
-  if (role) payload.role = role;
-  if (status) payload.status = status;
-
-  await updateDoc(docRef, sanitizeFirestoreData(payload));
-  await sendServerAuditEvent({
-    action: 'permission_updated',
-    category: 'PERMISSIONS',
-    targetType: 'ACCOUNT',
-    targetId: userId,
-    newValue: { modulesAllowed, role, status },
-    actionSource: 'USER_RIGHTS_MODAL',
-    description: `Updated user access permissions for ${userId}.`,
-  });
+  const caller = getStoredActiveUser();
+  const headers = await getAuthHeaders();
+  await apiFetchJson(
+    '/api/admin/set-user-permissions',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        callerLoginId: caller?.loginId || 'superadmin',
+        targetId: userId,
+        modulesAllowed,
+        ...(role ? { role } : {}),
+        ...(status ? { status } : {}),
+      }),
+    },
+    'Failed to update user access permissions.'
+  );
 }
 
 // Secure User Account Deletion (Super Admin only, calls backend)
@@ -723,20 +667,19 @@ export async function deleteUserRole(userId: string, targetLoginId?: string): Pr
   const callerLoginId = caller?.loginId || 'superadmin';
   const headers = await getAuthHeaders();
 
-  const res = await fetch('/api/admin/delete-user', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      callerLoginId,
-      targetId: userId,
-      targetLoginId: targetLoginId || userId.replace(/^role_/, ''),
-    }),
-  });
-
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to delete user account.');
-  }
+  await apiFetchJson(
+    '/api/admin/delete-user',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        callerLoginId,
+        targetId: userId,
+        targetLoginId: targetLoginId || userId.replace(/^role_/, ''),
+      }),
+    },
+    'Failed to delete user account.'
+  );
 }
 
 export const deleteUserAccount = deleteUserRole;
@@ -778,12 +721,11 @@ export async function fetchDuplicateAccountsReport(): Promise<DuplicateReportRes
   const caller = getStoredActiveUser();
   const callerLoginId = caller?.loginId || 'superadmin';
   const headers = await getAuthHeaders();
-  const res = await fetch(`/api/admin/duplicate-accounts-report?callerLoginId=${encodeURIComponent(callerLoginId)}`, { headers });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to fetch duplicate accounts report.');
-  }
-  return data;
+  return apiFetchJson<DuplicateReportResponse>(
+    `/api/admin/duplicate-accounts-report?callerLoginId=${encodeURIComponent(callerLoginId)}`,
+    { headers },
+    'Failed to fetch duplicate accounts report.'
+  );
 }
 
 export async function consolidateDuplicateAccounts(): Promise<{
@@ -796,16 +738,15 @@ export async function consolidateDuplicateAccounts(): Promise<{
   const caller = getStoredActiveUser();
   const callerLoginId = caller?.loginId || 'superadmin';
   const headers = await getAuthHeaders();
-  const res = await fetch('/api/admin/consolidate-duplicates', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ callerLoginId }),
-  });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to consolidate duplicate accounts.');
-  }
-  return data;
+  return apiFetchJson(
+    '/api/admin/consolidate-duplicates',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ callerLoginId }),
+    },
+    'Failed to consolidate duplicate accounts.'
+  );
 }
 
 // Full 10-Account Master Authentication Audit
@@ -840,10 +781,9 @@ export async function fetchFullAuthAudit(): Promise<FullAuthAuditResponse> {
   const caller = getStoredActiveUser();
   const callerLoginId = caller?.loginId || 'superadmin';
   const headers = await getAuthHeaders();
-  const res = await fetch(`/api/admin/full-auth-audit?callerLoginId=${encodeURIComponent(callerLoginId)}`, { headers });
-  const data = await res.json();
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to fetch full authentication audit.');
-  }
-  return data;
+  return apiFetchJson<FullAuthAuditResponse>(
+    `/api/admin/full-auth-audit?callerLoginId=${encodeURIComponent(callerLoginId)}`,
+    { headers },
+    'Failed to fetch full authentication audit.'
+  );
 }

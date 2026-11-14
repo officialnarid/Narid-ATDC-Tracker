@@ -20,7 +20,8 @@ import {
   AuditLog, 
   Employee 
 } from '../types';
-import { sendServerAuditEvent } from './auditService';
+import { sendServerAuditEvent, getAuthHeaders } from './auditService';
+import { apiFetchJson } from '../config/api';
 
 export const DEFAULT_SETTINGS: SystemSetting = {
   id: 'global',
@@ -412,40 +413,32 @@ export async function loadAuthenticIndustrialManpower(): Promise<{ count: number
   return { count: added };
 }
 
-// Wipe out any mock / dummy attendance records and raw punch logs to ensure 100% clean, original data
-export async function clearAllAttendanceRecords(): Promise<{ deletedAttendance: number; deletedLogs: number }> {
-  let deletedAttendance = 0;
-  let deletedLogs = 0;
-
-  try {
-    const attSnap = await getDocs(collection(db, 'attendance'));
-    for (const d of attSnap.docs) {
-      await deleteDoc(d.ref);
-      deletedAttendance++;
-    }
-
-    const logSnap = await getDocs(collection(db, 'punch_logs'));
-    for (const d of logSnap.docs) {
-      await deleteDoc(d.ref);
-      deletedLogs++;
-    }
-
-    const rosterSnap = await getDocs(collection(db, 'shift_rosters'));
-    for (const d of rosterSnap.docs) {
-      await deleteDoc(d.ref);
-    }
-
-    await recordAuditLog({
-      action: 'CLEAR_ATTENDANCE_RECORDS',
-      newValue: `Cleared ${deletedAttendance} attendance records & ${deletedLogs} punch logs`,
-      actionSource: 'SYSTEM_SETTINGS',
-      reason: 'User requested reset to fresh original attendance state',
-    });
-  } catch (err) {
-    console.error('Error clearing attendance records:', err);
-  }
-
-  return { deletedAttendance, deletedLogs };
+// Wipe out mock / dummy attendance records through authenticated Super Admin backend endpoint
+export async function clearAllAttendanceRecords(
+  confirmPhrase: string = 'CLEAR_ALL_ATTENDANCE'
+): Promise<{ deletedAttendance: number; deletedLogs: number }> {
+  const headers = await getAuthHeaders();
+  const data = await apiFetchJson<{
+    success: boolean;
+    deletedAttendance?: number;
+    deletedLogs?: number;
+  }>(
+    '/api/attendance/clear',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        confirmed: true,
+        confirmPhrase,
+        reason: 'Super Admin requested controlled reset to fresh attendance state',
+      }),
+    },
+    'Failed to clear attendance records.'
+  );
+  return {
+    deletedAttendance: Number(data.deletedAttendance || 0),
+    deletedLogs: Number(data.deletedLogs || 0),
+  };
 }
 
 export const getLines = getFloors;

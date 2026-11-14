@@ -46,7 +46,6 @@ import {
   fetchFullAuthAudit,
   DuplicateReportResponse,
   FullAuthAuditResponse,
-  INITIAL_DEFAULT_PASSWORD
 } from '../services/authService';
 import {
   AccountCleanupAuditResponse,
@@ -83,6 +82,34 @@ const safeStr = (v: any, fallback = ''): string => {
   }
   return String(v);
 };
+
+function generateInitialUserPassword(length: number = 12): string {
+  const upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  const lower = 'abcdefghijkmnopqrstuvwxyz';
+  const digits = '23456789';
+  const symbols = '@#$%&*!';
+  const all = upper + lower + digits + symbols;
+  const pick = (pool: string, byte: number) => pool[byte % pool.length];
+  const bytes = new Uint8Array(Math.max(8, length));
+  window.crypto.getRandomValues(bytes);
+  const chars: string[] = [
+    pick(upper, bytes[0]),
+    pick(lower, bytes[1]),
+    pick(digits, bytes[2]),
+    pick(symbols, bytes[3]),
+  ];
+  for (let i = 4; i < bytes.length; i++) {
+    chars.push(pick(all, bytes[i]));
+  }
+  // Fisher-Yates shuffle using remaining randomness
+  const shuffleBytes = new Uint8Array(chars.length);
+  window.crypto.getRandomValues(shuffleBytes);
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = shuffleBytes[i] % (i + 1);
+    [chars[i], chars[j]] = [chars[j], chars[i]];
+  }
+  return chars.join('');
+}
 
 interface UserRightsProps {
   currentUserRole?: UserRoleRecord | null;
@@ -155,7 +182,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
     loginId: '',
     email: '',
     role: 'admin' as UserRoleType,
-    password: INITIAL_DEFAULT_PASSWORD,
+    password: '',
     status: 'Active' as 'Active' | 'Inactive',
     mustChangePassword: true,
     modulesAllowed: ['dashboard', 'scanner', 'employees', 'history', 'reports'] as string[],
@@ -459,7 +486,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       loginId: '',
       email: '',
       role: 'admin',
-      password: INITIAL_DEFAULT_PASSWORD,
+      password: '',
       status: 'Active',
       mustChangePassword: true,
       modulesAllowed: ['dashboard', 'scanner', 'employees', 'history', 'reports', 'qr_codes'],
@@ -1794,14 +1821,28 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
 
               {/* Password */}
               <div>
-                <label className="block text-xs font-bold text-slate-700 mb-1">
-                  Initial Password *
-                </label>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-bold text-slate-700">
+                    Initial Password *
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCreateFormData({ ...createFormData, password: generateInitialUserPassword() });
+                      setShowCreatePassword(true);
+                    }}
+                    className="inline-flex items-center gap-1 text-[11px] font-semibold text-blue-600 hover:text-blue-700 cursor-pointer"
+                  >
+                    <Sparkles className="w-3 h-3" />
+                    <span>Generate</span>
+                  </button>
+                </div>
                 <div className="relative">
                   <input
                     type={showCreatePassword ? 'text' : 'password'}
                     required
                     minLength={6}
+                    placeholder="Enter initial password (min 6 chars)"
                     value={createFormData.password}
                     onChange={e => setCreateFormData({ ...createFormData, password: e.target.value })}
                     className="w-full text-xs px-3 py-2 pr-10 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono font-medium"
@@ -1814,7 +1855,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                     {showCreatePassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                   </button>
                 </div>
-                <span className="text-[10px] text-slate-400">Default is "Narid@12345" (minimum 6 characters)</span>
+                <span className="text-[10px] text-slate-400">Minimum 6 characters (enter manually or click Generate).</span>
               </div>
 
               <div className="flex items-center gap-6 pt-1">
