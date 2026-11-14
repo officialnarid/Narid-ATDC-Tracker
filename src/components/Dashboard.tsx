@@ -36,6 +36,7 @@ import { formatDateKey, formatMinutes } from '../services/attendanceService';
 import { isModuleAllowedForUser } from '../services/authService';
 import { 
   DashboardCardId, 
+  getPermittedCardIdsForRole,
   isDashboardCardVisible, 
   normalizeUserRole 
 } from '../config/dashboardCardsConfig';
@@ -658,23 +659,14 @@ export const Dashboard: React.FC<DashboardProps> = ({
       </div>
 
       {/*
-        REAL-TIME ATTENDANCE MONITORING CARDS (12 KPIs across 2 rows of 6)
-        Displayed consistently for SUPER_ADMIN, ADMIN, and USER (Read-Only).
+        REAL-TIME ATTENDANCE MONITORING CARDS
+        - SUPER_ADMIN & ADMIN: All 12 KPIs across 2 rows of 6
+        - USER (Read-Only): Strictly 6 permitted KPIs (Active Total, Total Present, Absent, Duty Hours, OT Hours, Missed Punch Out)
       */}
-      <div className="flex flex-col gap-3">
-        {/* Row 1: 6 Cards */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-          {(['active_total', 'total_present', 'currently_inside', 'currently_outside', 'absent', 'on_leave'] as DashboardCardId[]).map(cardId => (
-            renderCard(cardId)
-          ))}
-        </div>
-
-        {/* Row 2: 6 Cards */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-          {(['first_in', 'final_out', 'duty_hours', 'ot_hours', 'auto_closed', 'missed_punch_out'] as DashboardCardId[]).map(cardId => (
-            renderCard(cardId)
-          ))}
-        </div>
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+        {getPermittedCardIdsForRole(verifiedRole).map(cardId => (
+          renderCard(cardId)
+        ))}
       </div>
 
       {/* INDUSTRIAL BREAKDOWN TABLES (Floor, Section, Department, Employee Type) */}

@@ -46,10 +46,19 @@ const ALL_DASHBOARD_CARDS: DashboardCardId[] = [
   'missed_punch_out',
 ];
 
+const USER_DASHBOARD_CARDS: DashboardCardId[] = [
+  'active_total',
+  'total_present',
+  'absent',
+  'duty_hours',
+  'ot_hours',
+  'missed_punch_out',
+];
+
 export const ROLE_CARD_VISIBILITY: Record<'SUPER_ADMIN' | 'ADMIN' | 'USER', DashboardCardId[]> = {
   SUPER_ADMIN: ALL_DASHBOARD_CARDS,
   ADMIN: ALL_DASHBOARD_CARDS,
-  USER: ALL_DASHBOARD_CARDS,
+  USER: USER_DASHBOARD_CARDS,
 };
 
 /**
