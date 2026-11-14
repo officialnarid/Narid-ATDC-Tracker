@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { onAuthStateChanged, signInWithEmailAndPassword, User as FirebaseUser } from 'firebase/auth';
+import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
 import { auth, testConnection } from './firebase';
 import { 
   initializeMasterData, 
@@ -16,8 +16,7 @@ import {
   logoutUser, 
   getDefaultTabForRole, 
   isModuleAllowedForUser, 
-  seedDefaultUserRoles,
-  INITIAL_DEFAULT_PASSWORD
+  seedDefaultUserRoles
 } from './services/authService';
 import { Employee, Floor, Section, Department, Shift, UserRoleRecord } from './types';
 
@@ -38,18 +37,62 @@ import { ShiftManagement } from './components/ShiftManagement';
 import { AttendanceHistory } from './components/AttendanceHistory';
 import { Reports } from './components/Reports';
 import { UserRights } from './components/UserRights';
+import { AuditLogsManagement } from './components/AuditLogsManagement';
+import { SecurityManagement } from './components/SecurityManagement';
 import { SystemSettingsView } from './components/SystemSettings';
 import { UnauthorizedAccess } from './components/UnauthorizedAccess';
 import { RolePermissionRecord, subscribeToAllRolePermissions } from './services/permissionService';
+
+const VALID_TABS: NavItem[] = [
+  'dashboard',
+  'scanner',
+  'employees',
+  'excel_import',
+  'qr_codes',
+  'floors',
+  'sections',
+  'departments',
+  'shifts',
+  'history',
+  'reports',
+  'user_rights',
+  'audit_logs',
+  'security_management',
+  'settings',
+];
+
+function normalizeTabCandidate(raw: string | null | undefined): NavItem | null {
+  if (!raw) return null;
+  const cleaned = raw.trim().replace(/^\/+|\/+$/g, '').replace(/-/g, '_').toLowerCase();
+  if (VALID_TABS.includes(cleaned as NavItem)) {
+    return cleaned as NavItem;
+  }
+  return null;
+}
+
+function getTabFromLocation(): NavItem | null {
+  if (typeof window === 'undefined') return null;
+  const params = new URLSearchParams(window.location.search);
+  const queryTab = normalizeTabCandidate(params.get('tab'));
+  if (queryTab) return queryTab;
+
+  const hashTab = normalizeTabCandidate(window.location.hash.replace(/^#/, ''));
+  if (hashTab) return hashTab;
+
+  const pathTab = normalizeTabCandidate(window.location.pathname.split('/')[1]);
+  if (pathTab) return pathTab;
+
+  return null;
+}
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState<FirebaseUser | null>(null);
   const [currentUserRole, setCurrentUserRole] = useState<UserRoleRecord | null>(null);
   const [isAuthChecking, setIsAuthChecking] = useState<boolean>(true);
 
-  const [currentTab, setCurrentTab] = useState<NavItem>('dashboard');
+  const [currentTab, setCurrentTab] = useState<NavItem>(() => getTabFromLocation() || 'dashboard');
   const [isMobileNavOpen, setIsMobileNavOpen] = useState<boolean>(false);
-  const [isFullscreenDashboard, setIsFullscreenDashboard] = useState<boolean>(false);
+  const [fullscreenTab, setFullscreenTab] = useState<'dashboard' | 'scanner' | null>(null);
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [floors, setFloors] = useState<Floor[]>([]);
   const [sections, setSections] = useState<Section[]>([]);
@@ -65,13 +108,33 @@ export default function App() {
     return () => unsub();
   }, [currentUser]);
 
+  // Synchronize direct URL navigation / browser Back-Forward
+  useEffect(() => {
+    const syncFromUrl = () => {
+      const targetTab = getTabFromLocation();
+      if (targetTab) {
+        setCurrentTab(targetTab);
+      } else {
+        setCurrentTab('dashboard');
+      }
+    };
+    window.addEventListener('popstate', syncFromUrl);
+    window.addEventListener('hashchange', syncFromUrl);
+    return () => {
+      window.removeEventListener('popstate', syncFromUrl);
+      window.removeEventListener('hashchange', syncFromUrl);
+    };
+  }, []);
+
   // Load all master collections (only when authenticated in Firebase Auth)
-  const loadAllMasterData = useCallback(async () => {
+  const loadAllMasterData = useCallback(async (allowSeed: boolean = false) => {
     if (!auth.currentUser) return;
     setIsLoadingMasterData(true);
     try {
       await testConnection();
-      await initializeMasterData();
+      if (allowSeed) {
+        await initializeMasterData();
+      }
 
       const [empsData, flsData, secsData, deptsData, sftsData] = await Promise.all([
         getEmployees(),
@@ -104,9 +167,18 @@ export default function App() {
         try {
           const profile = await getUserProfileByEmail(fbUser.email);
           if (profile && profile.status === 'Active') {
+            try {
+              if (localStorage.getItem('narid_active_user')) {
+                localStorage.setItem('narid_active_user', JSON.stringify(profile));
+              }
+              if (sessionStorage.getItem('narid_active_user')) {
+                sessionStorage.setItem('narid_active_user', JSON.stringify(profile));
+              }
+            } catch {}
             setCurrentUser(fbUser);
             setCurrentUserRole(profile);
-            loadAllMasterData();
+            const isPrivileged = profile.role === 'super_admin' || profile.role === 'admin';
+            loadAllMasterData(isPrivileged);
           } else {
             logoutUser();
             setCurrentUser(null);
@@ -117,40 +189,20 @@ export default function App() {
         }
         setIsAuthChecking(false);
       } else {
-        // Firebase Auth is not signed in
+        // Firebase Auth is not signed in — do NOT issue automatic password-guessing retries.
+        // Clear any stale cached browser metadata and cleanly render the Login screen.
         const stored = getStoredActiveUser();
-        if (stored && stored.loginId) {
-          // Attempt silent session reconnect with Firebase Auth
-          const candidateEmails = [
-            stored.email,
-            `${stored.loginId}@narid.com`,
-            `${stored.loginId}_root@narid.com`
-          ].filter(Boolean);
-
-          let reconnected = false;
-          for (const em of candidateEmails) {
-            try {
-              const res = await signInWithEmailAndPassword(auth, em, INITIAL_DEFAULT_PASSWORD);
-              if (res.user) {
-                reconnected = true;
-                break;
-              }
-            } catch {
-              // Try next candidate
-            }
-          }
-
-          if (!reconnected) {
-            logoutUser();
-            setCurrentUser(null);
-            setCurrentUserRole(null);
-            setIsAuthChecking(false);
-          }
-        } else {
-          setCurrentUser(null);
-          setCurrentUserRole(null);
-          setIsAuthChecking(false);
+        if (stored) {
+          try {
+            localStorage.removeItem('narid_active_user');
+            sessionStorage.removeItem('narid_active_user');
+            localStorage.removeItem('narid_session_id');
+            sessionStorage.removeItem('narid_session_id');
+          } catch {}
         }
+        setCurrentUser(null);
+        setCurrentUserRole(null);
+        setIsAuthChecking(false);
       }
     });
 
@@ -165,39 +217,21 @@ export default function App() {
     const fbUser = auth.currentUser || ({ uid: profile.id, email: profile.email } as any);
     setCurrentUser(fbUser);
     setCurrentUserRole(profile);
-    const destinationTab = getDefaultTabForRole(profile.role);
+    const requestedUrlTab = getTabFromLocation();
+    const destinationTab = requestedUrlTab || getDefaultTabForRole(profile.role);
     setCurrentTab(destinationTab);
-    if (auth.currentUser) {
-      loadAllMasterData();
-    }
-  };
-
-  // Handle logout
-  const handleLogout = async () => {
     try {
-      await logoutUser();
-    } catch (err) {
-      console.error('Logout error:', err);
-    } finally {
-      setCurrentUser(null);
-      setCurrentUserRole(null);
+      window.history.replaceState(null, '', `/${destinationTab}`);
+    } catch {}
+    if (auth.currentUser) {
+      const isPrivileged = profile.role === 'super_admin' || profile.role === 'admin';
+      loadAllMasterData(isPrivileged);
     }
   };
 
-  // Handle safe tab navigation with RBAC permission enforcement
-  const handleSelectTab = (tab: NavItem) => {
-    if (!currentUserRole) return;
-    if (!isModuleAllowedForUser(currentUserRole, tab)) {
-      console.warn(`Access denied for role ${currentUserRole.role} to module ${tab}`);
-      return;
-    }
-    setCurrentTab(tab);
-    setIsMobileNavOpen(false);
-  };
-
-  // Full Screen Dashboard Handlers (Native Fullscreen API with fallback support)
-  const handleEnterFullscreen = async () => {
-    setIsFullscreenDashboard(true);
+  // Full Screen Handlers (Native Fullscreen API with in-app fallback support)
+  const handleEnterFullscreen = useCallback(async (target: 'dashboard' | 'scanner') => {
+    setFullscreenTab(target);
     try {
       if (document.documentElement.requestFullscreen) {
         await document.documentElement.requestFullscreen();
@@ -207,13 +241,13 @@ export default function App() {
         await (document.documentElement as any).msRequestFullscreen();
       }
     } catch (err) {
-      // In-app full width works seamlessly even if browser fullscreen is blocked (e.g. inside iframe)
+      // In-app full screen works seamlessly even if browser fullscreen is blocked (e.g. inside iframe)
       console.info('[Fullscreen] In-app fullscreen active (native API fallback):', err);
     }
-  };
+  }, []);
 
-  const handleExitFullscreen = async () => {
-    setIsFullscreenDashboard(false);
+  const handleExitFullscreen = useCallback(async () => {
+    setFullscreenTab(null);
     try {
       if (
         document.fullscreenElement ||
@@ -232,14 +266,47 @@ export default function App() {
     } catch (err) {
       console.info('[Fullscreen] Exit notice:', err);
     }
-  };
+  }, []);
 
-  const handleToggleFullscreen = () => {
-    if (isFullscreenDashboard) {
+  const handleToggleFullscreen = useCallback((target: 'dashboard' | 'scanner') => {
+    if (fullscreenTab === target) {
       handleExitFullscreen();
     } else {
-      handleEnterFullscreen();
+      handleEnterFullscreen(target);
     }
+  }, [fullscreenTab, handleEnterFullscreen, handleExitFullscreen]);
+
+  // Handle logout
+  const handleLogout = useCallback(async (reason: 'logout' | 'session_expired' = 'logout') => {
+    const safeReason = reason === 'session_expired' ? 'session_expired' : 'logout';
+    await handleExitFullscreen();
+    try {
+      await logoutUser(safeReason);
+    } catch (err) {
+      console.error('Logout error:', err);
+    } finally {
+      setCurrentUser(null);
+      setCurrentUserRole(null);
+      try {
+        window.history.replaceState(null, '', '/');
+      } catch {}
+    }
+  }, [handleExitFullscreen]);
+
+  // Handle safe tab navigation with RBAC permission enforcement
+  const handleSelectTab = (tab: NavItem) => {
+    if (!currentUserRole) return;
+    if (!isModuleAllowedForUser(currentUserRole, tab)) {
+      console.warn(`Access denied for role ${currentUserRole.role} to module ${tab}`);
+      return;
+    }
+    setCurrentTab(tab);
+    setIsMobileNavOpen(false);
+    try {
+      if (window.location.pathname !== `/${tab}`) {
+        window.history.pushState(null, '', `/${tab}`);
+      }
+    } catch {}
   };
 
   // Synchronize layout with browser fullscreenchange and ESC key
@@ -251,13 +318,13 @@ export default function App() {
         (document as any).mozFullScreenElement ||
         (document as any).msFullscreenElement
       );
-      if (!isNativeFs && isFullscreenDashboard) {
-        setIsFullscreenDashboard(false);
+      if (!isNativeFs && fullscreenTab !== null) {
+        setFullscreenTab(null);
       }
     };
 
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && isFullscreenDashboard) {
+      if (e.key === 'Escape' && fullscreenTab !== null) {
         handleExitFullscreen();
       }
     };
@@ -275,14 +342,14 @@ export default function App() {
       document.removeEventListener('MSFullscreenChange', onFullscreenChange);
       window.removeEventListener('keydown', onKeyDown);
     };
-  }, [isFullscreenDashboard]);
+  }, [fullscreenTab, handleExitFullscreen]);
 
-  // Restore sidebar if user navigates away from Dashboard
+  // Restore sidebar and exit fullscreen if user navigates away from the fullscreen tab
   useEffect(() => {
-    if (currentTab !== 'dashboard' && isFullscreenDashboard) {
+    if (fullscreenTab && currentTab !== fullscreenTab) {
       handleExitFullscreen();
     }
-  }, [currentTab, isFullscreenDashboard]);
+  }, [currentTab, fullscreenTab, handleExitFullscreen]);
 
   // Periodic account status and session validity verification
   useEffect(() => {
@@ -297,7 +364,7 @@ export default function App() {
         .then(data => {
           if (data && data.success === false) {
             console.warn('[Session Guard] Session revoked or account deactivated.');
-            handleLogout();
+            handleLogout('session_expired');
           }
         })
         .catch(() => {});
@@ -323,8 +390,8 @@ export default function App() {
     return <Login onLoginSuccess={handleLoginSuccess} />;
   }
 
-  // 2.1 First-Time Login Check -> Require individual password change ONLY on first login or forced reset
-  if (currentUserRole.mustChangePassword === true) {
+  // 2.1 First-Time / Temporary Password Login Check -> Require individual password change when flagged
+  if (currentUserRole.mustChangePassword === true || currentUserRole.forcePasswordChange === true) {
     return (
       <PasswordChangeModal 
         userProfile={currentUserRole}
@@ -332,12 +399,17 @@ export default function App() {
           const cleanProfile: UserRoleRecord = {
             ...updatedProfile,
             mustChangePassword: false,
+            forcePasswordChange: false,
           };
           localStorage.setItem('narid_active_user', JSON.stringify(cleanProfile));
           sessionStorage.setItem('narid_active_user', JSON.stringify(cleanProfile));
           setCurrentUserRole(cleanProfile);
-          setCurrentTab(getDefaultTabForRole(cleanProfile.role));
-          loadAllMasterData();
+          const nextTab = getDefaultTabForRole(cleanProfile.role);
+          setCurrentTab(nextTab);
+          try {
+            window.history.replaceState(null, '', `/${nextTab}`);
+          } catch {}
+          loadAllMasterData(cleanProfile.role === 'super_admin' || cleanProfile.role === 'admin');
         }}
         onCancelLogout={handleLogout}
       />
@@ -346,13 +418,16 @@ export default function App() {
 
   // 3. Authenticated State -> Display authorized application
   const activeEmployeeCount = employees.filter(e => e.employeeStatus === 'Active').length;
+  const isFullscreenDashboard = fullscreenTab === 'dashboard' && currentTab === 'dashboard';
+  const isFullscreenScanner = fullscreenTab === 'scanner' && currentTab === 'scanner';
+  const isFullscreenAny = isFullscreenDashboard || isFullscreenScanner;
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-slate-100 font-sans antialiased text-slate-800">
-      {/* Industrial Left Sidebar (Filtered by Role, smoothly collapses in Full Screen Mode) */}
+      {/* Industrial Left Sidebar (Filtered by Role, hides completely in Full Screen Mode) */}
       <div 
         className={`transition-all duration-200 ease-in-out shrink-0 ${
-          isFullscreenDashboard 
+          isFullscreenAny
             ? 'w-0 -translate-x-full opacity-0 pointer-events-none hidden' 
             : 'w-64 translate-x-0 opacity-100 block'
         }`}
@@ -362,7 +437,7 @@ export default function App() {
           onSelectTab={handleSelectTab} 
           activeEmployeeCount={activeEmployeeCount}
           currentUserRole={currentUserRole}
-          onLogout={handleLogout}
+          onLogout={() => handleLogout('logout')}
           isMobileOpen={isMobileNavOpen}
           onCloseMobile={() => setIsMobileNavOpen(false)}
         />
@@ -370,15 +445,17 @@ export default function App() {
 
       {/* Main Workspace (Expands to 100% full width smoothly) */}
       <div className="flex-1 flex flex-col h-full overflow-hidden min-w-0 transition-all duration-200 ease-in-out w-full">
-        {/* Top Header Bar */}
-        <Header 
-          shifts={shifts}
-          onOpenScanner={() => handleSelectTab('scanner')}
-          onRefreshData={loadAllMasterData}
-          currentUserRole={currentUserRole}
-          onLogout={handleLogout}
-          onToggleMobileNav={() => setIsMobileNavOpen(prev => !prev)}
-        />
+        {/* Top Header Bar (Hidden completely in Attendance Scanner Full Screen Mode) */}
+        {!isFullscreenScanner && (
+          <Header 
+            shifts={shifts}
+            onOpenScanner={() => handleSelectTab('scanner')}
+            onRefreshData={() => loadAllMasterData(false)}
+            currentUserRole={currentUserRole}
+            onLogout={() => handleLogout('logout')}
+            onToggleMobileNav={() => setIsMobileNavOpen(prev => !prev)}
+          />
+        )}
 
         {/* Active Page View Body */}
         <main className="flex-1 overflow-y-auto transition-all duration-200 ease-in-out">
@@ -393,7 +470,7 @@ export default function App() {
             <UnauthorizedAccess 
               currentTab={currentTab} 
               currentUserRole={currentUserRole} 
-              onGoHome={() => setCurrentTab(getDefaultTabForRole(currentUserRole.role))} 
+              onGoHome={() => handleSelectTab(getDefaultTabForRole(currentUserRole.role))} 
             />
           ) : (
             <>
@@ -406,16 +483,21 @@ export default function App() {
                   departments={departments}
                   onNavigateToScanner={() => handleSelectTab('scanner')}
                   onNavigateToReports={() => handleSelectTab('reports')}
-                  onRefreshData={loadAllMasterData}
+                  onRefreshData={() => loadAllMasterData(false)}
                   currentUserRole={currentUserRole}
                   isFullscreen={isFullscreenDashboard}
-                  onToggleFullscreen={handleToggleFullscreen}
+                  onToggleFullscreen={() => handleToggleFullscreen('dashboard')}
                   onExitFullscreen={handleExitFullscreen}
                 />
               )}
 
               {currentTab === 'scanner' && isModuleAllowedForUser(currentUserRole, 'scanner') && (
-                <Scanner onAttendanceUpdated={loadAllMasterData} />
+                <Scanner
+                  onAttendanceUpdated={() => loadAllMasterData(false)}
+                  isFullscreen={isFullscreenScanner}
+                  onToggleFullscreen={() => handleToggleFullscreen('scanner')}
+                  onExitFullscreen={handleExitFullscreen}
+                />
               )}
 
               {currentTab === 'employees' && isModuleAllowedForUser(currentUserRole, 'employees') && (
@@ -507,8 +589,36 @@ export default function App() {
                 />
               )}
 
+              {currentTab === 'audit_logs' && isModuleAllowedForUser(currentUserRole, 'audit_logs') && (
+                (currentUserRole.role?.toUpperCase() === 'SUPER_ADMIN' || currentUserRole.loginId?.toLowerCase() === 'superadmin') ? (
+                  <AuditLogsManagement currentUserRole={currentUserRole} />
+                ) : (
+                  <UnauthorizedAccess
+                    currentTab={currentTab}
+                    currentUserRole={currentUserRole}
+                    onGoHome={() => setCurrentTab(getDefaultTabForRole(currentUserRole.role))}
+                  />
+                )
+              )}
+
+              {currentTab === 'security_management' && isModuleAllowedForUser(currentUserRole, 'security_management') && (
+                (currentUserRole.role?.toUpperCase() === 'SUPER_ADMIN' || currentUserRole.loginId?.toLowerCase() === 'superadmin') ? (
+                  <SecurityManagement currentUserRole={currentUserRole} />
+                ) : (
+                  <UnauthorizedAccess
+                    currentTab={currentTab}
+                    currentUserRole={currentUserRole}
+                    onGoHome={() => setCurrentTab(getDefaultTabForRole(currentUserRole.role))}
+                  />
+                )
+              )}
+
               {currentTab === 'settings' && isModuleAllowedForUser(currentUserRole, 'settings') && (
-                <SystemSettingsView onRefreshData={loadAllMasterData} />
+                <SystemSettingsView
+                  onRefreshData={loadAllMasterData}
+                  currentUserRole={currentUserRole}
+                  onOpenAuditConsole={() => handleSelectTab('audit_logs')}
+                />
               )}
             </>
           )}

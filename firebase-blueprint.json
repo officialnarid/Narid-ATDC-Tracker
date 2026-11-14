@@ -152,23 +152,96 @@
     },
     "AuditLog": {
       "title": "AuditLog",
-      "description": "System event audit trail",
+      "description": "Enterprise system activity and security audit trail",
       "type": "object",
       "properties": {
-        "id": { "type": "string" },
-        "action": { "type": "string" },
-        "employeeId": { "type": "string" },
+        "id": { "type": "string", "maxLength": 128 },
+        "action": { "type": "string", "maxLength": 128 },
+        "eventType": { "type": "string", "maxLength": 128 },
+        "category": { "type": "string", "enum": ["AUTH", "ACCOUNT", "EMPLOYEE", "ATTENDANCE", "QR", "ORG", "PERMISSIONS", "EXPORT", "SETTINGS", "SECURITY", "AUDIT_LIFECYCLE", "SYSTEM"] },
+        "severity": { "type": "string", "enum": ["INFO", "WARNING", "CRITICAL"] },
+        "actorUid": { "type": "string", "maxLength": 128 },
+        "actorLoginId": { "type": "string", "maxLength": 128 },
+        "actorRole": { "type": "string", "maxLength": 64 },
+        "targetId": { "type": "string", "maxLength": 128 },
+        "employeeId": { "type": "string", "maxLength": 128 },
         "timestamp": { "type": "string", "format": "date-time" },
-        "oldValue": { "type": "string" },
-        "newValue": { "type": "string" },
-        "actionSource": { "type": "string" },
-        "reason": { "type": "string" }
+        "oldValue": { "type": "string", "maxLength": 8000 },
+        "newValue": { "type": "string", "maxLength": 8000 },
+        "actionSource": { "type": "string", "maxLength": 128 },
+        "reason": { "type": "string", "maxLength": 2000 },
+        "success": { "type": "boolean" },
+        "ipAddress": { "type": "string", "maxLength": 128 },
+        "sessionId": { "type": "string", "maxLength": 128 },
+        "isImportant": { "type": "boolean" },
+        "isProtected": { "type": "boolean" },
+        "archived": { "type": "boolean" }
       },
-      "required": ["action", "timestamp", "actionSource"]
+      "required": ["action", "timestamp"]
+    },
+    "LoginHistory": {
+      "title": "LoginHistory",
+      "description": "Trusted server-captured login, logout, and IP/geolocation telemetry",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "eventType": { "type": "string", "enum": ["LOGIN_SUCCESS", "LOGIN_FAILED", "LOGIN_LOCKED", "LOGOUT", "SESSION_EXPIRED"] },
+        "loginId": { "type": "string", "maxLength": 128 },
+        "authUid": { "type": "string", "maxLength": 128 },
+        "role": { "type": "string", "maxLength": 64 },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "success": { "type": "boolean" },
+        "ipAddress": { "type": "string", "maxLength": 128 },
+        "browser": { "type": "string", "maxLength": 128 },
+        "os": { "type": "string", "maxLength": 128 },
+        "deviceType": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "eventType", "loginId", "timestamp", "success"]
+    },
+    "AuditArchive": {
+      "title": "AuditArchive",
+      "description": "Reviewed non-critical audit logs archived per retention policy",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "action": { "type": "string", "maxLength": 128 },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "archivedAt": { "type": "string", "format": "date-time" },
+        "archivedBy": { "type": "string", "maxLength": 128 }
+      },
+      "required": ["id", "action", "timestamp", "archivedAt", "archivedBy"]
+    },
+    "AuditLogDeletion": {
+      "title": "AuditLogDeletion",
+      "description": "Immutable permanent ledger of Super Admin approved controlled log deletions",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "deletedLogId": { "type": "string", "maxLength": 128 },
+        "deletedAction": { "type": "string", "maxLength": 128 },
+        "reason": { "type": "string", "minLength": 10, "maxLength": 1000 },
+        "approvedByUid": { "type": "string", "maxLength": 128 },
+        "approvedByLoginId": { "type": "string", "maxLength": 128 },
+        "deletedAt": { "type": "string", "format": "date-time" },
+        "ipAddress": { "type": "string", "maxLength": 128 }
+      },
+      "required": ["id", "deletedLogId", "reason", "approvedByUid", "approvedByLoginId", "deletedAt"]
+    },
+    "PasswordResetLog": {
+      "title": "PasswordResetLog",
+      "description": "Immutable log of Super Admin password resets and account unlocks",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "targetLoginId": { "type": "string", "maxLength": 128 },
+        "performedByLoginId": { "type": "string", "maxLength": 128 },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "targetLoginId", "performedByLoginId", "timestamp"]
     },
     "SystemSetting": {
       "title": "SystemSetting",
-      "description": "Global application configuration",
+      "description": "Global application and security retention configuration",
       "type": "object",
       "properties": {
         "companyName": { "type": "string" },
@@ -178,18 +251,22 @@
         "timeFormat": { "type": "string" },
         "autoPunchOutEnabled": { "type": "boolean" },
         "lateGraceMinutes": { "type": "number" },
-        "overtimeThresholdMinutes": { "type": "number" }
+        "overtimeThresholdMinutes": { "type": "number" },
+        "auditRetentionDays": { "type": "number" },
+        "protectCriticalLogs": { "type": "boolean" },
+        "captureGeoLocation": { "type": "boolean" },
+        "failedLoginAlertThreshold": { "type": "number" }
       },
       "required": ["companyName", "websiteName", "timezone"]
     },
     "UserRole": {
       "title": "UserRole",
-      "description": "RBAC user role structure for future authentication activation",
+      "description": "RBAC user role structure",
       "type": "object",
       "properties": {
         "id": { "type": "string" },
         "name": { "type": "string" },
-        "role": { "type": "string", "enum": ["SUPER_ADMIN", "ADMIN", "USER"] },
+        "role": { "type": "string", "enum": ["SUPER_ADMIN", "ADMIN", "USER", "super_admin", "admin", "user"] },
         "status": { "type": "string", "enum": ["Active", "Inactive"] },
         "modulesAllowed": { "type": "string" }
       },
@@ -234,6 +311,68 @@
         "updatedBy": { "type": "string" }
       },
       "required": ["userId", "loginId", "updatedAt"]
+    },
+    "AccountSecurity": {
+      "title": "AccountSecurity",
+      "description": "Server-managed account lock status, consecutive failed login counters, and last IP/device telemetry",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "loginId": { "type": "string" },
+        "role": { "type": "string" },
+        "firebaseUid": { "type": "string" },
+        "email": { "type": "string" },
+        "lockStatus": { "type": "string", "enum": ["ACTIVE", "LOCKED"] },
+        "consecutiveFailedAttempts": { "type": "number" },
+        "maxAttemptsAllowed": { "type": "number" },
+        "totalLoginAttempts": { "type": "number" },
+        "totalSuccessfulLogins": { "type": "number" },
+        "totalFailedLogins": { "type": "number" },
+        "forcePasswordChange": { "type": "boolean" },
+        "lockedAt": { "type": "string" },
+        "lockReason": { "type": "string" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "loginId", "role", "lockStatus", "consecutiveFailedAttempts", "updatedAt"]
+    },
+    "LoginAttempt": {
+      "title": "LoginAttempt",
+      "description": "Permanent immutable audit history of every login attempt with server IP, geo, and device info",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "loginId": { "type": "string" },
+        "role": { "type": "string" },
+        "firebaseUid": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "timestampMs": { "type": "number" },
+        "success": { "type": "boolean" },
+        "outcome": { "type": "string" },
+        "failureReasonCategory": { "type": "string" },
+        "ipAddress": { "type": "string" },
+        "browser": { "type": "string" },
+        "os": { "type": "string" },
+        "deviceType": { "type": "string" }
+      },
+      "required": ["id", "loginId", "timestamp", "success", "outcome", "ipAddress"]
+    },
+    "SecurityAuditLog": {
+      "title": "SecurityAuditLog",
+      "description": "Immutable security governance trail for lockouts, unblocks, temporary password resets, and rate-limit events",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "action": { "type": "string" },
+        "severity": { "type": "string", "enum": ["INFO", "WARNING", "CRITICAL"] },
+        "targetLoginId": { "type": "string" },
+        "actorUid": { "type": "string" },
+        "actorLoginId": { "type": "string" },
+        "actorRole": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "ipAddress": { "type": "string" },
+        "reason": { "type": "string" }
+      },
+      "required": ["id", "action", "severity", "actorUid", "actorLoginId", "timestamp"]
     }
   },
   "firestore": {
@@ -275,7 +414,23 @@
     },
     "/audit_logs/{auditId}": {
       "schema": "AuditLog",
-      "description": "System mutation audit logs"
+      "description": "System activity and security audit logs"
+    },
+    "/login_history/{historyId}": {
+      "schema": "LoginHistory",
+      "description": "Trusted server-captured login/logout IP, geo, and device telemetry"
+    },
+    "/audit_archives/{archiveId}": {
+      "schema": "AuditArchive",
+      "description": "Archived non-critical audit logs post 90-day retention review"
+    },
+    "/audit_log_deletions/{deletionId}": {
+      "schema": "AuditLogDeletion",
+      "description": "Immutable permanent ledger of controlled log deletions"
+    },
+    "/password_reset_logs/{logId}": {
+      "schema": "PasswordResetLog",
+      "description": "Immutable Super Admin password reset logs"
     },
     "/system_settings/{settingId}": {
       "schema": "SystemSetting",
@@ -296,6 +451,18 @@
     "/user_permissions/{permissionId}": {
       "schema": "UserPermission",
       "description": "Individual account permission overrides"
+    },
+    "/account_security/{secId}": {
+      "schema": "AccountSecurity",
+      "description": "Server-managed account lock status and consecutive failed login counters"
+    },
+    "/login_attempts/{attemptId}": {
+      "schema": "LoginAttempt",
+      "description": "Permanent immutable login attempt history"
+    },
+    "/security_audit_logs/{logId}": {
+      "schema": "SecurityAuditLog",
+      "description": "Immutable security governance audit trail"
     }
   }
 }

@@ -1,6 +1,5 @@
 import { 
   signInWithEmailAndPassword, 
-  createUserWithEmailAndPassword,
   signOut, 
   sendPasswordResetEmail,
   updatePassword,
@@ -24,15 +23,29 @@ import { auth, db, sanitizeFirestoreData } from '../firebase';
 import firebaseConfig from '../../firebase-applet-config.json';
 import { UserRoleRecord, UserRoleType } from '../types';
 import { NavItem } from '../components/Sidebar';
+import { getAuthHeaders, sendServerAuditEvent } from './auditService';
+import { reportFirebaseThrottleSignal } from './securityService';
+
+export interface LoginAuthError extends Error {
+  code?: string;
+  locked?: boolean;
+  warning?: boolean;
+  attemptNumber?: number;
+  maxAttempts?: number;
+  remainingAttempts?: number;
+  cooldownSeconds?: number;
+  firebaseAbuseProtection?: boolean;
+}
 
 export const INITIAL_DEFAULT_PASSWORD = 'Narid@12345';
 
-// Default initial industrial user accounts
+// Default initial industrial user accounts (canonical *@narid.com kept active)
 export const DEFAULT_ACCOUNTS: Omit<UserRoleRecord, 'id' | 'createdAt' | 'updatedAt'>[] = [
   {
     loginId: 'superadmin',
     name: 'Chief Plant Operations (Super Admin)',
-    email: 'superadmin_root@narid.com',
+    email: 'superadmin@narid.com',
+    emailAliases: ['superadmin_root@narid.com'],
     role: 'super_admin',
     status: 'Active',
     mustChangePassword: false,
@@ -41,7 +54,8 @@ export const DEFAULT_ACCOUNTS: Omit<UserRoleRecord, 'id' | 'createdAt' | 'update
   {
     loginId: 'admin',
     name: 'Shift Supervisor (Admin)',
-    email: 'admin_root@narid.com',
+    email: 'admin@narid.com',
+    emailAliases: ['admin_root@narid.com'],
     role: 'admin',
     status: 'Active',
     mustChangePassword: false,
@@ -62,11 +76,12 @@ export const DEFAULT_ACCOUNTS: Omit<UserRoleRecord, 'id' | 'createdAt' | 'update
   {
     loginId: 'user',
     name: 'Floor Operator (Scanner User)',
-    email: 'user_root@narid.com',
+    email: 'user@narid.com',
+    emailAliases: ['user_root@narid.com'],
     role: 'user',
     status: 'Active',
     mustChangePassword: false,
-    modulesAllowed: ['scanner'],
+    modulesAllowed: ['dashboard', 'scanner'],
   },
 ];
 
@@ -80,38 +95,42 @@ export async function seedDefaultUserRoles(): Promise<void> {
       // Backend provisioning optional if running client-only
     }
 
-    // 2. Synchronize Firestore user_roles documents without duplicating
-    const snap = await getDocs(collection(db, 'user_roles'));
-    const existingDocs = snap.docs.map(d => {
-      const data = d.data() as UserRoleRecord;
-      return { ...data, id: d.id };
-    });
+    // 2. Synchronize Firestore user_roles documents strictly onto canonical IDs
     const now = new Date().toISOString();
 
     for (const acc of DEFAULT_ACCOUNTS) {
       const id = `role_${acc.loginId}`;
-      const existing = existingDocs.find(
-        e => e.id === id || e.loginId?.toLowerCase() === acc.loginId.toLowerCase()
-      );
+      const docRef = doc(db, 'user_roles', id);
+      const snap = await getDoc(docRef);
 
-      if (!existing) {
+      if (!snap.exists()) {
         const record: UserRoleRecord = {
           ...acc,
           id,
           createdAt: now,
           updatedAt: now,
         };
-        await setDoc(doc(db, 'user_roles', id), sanitizeFirestoreData(record));
+        await setDoc(docRef, sanitizeFirestoreData(record));
       } else {
-        const updatePayload: Partial<UserRoleRecord> = {
+        const existing = snap.data() as UserRoleRecord & { dashboardAccessMigratedV1?: boolean };
+        const existingModules = Array.isArray(existing.modulesAllowed) ? existing.modulesAllowed : acc.modulesAllowed;
+        const nextModules =
+          acc.loginId === 'user' && !existing.dashboardAccessMigratedV1 && !existingModules.includes('dashboard')
+            ? ['dashboard', ...existingModules]
+            : existingModules;
+
+        const updatePayload: Record<string, any> = {
           loginId: acc.loginId,
           role: acc.role,
           name: existing.name || acc.name,
           status: existing.status || 'Active',
-          modulesAllowed: acc.modulesAllowed,
+          modulesAllowed: nextModules,
           updatedAt: now,
         };
-        await setDoc(doc(db, 'user_roles', existing.id), updatePayload, { merge: true });
+        if (acc.loginId === 'user' && !existing.dashboardAccessMigratedV1) {
+          updatePayload.dashboardAccessMigratedV1 = true;
+        }
+        await setDoc(docRef, updatePayload, { merge: true });
       }
     }
   } catch (error) {
@@ -167,12 +186,22 @@ export async function getUserProfileByLoginId(loginId: string): Promise<UserRole
   return null;
 }
 
-// Fetch all registered user roles from Firestore
+// Fetch all registered user roles from Firestore (with strict loginId deduplication)
 export async function getAllUserRoles(): Promise<UserRoleRecord[]> {
   try {
     const snap = await getDocs(collection(db, 'user_roles'));
     if (!snap.empty) {
-      return snap.docs.map(d => d.data() as UserRoleRecord);
+      const raw = snap.docs.map(d => ({ ...d.data(), id: d.id } as UserRoleRecord));
+      // Deduplicate by normalized loginId
+      const map = new Map<string, UserRoleRecord>();
+      raw.forEach(r => {
+        const key = (r.loginId || r.id.replace(/^role_/, '')).trim().toLowerCase();
+        const existing = map.get(key);
+        if (!existing || r.id === `role_${key}` || (!existing.id.startsWith('role_') && r.passwordHash)) {
+          map.set(key, r);
+        }
+      });
+      return Array.from(map.values());
     }
   } catch (error) {
     console.warn('Error fetching all user roles:', error);
@@ -274,7 +303,7 @@ export async function getUserProfileByEmail(email: string): Promise<UserRoleReco
     role: 'user',
     status: 'Active',
     mustChangePassword: false,
-    modulesAllowed: ['scanner'],
+    modulesAllowed: ['dashboard', 'scanner'],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
@@ -297,72 +326,103 @@ export async function loginWithLoginIdAndPassword(
   passwordInput: string,
   rememberMe: boolean = true
 ): Promise<{ user: FirebaseUser; profile: UserRoleRecord }> {
-  if (!loginIdInput.trim()) {
+  const normalizedLoginId = loginIdInput.trim();
+  if (!normalizedLoginId) {
     throw new Error('Please enter your Login ID.');
   }
   if (!passwordInput) {
     throw new Error('Please enter your password.');
   }
 
-  // 1. Authenticate against single-source-of-truth backend
+  // 1. Authenticate against single-source-of-truth backend (Atomic 3-Strike & Rate Limit Guard)
+  // Note: passwordInput is sent verbatim without trimming or transformation.
   const res = await fetch('/api/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      loginId: loginIdInput.trim(),
+      loginId: normalizedLoginId,
       password: passwordInput,
     }),
   });
 
   const data = await res.json();
   if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Invalid password, check again');
+    const authErr: LoginAuthError = new Error(data.error || 'Invalid password, check again');
+    authErr.code = data.code;
+    authErr.locked = Boolean(data.locked || res.status === 423);
+    authErr.warning = Boolean(data.warning);
+    authErr.attemptNumber = data.attemptNumber;
+    authErr.maxAttempts = data.maxAttempts;
+    authErr.remainingAttempts = data.remainingAttempts;
+    authErr.cooldownSeconds = data.cooldownSeconds;
+    throw authErr;
   }
 
   const profile: UserRoleRecord = data.profile;
+  const cleanLoginLower = String(profile.loginId || normalizedLoginId).trim().toLowerCase();
+  const canonicalEmail = `${cleanLoginLower}@narid.com`;
+  const rawEmail = String(profile.email || canonicalEmail).trim().toLowerCase();
 
-  // 2. Persist active session in browser storage
-  const storage = rememberMe ? localStorage : sessionStorage;
-  storage.setItem('narid_active_user', JSON.stringify(profile));
+  // Always prefer the canonical *@narid.com primary email over legacy *_root@narid.com aliases
+  const primaryAuthEmail =
+    rawEmail.endsWith('_root@narid.com') &&
+    (Array.isArray(profile.emailAliases) ? profile.emailAliases.map((e) => e.toLowerCase()).includes(canonicalEmail) : true)
+      ? canonicalEmail
+      : rawEmail;
 
-  // 3. Authenticate with Firebase Auth for direct client Firestore access
+  // 2. Authenticate with Firebase Auth ONCE using canonical email (never bypass or retry on failure/rate-limit)
+  await setPersistence(auth, rememberMe ? browserLocalPersistence : browserSessionPersistence);
+
   try {
-    await setPersistence(auth, rememberMe ? browserLocalPersistence : browserSessionPersistence);
-    const candidateEmails = [
-      profile.email,
-      `${profile.loginId}@narid.com`,
-      `${profile.loginId}_root@narid.com`
-    ].filter(Boolean);
+    await signInWithEmailAndPassword(auth, primaryAuthEmail, passwordInput);
+  } catch (fbErr: any) {
+    try {
+      localStorage.removeItem('narid_active_user');
+      sessionStorage.removeItem('narid_active_user');
+      localStorage.removeItem('narid_session_id');
+      sessionStorage.removeItem('narid_session_id');
+    } catch {}
 
-    for (const em of candidateEmails) {
-      if (auth.currentUser) break;
-      try {
-        await signInWithEmailAndPassword(auth, em, passwordInput);
-        break;
-      } catch {
-        try {
-          await signInWithEmailAndPassword(auth, em, INITIAL_DEFAULT_PASSWORD);
-          break;
-        } catch {
-          // continue to next candidate
-        }
-      }
+    const fbCode = String(fbErr?.code || '');
+    const fbMsg = String(fbErr?.message || '');
+
+    if (fbCode === 'auth/too-many-requests' || fbMsg.includes('TOO_MANY_ATTEMPTS_TRY_LATER')) {
+      await reportFirebaseThrottleSignal(cleanLoginLower);
+      const throttleErr: LoginAuthError = new Error(
+        'Too many authentication requests detected by Firebase security protection (TOO_MANY_ATTEMPTS_TRY_LATER). Please wait before trying again.'
+      );
+      throttleErr.code = 'TOO_MANY_ATTEMPTS_TRY_LATER';
+      throttleErr.firebaseAbuseProtection = true;
+      throw throttleErr;
     }
-  } catch (err) {
-    console.warn('Firebase Auth sign in notice:', err);
+
+    const syncErr: LoginAuthError = new Error(
+      `Firebase Authentication rejected sign-in for "${primaryAuthEmail}" (${fbCode || fbMsg || 'INVALID_LOGIN_CREDENTIALS'}). Please verify password synchronization with Super Admin.`
+    );
+    syncErr.code = fbCode || 'INVALID_LOGIN_CREDENTIALS';
+    throw syncErr;
   }
 
   const fbUser: FirebaseUser | null = auth.currentUser;
+  if (!fbUser) {
+    throw new Error('Firebase authentication session could not be established. Please try signing in again.');
+  }
+
+  // 3. Persist active session only AFTER both backend verification and Firebase Auth succeed
+  const normalizedProfile: UserRoleRecord = {
+    ...profile,
+    email: primaryAuthEmail,
+    authUid: fbUser.uid,
+  };
+  const storage = rememberMe ? localStorage : sessionStorage;
+  storage.setItem('narid_active_user', JSON.stringify(normalizedProfile));
+  if (data.sessionId) {
+    storage.setItem('narid_session_id', String(data.sessionId));
+  }
 
   return {
-    user: fbUser || ({
-      uid: profile.id,
-      email: profile.email,
-      displayName: profile.name,
-      emailVerified: true,
-      isAnonymous: false,
-    } as any),
-    profile,
+    user: fbUser,
+    profile: normalizedProfile,
   };
 }
 
@@ -375,13 +435,33 @@ export async function changeInitialPassword(newPassword: string, currentPassword
   const storedUser = getStoredActiveUser();
   const loginId = storedUser?.loginId || (auth.currentUser?.email ? auth.currentUser.email.split('@')[0] : 'admin');
 
+  let firebaseAuthUpdatedByClient = false;
+  if (auth.currentUser && auth.currentUser.email) {
+    const curEmail = auth.currentUser.email.toLowerCase();
+    const targetEmail = (storedUser?.email || `${loginId}@narid.com`).toLowerCase();
+    const matchesTarget =
+      (storedUser?.authUid && auth.currentUser.uid === storedUser.authUid) ||
+      curEmail === targetEmail ||
+      curEmail === `${loginId.toLowerCase()}@narid.com` ||
+      curEmail === `${loginId.toLowerCase()}_root@narid.com`;
+
+    if (matchesTarget) {
+      await updatePassword(auth.currentUser, newPassword);
+      await auth.currentUser.getIdToken(true);
+      firebaseAuthUpdatedByClient = true;
+    }
+  }
+
+  const headers = await getAuthHeaders();
+
   const res = await fetch('/api/auth/change-password', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({
       loginId,
       currentPassword,
       newPassword,
+      firebaseAuthUpdatedByClient,
     }),
   });
 
@@ -392,13 +472,10 @@ export async function changeInitialPassword(newPassword: string, currentPassword
 
   if (storedUser) {
     storedUser.mustChangePassword = false;
+    storedUser.forcePasswordChange = false;
     storedUser.passwordLastChangedAt = new Date().toISOString();
     localStorage.setItem('narid_active_user', JSON.stringify(storedUser));
     sessionStorage.setItem('narid_active_user', JSON.stringify(storedUser));
-  }
-
-  if (auth.currentUser) {
-    await updatePassword(auth.currentUser, newPassword).catch(() => {});
   }
 }
 
@@ -410,11 +487,26 @@ export async function sendUserPasswordReset(loginIdOrEmail: string): Promise<str
   return targetEmail;
 }
 
-// Sign Out
-export async function logoutUser(): Promise<void> {
+// Sign Out (Records server-enriched LOGOUT / SESSION_EXPIRED event before clearing Firebase token)
+export async function logoutUser(reason: 'logout' | 'session_expired' = 'logout'): Promise<void> {
+  if (auth.currentUser) {
+    await sendServerAuditEvent({
+      action: reason,
+      category: 'AUTH',
+      targetType: 'SESSION',
+      actionSource: reason === 'session_expired' ? 'SESSION_GUARD' : 'USER_LOGOUT',
+      description:
+        reason === 'session_expired'
+          ? 'Session automatically terminated by security session guard.'
+          : 'User signed out of NARID ATDC Tracker.',
+      success: true,
+    });
+  }
   try {
     localStorage.removeItem('narid_active_user');
     sessionStorage.removeItem('narid_active_user');
+    localStorage.removeItem('narid_session_id');
+    sessionStorage.removeItem('narid_session_id');
   } catch {}
   try {
     await signOut(auth);
@@ -430,9 +522,9 @@ export function getDefaultTabForRole(role: UserRoleType): NavItem {
     case 'ADMIN':
       return 'dashboard';
     case 'USER':
-      return 'scanner';
+      return 'dashboard';
     default:
-      return 'scanner';
+      return 'dashboard';
   }
 }
 
@@ -445,6 +537,11 @@ export function isModuleAllowedForUser(profile: UserRoleRecord | null | undefine
     return true; // Super Admin always has full access
   }
 
+  // Security Lockout Control, Audit Logs & User Rights are strictly SUPER_ADMIN only
+  if (tab === 'security_management' || tab === 'audit_logs' || tab === 'user_rights') {
+    return false;
+  }
+
   // Check custom granted permissions from Firestore
   if (Array.isArray(profile.modulesAllowed)) {
     if (profile.modulesAllowed.includes('all')) {
@@ -455,10 +552,10 @@ export function isModuleAllowedForUser(profile: UserRoleRecord | null | undefine
 
   // Default fallback if modulesAllowed is not set
   if (normalized === 'ADMIN') {
-    return tab !== 'user_rights' && tab !== 'settings';
+    return tab !== 'settings';
   }
   if (normalized === 'USER') {
-    return tab === 'scanner';
+    return tab === 'dashboard' || tab === 'scanner';
   }
   return false;
 }
@@ -469,11 +566,14 @@ export function isModuleAllowedForRole(role: UserRoleType, tab: NavItem): boolea
   if (normalized === 'SUPER_ADMIN') {
     return true; // Full access
   }
+  if (tab === 'security_management' || tab === 'audit_logs' || tab === 'user_rights') {
+    return false;
+  }
   if (normalized === 'ADMIN') {
-    return tab !== 'user_rights' && tab !== 'settings';
+    return tab !== 'settings';
   }
   if (normalized === 'USER') {
-    return tab === 'scanner';
+    return tab === 'dashboard' || tab === 'scanner';
   }
   return false;
 }
@@ -495,11 +595,12 @@ export async function createUserAccount(data: {
   }
 
   const caller = getStoredActiveUser();
+  const headers = await getAuthHeaders();
 
   // Provision through trusted backend single source of truth
   const res = await fetch('/api/admin/create-user', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({
       callerLoginId: caller?.loginId || 'superadmin',
       name: data.name,
@@ -528,18 +629,26 @@ export async function adminSetUserPassword(
   newPassword: string,
   mustChangePasswordOnLogin: boolean = true,
   unlockAccount: boolean = true,
-  revokeSessions: boolean = true
-): Promise<void> {
+  revokeSessions: boolean = true,
+  currentTargetPassword?: string
+): Promise<{
+  success: boolean;
+  message: string;
+  firebaseAuthSynced: boolean;
+  firebaseUid?: string;
+  matchedFirebaseEmail?: string | null;
+}> {
   if (!newPassword || newPassword.length < 6) {
     throw new Error('Password must be at least 6 characters.');
   }
 
   const cleanId = loginId.trim().toLowerCase();
   const caller = getStoredActiveUser();
+  const headers = await getAuthHeaders();
 
   const res = await fetch('/api/admin/set-user-password', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({
       callerLoginId: caller?.loginId || 'superadmin',
       targetLoginId: cleanId,
@@ -547,20 +656,28 @@ export async function adminSetUserPassword(
       mustChangePassword: mustChangePasswordOnLogin,
       unlockAccount,
       revokeSessions,
+      ...(currentTargetPassword ? { currentTargetPassword } : {}),
     }),
   });
 
   const data = await res.json();
   if (!res.ok || !data.success) {
-    throw new Error(data.error || 'Failed to update password.');
+    const err: any = new Error(data.error || 'Failed to update password.');
+    err.code = data.code;
+    err.firebaseAuthSynced = Boolean(data.firebaseAuthSynced);
+    err.adminSdkConfigured = data.adminSdkConfigured;
+    throw err;
   }
+
+  return data;
 }
 
 // Fetch password reset audit history (Super Admin Only)
 export async function fetchPasswordResetHistory(): Promise<any[]> {
   const caller = getStoredActiveUser();
   const callerLoginId = caller?.loginId || 'superadmin';
-  const res = await fetch(`/api/admin/password-reset-history?callerLoginId=${encodeURIComponent(callerLoginId)}`);
+  const headers = await getAuthHeaders();
+  const res = await fetch(`/api/admin/password-reset-history?callerLoginId=${encodeURIComponent(callerLoginId)}`, { headers });
   const data = await res.json();
   if (!res.ok || !data.success) {
     throw new Error(data.error || 'Failed to fetch password reset history.');
@@ -585,6 +702,15 @@ export async function updateUserRolePermissions(
   if (status) payload.status = status;
 
   await updateDoc(docRef, sanitizeFirestoreData(payload));
+  await sendServerAuditEvent({
+    action: 'permission_updated',
+    category: 'PERMISSIONS',
+    targetType: 'ACCOUNT',
+    targetId: userId,
+    newValue: { modulesAllowed, role, status },
+    actionSource: 'USER_RIGHTS_MODAL',
+    description: `Updated user access permissions for ${userId}.`,
+  });
 }
 
 // Secure User Account Deletion (Super Admin only, calls backend)
@@ -595,10 +721,11 @@ export async function deleteUserRole(userId: string, targetLoginId?: string): Pr
 
   const caller = getStoredActiveUser();
   const callerLoginId = caller?.loginId || 'superadmin';
+  const headers = await getAuthHeaders();
 
   const res = await fetch('/api/admin/delete-user', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({
       callerLoginId,
       targetId: userId,
@@ -613,3 +740,110 @@ export async function deleteUserRole(userId: string, targetLoginId?: string): Pr
 }
 
 export const deleteUserAccount = deleteUserRole;
+
+// Fetch Duplicate Accounts Report (Super Admin Only)
+export interface DuplicateDocDetail {
+  docId: string;
+  firebaseUid: string | null;
+  loginId: string;
+  name: string;
+  email: string;
+  role: string;
+  status: string;
+  hasPasswordHash: boolean;
+  createdAt: string | null;
+  associatedAuditLogs: number;
+  isPrimary: boolean;
+  recommendation: 'RETAIN_PRIMARY' | 'CONSOLIDATE_AND_DELETE';
+}
+
+export interface DuplicateGroupReport {
+  loginId: string;
+  totalDocs: number;
+  hasDuplicates: boolean;
+  primaryDocId: string;
+  documents: DuplicateDocDetail[];
+}
+
+export interface DuplicateReportResponse {
+  success: boolean;
+  totalRawDocuments: number;
+  totalUniqueAccounts: number;
+  duplicateCount: number;
+  report: DuplicateGroupReport[];
+  summary: string;
+}
+
+export async function fetchDuplicateAccountsReport(): Promise<DuplicateReportResponse> {
+  const caller = getStoredActiveUser();
+  const callerLoginId = caller?.loginId || 'superadmin';
+  const headers = await getAuthHeaders();
+  const res = await fetch(`/api/admin/duplicate-accounts-report?callerLoginId=${encodeURIComponent(callerLoginId)}`, { headers });
+  const data = await res.json();
+  if (!res.ok || !data.success) {
+    throw new Error(data.error || 'Failed to fetch duplicate accounts report.');
+  }
+  return data;
+}
+
+export async function consolidateDuplicateAccounts(): Promise<{
+  success: boolean;
+  message: string;
+  consolidatedDuplicatesCount: number;
+  remainingAccountsCount: number;
+  consolidationResults: any[];
+}> {
+  const caller = getStoredActiveUser();
+  const callerLoginId = caller?.loginId || 'superadmin';
+  const headers = await getAuthHeaders();
+  const res = await fetch('/api/admin/consolidate-duplicates', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ callerLoginId }),
+  });
+  const data = await res.json();
+  if (!res.ok || !data.success) {
+    throw new Error(data.error || 'Failed to consolidate duplicate accounts.');
+  }
+  return data;
+}
+
+// Full 10-Account Master Authentication Audit
+export interface FullAuthAuditAccount {
+  loginId: string;
+  email: string;
+  firebaseUid: string;
+  role: string;
+  createdDate: string;
+  lastSignIn: string;
+  accountType: string;
+  accountStatus: string;
+  firestoreReferences: string;
+  recommendation: string;
+}
+
+export interface FullAuthAuditResponse {
+  success: boolean;
+  auditTimestamp: string;
+  totalAccountsAudited: number;
+  primaryAccountsCount: number;
+  legacyAccountsCount: number;
+  activeFirestoreDirectoryCount: number;
+  totalAuditLogsCount: number;
+  totalPasswordResetLogsCount: number;
+  requiresSuperAdminApprovalForPurge: boolean;
+  safeguardMessage: string;
+  accounts: FullAuthAuditAccount[];
+}
+
+export async function fetchFullAuthAudit(): Promise<FullAuthAuditResponse> {
+  const caller = getStoredActiveUser();
+  const callerLoginId = caller?.loginId || 'superadmin';
+  const headers = await getAuthHeaders();
+  const res = await fetch(`/api/admin/full-auth-audit?callerLoginId=${encodeURIComponent(callerLoginId)}`, { headers });
+  const data = await res.json();
+  if (!res.ok || !data.success) {
+    throw new Error(data.error || 'Failed to fetch full authentication audit.');
+  }
+  return data;
+}

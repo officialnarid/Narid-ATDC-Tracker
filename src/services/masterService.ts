@@ -10,7 +10,7 @@ import {
   orderBy, 
   limit 
 } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType, sanitizeFirestoreData } from '../firebase';
+import { db, auth, handleFirestoreError, OperationType, sanitizeFirestoreData } from '../firebase';
 import { 
   Floor, 
   Section, 
@@ -18,9 +18,9 @@ import {
   Shift, 
   SystemSetting, 
   AuditLog, 
-  UserRoleRecord,
   Employee 
 } from '../types';
+import { sendServerAuditEvent } from './auditService';
 
 export const DEFAULT_SETTINGS: SystemSetting = {
   id: 'global',
@@ -34,6 +34,10 @@ export const DEFAULT_SETTINGS: SystemSetting = {
   scheduledDurationMinutes: 510, // 8h 30m
   overtimeThresholdMinutes: 510,
   scannerMode: 'USB_PRIMARY',
+  auditRetentionDays: 90,
+  protectCriticalLogs: true,
+  captureGeoLocation: true,
+  failedLoginAlertThreshold: 5,
 };
 
 export const DEFAULT_SHIFTS: Shift[] = [
@@ -123,8 +127,9 @@ export const AUTHENTIC_INDUSTRIAL_MANPOWER: Partial<Employee>[] = [
   { employeeId: 'JMD12374', employeeName: 'ARUN PRASAD', employeeType: 'Permanent', section: 'FATP', department: 'Production', floor: 'FATP-STB', designation: 'Functional Testing Incharge' },
 ];
 
-// Initialize database with default collections if empty
+// Initialize database with default collections if empty (strictly guarded on Firebase Auth)
 export async function initializeMasterData(): Promise<void> {
+  if (!auth.currentUser) return;
   try {
     // 1. Settings
     const settingsRef = doc(db, 'system_settings', 'global');
@@ -315,35 +320,30 @@ export async function saveShift(shift: Shift): Promise<void> {
   }
 }
 
-// Audit Log
+// Audit Log — routes exclusively through authenticated server endpoint for IP/Geo/UA enrichment & redaction
 export async function recordAuditLog(log: Omit<AuditLog, 'id' | 'timestamp'>): Promise<void> {
+  if (!auth.currentUser) return;
   try {
-    const id = `audit_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    const fullLog: Record<string, any> = {
-      id,
-      timestamp: new Date().toISOString(),
+    await sendServerAuditEvent({
       action: log.action || 'GENERAL_ACTION',
-      actionSource: log.actionSource || 'SYSTEM',
-    };
-    if (log.employeeId !== undefined && log.employeeId !== null) {
-      fullLog.employeeId = String(log.employeeId);
-    }
-    if (log.oldValue !== undefined && log.oldValue !== null) {
-      fullLog.oldValue = String(log.oldValue);
-    }
-    if (log.newValue !== undefined && log.newValue !== null) {
-      fullLog.newValue = String(log.newValue);
-    }
-    if (log.reason !== undefined && log.reason !== null) {
-      fullLog.reason = String(log.reason);
-    }
-    await setDoc(doc(db, 'audit_logs', id), sanitizeFirestoreData(fullLog));
+      category: log.category,
+      targetType: log.targetType || (log.employeeId ? 'EMPLOYEE' : 'SYSTEM'),
+      targetId: log.targetId || log.employeeId,
+      employeeId: log.employeeId,
+      oldValue: log.oldValue ?? log.previousValue,
+      newValue: log.newValue,
+      actionSource: log.actionSource || 'CLIENT_APP',
+      reason: log.reason,
+      description: log.description || log.reason || log.newValue || log.action,
+      success: log.success !== undefined ? log.success : true,
+    });
   } catch (err) {
-    console.error('Failed to write audit log:', err);
+    console.warn('Failed to forward audit log to server:', err);
   }
 }
 
 export async function getAuditLogs(max: number = 100): Promise<AuditLog[]> {
+  if (!auth.currentUser) return [];
   try {
     const q = query(collection(db, 'audit_logs'), orderBy('timestamp', 'desc'), limit(max));
     const snap = await getDocs(q);
@@ -370,7 +370,7 @@ export async function getAuditLogs(max: number = 100): Promise<AuditLog[]> {
         oldValue: stringifyField(data.oldValue || data.previousValue),
         newValue: stringifyField(data.newValue),
         actionSource: String(data.actionSource || 'SYSTEM'),
-        reason: stringifyField(data.reason || data.details),
+        reason: stringifyField(data.reason || data.details || data.description),
       } as AuditLog;
     });
   } catch (error) {

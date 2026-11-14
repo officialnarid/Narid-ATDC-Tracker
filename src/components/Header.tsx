@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { Clock, Play, CheckCircle2, AlertCircle, ScanLine, ShieldAlert, LogOut, User, Menu } from 'lucide-react';
+import { Clock, Play, CheckCircle2, ScanLine, LogOut, Menu } from 'lucide-react';
 import { runAutoCloseShiftsEngine, getKolkataTimeParts } from '../services/attendanceService';
+import { isModuleAllowedForUser } from '../services/authService';
 import { Shift, UserRoleRecord } from '../types';
 
 interface HeaderProps {
@@ -24,6 +25,10 @@ export const Header: React.FC<HeaderProps> = ({
   const [isRunningAutoClose, setIsRunningAutoClose] = useState(false);
   const [autoCloseMessage, setAutoCloseMessage] = useState<string | null>(null);
 
+  const normalizedRole = String(currentUserRole?.role || 'USER').toUpperCase();
+  const canRunAutoClose = normalizedRole === 'SUPER_ADMIN' || normalizedRole === 'ADMIN';
+  const canOpenScanner = isModuleAllowedForUser(currentUserRole, 'scanner');
+
   // Live Clock (Asia/Kolkata)
   useEffect(() => {
     const timer = setInterval(() => {
@@ -32,8 +37,9 @@ export const Header: React.FC<HeaderProps> = ({
     return () => clearInterval(timer);
   }, []);
 
-  // Periodic automatic shift closing runner (every 60 seconds)
+  // Periodic automatic shift closing runner (every 60 seconds, Admin / Super Admin only)
   useEffect(() => {
+    if (!canRunAutoClose) return;
     const autoCloseInterval = setInterval(async () => {
       try {
         const res = await runAutoCloseShiftsEngine();
@@ -48,9 +54,10 @@ export const Header: React.FC<HeaderProps> = ({
     }, 60000);
 
     return () => clearInterval(autoCloseInterval);
-  }, [onRefreshData]);
+  }, [canRunAutoClose, onRefreshData]);
 
   const handleManualAutoClose = async () => {
+    if (!canRunAutoClose) return;
     setIsRunningAutoClose(true);
     setAutoCloseMessage(null);
     try {
@@ -132,25 +139,29 @@ export const Header: React.FC<HeaderProps> = ({
           <span className="text-[10px] text-slate-500 font-sans uppercase">IST</span>
         </div>
 
-        {/* Scheduled Shift Auto-Close Trigger */}
-        <button
-          onClick={handleManualAutoClose}
-          disabled={isRunningAutoClose}
-          title="Run Scheduled Auto-Closing check on open attendance past shift end"
-          className="flex items-center gap-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-300 px-2.5 py-1.5 rounded transition disabled:opacity-50"
-        >
-          <Play className={`w-3.5 h-3.5 text-slate-600 ${isRunningAutoClose ? 'animate-spin' : ''}`} />
-          <span className="hidden lg:inline">{isRunningAutoClose ? 'Checking...' : 'Run Auto-Close'}</span>
-        </button>
+        {/* Scheduled Shift Auto-Close Trigger (Admin / Super Admin Only) */}
+        {canRunAutoClose && (
+          <button
+            onClick={handleManualAutoClose}
+            disabled={isRunningAutoClose}
+            title="Run Scheduled Auto-Closing check on open attendance past shift end"
+            className="flex items-center gap-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-300 px-2.5 py-1.5 rounded transition disabled:opacity-50"
+          >
+            <Play className={`w-3.5 h-3.5 text-slate-600 ${isRunningAutoClose ? 'animate-spin' : ''}`} />
+            <span className="hidden lg:inline">{isRunningAutoClose ? 'Checking...' : 'Run Auto-Close'}</span>
+          </button>
+        )}
 
-        {/* Full Screen Scanner CTA */}
-        <button
-          onClick={onOpenScanner}
-          className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs px-3.5 py-1.5 rounded shadow-sm transition"
-        >
-          <ScanLine className="w-4 h-4" />
-          <span>Open Scanner</span>
-        </button>
+        {/* Dedicated Scanner CTA */}
+        {canOpenScanner && (
+          <button
+            onClick={onOpenScanner}
+            className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs px-3.5 py-1.5 rounded shadow-sm transition cursor-pointer"
+          >
+            <ScanLine className="w-4 h-4" />
+            <span>Open Scanner</span>
+          </button>
+        )}
 
         {/* User Profile & Logout */}
         {currentUserRole && (

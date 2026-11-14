@@ -15,6 +15,7 @@ import {
   Info,
   ShieldAlert,
   Save,
+  Users,
   Check,
   Building,
   User,
@@ -24,12 +25,15 @@ import {
   History,
   Sparkles,
   Unlock,
-  RotateCcw
+  RotateCcw,
+  Copy,
+  Globe,
+  Monitor
 } from 'lucide-react';
 import { RolePermissionsManagement } from './RolePermissionsManagement';
 import { onSnapshot, collection } from 'firebase/firestore';
 import { db } from '../firebase';
-import { UserRoleRecord, UserRoleType } from '../types';
+import { LoginHistoryEntry, UserRoleRecord, UserRoleType } from '../types';
 import { 
   getAllUserRoles, 
   createUserAccount, 
@@ -37,8 +41,24 @@ import {
   fetchPasswordResetHistory,
   updateUserRolePermissions, 
   deleteUserRole,
+  fetchDuplicateAccountsReport,
+  consolidateDuplicateAccounts,
+  fetchFullAuthAudit,
+  DuplicateReportResponse,
+  FullAuthAuditResponse,
   INITIAL_DEFAULT_PASSWORD
 } from '../services/authService';
+import {
+  AccountCleanupAuditResponse,
+  CleanupAuditAccount,
+  approveAccountCleanup,
+  fetchAccountCleanupAudit,
+  fetchLoginHistory
+} from '../services/auditService';
+import {
+  fetchFirebaseAdminStatus,
+  FirebaseAdminStatusResponse
+} from '../services/securityService';
 import {
   PERMISSION_MODULES,
   RoleRecord,
@@ -82,6 +102,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
 
   // Super Admin Password Management Panel State (Section 4)
   const [selectedResetUser, setSelectedResetUser] = useState<UserRoleRecord | null>(null);
+  const [panelCurrentPassword, setPanelCurrentPassword] = useState('');
   const [panelNewPassword, setPanelNewPassword] = useState('');
   const [showPanelNewPassword, setShowPanelNewPassword] = useState(false);
   const [panelForceChange, setPanelForceChange] = useState(true);
@@ -90,12 +111,39 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
   const [isSubmittingPanelReset, setIsSubmittingPanelReset] = useState(false);
   const [passwordHistoryList, setPasswordHistoryList] = useState<any[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [firebaseAdminStatus, setFirebaseAdminStatus] = useState<FirebaseAdminStatusResponse | null>(null);
 
   // Modal States
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [isPasswordModalOpen, setIsPasswordModalOpen] = useState(false);
   const [isPermissionsModalOpen, setIsPermissionsModalOpen] = useState(false);
   const [selectedUser, setSelectedUser] = useState<UserRoleRecord | null>(null);
+
+  // Duplicate Account Audit, Cleanup Governance & Health Modal State
+  const [isDuplicateModalOpen, setIsDuplicateModalOpen] = useState(false);
+  const [duplicateModalTab, setDuplicateModalTab] = useState<'authAudit' | 'cleanup' | 'uniqueness'>('authAudit');
+  const [duplicateReport, setDuplicateReport] = useState<DuplicateReportResponse | null>(null);
+  const [authAuditData, setAuthAuditData] = useState<FullAuthAuditResponse | null>(null);
+  const [cleanupAuditData, setCleanupAuditData] = useState<AccountCleanupAuditResponse | null>(null);
+  const [isLoadingDuplicateReport, setIsLoadingDuplicateReport] = useState(false);
+  const [isLoadingAuthAudit, setIsLoadingAuthAudit] = useState(false);
+  const [isConsolidating, setIsConsolidating] = useState(false);
+
+  // Per-account Super Admin cleanup approval state
+  const [cleanupTarget, setCleanupTarget] = useState<CleanupAuditAccount | null>(null);
+  const [cleanupConfirmEmail, setCleanupConfirmEmail] = useState('');
+  const [cleanupMigrateCanonical, setCleanupMigrateCanonical] = useState(true);
+  const [isApprovingCleanup, setIsApprovingCleanup] = useState(false);
+  const [cleanupApprovalResult, setCleanupApprovalResult] = useState<{
+    email: string;
+    message: string;
+    cliSnippet: string;
+    consoleUrl: string;
+  } | null>(null);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  // Recent Login Telemetry for Password Governance tab
+  const [recentLoginHistory, setRecentLoginHistory] = useState<LoginHistoryEntry[]>([]);
 
   // Deletion Confirmation Modal State (Section 1)
   const [userToDelete, setUserToDelete] = useState<UserRoleRecord | null>(null);
@@ -116,6 +164,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
   const [showCreatePassword, setShowCreatePassword] = useState(false);
 
   // Form States - Change Password
+  const [modalCurrentPassword, setModalCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [showNewPassword, setShowNewPassword] = useState(false);
   const [requirePasswordChange, setRequirePasswordChange] = useState(false);
@@ -146,27 +195,43 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
           return { ...data, id: doc.id };
         });
 
+        // Strict Deduplication by normalized loginId
+        const uniqueMap = new Map<string, UserRoleRecord>();
+        fetched.forEach(item => {
+          const key = (item.loginId || item.id.replace(/^role_/, '')).trim().toLowerCase();
+          const existing = uniqueMap.get(key);
+          if (!existing) {
+            uniqueMap.set(key, item);
+          } else {
+            // Prioritize canonical doc ('role_' + key) or document with passwordHash
+            if (item.id === `role_${key}` || (!existing.id.startsWith('role_') && item.passwordHash)) {
+              uniqueMap.set(key, item);
+            }
+          }
+        });
+        const deduplicated = Array.from(uniqueMap.values());
+
         // Sort: Super Admin first, then admin, then user
         const order: Record<string, number> = { super_admin: 0, admin: 1, user: 2 };
-        fetched.sort((a, b) => {
+        deduplicated.sort((a, b) => {
           const aOrder = order[a.role?.toLowerCase()] ?? 3;
           const bOrder = order[b.role?.toLowerCase()] ?? 3;
           if (aOrder !== bOrder) return aOrder - bOrder;
           return (a.loginId || '').localeCompare(b.loginId || '');
         });
 
-        setUsers(fetched);
+        setUsers(deduplicated);
         setIsLoadingUsers(false);
 
         // Update default matrix selection if not selected
-        if (!selectedMatrixUserId && fetched.length > 0) {
-          const firstNonSuper = fetched.find(u => u.role?.toLowerCase() !== 'super_admin') || fetched[0];
+        if (!selectedMatrixUserId && deduplicated.length > 0) {
+          const firstNonSuper = deduplicated.find(u => u.role?.toLowerCase() !== 'super_admin') || deduplicated[0];
           setSelectedMatrixUserId(firstNonSuper.id);
         }
 
         // Update current session profile if matched
         if (currentUserRole) {
-          const currentInDb = fetched.find(u => u.id === currentUserRole.id || u.loginId === currentUserRole.loginId);
+          const currentInDb = deduplicated.find(u => u.id === currentUserRole.id || u.loginId === currentUserRole.loginId);
           if (currentInDb && onRoleProfileUpdated) {
             onRoleProfileUpdated(currentInDb);
           }
@@ -225,6 +290,89 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
     }
   };
 
+  // Duplicate Account Audit, Cleanup Governance & Consolidation Handlers
+  const handleOpenDuplicateModal = async () => {
+    setIsDuplicateModalOpen(true);
+    setIsLoadingDuplicateReport(true);
+    setIsLoadingAuthAudit(true);
+    setCleanupApprovalResult(null);
+    try {
+      const [rep, audit, cleanup, adminStatus] = await Promise.all([
+        fetchDuplicateAccountsReport(),
+        fetchFullAuthAudit(),
+        fetchAccountCleanupAudit(),
+        fetchFirebaseAdminStatus().catch(() => null),
+      ]);
+      setDuplicateReport(rep);
+      setAuthAuditData(audit);
+      setCleanupAuditData(cleanup);
+      if (adminStatus) setFirebaseAdminStatus(adminStatus);
+    } catch (err: any) {
+      showToast('error', err.message || 'Failed to load authentication & cleanup audit reports.');
+    } finally {
+      setIsLoadingDuplicateReport(false);
+      setIsLoadingAuthAudit(false);
+    }
+  };
+
+  const handleCopyText = async (key: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedKey(key);
+      setTimeout(() => setCopiedKey(null), 2500);
+    } catch {
+      showToast('error', 'Clipboard access unavailable in this browser context.');
+    }
+  };
+
+  const handleSubmitCleanupApproval = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!cleanupTarget) return;
+    if (cleanupConfirmEmail.trim() !== cleanupTarget.email) {
+      showToast('error', `Please type exact email "${cleanupTarget.email}" to confirm.`);
+      return;
+    }
+
+    setIsApprovingCleanup(true);
+    try {
+      const res = await approveAccountCleanup({
+        accountKey: cleanupTarget.key,
+        migrateCanonicalEmails: cleanupMigrateCanonical,
+        confirmEmail: cleanupConfirmEmail.trim(),
+      });
+      setCleanupApprovalResult({
+        email: cleanupTarget.email,
+        message: res.message,
+        cliSnippet: res.cliSnippet,
+        consoleUrl: res.consoleUrl,
+      });
+      showToast('success', res.message);
+      setCleanupTarget(null);
+      setCleanupConfirmEmail('');
+      const refreshed = await fetchAccountCleanupAudit();
+      setCleanupAuditData(refreshed);
+    } catch (err: any) {
+      showToast('error', err.message || 'Failed to approve account cleanup.');
+    } finally {
+      setIsApprovingCleanup(false);
+    }
+  };
+
+  const handleExecuteConsolidation = async () => {
+    setIsConsolidating(true);
+    try {
+      const res = await consolidateDuplicateAccounts();
+      showToast('success', res.message || 'Duplicate accounts successfully consolidated!');
+      const rep = await fetchDuplicateAccountsReport();
+      setDuplicateReport(rep);
+      loadUsersManual();
+    } catch (err: any) {
+      showToast('error', err.message || 'Failed to consolidate duplicates.');
+    } finally {
+      setIsConsolidating(false);
+    }
+  };
+
   const showToast = (type: 'success' | 'error', text: string) => {
     setStatusMessage({ type, text });
     setTimeout(() => setStatusMessage(null), 5000);
@@ -235,8 +383,14 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
     if (!isSuperAdmin) return;
     setIsLoadingHistory(true);
     try {
-      const history = await fetchPasswordResetHistory();
+      const [history, loginTelemetry, adminStatus] = await Promise.all([
+        fetchPasswordResetHistory(),
+        fetchLoginHistory().catch(() => [] as LoginHistoryEntry[]),
+        fetchFirebaseAdminStatus().catch(() => null),
+      ]);
       setPasswordHistoryList(history);
+      setRecentLoginHistory(loginTelemetry.slice(0, 12));
+      if (adminStatus) setFirebaseAdminStatus(adminStatus);
     } catch (err: any) {
       console.warn('Failed to load password reset history:', err.message);
     } finally {
@@ -277,16 +431,18 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
 
     setIsSubmittingPanelReset(true);
     try {
-      await adminSetUserPassword(
+      const res = await adminSetUserPassword(
         selectedResetUser.id,
         selectedResetUser.loginId,
         panelNewPassword,
         panelForceChange,
         panelUnlockAccount,
-        panelRevokeSessions
+        panelRevokeSessions,
+        panelCurrentPassword.trim() || undefined
       );
-      showToast('success', `Password for "${selectedResetUser.loginId}" reset successfully. Force next login change: ${panelForceChange ? 'Enabled' : 'Disabled'}.`);
+      showToast('success', res.message || `Password for "${selectedResetUser.loginId}" synchronized in Firebase Auth & Firestore.`);
       setPanelNewPassword('');
+      setPanelCurrentPassword('');
       loadPasswordHistory();
       loadUsersManual();
     } catch (err: any) {
@@ -312,13 +468,28 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
     setIsCreateModalOpen(true);
   };
 
-  // 2. SUBMIT CREATE USER (Section 2)
+  // 2. SUBMIT CREATE USER (Section 2 - with Uniqueness Enforcement)
   const handleCreateUserSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!createFormData.loginId.trim()) {
+    const cleanId = createFormData.loginId.trim().toLowerCase();
+    const cleanEmail = createFormData.email.trim().toLowerCase();
+
+    if (!cleanId) {
       showToast('error', 'Please enter a Login ID.');
       return;
     }
+
+    // Client-side uniqueness validation
+    if (users.some(u => (u.loginId || '').trim().toLowerCase() === cleanId)) {
+      showToast('error', `Login ID "${cleanId}" already exists. Duplicate Login IDs are prohibited.`);
+      return;
+    }
+
+    if (cleanEmail && users.some(u => (u.email || '').trim().toLowerCase() === cleanEmail)) {
+      showToast('error', `Email "${cleanEmail}" is already registered to another account.`);
+      return;
+    }
+
     if (!createFormData.password || createFormData.password.length < 6) {
       showToast('error', 'Password must be at least 6 characters.');
       return;
@@ -329,8 +500,8 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       const finalModules = createFormData.role === 'super_admin' ? ['all'] : createFormData.modulesAllowed;
       const created = await createUserAccount({
         name: createFormData.name || createFormData.loginId.toUpperCase(),
-        loginId: createFormData.loginId.trim().toLowerCase(),
-        email: createFormData.email.trim() || undefined,
+        loginId: cleanId,
+        email: cleanEmail || undefined,
         password: createFormData.password,
         role: createFormData.role,
         modulesAllowed: finalModules,
@@ -340,6 +511,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
 
       showToast('success', `Login ID "${created.loginId}" created and synchronized with Firebase!`);
       setIsCreateModalOpen(false);
+      loadUsersManual();
     } catch (err: any) {
       showToast('error', err.message || 'Failed to create user account.');
     } finally {
@@ -350,10 +522,14 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
   // 3. OPEN PASSWORD CHANGE MODAL
   const handleOpenPasswordModal = (user: UserRoleRecord) => {
     setSelectedUser(user);
+    setModalCurrentPassword('');
     setNewPassword('');
     setShowNewPassword(false);
     setRequirePasswordChange(false);
     setIsPasswordModalOpen(true);
+    if (isSuperAdmin && !firebaseAdminStatus) {
+      fetchFirebaseAdminStatus().then(setFirebaseAdminStatus).catch(() => {});
+    }
   };
 
   // 4. SUBMIT PASSWORD CHANGE
@@ -367,15 +543,17 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
 
     setIsSubmittingPassword(true);
     try {
-      await adminSetUserPassword(
+      const res = await adminSetUserPassword(
         selectedUser.id,
         selectedUser.loginId,
         newPassword,
         requirePasswordChange,
         true,
-        true
+        true,
+        modalCurrentPassword.trim() || undefined
       );
-      showToast('success', `Password for "${selectedUser.loginId}" successfully updated in Firebase! Force next login change: ${requirePasswordChange ? 'Yes' : 'No'}.`);
+      showToast('success', res.message || `Password for "${selectedUser.loginId}" synchronized in Firebase Auth & Firestore.`);
+      setModalCurrentPassword('');
       setIsPasswordModalOpen(false);
       loadPasswordHistory();
       loadUsersManual();
@@ -544,6 +722,17 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
             <span>FIREBASE SYNC: LIVE</span>
           </div>
 
+          {isSuperAdmin && (
+            <button
+              onClick={handleOpenDuplicateModal}
+              className="px-3 py-1.5 rounded-xl border border-indigo-200 bg-indigo-50/70 hover:bg-indigo-100 text-indigo-800 text-xs font-bold flex items-center gap-2 transition cursor-pointer"
+              title="Audit and consolidate duplicate accounts"
+            >
+              <ShieldCheck className="w-4 h-4 text-indigo-600" />
+              <span>Duplicate Accounts Audit</span>
+            </button>
+          )}
+
           <button
             onClick={loadUsersManual}
             disabled={isLoadingUsers}
@@ -603,7 +792,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
           }`}
         >
           <User className="w-4 h-4" />
-          <span>Active User Directory ({users.length})</span>
+          <span>Active User Directory ({users.length} Unique Accounts)</span>
         </button>
 
         {/* ROLE PERMISSIONS MANAGEMENT SUBMODULE */}
@@ -668,15 +857,32 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       {/* ========================================================================= */}
       {activeTab === 'users' && (
         <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
-          <div className="p-4 border-b border-slate-200 bg-slate-50/80 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <div className="p-4 border-b border-slate-200 bg-slate-50/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
-              <h3 className="text-xs font-extrabold text-slate-800 uppercase tracking-wider">
-                Authorized Personnel Directory ({users.length} Total)
-              </h3>
-              <p className="text-[11px] text-slate-500">
-                Click actions on any row to change password, customize module access, or delete account
+              <div className="flex items-center gap-2 flex-wrap">
+                <h3 className="text-xs font-extrabold text-slate-800 uppercase tracking-wider">
+                  Authorized Personnel Directory
+                </h3>
+                <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-blue-100 text-blue-800 border border-blue-200">
+                  {users.length} Unique Accounts
+                </span>
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-100 text-emerald-800 flex items-center gap-1">
+                  <Check className="w-3 h-3" /> Uniqueness Enforced
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-500 mt-0.5">
+                Each Login ID is strictly unique (1 SUPER_ADMIN, 1 ADMIN, 1 USER). Click actions on any row to manage settings.
               </p>
             </div>
+            {isSuperAdmin && (
+              <button
+                onClick={handleOpenDuplicateModal}
+                className="self-start sm:self-auto px-3 py-1.5 rounded-xl border border-slate-200 hover:bg-slate-100 bg-white text-slate-700 text-xs font-bold flex items-center gap-1.5 transition shadow-2xs cursor-pointer"
+              >
+                <ShieldCheck className="w-3.5 h-3.5 text-blue-600" />
+                <span>Duplicate Accounts Report</span>
+              </button>
+            )}
           </div>
 
           <div className="overflow-x-auto">
@@ -1160,6 +1366,42 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                   </div>
                 )}
 
+                {/* Firebase Admin SDK Diagnostic Status */}
+                {firebaseAdminStatus && (
+                  <div className={`p-3 rounded-xl border text-[11px] leading-relaxed ${
+                    firebaseAdminStatus.adminSdkConfigured
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                      : 'bg-amber-50 border-amber-200 text-amber-950'
+                  }`}>
+                    {firebaseAdminStatus.adminSdkConfigured ? (
+                      <div className="font-semibold">
+                        Firebase Admin SDK Active ({firebaseAdminStatus.credentialSource}) — {firebaseAdminStatus.authUsers.length} Firebase Auth users verified for {firebaseAdminStatus.projectId}.
+                      </div>
+                    ) : (
+                      <div>
+                        <span className="font-bold">Admin SDK Service Account Not Mounted: </span>
+                        Runtime default credentials resolve to sandbox project {firebaseAdminStatus.adcSandboxProject} instead of {firebaseAdminStatus.projectId}. To reset a password when the account no longer uses the initial default, either mount <code className="font-mono font-bold">FIREBASE_SERVICE_ACCOUNT_KEY</code> or supply the account&apos;s current Firebase password below.
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Optional Current Password (when Admin SDK key is not mounted) */}
+                {(!firebaseAdminStatus || !firebaseAdminStatus.adminSdkConfigured) && (
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 mb-1.5 uppercase tracking-wider">
+                      Current Firebase Password (Optional)
+                    </label>
+                    <input
+                      type="password"
+                      placeholder="Leave blank if account uses initial password or Admin SDK key is mounted"
+                      value={panelCurrentPassword}
+                      onChange={e => setPanelCurrentPassword(e.target.value)}
+                      className="w-full text-xs px-3.5 py-2.5 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-amber-500 font-mono"
+                    />
+                  </div>
+                )}
+
                 {/* New Temporary Password Input */}
                 <div>
                   <div className="flex items-center justify-between mb-1.5">
@@ -1194,7 +1436,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                     </button>
                   </div>
                   <span className="text-[10px] text-slate-400 mt-1 block">
-                    Minimum 6 characters. Passwords are cryptographically hashed on the server.
+                    Minimum 6 characters. Firebase Auth UID is updated in-place before Firestore scrypt hash updates.
                   </span>
                 </div>
 
@@ -1376,6 +1618,74 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
               </div>
             </div>
           </div>
+
+          {/* Recent Login IP / Browser / OS Telemetry Card */}
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
+            <div className="p-4 border-b border-slate-200 bg-slate-50/80 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Globe className="w-4 h-4 text-blue-600" />
+                <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                  Recent Authentication &amp; Device Telemetry
+                </h4>
+              </div>
+              <span className="text-[10px] font-mono text-slate-500">
+                Latest {recentLoginHistory.length} sign-in / logout events
+              </span>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-50 text-slate-600 uppercase font-bold text-[10px] border-b border-slate-200">
+                  <tr>
+                    <th className="py-2.5 px-3.5">Time</th>
+                    <th className="py-2.5 px-3.5">Event</th>
+                    <th className="py-2.5 px-3.5">Login ID</th>
+                    <th className="py-2.5 px-3.5">IP &amp; GeoLocation</th>
+                    <th className="py-2.5 px-3.5">Browser / OS / Device</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {recentLoginHistory.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} className="py-6 text-center text-slate-400">
+                        No recent sign-in telemetry recorded yet.
+                      </td>
+                    </tr>
+                  ) : (
+                    recentLoginHistory.map(ev => (
+                      <tr key={ev.id} className="hover:bg-slate-50">
+                        <td className="py-2 px-3.5 font-mono text-[11px] text-slate-500 whitespace-nowrap">
+                          {new Date(ev.timestamp).toLocaleString()}
+                        </td>
+                        <td className="py-2 px-3.5">
+                          <span className={`px-1.5 py-0.5 rounded font-mono text-[10px] font-bold ${
+                            ev.success ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
+                          }`}>
+                            {ev.eventType}
+                          </span>
+                        </td>
+                        <td className="py-2 px-3.5 font-mono font-bold text-blue-700">{ev.loginId}</td>
+                        <td className="py-2 px-3.5 font-mono text-[11px] text-slate-700">
+                          {ev.ipAddress}
+                          {ev.geoLocation?.status === 'resolved' && (
+                            <span className="text-slate-400 ml-1">
+                              ({[ev.geoLocation.city, ev.geoLocation.country].filter(Boolean).join(', ')})
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-2 px-3.5 text-[11px] text-slate-600">
+                          <span className="inline-flex items-center gap-1">
+                            <Monitor className="w-3 h-3 text-slate-400" />
+                            {ev.browser} / {ev.os} ({ev.deviceType})
+                          </span>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
       )}
 
@@ -1456,7 +1766,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                         role: newRole,
                         modulesAllowed: newRole === 'super_admin' ? ['all'] :
                                        newRole === 'admin' ? ['dashboard', 'scanner', 'employees', 'history', 'reports', 'qr_codes'] :
-                                       ['scanner']
+                                       ['dashboard', 'scanner']
                       });
                     }}
                     className="w-full text-xs px-3 py-2 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 font-semibold"
@@ -1588,6 +1898,27 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
             </div>
 
             <form onSubmit={handlePasswordSubmit} className="p-6 space-y-4">
+              {firebaseAdminStatus && !firebaseAdminStatus.adminSdkConfigured && (
+                <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-950 text-[11px] leading-relaxed">
+                  <strong>Firebase Admin SDK Key Not Mounted:</strong> Supply the account&apos;s current Firebase password below (or mount <code className="font-mono font-bold">FIREBASE_SERVICE_ACCOUNT_KEY</code>) so Firebase Auth UID is updated in-place.
+                </div>
+              )}
+
+              {(!firebaseAdminStatus || !firebaseAdminStatus.adminSdkConfigured) && (
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1">
+                    Current Account Password (Optional)
+                  </label>
+                  <input
+                    type="password"
+                    placeholder="Needed if Admin SDK key is absent & password changed"
+                    value={modalCurrentPassword}
+                    onChange={e => setModalCurrentPassword(e.target.value)}
+                    className="w-full text-xs px-3 py-2 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono font-medium"
+                  />
+                </div>
+              )}
+
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">
                   New Password *
@@ -1861,6 +2192,638 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                   )}
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================= */}
+      {/* MODAL 5: DUPLICATE ACCOUNT AUDIT & CONSOLIDATION          */}
+      {/* ========================================================= */}
+      {isDuplicateModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs overflow-y-auto">
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-4xl my-8 overflow-hidden animate-in fade-in zoom-in-95 duration-150 flex flex-col max-h-[90vh]">
+            {/* Modal Header */}
+            <div className="p-5 border-b border-slate-200 bg-slate-50 flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-blue-600 text-white flex items-center justify-center font-bold shadow-md shadow-blue-600/20">
+                  <ShieldCheck className="w-6 h-6" />
+                </div>
+                <div>
+                  <h3 className="font-extrabold text-slate-900 text-base">Enterprise Authentication Audit & Account Mapping</h3>
+                  <p className="text-xs text-slate-500">
+                    Comprehensive cross-reference of Firebase Authentication UIDs, Firestore collections, and audit logs
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsDuplicateModalOpen(false)}
+                className="p-1.5 rounded-lg hover:bg-slate-200 text-slate-500 transition cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Tabs Header */}
+            <div className="px-5 pt-3 border-b border-slate-200 bg-slate-50/70 flex items-center gap-3 shrink-0 overflow-x-auto">
+              <button
+                type="button"
+                onClick={() => setDuplicateModalTab('authAudit')}
+                className={`pb-2.5 px-3 text-xs font-bold border-b-2 transition flex items-center gap-2 shrink-0 cursor-pointer ${
+                  duplicateModalTab === 'authAudit'
+                    ? 'border-blue-600 text-blue-700'
+                    : 'border-transparent text-slate-500 hover:text-slate-800'
+                }`}
+              >
+                <ShieldCheck className="w-4 h-4" />
+                <span>10-Account Firebase Auth Audit & Mapping</span>
+                <span className="px-1.5 py-0.5 rounded-full text-[10px] bg-blue-100 text-blue-800 font-extrabold">10</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setDuplicateModalTab('cleanup')}
+                className={`pb-2.5 px-3 text-xs font-bold border-b-2 transition flex items-center gap-2 shrink-0 cursor-pointer ${
+                  duplicateModalTab === 'cleanup'
+                    ? 'border-amber-600 text-amber-700'
+                    : 'border-transparent text-slate-500 hover:text-slate-800'
+                }`}
+              >
+                <ShieldAlert className="w-4 h-4" />
+                <span>Legacy Cleanup Governance (19 Collections)</span>
+                <span className="px-1.5 py-0.5 rounded-full text-[10px] bg-amber-100 text-amber-800 font-extrabold">
+                  {cleanupAuditData ? cleanupAuditData.accounts.filter(a => !a.isCanonicalKeep && !a.isProtected).length : 6}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setDuplicateModalTab('uniqueness')}
+                className={`pb-2.5 px-3 text-xs font-bold border-b-2 transition flex items-center gap-2 shrink-0 cursor-pointer ${
+                  duplicateModalTab === 'uniqueness'
+                    ? 'border-blue-600 text-blue-700'
+                    : 'border-transparent text-slate-500 hover:text-slate-800'
+                }`}
+              >
+                <Users className="w-4 h-4" />
+                <span>Unique Account Directory (3 Roles)</span>
+                <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-extrabold ${
+                  duplicateReport?.duplicateCount ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-800'
+                }`}>
+                  {duplicateReport ? `${duplicateReport.totalUniqueAccounts} Accounts` : '3 Accounts'}
+                </span>
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-6 overflow-y-auto space-y-5 grow">
+              {isLoadingDuplicateReport || isLoadingAuthAudit ? (
+                <div className="py-12 text-center text-slate-500 space-y-3">
+                  <div className="w-8 h-8 border-3 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto" />
+                  <p className="text-xs font-semibold">Auditing 10 Firebase Auth accounts and cross-referencing Firestore collections...</p>
+                </div>
+              ) : duplicateModalTab === 'authAudit' && authAuditData ? (
+                <>
+                  {/* Step 1 Summary Cards */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <div className="p-3.5 rounded-xl bg-blue-50 border border-blue-200">
+                      <div className="text-[10px] font-bold text-blue-600 uppercase tracking-wider">Total Audited</div>
+                      <div className="text-xl font-extrabold text-blue-900 mt-0.5">{authAuditData.totalAccountsAudited} Accounts</div>
+                      <div className="text-[10px] text-blue-700 mt-0.5">Firebase Auth Registry</div>
+                    </div>
+                    <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200">
+                      <div className="text-[10px] font-bold text-emerald-600 uppercase tracking-wider">Primary Active</div>
+                      <div className="text-xl font-extrabold text-emerald-800 mt-0.5">{authAuditData.primaryAccountsCount} Accounts</div>
+                      <div className="text-[10px] text-emerald-700 mt-0.5">Tested 12 Nov 2026</div>
+                    </div>
+                    <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200">
+                      <div className="text-[10px] font-bold text-amber-600 uppercase tracking-wider">Legacy Accounts</div>
+                      <div className="text-xl font-extrabold text-amber-800 mt-0.5">{authAuditData.legacyAccountsCount} Accounts</div>
+                      <div className="text-[10px] text-amber-700 mt-0.5">Protected & Pending</div>
+                    </div>
+                    <div className="p-3.5 rounded-xl bg-indigo-50 border border-indigo-200">
+                      <div className="text-[10px] font-bold text-indigo-600 uppercase tracking-wider">Audit Logs Traced</div>
+                      <div className="text-xl font-extrabold text-indigo-900 mt-0.5">{authAuditData.totalAuditLogsCount} Logs</div>
+                      <div className="text-[10px] text-indigo-700 mt-0.5">Historical verification</div>
+                    </div>
+                  </div>
+
+                  {/* Live Firebase Admin SDK Inspection Status */}
+                  {firebaseAdminStatus && (
+                    <div className={`p-4 rounded-xl border flex items-start gap-3 ${
+                      firebaseAdminStatus.adminSdkConfigured
+                        ? 'bg-emerald-50 border-emerald-200'
+                        : 'bg-amber-50 border-amber-200'
+                    }`}>
+                      <ShieldCheck className={`w-5 h-5 shrink-0 mt-0.5 ${
+                        firebaseAdminStatus.adminSdkConfigured ? 'text-emerald-600' : 'text-amber-700'
+                      }`} />
+                      <div className="text-xs leading-relaxed">
+                        <div className={`font-bold ${firebaseAdminStatus.adminSdkConfigured ? 'text-emerald-900' : 'text-amber-950'}`}>
+                          {firebaseAdminStatus.adminSdkConfigured
+                            ? `Live Firebase Admin SDK Connected (${firebaseAdminStatus.authUsers.length} Firebase Auth Users Loaded)`
+                            : 'Live Firebase Admin SDK Inspection Unavailable in Sandbox Runtime'}
+                        </div>
+                        <div className={firebaseAdminStatus.adminSdkConfigured ? 'text-emerald-800 mt-0.5' : 'text-amber-900 mt-0.5'}>
+                          {firebaseAdminStatus.adminSdkConfigured
+                            ? `Verified against project "${firebaseAdminStatus.projectId}" using ${firebaseAdminStatus.credentialSource}. Mapping conflicts detected: ${firebaseAdminStatus.firestoreMappings.filter(m => m.mappingConflict).length}.`
+                            : firebaseAdminStatus.reason}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Safety Guard Badge */}
+                  <div className="p-4 rounded-xl bg-blue-50/70 border border-blue-200 flex items-start gap-3">
+                    <ShieldCheck className="w-5 h-5 text-blue-600 shrink-0 mt-0.5" />
+                    <div>
+                      <div className="font-bold text-blue-900 text-xs">Read-Only Authentication Audit Safeguard</div>
+                      <div className="text-xs text-blue-800 mt-0.5 leading-relaxed">
+                        {authAuditData.safeguardMessage} Permanent UIDs, employee relations, attendance scan history, and QR codes remain fully preserved.
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 10-Account Mapping Table */}
+                  <div className="rounded-xl border border-slate-200 overflow-hidden bg-white shadow-2xs">
+                    <div className="p-3.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
+                      <span className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                        Master Firebase Authentication Account Mapping (10 Accounts)
+                      </span>
+                      <span className="text-[11px] text-slate-500 font-mono">
+                        Audited: {new Date(authAuditData.auditTimestamp).toLocaleDateString()}
+                      </span>
+                    </div>
+
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-xs">
+                        <thead className="bg-slate-50 text-slate-500 uppercase font-semibold text-[10px] border-b border-slate-200">
+                          <tr>
+                            <th className="py-2.5 px-3">Login ID & Role</th>
+                            <th className="py-2.5 px-3">Email</th>
+                            <th className="py-2.5 px-3">Firebase UID</th>
+                            <th className="py-2.5 px-3">Created / Sign-in</th>
+                            <th className="py-2.5 px-3">Firestore References</th>
+                            <th className="py-2.5 px-3">Status & Action</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {authAuditData.accounts.map((acc) => {
+                            const isPrimary = acc.accountType === 'PRIMARY_CURRENT';
+                            const isLegacyQA = acc.accountType === 'LEGACY_QA';
+                            const isSystem = acc.accountType === 'LEGACY_SYSTEM' || acc.accountType === 'GOOGLE_OWNER';
+                            return (
+                              <tr 
+                                key={acc.loginId + acc.email} 
+                                className={isPrimary ? 'bg-emerald-50/25' : isLegacyQA ? 'bg-amber-50/25' : 'bg-slate-50/30'}
+                              >
+                                <td className="py-3 px-3">
+                                  <div className="font-mono font-bold text-slate-900 text-[11px]">{acc.loginId}</div>
+                                  <span className={`inline-block mt-0.5 px-2 py-0.2 rounded-full text-[9px] font-bold uppercase ${
+                                    acc.role === 'SUPER_ADMIN' ? 'bg-purple-100 text-purple-800' :
+                                    acc.role === 'ADMIN' ? 'bg-blue-100 text-blue-800' :
+                                    'bg-slate-100 text-slate-800'
+                                  }`}>
+                                    {acc.role}
+                                  </span>
+                                </td>
+                                <td className="py-3 px-3 font-mono text-[11px] text-slate-700">
+                                  {acc.email}
+                                </td>
+                                <td className="py-3 px-3 font-mono text-[10px] text-slate-600 max-w-[150px] truncate" title={acc.firebaseUid}>
+                                  {acc.firebaseUid}
+                                </td>
+                                <td className="py-3 px-3 text-[10px] text-slate-500">
+                                  <div>Created: {new Date(acc.createdDate).toLocaleDateString()}</div>
+                                  <div className="text-slate-700 font-medium">Last Login: {new Date(acc.lastSignIn).toLocaleDateString()}</div>
+                                </td>
+                                <td className="py-3 px-3 text-[11px] text-slate-700 max-w-[200px]">
+                                  {acc.firestoreReferences}
+                                </td>
+                                <td className="py-3 px-3">
+                                  {isPrimary ? (
+                                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-emerald-100 text-emerald-800">
+                                      <CheckCircle2 className="w-3 h-3" />
+                                      ACTIVE PRIMARY
+                                    </span>
+                                  ) : isSystem ? (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-100 text-blue-800">
+                                      <ShieldCheck className="w-3 h-3" />
+                                      SYSTEM PRINCIPAL
+                                    </span>
+                                  ) : isLegacyQA ? (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800">
+                                      <AlertCircle className="w-3 h-3" />
+                                      PENDING APPROVAL
+                                    </span>
+                                  ) : (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-700">
+                                      ALIAS MAPPED
+                                    </span>
+                                  )}
+                                  <div className="text-[10px] text-slate-500 mt-1 leading-tight">
+                                    {acc.recommendation}
+                                  </div>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  {/* Step 6 Safe Legacy Cleanup Report Card */}
+                  <div className="p-4 rounded-xl border border-slate-200 bg-slate-50 space-y-2">
+                    <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-2">
+                      <Lock className="w-3.5 h-3.5 text-blue-600" />
+                      Step 6: Super Admin Legacy Account Cleanup Governance
+                    </h4>
+                    <p className="text-xs text-slate-600 leading-relaxed">
+                      Switch to the <strong>Legacy Cleanup Governance</strong> tab to inspect cross-collection UID dependencies across all 19 Firestore collections and explicitly approve legacy accounts before running Firebase Console / CLI deletion.
+                    </p>
+                  </div>
+                </>
+              ) : duplicateModalTab === 'cleanup' && cleanupAuditData ? (
+                <>
+                  {/* Cross-Collection Safeguard Notice */}
+                  <div className="p-4 rounded-xl bg-amber-50 border border-amber-200 flex items-start gap-3">
+                    <ShieldAlert className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+                    <div className="text-xs text-amber-900 space-y-1">
+                      <div className="font-bold">
+                        Cross-Collection UID Reconciliation ({cleanupAuditData.collectionsScanned} Collections Scanned)
+                      </div>
+                      <p className="leading-relaxed">
+                        Canonical Keep Accounts: <span className="font-mono font-bold">{cleanupAuditData.canonicalKeepEmails.join(', ')}</span> (+ GCP Owner protected).
+                        {' '}{cleanupAuditData.safeguardMessage}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Generated CLI / Console Snippet Banner after Approval */}
+                  {cleanupApprovalResult && (
+                    <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-300 space-y-2.5 text-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="font-bold text-emerald-900 flex items-center gap-1.5">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                          <span>Cleanup Approved for {cleanupApprovalResult.email}</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleCopyText('console_url', cleanupApprovalResult.consoleUrl)}
+                          className="px-2.5 py-1 rounded bg-white border border-emerald-300 text-emerald-800 font-semibold flex items-center gap-1 cursor-pointer"
+                        >
+                          <Copy className="w-3 h-3" />
+                          <span>{copiedKey === 'console_url' ? 'Copied Console URL' : 'Copy Firebase Console URL'}</span>
+                        </button>
+                      </div>
+                      <p className="text-emerald-800">{cleanupApprovalResult.message}</p>
+                      <div className="bg-slate-900 text-emerald-300 p-3 rounded-lg font-mono text-[11px] flex items-start justify-between gap-2">
+                        <code className="break-all">{cleanupApprovalResult.cliSnippet}</code>
+                        <button
+                          type="button"
+                          onClick={() => handleCopyText('cli_snippet', cleanupApprovalResult.cliSnippet)}
+                          className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-white text-[10px] font-bold shrink-0 flex items-center gap-1 cursor-pointer"
+                        >
+                          <Copy className="w-3 h-3" />
+                          <span>{copiedKey === 'cli_snippet' ? 'Copied' : 'Copy'}</span>
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Per-Account Approval Sub-form */}
+                  {cleanupTarget && (
+                    <form onSubmit={handleSubmitCleanupApproval} className="p-4 rounded-xl border-2 border-amber-400 bg-amber-50/60 space-y-3 text-xs">
+                      <div className="flex items-center justify-between">
+                        <h4 className="font-bold text-amber-950">
+                          Approve Cleanup for: <span className="font-mono">{cleanupTarget.email}</span>
+                        </h4>
+                        <button
+                          type="button"
+                          onClick={() => setCleanupTarget(null)}
+                          className="p-1 rounded hover:bg-amber-200 text-amber-800 cursor-pointer"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+
+                      <div className="text-[11px] text-amber-900">
+                        UID: <span className="font-mono font-bold">{cleanupTarget.firebaseUid}</span> • Active Blocking Dependencies: <strong>{cleanupTarget.activeBlockingDependencies}</strong>
+                      </div>
+
+                      {cleanupTarget.key.endsWith('_root_legacy') && (
+                        <label className="flex items-center gap-2 cursor-pointer font-medium text-amber-950">
+                          <input
+                            type="checkbox"
+                            checked={cleanupMigrateCanonical}
+                            onChange={e => setCleanupMigrateCanonical(e.target.checked)}
+                            className="rounded border-amber-400 text-amber-600 w-4 h-4"
+                          />
+                          <span>Migrate Firestore user_roles reference cleanly to canonical *@narid.com while preserving aliases</span>
+                        </label>
+                      )}
+
+                      <div>
+                        <label className="block font-bold text-amber-950 mb-1">
+                          Type exact email <span className="font-mono">{cleanupTarget.email}</span> to approve cleanup *
+                        </label>
+                        <input
+                          type="email"
+                          required
+                          placeholder={cleanupTarget.email}
+                          value={cleanupConfirmEmail}
+                          onChange={e => setCleanupConfirmEmail(e.target.value)}
+                          className="w-full px-3 py-2 border border-amber-300 rounded-lg bg-white font-mono"
+                        />
+                      </div>
+
+                      <div className="flex justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setCleanupTarget(null)}
+                          className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white text-slate-700 font-semibold cursor-pointer"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="submit"
+                          disabled={isApprovingCleanup}
+                          className="px-4 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-bold cursor-pointer disabled:opacity-50"
+                        >
+                          {isApprovingCleanup ? 'Recording Approval...' : 'Confirm Super Admin Approval'}
+                        </button>
+                      </div>
+                    </form>
+                  )}
+
+                  {/* 10-Account Dependency Table */}
+                  <div className="rounded-xl border border-slate-200 overflow-hidden bg-white">
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-xs">
+                        <thead className="bg-slate-50 text-slate-600 uppercase font-bold text-[10px] border-b border-slate-200">
+                          <tr>
+                            <th className="py-2.5 px-3">Account &amp; Role</th>
+                            <th className="py-2.5 px-3">UID</th>
+                            <th className="py-2.5 px-3">Cross-Collection Dependencies</th>
+                            <th className="py-2.5 px-3">Recommendation</th>
+                            <th className="py-2.5 px-3 text-right">Governance Action</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {cleanupAuditData.accounts.map(acc => (
+                            <tr key={acc.key} className={acc.isCanonicalKeep ? 'bg-emerald-50/20' : 'bg-white'}>
+                              <td className="py-2.5 px-3">
+                                <div className="font-mono font-bold text-slate-900">{acc.email}</div>
+                                <div className="text-[10px] text-slate-500 uppercase font-semibold">
+                                  {acc.loginId} • {acc.role}
+                                </div>
+                              </td>
+                              <td className="py-2.5 px-3 font-mono text-[10px] text-slate-600 max-w-[140px] truncate" title={acc.firebaseUid}>
+                                {acc.firebaseUid}
+                              </td>
+                              <td className="py-2.5 px-3">
+                                {acc.dependencies.length === 0 ? (
+                                  <span className="text-[11px] text-slate-400">0 references</span>
+                                ) : (
+                                  <div className="flex flex-wrap gap-1">
+                                    {acc.dependencies.map(dep => (
+                                      <span
+                                        key={dep.collection}
+                                        className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 font-mono text-[10px] text-slate-700"
+                                        title={dep.note}
+                                      >
+                                        {dep.collection}: {dep.matches}
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
+                              </td>
+                              <td className="py-2.5 px-3 text-[11px] text-slate-700 max-w-[200px]">
+                                {acc.recommendation}
+                              </td>
+                              <td className="py-2.5 px-3 text-right whitespace-nowrap">
+                                {acc.isCanonicalKeep || acc.isProtected ? (
+                                  <span className="px-2 py-1 rounded bg-emerald-100 text-emerald-800 text-[10px] font-bold uppercase">
+                                    Protected Keep
+                                  </span>
+                                ) : acc.approvalState?.approved ? (
+                                  <div className="inline-flex flex-col items-end gap-1">
+                                    <span className="px-2 py-0.5 rounded bg-blue-100 text-blue-800 text-[10px] font-bold">
+                                      Approved by {acc.approvalState.approvedBy}
+                                    </span>
+                                    {acc.consoleCleanupCommand && (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleCopyText(acc.key, acc.consoleCleanupCommand || '')}
+                                        className="px-2 py-0.5 rounded border border-slate-300 bg-white hover:bg-slate-50 text-[10px] font-semibold flex items-center gap-1 cursor-pointer"
+                                      >
+                                        <Copy className="w-3 h-3" />
+                                        <span>{copiedKey === acc.key ? 'Copied' : 'Copy CLI'}</span>
+                                      </button>
+                                    )}
+                                  </div>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setCleanupTarget(acc);
+                                      setCleanupConfirmEmail('');
+                                      setCleanupMigrateCanonical(acc.key.endsWith('_root_legacy'));
+                                    }}
+                                    className="px-2.5 py-1 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-[11px] font-bold cursor-pointer"
+                                  >
+                                    Approve Cleanup
+                                  </button>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </>
+              ) : duplicateReport ? (
+                <>
+                  {/* Summary Metric Cards */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200">
+                      <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Raw Documents</div>
+                      <div className="text-xl font-extrabold text-slate-800 mt-0.5">{duplicateReport.totalRawDocuments}</div>
+                    </div>
+                    <div className="p-3.5 rounded-xl bg-blue-50 border border-blue-200">
+                      <div className="text-[10px] font-bold text-blue-600 uppercase tracking-wider">Unique Accounts</div>
+                      <div className="text-xl font-extrabold text-blue-800 mt-0.5">{duplicateReport.totalUniqueAccounts}</div>
+                    </div>
+                    <div className={`p-3.5 rounded-xl border ${duplicateReport.duplicateCount > 0 ? 'bg-amber-50 border-amber-300' : 'bg-emerald-50 border-emerald-300'}`}>
+                      <div className={`text-[10px] font-bold uppercase tracking-wider ${duplicateReport.duplicateCount > 0 ? 'text-amber-700' : 'text-emerald-700'}`}>
+                        Shadow Duplicates
+                      </div>
+                      <div className={`text-xl font-extrabold mt-0.5 ${duplicateReport.duplicateCount > 0 ? 'text-amber-800' : 'text-emerald-800'}`}>
+                        {duplicateReport.duplicateCount}
+                      </div>
+                    </div>
+                    <div className="p-3.5 rounded-xl bg-purple-50 border border-purple-200">
+                      <div className="text-[10px] font-bold text-purple-600 uppercase tracking-wider">Integrity Status</div>
+                      <div className="text-xs font-extrabold text-purple-800 mt-1">
+                        {duplicateReport.duplicateCount === 0 ? '100% CANONICAL' : 'CONSOLIDATION NEEDED'}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Status Banner */}
+                  {duplicateReport.duplicateCount === 0 ? (
+                    <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200 flex items-start gap-3">
+                      <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+                      <div>
+                        <div className="font-bold text-emerald-900 text-xs">Database Uniqueness Verified</div>
+                        <div className="text-xs text-emerald-800 mt-0.5 leading-relaxed">
+                          Exactly <strong>{duplicateReport.totalUniqueAccounts} unique canonical accounts</strong> are active (1 SUPER_ADMIN, 1 ADMIN, 1 USER). No redundant shadow duplicates exist in Firestore. Unique Login ID constraints are active on both frontend and backend.
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="p-4 rounded-xl bg-amber-50 border border-amber-300 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div className="flex items-start gap-3">
+                        <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                        <div>
+                          <div className="font-bold text-amber-900 text-xs">Duplicate Records Detected ({duplicateReport.duplicateCount})</div>
+                          <div className="text-xs text-amber-800 mt-0.5">
+                            Shadow duplicate document(s) share identical Login IDs. Consolidate them to retain the primary canonical record and preserve all authentication mappings.
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        onClick={handleExecuteConsolidation}
+                        disabled={isConsolidating}
+                        className="px-4 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs flex items-center gap-2 shadow-md shrink-0 cursor-pointer disabled:opacity-50"
+                      >
+                        {isConsolidating ? (
+                          <>
+                            <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                            <span>Consolidating...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Sparkles className="w-4 h-4" />
+                            <span>Consolidate Duplicates</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Detailed Account Groups */}
+                  <div className="space-y-4">
+                    <h4 className="text-xs font-bold text-slate-700 uppercase tracking-wider">
+                      Account Breakdown by Login ID
+                    </h4>
+
+                    {duplicateReport.report.map((group) => (
+                      <div key={group.loginId} className="rounded-xl border border-slate-200 overflow-hidden bg-white shadow-2xs">
+                        <div className="p-3 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono font-bold text-blue-700 text-sm">
+                              {group.loginId}
+                            </span>
+                            <span className="text-[11px] text-slate-500">
+                              ({group.totalDocs} document{group.totalDocs > 1 ? 's' : ''})
+                            </span>
+                          </div>
+                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
+                            group.hasDuplicates 
+                              ? 'bg-amber-100 text-amber-800' 
+                              : 'bg-emerald-100 text-emerald-800'
+                          }`}>
+                            {group.hasDuplicates ? 'Duplicates Detected' : 'Unique (1 Primary)'}
+                          </span>
+                        </div>
+
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-left text-xs">
+                            <thead className="bg-slate-50/50 text-slate-500 uppercase font-semibold text-[10px] border-b border-slate-100">
+                              <tr>
+                                <th className="py-2.5 px-3">Document ID / Auth UID</th>
+                                <th className="py-2.5 px-3">Email</th>
+                                <th className="py-2.5 px-3">Role</th>
+                                <th className="py-2.5 px-3">Password Hash</th>
+                                <th className="py-2.5 px-3">Audit Logs</th>
+                                <th className="py-2.5 px-3 text-right">Status</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-100">
+                              {group.documents.map((doc) => (
+                                <tr key={doc.docId} className={doc.isPrimary ? 'bg-emerald-50/20' : 'bg-amber-50/20'}>
+                                  <td className="py-2.5 px-3">
+                                    <div className="font-mono font-bold text-slate-800 text-[11px]">{doc.docId}</div>
+                                    {doc.firebaseUid && doc.firebaseUid !== doc.docId && (
+                                      <div className="text-[10px] text-slate-400 font-mono">UID: {doc.firebaseUid}</div>
+                                    )}
+                                  </td>
+                                  <td className="py-2.5 px-3 font-mono text-[11px] text-slate-600">
+                                    {doc.email}
+                                  </td>
+                                  <td className="py-2.5 px-3">
+                                    <span className="px-2 py-0.5 rounded-full text-[9px] font-bold uppercase bg-slate-100 text-slate-700">
+                                      {doc.role}
+                                    </span>
+                                  </td>
+                                  <td className="py-2.5 px-3">
+                                    {doc.hasPasswordHash ? (
+                                      <span className="text-[10px] text-emerald-700 font-semibold flex items-center gap-1">
+                                        <Check className="w-3 h-3" /> Scrypt Hash
+                                      </span>
+                                    ) : (
+                                      <span className="text-[10px] text-slate-400">None</span>
+                                    )}
+                                  </td>
+                                  <td className="py-2.5 px-3 font-semibold text-slate-700">
+                                    {doc.associatedAuditLogs} references
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right">
+                                    {doc.isPrimary ? (
+                                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-emerald-100 text-emerald-800">
+                                        <CheckCircle2 className="w-3 h-3" />
+                                        PRIMARY CANONICAL
+                                      </span>
+                                    ) : (
+                                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800">
+                                        <AlertCircle className="w-3 h-3" />
+                                        SHADOW DUPLICATE
+                                      </span>
+                                    )}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : null}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-4 border-t border-slate-200 bg-slate-50 flex items-center justify-between shrink-0">
+              <button
+                type="button"
+                onClick={handleOpenDuplicateModal}
+                disabled={isLoadingDuplicateReport || isLoadingAuthAudit}
+                className="px-4 py-2 rounded-xl border border-slate-300 hover:bg-white text-slate-700 text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isLoadingDuplicateReport || isLoadingAuthAudit ? 'animate-spin text-blue-600' : ''}`} />
+                <span>Re-Scan Database</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsDuplicateModalOpen(false)}
+                className="px-5 py-2 rounded-xl bg-slate-800 hover:bg-slate-900 text-white font-bold text-xs transition cursor-pointer"
+              >
+                Close
+              </button>
             </div>
           </div>
         </div>

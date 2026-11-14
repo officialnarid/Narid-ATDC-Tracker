@@ -46,7 +46,7 @@ service cloud.firestore {
       return isSignedIn() && (
         isAdmin() ||
         (hasRoleDoc(request.auth.uid) && getRoleDoc(request.auth.uid).status == 'Active') ||
-        (hasRoleDoc('role_' + request.auth.uid) && getRoleDoc('role_' + request.auth.uid).status == 'Active') ||
+        (hasRoleDoc('role_' + request.auth.uid) && getRoleDoc(request.auth.uid).status == 'Active') ||
         request.auth.token.email == 'user_root@narid.com' ||
         request.auth.token.email == 'user@narid.com'
       );
@@ -54,15 +54,19 @@ service cloud.firestore {
 
     // 1. User Roles & Accounts Collection
     match /user_roles/{userRoleId} {
-      // Super Admin can list/get all; individual users can only get their own account record
       allow list: if isSuperAdmin();
-      allow get: if isSignedIn() && (isSuperAdmin() || request.auth.uid == userRoleId || ('role_' + request.auth.uid) == userRoleId);
-      // Only Super Admin can provision new accounts
-      allow create: if isSuperAdmin() && isValidId(userRoleId);
-      // Strictly only Super Admin can modify account records, passwords, roles, status, or mustChangePassword flags
-      allow update: if isSuperAdmin() && isValidId(userRoleId);
-      // Only Super Admin can delete account records
-      allow delete: if isSuperAdmin() && isValidId(userRoleId);
+      allow get: if isSignedIn() && (
+        isSuperAdmin() ||
+        request.auth.uid == userRoleId ||
+        ('role_' + request.auth.uid) == userRoleId ||
+        (resource != null && (
+          resource.data.authUid == request.auth.uid ||
+          (resource.data.email != null && resource.data.email == request.auth.token.email)
+        )) ||
+        (userRoleId == 'role_admin' && (request.auth.token.email == 'admin@narid.com' || request.auth.token.email == 'admin_root@narid.com')) ||
+        (userRoleId == 'role_user' && (request.auth.token.email == 'user@narid.com' || request.auth.token.email == 'user_root@narid.com'))
+      );
+      allow create, update, delete: if isSuperAdmin() && isValidId(userRoleId);
     }
 
     // 2. Shared Role Definitions Collection
@@ -74,7 +78,15 @@ service cloud.firestore {
     // 3. User Individual Permissions Collection
     match /user_permissions/{permissionId} {
       allow list: if isSuperAdmin();
-      allow get: if isSignedIn() && (isSuperAdmin() || request.auth.uid == permissionId || ('role_' + request.auth.uid) == permissionId);
+      allow get: if isSignedIn() && (
+        isSuperAdmin() ||
+        request.auth.uid == permissionId ||
+        ('role_' + request.auth.uid) == permissionId ||
+        (resource != null && resource.data.loginId != null && (
+          (resource.data.loginId == 'admin' && (request.auth.token.email == 'admin@narid.com' || request.auth.token.email == 'admin_root@narid.com')) ||
+          (resource.data.loginId == 'user' && (request.auth.token.email == 'user@narid.com' || request.auth.token.email == 'user_root@narid.com'))
+        ))
+      );
       allow create, update, delete: if isSuperAdmin() && isValidId(permissionId);
     }
 
@@ -111,14 +123,38 @@ service cloud.firestore {
       allow update, delete: if false; // Immutable audit log
     }
 
-    // 9. Enterprise Compliance Audit Logs
+    // 9. Enterprise Compliance Audit Logs (Server-verified creation; protected records immutable)
     match /audit_logs/{auditId} {
       allow list, get: if isSuperAdmin();
-      allow create: if isSignedIn() && isActiveUser() && isValidId(auditId);
-      allow update, delete: if false; // Strictly append-only, immutable security audit trail
+      allow create, update: if isSuperAdmin() && isValidId(auditId);
+      allow delete: if isSuperAdmin() && isValidId(auditId) &&
+        resource.data.isProtected != true &&
+        resource.data.isImportant != true &&
+        resource.data.severity != 'CRITICAL';
     }
 
-    // 9.1 Password Reset Audit Trail (Super Admin Governance)
+    // 9.1 Login History & IP / Geo / Device Telemetry (Immutable)
+    match /login_history/{historyId} {
+      allow list, get: if isSuperAdmin();
+      allow create: if isSuperAdmin() && isValidId(historyId);
+      allow update, delete: if false;
+    }
+
+    // 9.2 Long-Term Audit Archives (Permanent compliance archive)
+    match /audit_archives/{archiveId} {
+      allow list, get: if isSuperAdmin();
+      allow create, update: if isSuperAdmin() && isValidId(archiveId);
+      allow delete: if false;
+    }
+
+    // 9.3 Permanent Controlled Audit Deletion Ledger (Immutable)
+    match /audit_log_deletions/{deletionId} {
+      allow list, get: if isSuperAdmin();
+      allow create: if isSuperAdmin() && isValidId(deletionId);
+      allow update, delete: if false;
+    }
+
+    // 9.4 Password Reset Audit Trail (Super Admin Governance)
     match /password_reset_logs/{logId} {
       allow list, get: if isSuperAdmin();
       allow create: if isSuperAdmin() && isValidId(logId);
@@ -167,8 +203,29 @@ service cloud.firestore {
     match /users/{userId} {
       allow list: if isSuperAdmin();
       allow get: if isSignedIn() && (isSuperAdmin() || request.auth.uid == userId);
-      allow create, update: if isSuperAdmin() || (isSignedIn() && request.auth.uid == userId);
-      allow delete: if isSuperAdmin();
+      allow create, update: if isValidId(userId) && (isSuperAdmin() || (isSignedIn() && request.auth.uid == userId));
+      allow delete: if isSuperAdmin() && isValidId(userId);
+    }
+
+    // 14. Account Security & Lockout State (Super Admin & Trusted Server Principal Only; ADMIN/USER strictly denied)
+    match /account_security/{secId} {
+      allow list, get: if isSuperAdmin();
+      allow create, update: if isSuperAdmin() && isValidId(secId);
+      allow delete: if false; // Never delete security records
+    }
+
+    // 15. Login Attempts Immutable Ledger (Super Admin & Trusted Server Principal Only; append-only)
+    match /login_attempts/{attemptId} {
+      allow list, get: if isSuperAdmin();
+      allow create: if isSuperAdmin() && isValidId(attemptId);
+      allow update, delete: if false; // Strictly immutable history
+    }
+
+    // 16. Security Governance Audit Logs (Super Admin & Trusted Server Principal Only; append-only)
+    match /security_audit_logs/{logId} {
+      allow list, get: if isSuperAdmin();
+      allow create: if isSuperAdmin() && isValidId(logId);
+      allow update, delete: if false; // Strictly immutable governance trail
     }
 
     // Default catch-all: Deny all unauthenticated or undeclared collection access

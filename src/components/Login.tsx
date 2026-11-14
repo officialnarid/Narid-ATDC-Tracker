@@ -12,11 +12,19 @@ import {
   Users,
   BarChart3
 } from 'lucide-react';
-import { loginWithLoginIdAndPassword } from '../services/authService';
+import { loginWithLoginIdAndPassword, LoginAuthError } from '../services/authService';
 import { UserRoleRecord } from '../types';
 
 interface LoginProps {
   onLoginSuccess: (profile: UserRoleRecord) => void;
+}
+
+interface LoginAlertState {
+  message: string;
+  tone: 'error' | 'warning' | 'locked' | 'ratelimit';
+  attemptNumber?: number;
+  maxAttempts?: number;
+  remainingAttempts?: number;
 }
 
 export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
@@ -24,19 +32,19 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [alertState, setAlertState] = useState<LoginAlertState | null>(null);
 
   // Handle Sign In submission
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setErrorMessage(null);
+    setAlertState(null);
 
     if (!loginId.trim()) {
-      setErrorMessage('Please enter your Login ID or registered Email.');
+      setAlertState({ message: 'Please enter your Login ID.', tone: 'error' });
       return;
     }
     if (!password) {
-      setErrorMessage('Please enter your password.');
+      setAlertState({ message: 'Please enter your password.', tone: 'error' });
       return;
     }
 
@@ -45,18 +53,42 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
       const { profile } = await loginWithLoginIdAndPassword(loginId, password, true);
       onLoginSuccess(profile);
     } catch (err: any) {
-      console.warn('Authentication failed:', err?.message || err);
-      const rawMsg = err?.message || '';
-      if (
-        rawMsg.includes('Invalid password') || 
-        rawMsg.includes('password') || 
-        rawMsg.includes('credentials') ||
-        rawMsg.includes('user-not-found') ||
-        rawMsg.includes('wrong-password')
+      const authErr = err as LoginAuthError;
+      const rawMsg = authErr?.message || 'Invalid password, check again';
+
+      if (authErr?.locked || authErr?.code === 'ACCOUNT_LOCKED' || rawMsg.includes('temporarily blocked')) {
+        setAlertState({
+          message: rawMsg,
+          tone: 'locked',
+          attemptNumber: authErr.attemptNumber,
+          maxAttempts: authErr.maxAttempts,
+          remainingAttempts: 0,
+        });
+      } else if (authErr?.warning || authErr?.code === 'SECOND_FAILED_WARNING') {
+        setAlertState({
+          message: rawMsg,
+          tone: 'warning',
+          attemptNumber: authErr.attemptNumber,
+          maxAttempts: authErr.maxAttempts,
+          remainingAttempts: authErr.remainingAttempts,
+        });
+      } else if (
+        authErr?.firebaseAbuseProtection ||
+        authErr?.code === 'RATE_LIMITED' ||
+        authErr?.code === 'TOO_MANY_ATTEMPTS_TRY_LATER'
       ) {
-        setErrorMessage('Invalid password, check again');
+        setAlertState({
+          message: rawMsg,
+          tone: 'ratelimit',
+        });
       } else {
-        setErrorMessage(rawMsg || 'Invalid password, check again');
+        setAlertState({
+          message: rawMsg,
+          tone: 'error',
+          attemptNumber: authErr.attemptNumber,
+          maxAttempts: authErr.maxAttempts,
+          remainingAttempts: authErr.remainingAttempts,
+        });
       }
     } finally {
       setIsLoading(false);
@@ -214,11 +246,40 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
             <div className="w-16 h-1.5 bg-gradient-to-r from-blue-600 via-sky-500 to-cyan-400 rounded-full mx-auto mt-3.5 shadow-sm" />
           </div>
 
-          {/* Clean Error Message Box (If Invalid Password) */}
-          {errorMessage && (
-            <div className="mb-6 p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-700 text-xs sm:text-sm flex items-start gap-2.5 animate-shake shadow-xs">
-              <AlertCircle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
-              <div className="leading-relaxed font-semibold">{errorMessage}</div>
+          {/* Security Alert / Lockout / Warning Message Box */}
+          {alertState && (
+            <div
+              role="alert"
+              className={`mb-6 p-3.5 rounded-xl border text-xs sm:text-sm flex items-start gap-2.5 shadow-xs ${
+                alertState.tone === 'warning' || alertState.tone === 'ratelimit'
+                  ? 'bg-amber-50 border-amber-300 text-amber-900'
+                  : 'bg-red-50 border-red-300 text-red-800'
+              }`}
+            >
+              {alertState.tone === 'locked' ? (
+                <Lock className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+              ) : (
+                <AlertCircle
+                  className={`w-4 h-4 shrink-0 mt-0.5 ${
+                    alertState.tone === 'warning' || alertState.tone === 'ratelimit'
+                      ? 'text-amber-600'
+                      : 'text-red-500'
+                  }`}
+                />
+              )}
+              <div className="leading-relaxed font-semibold flex-1">
+                {alertState.tone === 'locked' && (
+                  <div className="text-[11px] uppercase tracking-wider font-extrabold text-red-700 mb-0.5">
+                    Account Temporarily Blocked
+                  </div>
+                )}
+                {alertState.tone === 'warning' && (
+                  <div className="text-[11px] uppercase tracking-wider font-extrabold text-amber-800 mb-0.5">
+                    Security Warning — 1 Attempt Remaining
+                  </div>
+                )}
+                <div>{alertState.message}</div>
+              </div>
             </div>
           )}
 

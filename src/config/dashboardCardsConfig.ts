@@ -16,9 +16,8 @@ export type DashboardCardId =
 
 /**
  * REUSABLE ROLE-BASED DASHBOARD CARD VISIBILITY MATRIX
- * 
- * ROLE 1: SUPER_ADMIN
- * Shows all 12 dashboard cards:
+ *
+ * SUPER_ADMIN, ADMIN, and USER (Read-Only) share the same 12 attendance monitoring cards:
  * 1. Active Total
  * 2. Total Present
  * 3. Currently Inside
@@ -31,51 +30,26 @@ export type DashboardCardId =
  * 10. OT Hours
  * 11. Auto Closed
  * 12. Missed Punch Out
- * 
- * ROLE 2: ADMIN
- * Shows ONLY these 6 dashboard cards:
- * 1. Active Total
- * 2. Total Present
- * 3. Absent
- * 4. OT Hours
- * 5. Auto Closed
- * 6. Missed Punch Out
- * 
- * Completely hidden from Admin:
- * - Currently Inside
- * - Currently Outside
- * - On Leave
- * - First IN
- * - Final OUT
- * - Duty Hours
- * 
- * ROLE 3: USER
- * 0 dashboard cards (Redirected to Attendance Scanner)
  */
+const ALL_DASHBOARD_CARDS: DashboardCardId[] = [
+  'active_total',
+  'total_present',
+  'currently_inside',
+  'currently_outside',
+  'absent',
+  'on_leave',
+  'first_in',
+  'final_out',
+  'duty_hours',
+  'ot_hours',
+  'auto_closed',
+  'missed_punch_out',
+];
+
 export const ROLE_CARD_VISIBILITY: Record<'SUPER_ADMIN' | 'ADMIN' | 'USER', DashboardCardId[]> = {
-  SUPER_ADMIN: [
-    'active_total',
-    'total_present',
-    'currently_inside',
-    'currently_outside',
-    'absent',
-    'on_leave',
-    'first_in',
-    'final_out',
-    'duty_hours',
-    'ot_hours',
-    'auto_closed',
-    'missed_punch_out',
-  ],
-  ADMIN: [
-    'active_total',
-    'total_present',
-    'absent',
-    'ot_hours',
-    'auto_closed',
-    'missed_punch_out',
-  ],
-  USER: [],
+  SUPER_ADMIN: ALL_DASHBOARD_CARDS,
+  ADMIN: ALL_DASHBOARD_CARDS,
+  USER: ALL_DASHBOARD_CARDS,
 };
 
 /**

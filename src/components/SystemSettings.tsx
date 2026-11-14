@@ -11,9 +11,12 @@ import {
   Clock,
   ShieldAlert,
   Trash2,
-  Users
+  Users,
+  FileSearch,
+  Lock,
+  ArrowUpRight
 } from 'lucide-react';
-import { SystemSetting, AuditLog } from '../types';
+import { SystemSetting, AuditLog, UserRoleRecord } from '../types';
 import { 
   getSystemSettings, 
   updateSystemSettings, 
@@ -21,10 +24,12 @@ import {
   loadAuthenticIndustrialManpower,
   clearAllAttendanceRecords 
 } from '../services/masterService';
-import { formatTimeDisplay } from '../services/attendanceService';
+import { AuditKpis, fetchAuditLogs } from '../services/auditService';
 
 interface SystemSettingsProps {
   onRefreshData?: () => void;
+  currentUserRole?: UserRoleRecord | null;
+  onOpenAuditConsole?: () => void;
 }
 
 const safeText = (val: any, fallback = '--'): string => {
@@ -39,14 +44,24 @@ const safeText = (val: any, fallback = '--'): string => {
   return String(val);
 };
 
-export const SystemSettingsView: React.FC<SystemSettingsProps> = ({ onRefreshData }) => {
+export const SystemSettingsView: React.FC<SystemSettingsProps> = ({
+  onRefreshData,
+  currentUserRole,
+  onOpenAuditConsole,
+}) => {
+  const isSuperAdmin =
+    currentUserRole?.role?.toUpperCase() === 'SUPER_ADMIN' ||
+    currentUserRole?.loginId?.toLowerCase() === 'superadmin';
+
   const [settings, setSettings] = useState<SystemSetting | null>(null);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+  const [auditKpis, setAuditKpis] = useState<AuditKpis | null>(null);
   const [loading, setLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [isSeeding, setIsSeeding] = useState(false);
   const [isClearing, setIsClearing] = useState(false);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [activeTab, setActiveTab] = useState<'settings' | 'audit'>('settings');
 
@@ -54,9 +69,26 @@ export const SystemSettingsView: React.FC<SystemSettingsProps> = ({ onRefreshDat
     setLoading(true);
     try {
       const s = await getSystemSettings();
-      setSettings(s);
-      const logs = await getAuditLogs(100);
-      setAuditLogs(logs);
+      setSettings({
+        ...s,
+        auditRetentionDays: s.auditRetentionDays ?? 90,
+        protectCriticalLogs: s.protectCriticalLogs ?? true,
+        captureGeoLocation: s.captureGeoLocation ?? true,
+        failedLoginAlertThreshold: s.failedLoginAlertThreshold ?? 5,
+      });
+
+      if (isSuperAdmin) {
+        try {
+          const enriched = await fetchAuditLogs({ pageSize: 50, lifecycle: 'all' });
+          setAuditLogs(enriched.logs);
+          setAuditKpis(enriched.kpis);
+        } catch {
+          const logs = await getAuditLogs(100);
+          setAuditLogs(logs);
+        }
+      } else {
+        setAuditLogs([]);
+      }
     } catch (err) {
       console.error(err);
     } finally {
@@ -66,12 +98,13 @@ export const SystemSettingsView: React.FC<SystemSettingsProps> = ({ onRefreshDat
 
   useEffect(() => {
     loadData();
-  }, []);
+  }, [isSuperAdmin]);
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!settings) return;
     setIsSaving(true);
+    setActionError(null);
     try {
       await updateSystemSettings(settings);
       setSaveSuccess(true);
@@ -79,7 +112,7 @@ export const SystemSettingsView: React.FC<SystemSettingsProps> = ({ onRefreshDat
       onRefreshData?.();
       await loadData();
     } catch (err: any) {
-      alert(`Failed to save settings: ${err.message}`);
+      setActionError(`Failed to save settings: ${err.message}`);
     } finally {
       setIsSaving(false);
     }
@@ -88,6 +121,7 @@ export const SystemSettingsView: React.FC<SystemSettingsProps> = ({ onRefreshDat
   const handleLoadAuthenticManpower = async () => {
     if (!confirm('This will load authentic industrial manpower records (30 factory employees: Operators, Inspectors, Shift Supervisors, PPC & Store Officers) into Firestore. Continue?')) return;
     setIsSeeding(true);
+    setActionError(null);
     try {
       const res = await loadAuthenticIndustrialManpower();
       setActionNotice(`Successfully loaded ${res.count} authentic industrial manpower records!`);
@@ -95,7 +129,7 @@ export const SystemSettingsView: React.FC<SystemSettingsProps> = ({ onRefreshDat
       onRefreshData?.();
       await loadData();
     } catch (err: any) {
-      alert(`Failed to load manpower records: ${err.message}`);
+      setActionError(`Failed to load manpower records: ${err.message}`);
     } finally {
       setIsSeeding(false);
     }
@@ -104,6 +138,7 @@ export const SystemSettingsView: React.FC<SystemSettingsProps> = ({ onRefreshDat
   const handleClearAttendance = async () => {
     if (!confirm('Are you sure you want to remove all attendance and punch logs? This will leave your Employee Master intact and reset the attendance board to 0 for real live scanning.')) return;
     setIsClearing(true);
+    setActionError(null);
     try {
       const res = await clearAllAttendanceRecords();
       setActionNotice(`Cleared ${res.deletedAttendance} attendance records and ${res.deletedLogs} punch logs. Ready for real scanning!`);
@@ -111,7 +146,7 @@ export const SystemSettingsView: React.FC<SystemSettingsProps> = ({ onRefreshDat
       onRefreshData?.();
       await loadData();
     } catch (err: any) {
-      alert(`Clear failed: ${err.message}`);
+      setActionError(`Clear failed: ${err.message}`);
     } finally {
       setIsClearing(false);
     }
@@ -164,6 +199,13 @@ export const SystemSettingsView: React.FC<SystemSettingsProps> = ({ onRefreshDat
         <div className="bg-emerald-50 text-emerald-900 border border-emerald-300 px-4 py-2.5 rounded-xl text-xs font-semibold flex items-center gap-2 animate-fadeIn">
           <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
           <span>{actionNotice}</span>
+        </div>
+      )}
+
+      {actionError && (
+        <div className="bg-red-50 text-red-900 border border-red-300 px-4 py-2.5 rounded-xl text-xs font-semibold flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+          <span>{actionError}</span>
         </div>
       )}
 
@@ -270,6 +312,85 @@ export const SystemSettingsView: React.FC<SystemSettingsProps> = ({ onRefreshDat
             </div>
           </div>
 
+          {/* Security Monitoring & Audit Retention Governance */}
+          <div className="border-t border-slate-200 pt-5 space-y-4">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
+                  <Lock className="w-3.5 h-3.5 text-blue-600" />
+                  <span>Security Monitoring &amp; Audit Retention Policy</span>
+                </h3>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Controls retention eligibility, critical log immutability, IP geolocation enrichment, and failed login alert thresholds.
+                </p>
+              </div>
+              {isSuperAdmin && onOpenAuditConsole && (
+                <button
+                  type="button"
+                  onClick={onOpenAuditConsole}
+                  className="px-3 py-1.5 rounded-lg bg-[#0a192f] hover:bg-slate-800 text-white text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer shrink-0"
+                >
+                  <FileSearch className="w-3.5 h-3.5 text-blue-400" />
+                  <span>Open Security Console</span>
+                </button>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+              <div>
+                <label className="block text-slate-700 font-semibold mb-1">Audit Retention Window (Days)</label>
+                <input
+                  type="number"
+                  min="30"
+                  max="3650"
+                  value={settings.auditRetentionDays ?? 90}
+                  onChange={(e) => setSettings({ ...settings, auditRetentionDays: Math.max(30, Number(e.target.value)) })}
+                  className="w-full border border-slate-300 rounded px-3 py-2 text-xs font-mono"
+                />
+                <span className="text-[10px] text-slate-400 mt-1 block">
+                  Default: 90 days before non-critical logs become eligible for Super Admin archival/review.
+                </span>
+              </div>
+
+              <div>
+                <label className="block text-slate-700 font-semibold mb-1">Failed Login Security Alert Threshold</label>
+                <input
+                  type="number"
+                  min="3"
+                  max="20"
+                  value={settings.failedLoginAlertThreshold ?? 5}
+                  onChange={(e) => setSettings({ ...settings, failedLoginAlertThreshold: Math.max(3, Number(e.target.value)) })}
+                  className="w-full border border-slate-300 rounded px-3 py-2 text-xs font-mono"
+                />
+                <span className="text-[10px] text-slate-400 mt-1 block">
+                  Triggers CRITICAL security alert after consecutive failed login attempts.
+                </span>
+              </div>
+            </div>
+
+            <div className="flex flex-col sm:flex-row sm:items-center gap-4 text-xs">
+              <label className="flex items-center gap-2 cursor-pointer font-medium text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={settings.protectCriticalLogs ?? true}
+                  onChange={(e) => setSettings({ ...settings, protectCriticalLogs: e.target.checked })}
+                  className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4"
+                />
+                <span>Enforce immutable protection on CRITICAL security &amp; Important logs</span>
+              </label>
+
+              <label className="flex items-center gap-2 cursor-pointer font-medium text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={settings.captureGeoLocation ?? true}
+                  onChange={(e) => setSettings({ ...settings, captureGeoLocation: e.target.checked })}
+                  className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4"
+                />
+                <span>Resolve coarse IP GeoLocation on login &amp; audit events</span>
+              </label>
+            </div>
+          </div>
+
           <div className="border-t border-slate-200 pt-4 flex items-center justify-between">
             <div className="flex items-center gap-2">
               <input
@@ -296,61 +417,107 @@ export const SystemSettingsView: React.FC<SystemSettingsProps> = ({ onRefreshDat
         </form>
       )}
 
-      {/* TAB 2: IMMUTABLE AUDIT TRAIL */}
+      {/* TAB 2: SECURITY ACTIVITY & AUDIT TRAIL PREVIEW */}
       {activeTab === 'audit' && (
-        <div className="bg-white rounded-xl border border-slate-200 shadow-2xs overflow-hidden">
-          <div className="overflow-x-auto max-h-[600px]">
-            <table className="w-full text-left text-xs">
-              <thead className="bg-slate-50 text-slate-600 uppercase font-semibold border-b border-slate-200 sticky top-0">
-                <tr>
-                  <th className="py-2.5 px-3.5">Timestamp</th>
-                  <th className="py-2.5 px-3.5">Action</th>
-                  <th className="py-2.5 px-3.5">Employee ID</th>
-                  <th className="py-2.5 px-3.5">Source</th>
-                  <th className="py-2.5 px-3.5">New Value / Outcome</th>
-                  <th className="py-2.5 px-3.5">Reason</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {auditLogs.length === 0 ? (
+        <div className="space-y-4">
+          {isSuperAdmin && (
+            <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-2xs flex flex-col md:flex-row md:items-center justify-between gap-4">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 flex-1 text-xs">
+                <div>
+                  <div className="text-[10px] font-bold uppercase text-slate-500">Total Logs</div>
+                  <div className="text-lg font-extrabold font-mono text-slate-900">{auditKpis?.totalLogs ?? auditLogs.length}</div>
+                </div>
+                <div>
+                  <div className="text-[10px] font-bold uppercase text-emerald-600">Login Success</div>
+                  <div className="text-lg font-extrabold font-mono text-emerald-700">{auditKpis?.successfulLogins ?? 0}</div>
+                </div>
+                <div>
+                  <div className="text-[10px] font-bold uppercase text-red-600">Security Alerts</div>
+                  <div className="text-lg font-extrabold font-mono text-red-700">{auditKpis?.securityAlerts ?? 0}</div>
+                </div>
+                <div>
+                  <div className="text-[10px] font-bold uppercase text-amber-600">Pending &gt;{settings?.auditRetentionDays ?? 90}d</div>
+                  <div className="text-lg font-extrabold font-mono text-amber-700">{auditKpis?.pendingLogReviews ?? 0}</div>
+                </div>
+              </div>
+
+              {onOpenAuditConsole && (
+                <button
+                  type="button"
+                  onClick={onOpenAuditConsole}
+                  className="px-4 py-2 rounded-lg bg-[#0a192f] hover:bg-slate-800 text-white text-xs font-bold flex items-center gap-2 shrink-0 cursor-pointer"
+                >
+                  <FileSearch className="w-4 h-4 text-blue-400" />
+                  <span>Open Full Security &amp; Audit Console</span>
+                  <ArrowUpRight className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+          )}
+
+          <div className="bg-white rounded-xl border border-slate-200 shadow-2xs overflow-hidden">
+            <div className="overflow-x-auto max-h-[600px]">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-50 text-slate-600 uppercase font-semibold border-b border-slate-200 sticky top-0">
                   <tr>
-                    <td colSpan={6} className="py-8 text-center text-slate-400">
-                      No audit events recorded yet.
-                    </td>
+                    <th className="py-2.5 px-3.5">Timestamp</th>
+                    <th className="py-2.5 px-3.5">Action / Category</th>
+                    <th className="py-2.5 px-3.5">Actor / Target</th>
+                    <th className="py-2.5 px-3.5">IP &amp; Source</th>
+                    <th className="py-2.5 px-3.5">New Value / Description</th>
+                    <th className="py-2.5 px-3.5">Reason</th>
                   </tr>
-                ) : (
-                  auditLogs.map((log) => (
-                    <tr key={log.id} className="hover:bg-slate-50">
-                      <td className="py-2.5 px-3.5 font-mono text-slate-500 text-[11px]">
-                        {new Date(log.timestamp).toLocaleString('en-IN', {
-                          day: '2-digit',
-                          month: 'short',
-                          hour: '2-digit',
-                          minute: '2-digit',
-                          second: '2-digit',
-                          hour12: true,
-                        })}
-                      </td>
-                      <td className="py-2.5 px-3.5">
-                        <span className="font-bold text-slate-800">{safeText(log.action)}</span>
-                      </td>
-                      <td className="py-2.5 px-3.5 font-mono font-bold text-blue-700">
-                        {safeText(log.employeeId)}
-                      </td>
-                      <td className="py-2.5 px-3.5 text-slate-600 font-mono text-[11px]">
-                        {safeText(log.actionSource)}
-                      </td>
-                      <td className="py-2.5 px-3.5 text-slate-700 font-medium font-mono text-[11px] max-w-[280px] truncate" title={safeText(log.newValue)}>
-                        {safeText(log.newValue)}
-                      </td>
-                      <td className="py-2.5 px-3.5 text-slate-500 text-[11px] max-w-[200px] truncate" title={safeText(log.reason)}>
-                        {safeText(log.reason)}
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {auditLogs.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="py-8 text-center text-slate-400">
+                        No audit events recorded yet.
                       </td>
                     </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
+                  ) : (
+                    auditLogs.map((log) => (
+                      <tr key={log.id} className="hover:bg-slate-50">
+                        <td className="py-2.5 px-3.5 font-mono text-slate-500 text-[11px] whitespace-nowrap">
+                          {new Date(log.timestamp).toLocaleString('en-IN', {
+                            day: '2-digit',
+                            month: 'short',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                            second: '2-digit',
+                            hour12: true,
+                          })}
+                        </td>
+                        <td className="py-2.5 px-3.5">
+                          <span className="font-bold text-slate-800">{safeText(log.action)}</span>
+                          {log.category && (
+                            <span className="ml-1.5 px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 font-mono text-[9px] font-bold">
+                              {log.category}
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-2.5 px-3.5 font-mono text-[11px]">
+                          <span className="font-bold text-blue-700">{safeText(log.actorLoginId || log.employeeId)}</span>
+                          {log.employeeId && log.actorLoginId && (
+                            <span className="block text-[10px] text-slate-500">Emp: {log.employeeId}</span>
+                          )}
+                        </td>
+                        <td className="py-2.5 px-3.5 text-slate-600 font-mono text-[11px]">
+                          <div>{safeText(log.ipAddress, '--')}</div>
+                          <div className="text-[10px] text-slate-400">{safeText(log.actionSource)}</div>
+                        </td>
+                        <td className="py-2.5 px-3.5 text-slate-700 font-medium font-mono text-[11px] max-w-[280px] truncate" title={safeText(log.description || log.newValue)}>
+                          {safeText(log.description || log.newValue)}
+                        </td>
+                        <td className="py-2.5 px-3.5 text-slate-500 text-[11px] max-w-[200px] truncate" title={safeText(log.reason)}>
+                          {safeText(log.reason)}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       )}

@@ -17,6 +17,7 @@ import { collection, getDocs, query, where, orderBy } from 'firebase/firestore';
 import { db } from '../firebase';
 import { formatDateKey, formatMinutes, formatTimeDisplay } from '../services/attendanceService';
 import { exportTableToExcel, exportTableToCsv } from '../services/exportService';
+import { sendServerAuditEvent } from '../services/auditService';
 
 interface ReportsProps {
   employees: Employee[];
@@ -337,10 +338,38 @@ export const Reports: React.FC<ReportsProps> = ({
 
   const handleExportXlsx = () => {
     exportTableToExcel(tableData, tableColumns, fileName);
+    sendServerAuditEvent({
+      action: 'REPORT_EXPORTED',
+      category: 'EXPORT',
+      targetType: 'REPORT',
+      targetId: activeReport,
+      newValue: {
+        format: 'xlsx',
+        fileName,
+        rowCount: tableData.length,
+        period: activeReport === 'monthly_attendance' || activeReport === 'employee_wise' ? selectedMonth : selectedDate,
+      },
+      actionSource: 'REPORTS_MODULE',
+      description: `Exported "${activeReport}" report (${tableData.length} rows) as Excel (.xlsx).`,
+    });
   };
 
   const handleExportCsv = () => {
     exportTableToCsv(tableData, tableColumns, fileName);
+    sendServerAuditEvent({
+      action: 'REPORT_EXPORTED',
+      category: 'EXPORT',
+      targetType: 'REPORT',
+      targetId: activeReport,
+      newValue: {
+        format: 'csv',
+        fileName,
+        rowCount: tableData.length,
+        period: activeReport === 'monthly_attendance' || activeReport === 'employee_wise' ? selectedMonth : selectedDate,
+      },
+      actionSource: 'REPORTS_MODULE',
+      description: `Exported "${activeReport}" report (${tableData.length} rows) as CSV.`,
+    });
   };
 
   return (

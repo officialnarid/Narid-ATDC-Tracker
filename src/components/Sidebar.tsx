@@ -16,7 +16,9 @@ import {
   LogOut,
   ChevronDown,
   Building,
-  X
+  X,
+  FileSearch,
+  ShieldAlert
 } from 'lucide-react';
 import { UserRoleRecord } from '../types';
 import { isModuleAllowedForUser } from '../services/authService';
@@ -34,6 +36,8 @@ export type NavItem =
   | 'history'
   | 'reports'
   | 'user_rights'
+  | 'audit_logs'
+  | 'security_management'
   | 'settings';
 
 interface SidebarProps {
@@ -113,11 +117,21 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: 'history', label: 'Attendance History', icon: History },
     { id: 'reports', label: 'Reports & Export', icon: FileSpreadsheet },
     { id: 'user_rights', label: 'User Rights & Auth', icon: ShieldCheck },
+    { id: 'audit_logs', label: 'Audit Logs & Security', icon: FileSearch },
+    { id: 'security_management', label: 'Security & Lockouts', icon: ShieldAlert },
     { id: 'settings', label: 'System Settings', icon: Settings },
   ];
 
+  const isSuperAdmin =
+    currentUserRole?.role?.toUpperCase() === 'SUPER_ADMIN' ||
+    currentUserRole?.loginId?.toLowerCase() === 'superadmin';
+
   const allowedTopItems = topNavItems.filter(item => isModuleAllowedForUser(currentUserRole, item.id));
-  const allowedBottomItems = bottomNavItems.filter(item => isModuleAllowedForUser(currentUserRole, item.id));
+  const allowedBottomItems = bottomNavItems.filter(item =>
+    item.id === 'audit_logs' || item.id === 'security_management' || item.id === 'user_rights'
+      ? isSuperAdmin && isModuleAllowedForUser(currentUserRole, item.id)
+      : isModuleAllowedForUser(currentUserRole, item.id)
+  );
 
   const handleItemClick = (id: NavItem) => {
     onSelectTab(id);

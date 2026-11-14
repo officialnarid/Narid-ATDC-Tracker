@@ -17,7 +17,9 @@ import {
   Sparkles,
   Smartphone,
   ChevronRight,
-  Activity
+  Activity,
+  Maximize2,
+  Minimize2
 } from 'lucide-react';
 import { processDualAttendanceScan } from '../services/attendanceService';
 import { ScanResult, ScannerType } from '../types';
@@ -25,9 +27,17 @@ import { Html5QrcodeScanner } from 'html5-qrcode';
 
 interface ScannerProps {
   onAttendanceUpdated?: () => void;
+  isFullscreen?: boolean;
+  onToggleFullscreen?: () => void;
+  onExitFullscreen?: () => void;
 }
 
-export const Scanner: React.FC<ScannerProps> = ({ onAttendanceUpdated }) => {
+export const Scanner: React.FC<ScannerProps> = ({
+  onAttendanceUpdated,
+  isFullscreen = false,
+  onToggleFullscreen,
+  onExitFullscreen,
+}) => {
   // Mode selection: Dual side-by-side or dedicated single station
   const [activeStationMode, setActiveStationMode] = useState<'DUAL' | 'IN_ONLY' | 'OUT_ONLY'>('DUAL');
 
@@ -308,8 +318,9 @@ export const Scanner: React.FC<ScannerProps> = ({ onAttendanceUpdated }) => {
 
           {/* Sound Toggle */}
           <button
+            type="button"
             onClick={() => setSoundEnabled(!soundEnabled)}
-            className={`p-2 rounded border text-xs flex items-center gap-1.5 transition ${
+            className={`p-2 rounded border text-xs flex items-center gap-1.5 transition cursor-pointer ${
               soundEnabled 
                 ? 'bg-slate-800 border-slate-700 text-slate-200 hover:bg-slate-700' 
                 : 'bg-red-950/80 border-red-800 text-red-300'
@@ -318,6 +329,35 @@ export const Scanner: React.FC<ScannerProps> = ({ onAttendanceUpdated }) => {
           >
             {soundEnabled ? <Volume2 className="w-4 h-4 text-emerald-400" /> : <VolumeX className="w-4 h-4 text-red-400" />}
           </button>
+
+          {/* Full Screen Mode Toggle Button */}
+          {onToggleFullscreen && (
+            <button
+              type="button"
+              onClick={isFullscreen && onExitFullscreen ? onExitFullscreen : onToggleFullscreen}
+              className={`px-3 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1.5 transition shadow-sm cursor-pointer ${
+                isFullscreen
+                  ? 'bg-red-600 hover:bg-red-500 border-red-500 text-white'
+                  : 'bg-blue-600 hover:bg-blue-500 border-blue-500 text-white'
+              }`}
+              title={isFullscreen ? 'Exit Full Screen Mode (or press ESC)' : 'Enter Full Screen Attendance Scanner Mode'}
+            >
+              {isFullscreen ? (
+                <>
+                  <Minimize2 className="w-4 h-4 shrink-0" />
+                  <span>Exit Full Screen</span>
+                  <kbd className="hidden sm:inline-block text-[10px] bg-red-800/90 px-1.5 py-0.5 rounded font-mono font-normal">
+                    ESC
+                  </kbd>
+                </>
+              ) : (
+                <>
+                  <Maximize2 className="w-4 h-4 shrink-0" />
+                  <span>Full Screen</span>
+                </>
+              )}
+            </button>
+          )}
         </div>
       </div>
 
@@ -341,7 +381,7 @@ export const Scanner: React.FC<ScannerProps> = ({ onAttendanceUpdated }) => {
       )}
 
       {/* Main Dual Scanner Workstation Stage */}
-      <div className="flex-1 p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 max-w-7xl mx-auto w-full">
+      <div className={`flex-1 p-4 sm:p-6 grid grid-cols-1 lg:grid-cols-12 gap-5 sm:gap-6 w-full ${isFullscreen ? 'max-w-none' : 'max-w-7xl mx-auto'}`}>
         {/* Left/Middle: Scanners Area (8 or 9 cols) */}
         <div className="lg:col-span-8 flex flex-col gap-6">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">

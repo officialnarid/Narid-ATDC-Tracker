@@ -8,6 +8,7 @@ import {
 } from 'firebase/firestore';
 import { db } from '../firebase';
 import { UserRoleRecord, UserRoleType } from '../types';
+import { getAuthHeaders } from './auditService';
 
 export type ModuleAction = 'view' | 'add' | 'edit' | 'delete';
 
@@ -142,17 +143,27 @@ export const PERMISSION_MODULES: PermissionModuleItem[] = [
     description: 'Account directory, login ID creation, passwords, permissions',
   },
   {
-    key: 'settings',
-    label: '11. System Settings',
+    key: 'audit_logs',
+    label: '11. Audit Logs & Security',
     category: 'Administration',
-    description: 'Camera parameters, company branding, sync intervals',
+    description: 'Enterprise activity logs, login IP/geo history, retention review & cleanup',
+  },
+  {
+    key: 'security_management',
+    label: '12. Security & Lockout Control',
+    category: 'Administration',
+    description: 'Login attempt monitoring, rate limiting, account unblocking & temporary password resets',
+  },
+  {
+    key: 'settings',
+    label: '13. System Settings',
+    category: 'Administration',
+    description: 'Camera parameters, company branding, security retention policies',
   },
 ];
 
 // Default permissions for Super Admin (Always complete and unrestricted)
 const FULL_PERMISSIONS: ModulePermission = { view: true, add: true, edit: true, delete: true };
-const READ_ONLY_PERMISSIONS: ModulePermission = { view: true, add: false, edit: false, delete: false };
-const NO_PERMISSIONS: ModulePermission = { view: false, add: false, edit: false, delete: false };
 
 export const DEFAULT_SUPER_ADMIN_PERMISSIONS: Record<string, ModulePermission> = PERMISSION_MODULES.reduce((acc, m) => {
   acc[m.key] = { ...FULL_PERMISSIONS };
@@ -173,11 +184,13 @@ export const DEFAULT_ADMIN_PERMISSIONS: Record<string, ModulePermission> = {
   history: { view: true, add: false, edit: true, delete: false },
   reports: { view: true, add: false, edit: false, delete: false },
   user_rights: { view: false, add: false, edit: false, delete: false },
+  audit_logs: { view: false, add: false, edit: false, delete: false },
+  security_management: { view: false, add: false, edit: false, delete: false },
   settings: { view: false, add: false, edit: false, delete: false },
 };
 
 export const DEFAULT_USER_PERMISSIONS: Record<string, ModulePermission> = {
-  dashboard: { view: false, add: false, edit: false, delete: false },
+  dashboard: { view: true, add: false, edit: false, delete: false },
   scanner: { view: true, add: true, edit: false, delete: false },
   employees: { view: false, add: false, edit: false, delete: false },
   excel_import: { view: false, add: false, edit: false, delete: false },
@@ -190,6 +203,8 @@ export const DEFAULT_USER_PERMISSIONS: Record<string, ModulePermission> = {
   history: { view: false, add: false, edit: false, delete: false },
   reports: { view: false, add: false, edit: false, delete: false },
   user_rights: { view: false, add: false, edit: false, delete: false },
+  audit_logs: { view: false, add: false, edit: false, delete: false },
+  security_management: { view: false, add: false, edit: false, delete: false },
   settings: { view: false, add: false, edit: false, delete: false },
 };
 
@@ -336,10 +351,11 @@ export async function saveRolePermissions(
   targetRoleId: 'admin' | 'user',
   modulePermissions: Record<string, ModulePermission>
 ): Promise<void> {
+  const headers = await getAuthHeaders();
   // 1. Call trusted backend endpoint
   const res = await fetch('/api/admin/role-permissions', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({
       callerLoginId,
       roleId: targetRoleId,
@@ -421,7 +437,7 @@ export function subscribeToRoles(
     const defaultDescriptions: Record<string, string> = {
       super_admin: 'Complete access to all application modules, account management, role permissions, system settings and administrative controls.',
       admin: 'Operational dashboard, attendance management, employee records, reports and other specifically authorized modules.',
-      user: 'Attendance Scanner access only, according to assigned permissions.',
+      user: 'Read-only Dashboard monitoring and Attendance Scanner access, according to assigned permissions.',
     };
 
     const rolesMap = new Map<string, RoleRecord>();
@@ -478,9 +494,10 @@ export async function saveUserIndividualPermissions(
   role?: UserRoleType,
   status?: 'Active' | 'Inactive'
 ): Promise<void> {
+  const headers = await getAuthHeaders();
   const res = await fetch('/api/admin/set-user-permissions', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({
       callerLoginId,
       targetId: targetUserId,

@@ -147,15 +147,107 @@ export interface PunchLog {
   message: string;
 }
 
+export type AuditSeverity = 'INFO' | 'WARNING' | 'CRITICAL';
+export type AuditCategory =
+  | 'AUTH'
+  | 'ACCOUNT'
+  | 'EMPLOYEE'
+  | 'ATTENDANCE'
+  | 'QR'
+  | 'ORG'
+  | 'PERMISSIONS'
+  | 'EXPORT'
+  | 'SETTINGS'
+  | 'SECURITY'
+  | 'AUDIT_LIFECYCLE'
+  | 'SYSTEM';
+
+export interface GeoLocationInfo {
+  country: string;
+  region: string;
+  city: string;
+  status: 'resolved' | 'unavailable';
+}
+
+export interface UserAgentMeta {
+  browser: string;
+  os: string;
+  deviceType: 'Desktop' | 'Mobile' | 'Tablet' | 'Bot' | 'Unknown';
+  raw?: string;
+}
+
 export interface AuditLog {
   id: string;
   action: string;
+  eventType?: string;
+  category?: AuditCategory;
+  severity?: AuditSeverity;
+  actorUid?: string;
+  actorLoginId?: string;
+  actorRole?: string;
+  loginId?: string;
+  performedByUid?: string;
+  performedByLoginId?: string;
+  targetType?: string;
+  targetId?: string;
+  targetUid?: string;
   employeeId?: string;
   timestamp: string;
+  timestampMs?: number;
   oldValue?: string;
+  previousValue?: string;
   newValue?: string;
   actionSource: string;
   reason?: string;
+  details?: string;
+  description?: string;
+  success?: boolean;
+  ipAddress?: string;
+  geoLocation?: GeoLocationInfo;
+  userAgentMeta?: UserAgentMeta;
+  sessionId?: string;
+  isImportant?: boolean;
+  isProtected?: boolean;
+  archived?: boolean;
+  archivedAt?: string;
+  archivedBy?: string;
+  reviewedBy?: string;
+  reviewedAt?: string;
+  reviewNote?: string;
+}
+
+export interface LoginHistoryEntry {
+  id: string;
+  eventType: 'LOGIN_SUCCESS' | 'LOGIN_FAILED' | 'LOGIN_LOCKED' | 'LOGOUT' | 'SESSION_EXPIRED';
+  loginId: string;
+  authUid?: string;
+  role: string;
+  timestamp: string;
+  timestampMs: number;
+  success: boolean;
+  failureReason?: string;
+  ipAddress: string;
+  geoLocation: GeoLocationInfo;
+  browser: string;
+  os: string;
+  deviceType: string;
+  sessionId?: string;
+}
+
+export interface AuditDeletionRecord {
+  id: string;
+  deletedLogId: string;
+  deletedAction: string;
+  deletedCategory: string;
+  deletedTimestamp: string;
+  deletedActorLoginId: string;
+  deletedSummary: string;
+  linkedRecordsChecked: string[];
+  reason: string;
+  approvedByUid: string;
+  approvedByLoginId: string;
+  deletedAt: string;
+  ipAddress: string;
 }
 
 export interface SystemSetting {
@@ -170,6 +262,10 @@ export interface SystemSetting {
   scheduledDurationMinutes: number;
   overtimeThresholdMinutes: number;
   scannerMode: 'USB_PRIMARY' | 'CAMERA_HYBRID';
+  auditRetentionDays?: number;
+  protectCriticalLogs?: boolean;
+  captureGeoLocation?: boolean;
+  failedLoginAlertThreshold?: number;
 }
 
 export type UserRoleType = 'SUPER_ADMIN' | 'ADMIN' | 'USER' | 'super_admin' | 'admin' | 'user';
@@ -183,9 +279,126 @@ export interface UserRoleRecord {
   status: 'Active' | 'Inactive';
   modulesAllowed: string[]; // ['dashboard', 'scanner', 'employees', 'qr', 'reports', etc.]
   mustChangePassword?: boolean;
+  forcePasswordChange?: boolean;
+  lockStatus?: 'ACTIVE' | 'LOCKED';
+  isLocked?: boolean;
+  consecutiveFailedAttempts?: number;
   passwordLastChangedAt?: string;
+  passwordHash?: string;
+  authUid?: string;
+  linkedAuthUids?: string[];
+  emailAliases?: string[];
   createdAt: string;
   updatedAt: string;
+}
+
+export interface DeviceSummaryInfo {
+  browser: string;
+  os: string;
+  deviceType: string;
+}
+
+export interface AccountSecurityRecord {
+  id: string;
+  roleDocId: string;
+  loginId: string;
+  name: string;
+  email: string;
+  role: string;
+  firebaseUid: string;
+  accountStatus: 'Active' | 'Inactive';
+  lockStatus: 'ACTIVE' | 'LOCKED';
+  consecutiveFailedAttempts: number;
+  maxAttemptsAllowed: number;
+  totalLoginAttempts: number;
+  totalSuccessfulLogins: number;
+  totalFailedLogins: number;
+  forcePasswordChange: boolean;
+  mustChangePassword: boolean;
+  lockedAt?: string | null;
+  lockReason?: string | null;
+  lastSuccessAt?: string | null;
+  lastSuccessIp?: string | null;
+  lastSuccessGeo?: GeoLocationInfo | null;
+  lastSuccessDevice?: DeviceSummaryInfo | null;
+  lastFailedAt?: string | null;
+  lastFailedIp?: string | null;
+  lastFailedGeo?: GeoLocationInfo | null;
+  lastFailedDevice?: DeviceSummaryInfo | null;
+  lastFailedReason?: string | null;
+  unblockedByUid?: string | null;
+  unblockedByLoginId?: string | null;
+  unblockedAt?: string | null;
+  unblockReason?: string | null;
+  tempPasswordResetByUid?: string | null;
+  tempPasswordResetByLoginId?: string | null;
+  tempPasswordResetAt?: string | null;
+  passwordLastChangedAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface LoginAttemptRecord {
+  id: string;
+  loginId: string;
+  role: string;
+  firebaseUid?: string | null;
+  timestamp: string;
+  timestampMs: number;
+  success: boolean;
+  outcome:
+    | 'SUCCESS'
+    | 'FAILED_PASSWORD'
+    | 'BLOCKED_LOCKED'
+    | 'BLOCKED_INACTIVE'
+    | 'BLOCKED_RATE_LIMIT'
+    | 'FIREBASE_TOO_MANY_ATTEMPTS'
+    | 'ACCOUNT_NOT_FOUND';
+  failureReasonCategory: string;
+  failureReason?: string | null;
+  attemptNumber?: number | null;
+  consecutiveFailedAfter?: number | null;
+  triggeredLock?: boolean;
+  ipAddress: string;
+  geoLocation?: GeoLocationInfo;
+  browser: string;
+  os: string;
+  deviceType: string;
+  sessionId?: string | null;
+}
+
+export interface SecurityAuditLogRecord {
+  id: string;
+  action: string;
+  severity: 'INFO' | 'WARNING' | 'CRITICAL';
+  targetLoginId: string;
+  targetRole: string;
+  targetUid?: string | null;
+  actorUid: string;
+  actorLoginId: string;
+  actorRole: string;
+  timestamp: string;
+  timestampMs: number;
+  ipAddress: string;
+  geoLocation?: GeoLocationInfo;
+  deviceInfo?: DeviceSummaryInfo;
+  reason: string;
+  details: string;
+  metadata?: Record<string, any>;
+}
+
+export interface SecurityOverviewResponse {
+  success: boolean;
+  kpis: {
+    totalLoginAttempts: number;
+    successfulLogins: number;
+    failedLogins: number;
+    currentlyLockedAccounts: number;
+    accountsWithForcePasswordChange: number;
+    rateLimitAlerts: number;
+  };
+  accounts: AccountSecurityRecord[];
+  recentAttempts: LoginAttemptRecord[];
+  recentSecurityLogs: SecurityAuditLogRecord[];
 }
 
 export interface ScanResult {

@@ -33,7 +33,7 @@ import {
 import { collection, doc, getDocs, onSnapshot, query, where } from 'firebase/firestore';
 import { db, auth } from '../firebase';
 import { formatDateKey, formatMinutes } from '../services/attendanceService';
-import { generateRosterForDate } from '../services/attendanceService';
+import { isModuleAllowedForUser } from '../services/authService';
 import { 
   DashboardCardId, 
   isDashboardCardVisible, 
@@ -84,7 +84,6 @@ export const Dashboard: React.FC<DashboardProps> = ({
   const [attendanceRecords, setAttendanceRecords] = useState<AttendanceRecord[]>([]);
   const [rosterRecords, setRosterRecords] = useState<ShiftRoster[]>([]);
   const [loading, setLoading] = useState(true);
-  const [isGeneratingRoster, setIsGeneratingRoster] = useState(false);
 
   // Drilldown modal state
   const [drilldownTitle, setDrilldownTitle] = useState<string | null>(null);
@@ -94,10 +93,15 @@ export const Dashboard: React.FC<DashboardProps> = ({
     status: string;
   }[]>([]);
 
+  // Keep verifiedRole synced with currentUserRole prop
+  useEffect(() => {
+    setVerifiedRole(normalizeUserRole(currentUserRole?.role));
+  }, [currentUserRole?.role]);
+
   // 1. Authoritative Role Verification from Firestore user_roles collection
   useEffect(() => {
     const rawLoginId = currentUserRole?.loginId;
-    if (!rawLoginId) return;
+    if (!rawLoginId || !auth.currentUser) return;
 
     const cleanLoginId = rawLoginId.trim().toLowerCase();
     const docRef = doc(db, 'user_roles', `role_${cleanLoginId}`);
@@ -107,23 +111,13 @@ export const Dashboard: React.FC<DashboardProps> = ({
         const data = docSnap.data();
         const role = normalizeUserRole(data.role);
         setVerifiedRole(role);
-        if (role === 'USER') {
-          onNavigateToScanner();
-        }
       }
     }, (error) => {
       console.warn('[Dashboard] Real-time role subscription note:', error);
     });
 
     return () => unsubscribe();
-  }, [currentUserRole?.loginId, onNavigateToScanner]);
-
-  // Immediately redirect standard USER to Attendance Scanner
-  useEffect(() => {
-    if (verifiedRole === 'USER') {
-      onNavigateToScanner();
-    }
-  }, [verifiedRole, onNavigateToScanner]);
+  }, [currentUserRole?.loginId]);
 
   // 2. Real-time Attendance Stream from Firestore
   useEffect(() => {
@@ -304,26 +298,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
     setDrilldownEmployees(list);
   };
 
-  // If user role is standard USER, do not render administrative dashboard cards
-  if (verifiedRole === 'USER') {
-    return (
-      <div className="p-8 bg-slate-50 min-h-full flex flex-col items-center justify-center text-center">
-        <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm max-w-md w-full">
-          <ShieldAlert className="w-12 h-12 text-amber-500 mx-auto mb-3" />
-          <h2 className="text-lg font-bold text-slate-800">Redirecting to Attendance Scanner</h2>
-          <p className="text-xs text-slate-500 mt-1">
-            Standard user accounts have scanner access only. Redirecting now...
-          </p>
-          <button
-            onClick={onNavigateToScanner}
-            className="mt-4 w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-lg text-xs transition shadow-sm"
-          >
-            Open Attendance Scanner
-          </button>
-        </div>
-      </div>
-    );
-  }
+  const canOpenScanner = isModuleAllowedForUser(currentUserRole, 'scanner');
 
   // Registry of all 12 Dashboard Cards
   const renderCard = (cardId: DashboardCardId) => {
@@ -529,14 +504,20 @@ export const Dashboard: React.FC<DashboardProps> = ({
       {/* Top Controls: Title, Filter Bar, Date Selector */}
       <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-2xs flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <h2 className="text-xl font-bold text-slate-800 tracking-tight">MANPOWER DASHBOARD</h2>
             <span className={`text-[10px] font-bold px-2 py-0.5 rounded uppercase tracking-wider ${
-              verifiedRole === 'SUPER_ADMIN' 
-                ? 'bg-red-100 text-red-700 border border-red-200' 
-                : 'bg-blue-100 text-blue-700 border border-blue-200'
+              verifiedRole === 'SUPER_ADMIN'
+                ? 'bg-red-100 text-red-700 border border-red-200'
+                : verifiedRole === 'ADMIN'
+                  ? 'bg-blue-100 text-blue-700 border border-blue-200'
+                  : 'bg-emerald-100 text-emerald-700 border border-emerald-200'
             }`}>
-              {verifiedRole === 'SUPER_ADMIN' ? 'Super Admin View (All 12 Cards)' : 'Admin View (6 Cards)'}
+              {verifiedRole === 'SUPER_ADMIN'
+                ? 'Super Admin View (All 12 Cards)'
+                : verifiedRole === 'ADMIN'
+                  ? 'Admin View (All 12 Cards)'
+                  : 'User View (Read-Only)'}
             </span>
           </div>
           <p className="text-xs text-slate-500 mt-0.5">
@@ -665,45 +646,36 @@ export const Dashboard: React.FC<DashboardProps> = ({
           <span className="inline-flex items-center gap-1 bg-white border border-blue-300 text-blue-700 font-mono text-[11px] px-2 py-0.5 rounded font-medium">
             <Clock className="w-3 h-3 text-blue-500" /> Auto-Closing: Enabled
           </span>
-          <button
-            onClick={onNavigateToScanner}
-            className="bg-blue-600 hover:bg-blue-700 text-white font-medium px-2.5 py-1 rounded text-xs transition flex items-center gap-1 shadow-xs cursor-pointer"
-          >
-            Open Scanner
-          </button>
+          {canOpenScanner && (
+            <button
+              onClick={onNavigateToScanner}
+              className="bg-blue-600 hover:bg-blue-700 text-white font-medium px-2.5 py-1 rounded text-xs transition flex items-center gap-1 shadow-xs cursor-pointer"
+            >
+              Open Scanner
+            </button>
+          )}
         </div>
       </div>
 
-      {/* 
-        ROLE-BASED DASHBOARD CARDS DISPLAY:
-        - SUPER_ADMIN: All 12 Cards in 2 rows of 6
-        - ADMIN: EXACTLY 6 Cards in 1 row of 6 (no empty gaps)
+      {/*
+        REAL-TIME ATTENDANCE MONITORING CARDS (12 KPIs across 2 rows of 6)
+        Displayed consistently for SUPER_ADMIN, ADMIN, and USER (Read-Only).
       */}
-      {verifiedRole === 'ADMIN' ? (
-        /* ADMIN: Exact 6 Allowed Cards */
+      <div className="flex flex-col gap-3">
+        {/* Row 1: 6 Cards */}
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-          {(['active_total', 'total_present', 'absent', 'ot_hours', 'auto_closed', 'missed_punch_out'] as DashboardCardId[]).map(cardId => (
+          {(['active_total', 'total_present', 'currently_inside', 'currently_outside', 'absent', 'on_leave'] as DashboardCardId[]).map(cardId => (
             renderCard(cardId)
           ))}
         </div>
-      ) : (
-        /* SUPER_ADMIN: All 12 Cards (Row 1: Manpower & Gate Status, Row 2: First-In Last-Out & Shift Duty) */
-        <div className="flex flex-col gap-3">
-          {/* Row 1: 6 Cards */}
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-            {(['active_total', 'total_present', 'currently_inside', 'currently_outside', 'absent', 'on_leave'] as DashboardCardId[]).map(cardId => (
-              renderCard(cardId)
-            ))}
-          </div>
 
-          {/* Row 2: 6 Cards */}
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-            {(['first_in', 'final_out', 'duty_hours', 'ot_hours', 'auto_closed', 'missed_punch_out'] as DashboardCardId[]).map(cardId => (
-              renderCard(cardId)
-            ))}
-          </div>
+        {/* Row 2: 6 Cards */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+          {(['first_in', 'final_out', 'duty_hours', 'ot_hours', 'auto_closed', 'missed_punch_out'] as DashboardCardId[]).map(cardId => (
+            renderCard(cardId)
+          ))}
         </div>
-      )}
+      </div>
 
       {/* INDUSTRIAL BREAKDOWN TABLES (Floor, Section, Department, Employee Type) */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

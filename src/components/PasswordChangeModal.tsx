@@ -60,6 +60,7 @@ export const PasswordChangeModal: React.FC<PasswordChangeModalProps> = ({
       const updatedProfile: UserRoleRecord = {
         ...userProfile,
         mustChangePassword: false,
+        forcePasswordChange: false,
         passwordLastChangedAt: new Date().toISOString(),
       };
       onPasswordChanged(updatedProfile);
