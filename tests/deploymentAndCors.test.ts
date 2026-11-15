@@ -403,5 +403,142 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
       if (fs.existsSync(missingFieldsPath)) fs.unlinkSync(missingFieldsPath);
     }
   });
+
+  it('prevents ERR_REQUIRE_ESM between jwks-rsa and jose under strict CommonJS/ESM interop', () => {
+    const { execFileSync } = require('child_process');
+
+    const rootPkg = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'package.json'), 'utf-8'));
+    const faPkg = JSON.parse(
+      fs.readFileSync(path.resolve(process.cwd(), 'node_modules/firebase-admin/package.json'), 'utf-8')
+    );
+    const jwksPkg = JSON.parse(
+      fs.readFileSync(path.resolve(process.cwd(), 'node_modules/jwks-rsa/package.json'), 'utf-8')
+    );
+    const josePkg = JSON.parse(
+      fs.readFileSync(path.resolve(process.cwd(), 'node_modules/jose/package.json'), 'utf-8')
+    );
+
+    expect(rootPkg.dependencies['firebase-admin']).toBe('13.10.0');
+    expect(faPkg.version).toBe('13.10.0');
+    expect(Number(jwksPkg.version.split('.')[0])).toBe(3);
+    expect(Number(josePkg.version.split('.')[0])).toBe(4);
+    expect(josePkg.exports['.']?.require).toBe('./dist/node/cjs/index.js');
+
+    // Reproduces the exact Node runtime condition (--no-experimental-require-module) where jose@6 + jwks-rsa@4 failed with ERR_REQUIRE_ESM
+    const script = `
+      const http = require('http');
+      require('jwks-rsa');
+      require('jose');
+      require('firebase-admin/auth');
+      process.env.VERCEL = '1';
+      import('./api/[...all].ts').then(async (m) => {
+        const srv = http.createServer((req, res) => m.default(req, res));
+        srv.listen(0, '127.0.0.1', async () => {
+          const addr = srv.address();
+          const r = await fetch('http://127.0.0.1:' + addr.port + '/api/health');
+          const body = await r.json();
+          if (r.status !== 200 || body.projectId !== 'narid-atdc-tracker') {
+            process.exit(2);
+          }
+          console.log('NO_ERR_REQUIRE_ESM_OK');
+          srv.close();
+        });
+      }).catch((err) => {
+        console.error(err);
+        process.exit(1);
+      });
+    `;
+    const out = execFileSync(process.execPath, ['--no-experimental-require-module', '-e', script], {
+      cwd: process.cwd(),
+      encoding: 'utf-8',
+    });
+    expect(out).toContain('NO_ERR_REQUIRE_ESM_OK');
+  });
+
+  it('initializes real api/[...all].ts Firebase Admin SDK with service-account credentials, returns 200 /api/health, and rejects unverified JWTs', async () => {
+    const crypto = await import('crypto');
+    const http = await import('http');
+    const { deleteApp } = await import('firebase-admin/app');
+    const handlerMod = await import('../api/[...all].ts');
+    const { getFirebaseAdminContext } = await import('../serverFirebaseAdmin.ts');
+
+    const { privateKey } = crypto.generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+    });
+
+    const prevVercel = process.env.VERCEL;
+    const prevKey = process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
+
+    try {
+      process.env.VERCEL = '1';
+      process.env.FIREBASE_SERVICE_ACCOUNT_KEY = JSON.stringify({
+        type: 'service_account',
+        project_id: 'narid-atdc-tracker',
+        client_email: 'offline-test@narid-atdc-tracker.iam.gserviceaccount.com',
+        private_key: privateKey,
+      });
+
+      const ctx = getFirebaseAdminContext(true);
+      expect(ctx.credentialMode).toBe('SERVICE_ACCOUNT_ENV');
+      expect(ctx.app).not.toBeNull();
+      expect(ctx.auth).not.toBeNull();
+      expect(ctx.db).not.toBeNull();
+
+      handlerMod.resetServerlessAppHandlerForTests();
+      const server = http.createServer((req, res) => handlerMod.default(req, res));
+
+      const healthRes = await request(server).get('/api/health');
+      expect(healthRes.status).toBe(200);
+      expect(healthRes.body).toMatchObject({
+        status: 'ok',
+        projectId: 'narid-atdc-tracker',
+        databaseId: 'ai-studio-manpowertracker-9b87a863-5c0d-4126-accb-7a3be802b10b',
+        adminSdkInitialized: true,
+        firestoreAccess: 'ok',
+        credentialMode: 'SERVICE_ACCOUNT_ENV',
+      });
+
+      // Unsigned alg=none token must be rejected with 401
+      const algNoneHeader = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
+      const forgedPayload = Buffer.from(
+        JSON.stringify({
+          iss: 'https://securetoken.google.com/narid-atdc-tracker',
+          aud: 'narid-atdc-tracker',
+          sub: 'oX2vdSx5jGcoUDxyA0SIYN3SEig2',
+          user_id: 'oX2vdSx5jGcoUDxyA0SIYN3SEig2',
+          exp: Math.floor(Date.now() / 1000) + 3600,
+        })
+      ).toString('base64url');
+
+      const algNoneRes = await request(server)
+        .post('/api/auth/verify-session')
+        .set('Authorization', `Bearer ${algNoneHeader}.${forgedPayload}.`)
+        .send({ loginId: 'superadmin' });
+      expect(algNoneRes.status).toBe(401);
+      expect(algNoneRes.body.success).toBe(false);
+
+      // Invalid/mismatched RS256 signature token must be rejected with 401
+      const rs256Header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT', kid: 'fake-kid' })).toString('base64url');
+      const badSigRes = await request(server)
+        .post('/api/auth/verify-session')
+        .set('Authorization', `Bearer ${rs256Header}.${forgedPayload}.invalidSignature`)
+        .send({ loginId: 'superadmin' });
+      expect(badSigRes.status).toBe(401);
+      expect(badSigRes.body.success).toBe(false);
+    } finally {
+      const ctx = getFirebaseAdminContext(false);
+      if (ctx.app) {
+        await deleteApp(ctx.app).catch(() => {});
+      }
+      handlerMod.resetServerlessAppHandlerForTests();
+      if (prevVercel === undefined) delete process.env.VERCEL;
+      else process.env.VERCEL = prevVercel;
+      if (prevKey === undefined) delete process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
+      else process.env.FIREBASE_SERVICE_ACCOUNT_KEY = prevKey;
+      getFirebaseAdminContext(true);
+    }
+  });
 });
 
