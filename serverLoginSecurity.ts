@@ -1,4 +1,4 @@
-import express, { Request, Response } from 'express';
+import express, { type Request, type Response } from 'express';
 import crypto from 'crypto';
 import { z } from 'zod';
 import {
@@ -8,17 +8,17 @@ import {
   TARGET_DATABASE_ID,
 } from './serverFirebaseAdmin.ts';
 import {
-  AdminAuthLike,
-  AdminFirestoreLike,
-  VerifiedCaller,
+  type AdminAuthLike,
+  type AdminFirestoreLike,
+  type VerifiedCaller,
   extractTrustedClientIp,
   parseUserAgent,
   resolveIpGeoLocation,
   recordEnterpriseAuditEvent,
   recordLoginHistoryEntry,
   syncUserUidIndex,
-  GeoLocationInfo,
-  UserAgentMeta,
+  type GeoLocationInfo,
+  type UserAgentMeta,
 } from './serverSecurityAudit.ts';
 
 export const MAX_CONSECUTIVE_FAILED_ATTEMPTS = 3;

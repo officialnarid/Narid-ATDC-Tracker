@@ -2,49 +2,111 @@
 import express from "express";
 import cors from "cors";
 import fs2 from "fs";
-import path from "path";
+import path2 from "path";
 import crypto4 from "crypto";
 import { z as z3 } from "zod";
 
-// firebase-applet-config.json
-var firebase_applet_config_default = {
-  projectId: "narid-atdc-tracker",
-  appId: "1:1060028696945:web:c720807980550c1cc5ced0",
-  apiKey: "AIzaSyCbKuAw-NAC-geQHF2-jsbCZaRh-Yau2X0",
-  authDomain: "narid-atdc-tracker.firebaseapp.com",
-  firestoreDatabaseId: "ai-studio-manpowertracker-9b87a863-5c0d-4126-accb-7a3be802b10b",
-  storageBucket: "narid-atdc-tracker.firebasestorage.app",
-  messagingSenderId: "1060028696945",
-  measurementId: "",
-  oAuthClientId: "1060028696945-8fkiu807kgm7kv9ta6rggo04geg08go7.apps.googleusercontent.com"
-};
-
 // serverFirebaseAdmin.ts
 import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import { initializeApp, getApps, cert, applicationDefault } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { getFirestore } from "firebase-admin/firestore";
-var TARGET_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || firebase_applet_config_default.projectId || "narid-atdc-tracker";
-var TARGET_DATABASE_ID = process.env.FIREBASE_DATABASE_ID || firebase_applet_config_default.firestoreDatabaseId || "ai-studio-manpowertracker-9b87a863-5c0d-4126-accb-7a3be802b10b";
+var cachedAppletConfig = null;
+function loadFirebaseAppletConfig(customPath) {
+  if (!customPath && cachedAppletConfig) {
+    return cachedAppletConfig;
+  }
+  const cwdPath = customPath ? path.resolve(customPath) : path.resolve(process.cwd(), "firebase-applet-config.json");
+  let resolvedPath = cwdPath;
+  if (!customPath && !fs.existsSync(resolvedPath)) {
+    const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+    const moduleAdjacentPath = path.resolve(moduleDir, "firebase-applet-config.json");
+    if (fs.existsSync(moduleAdjacentPath)) {
+      resolvedPath = moduleAdjacentPath;
+    }
+  }
+  if (!fs.existsSync(resolvedPath)) {
+    throw new Error("Missing firebase-applet-config.json configuration file.");
+  }
+  let rawContent;
+  try {
+    rawContent = fs.readFileSync(resolvedPath, "utf8");
+  } catch {
+    throw new Error("Unable to read firebase-applet-config.json configuration file.");
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(rawContent);
+  } catch {
+    throw new Error("Invalid JSON in firebase-applet-config.json configuration file.");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Invalid firebase-applet-config.json: expected a JSON object.");
+  }
+  const record = parsed;
+  const projectId = typeof record.projectId === "string" ? record.projectId.trim() : "";
+  const firestoreDatabaseId = typeof record.firestoreDatabaseId === "string" ? record.firestoreDatabaseId.trim() : "";
+  if (!projectId || !firestoreDatabaseId) {
+    throw new Error(
+      "Invalid firebase-applet-config.json: missing required projectId or firestoreDatabaseId."
+    );
+  }
+  const config = {
+    projectId,
+    firestoreDatabaseId,
+    ...typeof record.apiKey === "string" && record.apiKey.trim() ? { apiKey: record.apiKey.trim() } : {},
+    ...typeof record.authDomain === "string" ? { authDomain: record.authDomain.trim() } : {},
+    ...typeof record.appId === "string" ? { appId: record.appId.trim() } : {},
+    ...typeof record.storageBucket === "string" ? { storageBucket: record.storageBucket.trim() } : {},
+    ...typeof record.messagingSenderId === "string" ? { messagingSenderId: record.messagingSenderId.trim() } : {},
+    ...typeof record.measurementId === "string" ? { measurementId: record.measurementId.trim() } : {},
+    ...typeof record.oAuthClientId === "string" ? { oAuthClientId: record.oAuthClientId.trim() } : {}
+  };
+  if (!customPath) {
+    cachedAppletConfig = config;
+  }
+  return config;
+}
+function tryLoadInitialConfig() {
+  try {
+    return loadFirebaseAppletConfig();
+  } catch {
+    return null;
+  }
+}
+var initialAppletConfig = tryLoadInitialConfig();
+var TARGET_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || initialAppletConfig?.projectId || "narid-atdc-tracker";
+var TARGET_DATABASE_ID = process.env.FIREBASE_DATABASE_ID || initialAppletConfig?.firestoreDatabaseId || "ai-studio-manpowertracker-9b87a863-5c0d-4126-accb-7a3be802b10b";
 var cachedContext = null;
+function normalizePrivateKeyNewlines(key) {
+  if (typeof key !== "string") return "";
+  return key.replace(/\\n/g, "\n").trim();
+}
 function parseServiceAccountFromSource(raw) {
   const trimmed = raw.trim();
   if (!trimmed) return null;
+  let parsed = null;
   if (trimmed.startsWith("{")) {
-    return JSON.parse(trimmed);
-  }
-  if (fs.existsSync(trimmed)) {
+    parsed = JSON.parse(trimmed);
+  } else if (fs.existsSync(trimmed)) {
     const fileContent = fs.readFileSync(trimmed, "utf8");
-    return JSON.parse(fileContent);
-  }
-  try {
-    const decoded = Buffer.from(trimmed, "base64").toString("utf8").trim();
-    if (decoded.startsWith("{")) {
-      return JSON.parse(decoded);
+    parsed = JSON.parse(fileContent);
+  } else {
+    try {
+      const decoded = Buffer.from(trimmed, "base64").toString("utf8").trim();
+      if (decoded.startsWith("{")) {
+        parsed = JSON.parse(decoded);
+      }
+    } catch {
+      return null;
     }
-  } catch {
   }
-  return null;
+  if (parsed && typeof parsed.private_key === "string") {
+    parsed.private_key = normalizePrivateKeyNewlines(parsed.private_key);
+  }
+  return parsed;
 }
 function isFirestorePermissionDeniedError(err) {
   if (!err || typeof err !== "object") {
@@ -57,15 +119,31 @@ function isFirestorePermissionDeniedError(err) {
   return anyErr.code === 7 || codeStr === "7" || codeStr === "PERMISSION_DENIED" || msg.includes("PERMISSION_DENIED") || msg.includes("permission-denied");
 }
 function formatAdminPermissionDeniedError(projectId = TARGET_PROJECT_ID, databaseId = TARGET_DATABASE_ID) {
-  return `Firebase Admin SDK credentials in this runtime lack Cloud Firestore IAM permissions (roles/datastore.user) for project "${projectId}" (database "${databaseId}"). Deploy the backend to Google Cloud Run in project "${projectId}" with an authorized service account, or configure FIREBASE_SERVICE_ACCOUNT_KEY / GOOGLE_APPLICATION_CREDENTIALS.`;
+  return `Firebase Admin SDK credentials lack Cloud Firestore IAM permissions (roles/datastore.user) for project "${projectId}" (database "${databaseId}"). Verify FIREBASE_SERVICE_ACCOUNT_KEY (or FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY) in Vercel Environment Variables.`;
 }
 function getFirebaseAdminContext(forceRefresh = false) {
   if (cachedContext && !forceRefresh) {
     return cachedContext;
   }
-  const projectId = TARGET_PROJECT_ID;
-  const databaseId = TARGET_DATABASE_ID;
+  let loadedConfig;
+  try {
+    loadedConfig = loadFirebaseAppletConfig();
+  } catch (cfgErr) {
+    cachedContext = {
+      app: null,
+      db: null,
+      auth: null,
+      projectId: TARGET_PROJECT_ID,
+      databaseId: TARGET_DATABASE_ID,
+      credentialMode: "UNCONFIGURED",
+      error: cfgErr?.message || "Missing or invalid firebase-applet-config.json configuration file."
+    };
+    return cachedContext;
+  }
+  const projectId = process.env.FIREBASE_PROJECT_ID || loadedConfig.projectId || TARGET_PROJECT_ID;
+  const databaseId = process.env.FIREBASE_DATABASE_ID || loadedConfig.firestoreDatabaseId || TARGET_DATABASE_ID;
   const appName = `narid-admin-${projectId}`;
+  const isVercelRuntime = Boolean(process.env.VERCEL);
   const envCandidates = [
     { name: "FIREBASE_SERVICE_ACCOUNT_KEY", value: process.env.FIREBASE_SERVICE_ACCOUNT_KEY },
     { name: "FIREBASE_SERVICE_ACCOUNT_JSON", value: process.env.FIREBASE_SERVICE_ACCOUNT_JSON },
@@ -96,6 +174,26 @@ function getFirebaseAdminContext(forceRefresh = false) {
       parseError = `${cand.name} invalid JSON/file: ${e?.message || e}`;
     }
   }
+  if (!parsedCred && !hadExplicitCredentialEnv) {
+    const discreteEmail = (process.env.FIREBASE_CLIENT_EMAIL || "").trim();
+    const discreteKey = normalizePrivateKeyNewlines(process.env.FIREBASE_PRIVATE_KEY);
+    if (discreteEmail || discreteKey) {
+      hadExplicitCredentialEnv = true;
+      const discreteProject = (process.env.FIREBASE_PROJECT_ID || projectId).trim();
+      if (!discreteEmail || !discreteKey) {
+        parseError = "Both FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY must be set together.";
+      } else if (discreteProject !== projectId) {
+        parseError = `FIREBASE_PROJECT_ID "${discreteProject}" does not match expected "${projectId}".`;
+      } else {
+        parsedCred = {
+          project_id: discreteProject,
+          client_email: discreteEmail,
+          private_key: discreteKey
+        };
+        sourceName = "FIREBASE_CLIENT_EMAIL+FIREBASE_PRIVATE_KEY";
+      }
+    }
+  }
   if (hadExplicitCredentialEnv && !parsedCred) {
     cachedContext = {
       app: null,
@@ -104,7 +202,19 @@ function getFirebaseAdminContext(forceRefresh = false) {
       projectId,
       databaseId,
       credentialMode: "UNCONFIGURED",
-      error: parseError || "Explicitly configured Firebase service-account credentials are invalid. Refusing unsafe fallback to ADC."
+      error: parseError || "Explicitly configured Firebase service-account credentials are invalid. Refusing unsafe fallback."
+    };
+    return cachedContext;
+  }
+  if (isVercelRuntime && !parsedCred) {
+    cachedContext = {
+      app: null,
+      db: null,
+      auth: null,
+      projectId,
+      databaseId,
+      credentialMode: "UNCONFIGURED",
+      error: "Missing Firebase Admin SDK credentials in Vercel environment. Configure FIREBASE_SERVICE_ACCOUNT_KEY (or FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY) on the server."
     };
     return cachedContext;
   }
@@ -143,7 +253,7 @@ function getFirebaseAdminContext(forceRefresh = false) {
       projectId,
       databaseId,
       credentialMode,
-      credentialSource: sourceName || (process.env.K_SERVICE ? "CLOUD_RUN_ADC" : "GOOGLE_ADC"),
+      credentialSource: sourceName || "GOOGLE_ADC",
       serviceAccountEmail: parsedCred?.client_email ? String(parsedCred.client_email) : void 0
     };
     return cachedContext;
@@ -243,9 +353,9 @@ async function verifyCallerIdentity(req, db, auth, _projectId) {
   let matchedDoc = null;
   const idxSnap = await db.collection("user_uid_index").doc(verifiedUid).get();
   if (idxSnap.exists) {
-    const idxData = idxSnap.data() || {};
-    if (idxData.roleDocId) {
-      const roleDocSnap = await db.collection("user_roles").doc(String(idxData.roleDocId)).get();
+    const idxData2 = idxSnap.data() || {};
+    if (idxData2.roleDocId) {
+      const roleDocSnap = await db.collection("user_roles").doc(String(idxData2.roleDocId)).get();
       if (roleDocSnap.exists) {
         const d = roleDocSnap.data() || {};
         const linked = Array.isArray(d.linkedAuthUids) ? d.linkedAuthUids : [];
@@ -301,15 +411,19 @@ async function verifyCallerIdentity(req, db, auth, _projectId) {
   const resolvedLoginId = String(
     matchedDoc.data.loginId || matchedDoc.id.replace(/^role_/, "")
   ).toLowerCase();
-  syncUserUidIndex(db, {
-    uid: verifiedUid,
-    roleDocId: matchedDoc.id,
-    role: normalizedRole,
-    status: String(matchedDoc.data.status || "Active"),
-    lockStatus: String(matchedDoc.data.lockStatus || "ACTIVE"),
-    loginId: resolvedLoginId
-  }).catch(() => {
-  });
+  const targetStatus = String(matchedDoc.data.status || "Active");
+  const targetLockStatus = String(matchedDoc.data.lockStatus || "ACTIVE");
+  const idxData = idxSnap.exists ? idxSnap.data() || {} : null;
+  if (!idxData || idxData.roleDocId !== matchedDoc.id || idxData.role !== normalizedRole || idxData.status !== targetStatus || idxData.lockStatus !== targetLockStatus || idxData.loginId !== resolvedLoginId) {
+    await syncUserUidIndex(db, {
+      uid: verifiedUid,
+      roleDocId: matchedDoc.id,
+      role: normalizedRole,
+      status: targetStatus,
+      lockStatus: targetLockStatus,
+      loginId: resolvedLoginId
+    });
+  }
   return {
     uid: verifiedUid,
     email: decodedEmail || String(matchedDoc.data.email || ""),
@@ -2502,12 +2616,6 @@ function registerLoginSecurityRoutes(app, deps) {
           if (!effectiveModules.includes("dashboard")) {
             effectiveModules = ["dashboard", ...effectiveModules];
           }
-          userRef.update({
-            modulesAllowed: effectiveModules,
-            dashboardAccessMigratedV1: true,
-            updatedAt: now
-          }).catch(() => {
-          });
         }
         await Promise.all([
           recordLoginAttemptDoc(db, {
@@ -4216,7 +4324,8 @@ function registerAttendanceRoutes(app, deps) {
               targetId: record.id,
               newValue: `Auto-closed at ${scheduledEndIso}, Duty: ${formatMinutes(scheduledDuration)}, OT: 00:00`,
               actionSource: "SYSTEM_SCHEDULER",
-              reason: "Employee missed scanning Punch Out at scheduled shift closing"
+              reason: "Employee missed scanning Punch Out at scheduled shift closing",
+              captureGeo: false
             });
           }
         }
@@ -4340,22 +4449,35 @@ function registerAttendanceRoutes(app, deps) {
       const { shiftDate, shiftId } = parsed.data;
       const empSnap = await db.collection("employees").where("employeeStatus", "==", "Active").get();
       const now = (/* @__PURE__ */ new Date()).toISOString();
-      let count = 0;
-      for (const empDoc of empSnap.docs) {
+      const entries = empSnap.docs.map((empDoc) => {
         const emp = empDoc.data();
         const empId = String(emp.employeeId || empDoc.id);
         const rosterId = `roster_${shiftDate}_${shiftId}_${empId}`;
-        await db.collection("shift_rosters").doc(rosterId).set({
-          id: rosterId,
-          shiftDate,
-          shiftId,
-          employeeId: empId,
-          rosterStatus: "SCHEDULED",
-          updatedByUid: caller.uid,
-          updatedByLoginId: caller.loginId,
-          updatedAt: now
-        });
-        count++;
+        return {
+          ref: db.collection("shift_rosters").doc(rosterId),
+          payload: {
+            id: rosterId,
+            shiftDate,
+            shiftId,
+            employeeId: empId,
+            rosterStatus: "SCHEDULED",
+            updatedByUid: caller.uid,
+            updatedByLoginId: caller.loginId,
+            updatedAt: now
+          }
+        };
+      });
+      const count = entries.length;
+      if (typeof db.batch === "function") {
+        for (let i = 0; i < entries.length; i += 400) {
+          const batch = db.batch();
+          for (const item of entries.slice(i, i + 400)) {
+            batch.set(item.ref, item.payload);
+          }
+          await batch.commit();
+        }
+      } else {
+        await Promise.all(entries.map((item) => item.ref.set(item.payload)));
       }
       await recordEnterpriseAuditEvent(db, {
         req,
@@ -4384,7 +4506,8 @@ function registerAttendanceRoutes(app, deps) {
         "Clear All Attendance Records"
       );
       if (!caller) return;
-      if (process.env.NODE_ENV === "production" && process.env.ALLOW_ATTENDANCE_CLEAR !== "true") {
+      const isProductionEnv = process.env.NODE_ENV === "production" || process.env.VERCEL_ENV === "production";
+      if (isProductionEnv && process.env.ALLOW_ATTENDANCE_CLEAR !== "true") {
         return res.status(403).json({
           success: false,
           code: "PRODUCTION_WIPE_BLOCKED",
@@ -4403,11 +4526,22 @@ function registerAttendanceRoutes(app, deps) {
         db.collection("punch_logs").get(),
         db.collection("shift_rosters").get()
       ]);
-      await Promise.all([
-        ...attSnap.docs.map((d) => db.collection("attendance").doc(d.id).delete()),
-        ...logSnap.docs.map((d) => db.collection("punch_logs").doc(d.id).delete()),
-        ...rosterSnap.docs.map((d) => db.collection("shift_rosters").doc(d.id).delete())
-      ]);
+      const refsToDelete = [
+        ...attSnap.docs.map((d) => db.collection("attendance").doc(d.id)),
+        ...logSnap.docs.map((d) => db.collection("punch_logs").doc(d.id)),
+        ...rosterSnap.docs.map((d) => db.collection("shift_rosters").doc(d.id))
+      ];
+      if (typeof db.batch === "function") {
+        for (let i = 0; i < refsToDelete.length; i += 400) {
+          const batch = db.batch();
+          for (const ref of refsToDelete.slice(i, i + 400)) {
+            batch.delete(ref);
+          }
+          await batch.commit();
+        }
+      } else {
+        await Promise.all(refsToDelete.map((ref) => ref.delete()));
+      }
       await recordEnterpriseAuditEvent(db, {
         req,
         action: "CLEAR_ATTENDANCE_RECORDS",
@@ -4456,8 +4590,15 @@ async function syncExistingFirebaseAuthPassword(email, targetUid, newPassword, k
     };
   }
   try {
+    const appletConfig = loadFirebaseAppletConfig();
+    if (!appletConfig.apiKey) {
+      return {
+        success: false,
+        error: "Missing Firebase web API key in firebase-applet-config.json."
+      };
+    }
     const res = await fetch(
-      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${firebase_applet_config_default.apiKey}`,
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${appletConfig.apiKey}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -4482,7 +4623,7 @@ async function syncExistingFirebaseAuthPassword(email, targetUid, newPassword, k
       };
     }
     const updateRes = await fetch(
-      `https://identitytoolkit.googleapis.com/v1/accounts:update?key=${firebase_applet_config_default.apiKey}`,
+      `https://identitytoolkit.googleapis.com/v1/accounts:update?key=${appletConfig.apiKey}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -4855,6 +4996,16 @@ function buildAllowedOriginsSet(explicitOverride) {
       allowed.add(clean);
     }
   }
+  for (const vercelHost of [
+    process.env.VERCEL_URL,
+    process.env.VERCEL_BRANCH_URL,
+    process.env.VERCEL_PROJECT_PRODUCTION_URL
+  ]) {
+    const cleanHost = (vercelHost || "").trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+    if (cleanHost) {
+      allowed.add(`https://${cleanHost}`);
+    }
+  }
   if (process.env.NODE_ENV !== "production") {
     allowed.add("http://localhost:3000");
     allowed.add("http://127.0.0.1:3000");
@@ -4879,9 +5030,12 @@ function createApp(options = {}) {
     const cleanOrigin = origin.trim().replace(/\/+$/, "");
     if (allowedOrigins.has(cleanOrigin)) return true;
     if (!useStrictExplicitCors) {
-      const host = req.get("host");
-      if (host) {
-        const proto = req.protocol || "http";
+      const candidateHosts = [
+        req.get("x-forwarded-host")?.split(",")[0]?.trim(),
+        req.get("host")
+      ].filter((h) => Boolean(h));
+      const proto = req.get("x-forwarded-proto")?.split(",")[0]?.trim() || req.protocol || "http";
+      for (const host of candidateHosts) {
         if (cleanOrigin === `${proto}://${host}` || cleanOrigin === `https://${host}`) {
           return true;
         }
@@ -4941,7 +5095,7 @@ function createApp(options = {}) {
       res.status(503).json({
         success: false,
         code: "FIREBASE_ADMIN_UNCONFIGURED",
-        error: adminCtx?.error || "Firebase Admin SDK is not initialized. Attach Cloud Run service account ADC or set FIREBASE_SERVICE_ACCOUNT_KEY."
+        error: adminCtx?.error || "Firebase Admin SDK is not initialized. Configure FIREBASE_SERVICE_ACCOUNT_KEY (or FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY) on the server."
       });
     });
     return { app, db: null, auth: null, projectId, databaseId, credentialMode };
@@ -5107,12 +5261,6 @@ function createApp(options = {}) {
         if (!effectiveModules.includes("dashboard")) {
           effectiveModules = ["dashboard", ...effectiveModules];
         }
-        adminDb.collection("user_roles").doc(userDoc.id).update({
-          modulesAllowed: effectiveModules,
-          dashboardAccessMigratedV1: true,
-          updatedAt: (/* @__PURE__ */ new Date()).toISOString()
-        }).catch(() => {
-        });
       }
       const forceChange = userData.mustChangePassword === true || secData?.forcePasswordChange === true;
       const { passwordHash: _, ...sanitizedProfile } = userData;
@@ -6275,14 +6423,14 @@ function createApp(options = {}) {
       return res.status(500).json({ success: false, error: "Failed to fetch role permissions." });
     }
   });
+  app.use("/api", (_req, res) => {
+    res.status(404).json({ success: false, error: "API endpoint not found." });
+  });
   return { app, db: adminDb, auth, projectId, databaseId, credentialMode };
 }
 async function startServer() {
   const { app, credentialMode, projectId, databaseId } = createApp();
   const PORT = Number(process.env.PORT) || 8080;
-  app.use("/api", (_req, res) => {
-    res.status(404).json({ success: false, error: "API endpoint not found." });
-  });
   if (process.env.NODE_ENV !== "production") {
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
@@ -6291,8 +6439,8 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distDir = path.resolve(process.cwd(), "dist");
-    const distIndex = path.join(distDir, "index.html");
+    const distDir = path2.resolve(process.cwd(), "dist");
+    const distIndex = path2.join(distDir, "index.html");
     if (fs2.existsSync(distIndex)) {
       app.use(express.static(distDir));
       app.get("*", (_req, res) => {
@@ -6321,7 +6469,7 @@ async function startServer() {
   process.once("SIGINT", () => shutdown("SIGINT"));
   return server;
 }
-if (!process.env.VITEST) {
+if (!process.env.VITEST && !process.env.VERCEL) {
   startServer().catch((err) => {
     console.error("Server startup failure:", err);
   });

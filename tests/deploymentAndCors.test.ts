@@ -350,5 +350,58 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
     expect(Object.keys(db.getRawCollection('roles'))).toHaveLength(0);
     expect(Object.keys(db.getRawCollection('account_security'))).toHaveLength(0);
   });
+
+  it('avoids static JSON ESM imports in backend files and safely loads/validates firebase-applet-config.json at runtime', async () => {
+    const os = await import('os');
+    const {
+      loadFirebaseAppletConfig,
+      resetFirebaseAppletConfigCacheForTests,
+      TARGET_PROJECT_ID,
+      TARGET_DATABASE_ID,
+    } = await import('../serverFirebaseAdmin.ts');
+
+    const backendFiles = [
+      'api/[...all].ts',
+      'server.ts',
+      'serverFirebaseAdmin.ts',
+      'serverSecurityAudit.ts',
+      'serverLoginSecurity.ts',
+      'serverAttendance.ts',
+    ];
+    for (const rel of backendFiles) {
+      const content = fs.readFileSync(path.resolve(process.cwd(), rel), 'utf-8');
+      expect(content, `Static JSON import found in ${rel}`).not.toMatch(/from\s+['"][^'"]+\.json['"]/);
+    }
+
+    resetFirebaseAppletConfigCacheForTests();
+    const cfg = loadFirebaseAppletConfig();
+    expect(cfg.projectId).toBe('narid-atdc-tracker');
+    expect(cfg.firestoreDatabaseId).toBe('ai-studio-manpowertracker-9b87a863-5c0d-4126-accb-7a3be802b10b');
+    expect(TARGET_PROJECT_ID).toBe('narid-atdc-tracker');
+    expect(TARGET_DATABASE_ID).toBe('ai-studio-manpowertracker-9b87a863-5c0d-4126-accb-7a3be802b10b');
+
+    const missingPath = path.join(os.tmpdir(), `missing-firebase-config-${Date.now()}.json`);
+    expect(() => loadFirebaseAppletConfig(missingPath)).toThrow('Missing firebase-applet-config.json');
+
+    const invalidJsonPath = path.join(os.tmpdir(), `invalid-firebase-config-${Date.now()}.json`);
+    const missingFieldsPath = path.join(os.tmpdir(), `incomplete-firebase-config-${Date.now()}.json`);
+    try {
+      fs.writeFileSync(invalidJsonPath, '{bad json', 'utf8');
+      expect(() => loadFirebaseAppletConfig(invalidJsonPath)).toThrow('Invalid JSON in firebase-applet-config.json');
+
+      fs.writeFileSync(missingFieldsPath, JSON.stringify({ apiKey: 'AIzaTestSecretShouldNotLeak' }), 'utf8');
+      let errMsg = '';
+      try {
+        loadFirebaseAppletConfig(missingFieldsPath);
+      } catch (e: any) {
+        errMsg = String(e?.message || '');
+      }
+      expect(errMsg).toContain('missing required projectId or firestoreDatabaseId');
+      expect(errMsg).not.toContain('AIzaTestSecretShouldNotLeak');
+    } finally {
+      if (fs.existsSync(invalidJsonPath)) fs.unlinkSync(invalidJsonPath);
+      if (fs.existsSync(missingFieldsPath)) fs.unlinkSync(missingFieldsPath);
+    }
+  });
 });
 

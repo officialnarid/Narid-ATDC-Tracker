@@ -1,15 +1,124 @@
 import fs from 'fs';
-import { initializeApp, getApps, cert, applicationDefault, App } from 'firebase-admin/app';
-import { getAuth, Auth } from 'firebase-admin/auth';
-import { getFirestore, Firestore } from 'firebase-admin/firestore';
-import firebaseConfig from './firebase-applet-config.json';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { initializeApp, getApps, cert, applicationDefault, type App } from 'firebase-admin/app';
+import { getAuth, type Auth } from 'firebase-admin/auth';
+import { getFirestore, type Firestore } from 'firebase-admin/firestore';
+
+export interface FirebaseAppletConfig {
+  projectId: string;
+  firestoreDatabaseId: string;
+  apiKey?: string;
+  authDomain?: string;
+  appId?: string;
+  storageBucket?: string;
+  messagingSenderId?: string;
+  measurementId?: string;
+  oAuthClientId?: string;
+}
+
+let cachedAppletConfig: FirebaseAppletConfig | null = null;
+
+export function resetFirebaseAppletConfigCacheForTests(): void {
+  cachedAppletConfig = null;
+}
+
+export function loadFirebaseAppletConfig(customPath?: string): FirebaseAppletConfig {
+  if (!customPath && cachedAppletConfig) {
+    return cachedAppletConfig;
+  }
+
+  const cwdPath = customPath
+    ? path.resolve(customPath)
+    : path.resolve(process.cwd(), 'firebase-applet-config.json');
+
+  let resolvedPath = cwdPath;
+  if (!customPath && !fs.existsSync(resolvedPath)) {
+    const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+    const moduleAdjacentPath = path.resolve(moduleDir, 'firebase-applet-config.json');
+    if (fs.existsSync(moduleAdjacentPath)) {
+      resolvedPath = moduleAdjacentPath;
+    }
+  }
+
+  if (!fs.existsSync(resolvedPath)) {
+    throw new Error('Missing firebase-applet-config.json configuration file.');
+  }
+
+  let rawContent: string;
+  try {
+    rawContent = fs.readFileSync(resolvedPath, 'utf8');
+  } catch {
+    throw new Error('Unable to read firebase-applet-config.json configuration file.');
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawContent);
+  } catch {
+    throw new Error('Invalid JSON in firebase-applet-config.json configuration file.');
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Invalid firebase-applet-config.json: expected a JSON object.');
+  }
+
+  const record = parsed as Record<string, unknown>;
+  const projectId = typeof record.projectId === 'string' ? record.projectId.trim() : '';
+  const firestoreDatabaseId =
+    typeof record.firestoreDatabaseId === 'string' ? record.firestoreDatabaseId.trim() : '';
+
+  if (!projectId || !firestoreDatabaseId) {
+    throw new Error(
+      'Invalid firebase-applet-config.json: missing required projectId or firestoreDatabaseId.'
+    );
+  }
+
+  const config: FirebaseAppletConfig = {
+    projectId,
+    firestoreDatabaseId,
+    ...(typeof record.apiKey === 'string' && record.apiKey.trim()
+      ? { apiKey: record.apiKey.trim() }
+      : {}),
+    ...(typeof record.authDomain === 'string' ? { authDomain: record.authDomain.trim() } : {}),
+    ...(typeof record.appId === 'string' ? { appId: record.appId.trim() } : {}),
+    ...(typeof record.storageBucket === 'string'
+      ? { storageBucket: record.storageBucket.trim() }
+      : {}),
+    ...(typeof record.messagingSenderId === 'string'
+      ? { messagingSenderId: record.messagingSenderId.trim() }
+      : {}),
+    ...(typeof record.measurementId === 'string'
+      ? { measurementId: record.measurementId.trim() }
+      : {}),
+    ...(typeof record.oAuthClientId === 'string'
+      ? { oAuthClientId: record.oAuthClientId.trim() }
+      : {}),
+  };
+
+  if (!customPath) {
+    cachedAppletConfig = config;
+  }
+
+  return config;
+}
+
+function tryLoadInitialConfig(): FirebaseAppletConfig | null {
+  try {
+    return loadFirebaseAppletConfig();
+  } catch {
+    return null;
+  }
+}
+
+const initialAppletConfig = tryLoadInitialConfig();
 
 export const TARGET_PROJECT_ID =
-  process.env.FIREBASE_PROJECT_ID || firebaseConfig.projectId || 'narid-atdc-tracker';
+  process.env.FIREBASE_PROJECT_ID || initialAppletConfig?.projectId || 'narid-atdc-tracker';
 
 export const TARGET_DATABASE_ID =
   process.env.FIREBASE_DATABASE_ID ||
-  firebaseConfig.firestoreDatabaseId ||
+  initialAppletConfig?.firestoreDatabaseId ||
   'ai-studio-manpowertracker-9b87a863-5c0d-4126-accb-7a3be802b10b';
 
 export interface FirebaseAdminContext {
@@ -93,8 +202,25 @@ export function getFirebaseAdminContext(forceRefresh = false): FirebaseAdminCont
     return cachedContext;
   }
 
-  const projectId = TARGET_PROJECT_ID;
-  const databaseId = TARGET_DATABASE_ID;
+  let loadedConfig: FirebaseAppletConfig;
+  try {
+    loadedConfig = loadFirebaseAppletConfig();
+  } catch (cfgErr: any) {
+    cachedContext = {
+      app: null,
+      db: null,
+      auth: null,
+      projectId: TARGET_PROJECT_ID,
+      databaseId: TARGET_DATABASE_ID,
+      credentialMode: 'UNCONFIGURED',
+      error: cfgErr?.message || 'Missing or invalid firebase-applet-config.json configuration file.',
+    };
+    return cachedContext;
+  }
+
+  const projectId = process.env.FIREBASE_PROJECT_ID || loadedConfig.projectId || TARGET_PROJECT_ID;
+  const databaseId =
+    process.env.FIREBASE_DATABASE_ID || loadedConfig.firestoreDatabaseId || TARGET_DATABASE_ID;
   const appName = `narid-admin-${projectId}`;
   const isVercelRuntime = Boolean(process.env.VERCEL);
 

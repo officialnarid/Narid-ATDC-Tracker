@@ -1,9 +1,9 @@
-import express, { Request, Response } from 'express';
+import express, { type Request, type Response } from 'express';
 import crypto from 'crypto';
 import { z } from 'zod';
 import {
-  AdminFirestoreLike,
-  VerifiedCaller,
+  type AdminFirestoreLike,
+  type VerifiedCaller,
   recordEnterpriseAuditEvent,
 } from './serverSecurityAudit.ts';
 

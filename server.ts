@@ -1,21 +1,21 @@
-import express, { Request, Response, NextFunction } from 'express';
+import express, { type Request, type Response, type NextFunction } from 'express';
 import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { z } from 'zod';
-import firebaseConfig from './firebase-applet-config.json';
 import {
   getFirebaseAdminContext,
+  loadFirebaseAppletConfig,
   TARGET_PROJECT_ID,
   TARGET_DATABASE_ID,
   isFirestorePermissionDeniedError,
   formatAdminPermissionDeniedError,
 } from './serverFirebaseAdmin.ts';
 import {
-  AdminAuthLike,
-  AdminFirestoreLike,
-  VerifiedCaller,
+  type AdminAuthLike,
+  type AdminFirestoreLike,
+  type VerifiedCaller,
   registerSecurityAuditRoutes,
   verifyCallerIdentity,
   recordEnterpriseAuditEvent,
@@ -73,8 +73,16 @@ export async function syncExistingFirebaseAuthPassword(
   }
 
   try {
+    const appletConfig = loadFirebaseAppletConfig();
+    if (!appletConfig.apiKey) {
+      return {
+        success: false,
+        error: 'Missing Firebase web API key in firebase-applet-config.json.',
+      };
+    }
+
     const res = await fetch(
-      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${firebaseConfig.apiKey}`,
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${appletConfig.apiKey}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -101,7 +109,7 @@ export async function syncExistingFirebaseAuthPassword(
     }
 
     const updateRes = await fetch(
-      `https://identitytoolkit.googleapis.com/v1/accounts:update?key=${firebaseConfig.apiKey}`,
+      `https://identitytoolkit.googleapis.com/v1/accounts:update?key=${appletConfig.apiKey}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
