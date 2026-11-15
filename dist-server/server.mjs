@@ -5088,6 +5088,13 @@ function createApp(options = {}) {
       });
     })
   );
+  app.use((req, _res, next) => {
+    const bodyDesc = Object.getOwnPropertyDescriptor(req, "body");
+    if (bodyDesc && "value" in bodyDesc && bodyDesc.value !== void 0 && bodyDesc.value !== null && req.readableEnded && !req._body) {
+      req._body = true;
+    }
+    next();
+  });
   app.use(express.json({ limit: "2mb" }));
   let runtimeFirestoreAccessError = null;
   const noteRuntimeFirestoreError = (err) => {

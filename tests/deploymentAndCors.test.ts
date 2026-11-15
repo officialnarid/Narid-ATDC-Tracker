@@ -576,12 +576,18 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
       'https://narid-atdc-tracker.vercel.app/api/audit/logs?limit=50&loginId=admin'
     );
 
-    // Rejects invalid URLs, extra path segments, embedded credentials, and unsupported protocols
+    // Rejects '/', relative URLs, invalid URLs, extra path segments, embedded credentials, and unsupported protocols
+    expect(validateApiBaseUrl('/')).toContain('relative URLs are not allowed');
+    expect(validateApiBaseUrl('/api')).toContain('relative URLs are not allowed');
+    expect(validateApiBaseUrl('./api')).toContain('relative URLs are not allowed');
+    expect(validateApiBaseUrl('narid-atdc-tracker.vercel.app')).toContain('Invalid VITE_API_BASE_URL');
     expect(validateApiBaseUrl('ftp://narid-atdc-tracker.vercel.app')).toContain('Unsupported protocol');
     expect(validateApiBaseUrl('javascript:alert(1)')).toContain('Unsupported protocol');
     expect(validateApiBaseUrl('https://')).toContain('Invalid VITE_API_BASE_URL');
     expect(validateApiBaseUrl('https://user:pass@narid-atdc-tracker.vercel.app')).toContain('credentials');
     expect(validateApiBaseUrl('https://narid-atdc-tracker.vercel.app/v2')).toContain('backend origin only');
+    expect(() => resolveApiUrl('/api/auth/login', '/')).toThrow('not allowed');
+    expect(() => resolveApiUrl('/api/auth/login', '/api')).toThrow('not allowed');
     expect(() => resolveApiUrl('/api/auth/login', 'ftp://narid-atdc-tracker.vercel.app')).toThrow('Unsupported protocol');
   });
 

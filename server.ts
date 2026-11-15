@@ -653,6 +653,22 @@ export function createApp(options: ServerAppOptions = {}) {
     })
   );
 
+  app.use((req: Request, _res: Response, next: NextFunction) => {
+    // Preserve platform-parsed body if a serverless runtime already drained the stream
+    const bodyDesc = Object.getOwnPropertyDescriptor(req, 'body');
+    if (
+      bodyDesc &&
+      'value' in bodyDesc &&
+      bodyDesc.value !== undefined &&
+      bodyDesc.value !== null &&
+      req.readableEnded &&
+      !(req as any)._body
+    ) {
+      (req as any)._body = true;
+    }
+    next();
+  });
+
   app.use(express.json({ limit: '2mb' }));
 
   let runtimeFirestoreAccessError: string | null = null;

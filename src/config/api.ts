@@ -2,19 +2,23 @@ export function normalizeApiBaseUrl(raw?: string | null): string {
   let clean = String(raw || '').trim();
   if (!clean) return '';
 
-  // Strip trailing slashes first, then strip a redundant trailing /api segment, then trailing slashes again
+  // Only normalize trailing slashes / trailing /api on absolute http(s):// URLs;
+  // leave '/' or relative strings intact so validateApiBaseUrl() rejects them explicitly.
+  if (!/^https?:\/\//i.test(clean)) {
+    return clean;
+  }
+
   clean = clean.replace(/\/+$/, '');
   clean = clean.replace(/\/api$/i, '');
   clean = clean.replace(/\/+$/, '');
-
-  return clean === '/' ? '' : clean;
+  return clean;
 }
 
 export const API_BASE_URL = normalizeApiBaseUrl(import.meta.env.VITE_API_BASE_URL);
 
 export function validateApiBaseUrl(baseUrl?: string | null, _hostname?: string): string | null {
   const raw = String(baseUrl || '').trim();
-  if (!raw) return null;
+  if (!raw) return null; // Empty / undefined -> same-origin /api/* (Vercel Production)
 
   if (
     /(?:your[_-]?cloud[_-]?run[_-]?url|cloud_run_url|your[_-]?api[_-]?url|<[^>]+>)/i.test(raw) ||
@@ -23,33 +27,32 @@ export function validateApiBaseUrl(baseUrl?: string | null, _hostname?: string):
     return 'Backend API URL placeholder detected in VITE_API_BASE_URL. Leave VITE_API_BASE_URL empty to use same-origin Vercel /api Serverless Functions, or provide a valid https:// URL.';
   }
 
-  const clean = normalizeApiBaseUrl(raw);
-  if (!clean) {
-    // Reject bare "/api" as malformed if explicitly supplied? No, normalizing "/api" -> "" resolves to same-origin /api/* cleanly.
-    // Reject bare "/" only if someone put invalid non-empty nonsense; "/" normalizes to "" cleanly.
-    return null;
+  // Strictly reject '/', relative URLs ('/api', './api', 'api/v1'), and scheme-less strings
+  if (raw === '/' || raw.startsWith('/') || raw.startsWith('.')) {
+    return 'Invalid VITE_API_BASE_URL configuration: "/" and relative URLs are not allowed. Leave VITE_API_BASE_URL empty for same-origin /api, or provide a full https:// URL.';
   }
 
-  let parsed: URL;
+  let rawParsed: URL;
   try {
-    parsed = new URL(clean);
+    rawParsed = new URL(raw);
   } catch {
     return 'Invalid VITE_API_BASE_URL configuration. Leave it empty for same-origin Vercel /api Serverless Functions, or provide a full https:// URL.';
   }
 
-  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-    return `Unsupported protocol "${parsed.protocol}" in VITE_API_BASE_URL. Only https:// (or http:// for local development) is allowed.`;
+  if (rawParsed.protocol !== 'https:' && rawParsed.protocol !== 'http:') {
+    return `Unsupported protocol "${rawParsed.protocol}" in VITE_API_BASE_URL. Only https:// (or http:// for local development) is allowed.`;
   }
 
-  if (!parsed.hostname) {
+  if (!rawParsed.hostname) {
     return 'Invalid VITE_API_BASE_URL configuration: missing hostname.';
   }
 
-  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+  if (rawParsed.username || rawParsed.password || rawParsed.search || rawParsed.hash) {
     return 'Invalid VITE_API_BASE_URL configuration: URL must be an origin without credentials, query parameters, or fragments.';
   }
 
-  if (parsed.pathname && parsed.pathname !== '/') {
+  const normalizedPath = rawParsed.pathname.replace(/\/+$/, '');
+  if (normalizedPath && normalizedPath !== '/api') {
     return 'Invalid VITE_API_BASE_URL configuration: provide the backend origin only (e.g. https://narid-atdc-tracker.vercel.app) without extra path segments.';
   }
 
