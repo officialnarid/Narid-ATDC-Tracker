@@ -4979,21 +4979,39 @@ async function seedInitialAccounts(db) {
     console.warn("[Settings Boot] Security retention defaults notice:", e?.message || e);
   }
 }
+var VERCEL_PRODUCTION_ORIGIN = "https://narid-atdc-tracker.vercel.app";
+var AI_STUDIO_DEV_ORIGIN = "https://ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app";
+var AI_STUDIO_PREVIEW_ORIGIN = "https://ais-pre-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app";
+function normalizeAllowedOrigin(raw) {
+  const clean = String(raw || "").trim().replace(/\/+$/, "");
+  if (!clean || clean === "*" || clean.includes("*")) return null;
+  try {
+    const parsed = new URL(clean);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+    if (!parsed.hostname) return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
 function buildAllowedOriginsSet(explicitOverride) {
   const allowed = /* @__PURE__ */ new Set();
   if (Array.isArray(explicitOverride)) {
     explicitOverride.forEach((o) => {
-      const clean = o.trim().replace(/\/+$/, "");
-      if (clean) allowed.add(clean);
+      const origin = normalizeAllowedOrigin(o);
+      if (origin) allowed.add(origin);
     });
     return allowed;
   }
+  allowed.add(VERCEL_PRODUCTION_ORIGIN);
+  allowed.add(AI_STUDIO_DEV_ORIGIN);
+  allowed.add(AI_STUDIO_PREVIEW_ORIGIN);
   const rawEnv = process.env.ALLOWED_ORIGINS || "";
-  rawEnv.split(",").map((s) => s.trim().replace(/\/+$/, "")).filter(Boolean).forEach((o) => allowed.add(o));
+  rawEnv.split(",").map((s) => normalizeAllowedOrigin(s)).filter((o) => Boolean(o)).forEach((o) => allowed.add(o));
   for (const singleUrl of [process.env.APP_URL, process.env.FRONTEND_URL]) {
-    const clean = (singleUrl || "").trim().replace(/\/+$/, "");
-    if (clean && clean !== "MY_APP_URL" && /^https?:\/\//i.test(clean)) {
-      allowed.add(clean);
+    const origin = normalizeAllowedOrigin(singleUrl);
+    if (origin) {
+      allowed.add(origin);
     }
   }
   for (const vercelHost of [
@@ -5003,7 +5021,8 @@ function buildAllowedOriginsSet(explicitOverride) {
   ]) {
     const cleanHost = (vercelHost || "").trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "");
     if (cleanHost) {
-      allowed.add(`https://${cleanHost}`);
+      const origin = normalizeAllowedOrigin(`https://${cleanHost}`);
+      if (origin) allowed.add(origin);
     }
   }
   if (process.env.NODE_ENV !== "production") {
@@ -5027,7 +5046,8 @@ function createApp(options = {}) {
   const useStrictExplicitCors = Array.isArray(options.allowedOrigins);
   const isOriginPermitted = (origin, req) => {
     if (!origin) return true;
-    const cleanOrigin = origin.trim().replace(/\/+$/, "");
+    const cleanOrigin = normalizeAllowedOrigin(origin);
+    if (!cleanOrigin) return false;
     if (allowedOrigins.has(cleanOrigin)) return true;
     if (!useStrictExplicitCors) {
       const candidateHosts = [
@@ -5044,6 +5064,7 @@ function createApp(options = {}) {
     return false;
   };
   app.use((req, res, next) => {
+    res.setHeader("Vary", "Origin");
     const origin = req.headers.origin;
     if (origin && !isOriginPermitted(origin, req)) {
       return res.status(403).json({
@@ -5055,17 +5076,16 @@ function createApp(options = {}) {
     return next();
   });
   app.use(
-    cors({
-      origin: (origin, callback) => {
-        if (!origin) return callback(null, true);
-        if (allowedOrigins.has(origin.trim().replace(/\/+$/, ""))) {
-          return callback(null, true);
-        }
-        return callback(null, true);
-      },
-      credentials: true,
-      methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-      allowedHeaders: ["Content-Type", "Authorization"]
+    cors((req, callback) => {
+      const rawOrigin = req.headers.origin;
+      const permitted = Boolean(rawOrigin && isOriginPermitted(rawOrigin, req));
+      callback(null, {
+        origin: permitted ? normalizeAllowedOrigin(rawOrigin) || false : false,
+        credentials: true,
+        methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allowedHeaders: ["Content-Type", "Authorization"],
+        optionsSuccessStatus: 204
+      });
     })
   );
   app.use(express.json({ limit: "2mb" }));
@@ -6475,9 +6495,13 @@ if (!process.env.VITEST && !process.env.VERCEL) {
   });
 }
 export {
+  AI_STUDIO_DEV_ORIGIN,
+  AI_STUDIO_PREVIEW_ORIGIN,
+  VERCEL_PRODUCTION_ORIGIN,
   buildAllowedOriginsSet,
   createApp,
   hashPassword,
+  normalizeAllowedOrigin,
   startServer,
   syncExistingFirebaseAuthPassword,
   verifyPassword

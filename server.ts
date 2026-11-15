@@ -504,28 +504,52 @@ async function seedInitialAccounts(db: AdminFirestoreLike) {
 // ============================================================================
 // CORS Origin Allowlist Helper
 // ============================================================================
+export const VERCEL_PRODUCTION_ORIGIN = 'https://narid-atdc-tracker.vercel.app';
+export const AI_STUDIO_DEV_ORIGIN =
+  'https://ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app';
+export const AI_STUDIO_PREVIEW_ORIGIN =
+  'https://ais-pre-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app';
+
+export function normalizeAllowedOrigin(raw?: string | null): string | null {
+  const clean = String(raw || '').trim().replace(/\/+$/, '');
+  if (!clean || clean === '*' || clean.includes('*')) return null;
+  try {
+    const parsed = new URL(clean);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
+    if (!parsed.hostname) return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
 export function buildAllowedOriginsSet(explicitOverride?: string[]): Set<string> {
   const allowed = new Set<string>();
 
   if (Array.isArray(explicitOverride)) {
     explicitOverride.forEach((o) => {
-      const clean = o.trim().replace(/\/+$/, '');
-      if (clean) allowed.add(clean);
+      const origin = normalizeAllowedOrigin(o);
+      if (origin) allowed.add(origin);
     });
     return allowed;
   }
 
+  // Canonical deployment origins (exact origins only; never wildcard subdomains)
+  allowed.add(VERCEL_PRODUCTION_ORIGIN);
+  allowed.add(AI_STUDIO_DEV_ORIGIN);
+  allowed.add(AI_STUDIO_PREVIEW_ORIGIN);
+
   const rawEnv = process.env.ALLOWED_ORIGINS || '';
   rawEnv
     .split(',')
-    .map((s) => s.trim().replace(/\/+$/, ''))
-    .filter(Boolean)
+    .map((s) => normalizeAllowedOrigin(s))
+    .filter((o): o is string => Boolean(o))
     .forEach((o) => allowed.add(o));
 
   for (const singleUrl of [process.env.APP_URL, process.env.FRONTEND_URL]) {
-    const clean = (singleUrl || '').trim().replace(/\/+$/, '');
-    if (clean && clean !== 'MY_APP_URL' && /^https?:\/\//i.test(clean)) {
-      allowed.add(clean);
+    const origin = normalizeAllowedOrigin(singleUrl);
+    if (origin) {
+      allowed.add(origin);
     }
   }
 
@@ -536,7 +560,8 @@ export function buildAllowedOriginsSet(explicitOverride?: string[]): Set<string>
   ]) {
     const cleanHost = (vercelHost || '').trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
     if (cleanHost) {
-      allowed.add(`https://${cleanHost}`);
+      const origin = normalizeAllowedOrigin(`https://${cleanHost}`);
+      if (origin) allowed.add(origin);
     }
   }
 
@@ -580,10 +605,11 @@ export function createApp(options: ServerAppOptions = {}) {
 
   const isOriginPermitted = (origin: string | undefined, req: Request): boolean => {
     if (!origin) return true; // Non-browser / same-origin fetch without Origin header
-    const cleanOrigin = origin.trim().replace(/\/+$/, '');
+    const cleanOrigin = normalizeAllowedOrigin(origin);
+    if (!cleanOrigin) return false;
     if (allowedOrigins.has(cleanOrigin)) return true;
 
-    // Allow exact same-origin requests against active host / forwarded host unless tests explicitly locked allowedOrigins
+    // Allow exact same-origin requests against active host / forwarded host unless explicit allowlist override was passed
     if (!useStrictExplicitCors) {
       const candidateHosts = [
         req.get('x-forwarded-host')?.split(',')[0]?.trim(),
@@ -601,6 +627,7 @@ export function createApp(options: ServerAppOptions = {}) {
   };
 
   app.use((req: Request, res: Response, next: NextFunction) => {
+    res.setHeader('Vary', 'Origin');
     const origin = req.headers.origin;
     if (origin && !isOriginPermitted(origin, req)) {
       return res.status(403).json({
@@ -613,17 +640,16 @@ export function createApp(options: ServerAppOptions = {}) {
   });
 
   app.use(
-    cors({
-      origin: (origin, callback) => {
-        if (!origin) return callback(null, true);
-        if (allowedOrigins.has(origin.trim().replace(/\/+$/, ''))) {
-          return callback(null, true);
-        }
-        return callback(null, true); // Host same-origin already vetted by middleware above
-      },
-      credentials: true,
-      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization'],
+    cors((req: Request, callback) => {
+      const rawOrigin = req.headers.origin;
+      const permitted = Boolean(rawOrigin && isOriginPermitted(rawOrigin, req));
+      callback(null, {
+        origin: permitted ? normalizeAllowedOrigin(rawOrigin) || false : false,
+        credentials: true,
+        methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+        allowedHeaders: ['Content-Type', 'Authorization'],
+        optionsSuccessStatus: 204,
+      });
     })
   );
 

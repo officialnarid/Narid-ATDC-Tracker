@@ -21,11 +21,11 @@ Architecture:
 
 ---
 
-## 2. Vercel Environment Variables
+## 2. Dual-Environment Variables (Vercel Production + AI Studio Preview)
 
 Configure the following environment variables in **Vercel Project Settings -> Environment Variables** (never expose service-account secrets with a `VITE_` prefix):
 
-### Server-Side Variables (All Environments / Production & Preview)
+### Vercel Server-Side Variables (All Environments / Production & Preview)
 - `FIREBASE_PROJECT_ID` = `narid-atdc-tracker`
 - `FIREBASE_DATABASE_ID` = `ai-studio-manpowertracker-9b87a863-5c0d-4126-accb-7a3be802b10b`
 - **Firebase Admin Credentials** (choose Option A or Option B):
@@ -34,10 +34,10 @@ Configure the following environment variables in **Vercel Project Settings -> En
   - **Option B (Discrete Fields):**
     - `FIREBASE_CLIENT_EMAIL` = *(service account `client_email`)*
     - `FIREBASE_PRIVATE_KEY` = *(PEM `private_key`, supports escaped `\n` newlines)*
-- `ALLOWED_ORIGINS` = `https://narid-atdc-tracker.vercel.app` *(comma-separated allowlist for custom/production domains)*
+- `ALLOWED_ORIGINS` = `https://narid-atdc-tracker.vercel.app,https://ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app,https://ais-pre-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app`
 - `APP_URL` = `https://narid-atdc-tracker.vercel.app`
 
-### Frontend Public Build-Time Variables
+### Vercel Production Frontend Variables
 - `VITE_API_BASE_URL` = `""` *(leave unset or empty for same-origin `/api/*` Vercel Serverless Functions)*
 - `VITE_FIREBASE_PROJECT_ID` = `narid-atdc-tracker`
 - `VITE_FIREBASE_API_KEY` = *(existing Firebase Web API key)*
@@ -46,6 +46,9 @@ Configure the following environment variables in **Vercel Project Settings -> En
 - `VITE_FIREBASE_APP_ID` = `1:1060028696945:web:c720807980550c1cc5ced0`
 - `VITE_FIREBASE_STORAGE_BUCKET` = `narid-atdc-tracker.firebasestorage.app`
 - `VITE_FIREBASE_MESSAGING_SENDER_ID` = `1060028696945`
+
+### Google AI Studio Preview Frontend Variable (`.env.development`)
+- `VITE_API_BASE_URL` = `https://narid-atdc-tracker.vercel.app` *(routes AI Studio Preview `/api/*` requests directly to the shared Vercel Serverless backend; ignored by `vite build` for Vercel Production)*
 
 ---
 

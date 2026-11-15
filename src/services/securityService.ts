@@ -1,6 +1,7 @@
 import {
   apiFetchJson,
   apiUrl,
+  executeApiFetch,
   isApiBaseUsableForCurrentOrigin,
 } from '../config/api';
 import { getAuthHeaders } from './auditService';
@@ -119,11 +120,15 @@ export async function generateTemporaryPasswordForAccount(payload: {
 export async function reportFirebaseThrottleSignal(loginId: string): Promise<void> {
   if (!isApiBaseUsableForCurrentOrigin()) return;
   try {
-    await fetch(apiUrl('/api/auth/firebase-throttle-signal'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ loginId }),
-    });
+    await executeApiFetch(
+      apiUrl('/api/auth/firebase-throttle-signal'),
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ loginId }),
+      },
+      'POST /api/auth/firebase-throttle-signal'
+    );
   } catch {
     // non-blocking telemetry
   }

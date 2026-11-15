@@ -186,7 +186,7 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
     });
   });
 
-  it('uses centralized API_BASE_URL in all frontend services without raw res.json() or external rewrites in vercel.json', () => {
+  it('uses centralized apiUrl/executeApiFetch in all frontend services without raw fetch(), raw res.json(), or external rewrites', () => {
     const vercelJson = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'vercel.json'), 'utf-8'));
     const rewrites = JSON.stringify(vercelJson.rewrites || []);
     expect(rewrites).toContain('(?!api');
@@ -194,7 +194,7 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
     expect(vercelJson.functions?.['api/[...all].ts']?.includeFiles).toContain('firebase-applet-config.json');
 
     const authServiceSrc = fs.readFileSync(path.resolve(process.cwd(), 'src/services/authService.ts'), 'utf-8');
-    expect(authServiceSrc).toContain('${API_BASE_URL}/api/auth/login');
+    expect(authServiceSrc).toContain("apiUrl('/api/auth/login')");
 
     const frontendApiFiles = [
       'src/App.tsx',
@@ -208,6 +208,7 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
     for (const rel of frontendApiFiles) {
       const content = fs.readFileSync(path.resolve(process.cwd(), rel), 'utf-8');
       expect(content, `Unsafe raw res.json() remaining in ${rel}`).not.toMatch(/\bres\.json\(/);
+      expect(content, `Direct fetch() bypassing src/config/api.ts found in ${rel}`).not.toMatch(/\bfetch\(/);
     }
   });
 
@@ -532,6 +533,219 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
       if (ctx.app) {
         await deleteApp(ctx.app).catch(() => {});
       }
+      handlerMod.resetServerlessAppHandlerForTests();
+      if (prevVercel === undefined) delete process.env.VERCEL;
+      else process.env.VERCEL = prevVercel;
+      if (prevKey === undefined) delete process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
+      else process.env.FIREBASE_SERVICE_ACCOUNT_KEY = prevKey;
+      getFirebaseAdminContext(true);
+    }
+  });
+  it('resolves dual-environment API URLs cleanly without double /api/api or malformed protocols', async () => {
+    const {
+      normalizeApiBaseUrl,
+      validateApiBaseUrl,
+      resolveApiUrl,
+    } = await import('../src/config/api.ts');
+
+    // Empty / undefined -> same-origin /api/* (Vercel Production)
+    expect(resolveApiUrl('/api/auth/login', undefined)).toBe('/api/auth/login');
+    expect(resolveApiUrl('/api/auth/login', '')).toBe('/api/auth/login');
+    expect(resolveApiUrl('/api/health', '   ')).toBe('/api/health');
+
+    // Absolute HTTPS URL -> Google AI Studio Preview pointing at shared Vercel backend
+    expect(resolveApiUrl('/api/auth/login', 'https://narid-atdc-tracker.vercel.app')).toBe(
+      'https://narid-atdc-tracker.vercel.app/api/auth/login'
+    );
+    expect(resolveApiUrl('/api/auth/login', 'https://narid-atdc-tracker.vercel.app/')).toBe(
+      'https://narid-atdc-tracker.vercel.app/api/auth/login'
+    );
+    // Trailing /api on base URL or duplicate /api/api in path never doubles /api
+    expect(normalizeApiBaseUrl('https://narid-atdc-tracker.vercel.app/api/')).toBe(
+      'https://narid-atdc-tracker.vercel.app'
+    );
+    expect(resolveApiUrl('/api/auth/login', 'https://narid-atdc-tracker.vercel.app/api')).toBe(
+      'https://narid-atdc-tracker.vercel.app/api/auth/login'
+    );
+    expect(resolveApiUrl('/api/api/auth/login', 'https://narid-atdc-tracker.vercel.app')).toBe(
+      'https://narid-atdc-tracker.vercel.app/api/auth/login'
+    );
+
+    // Preserves query strings accurately
+    expect(resolveApiUrl('/api/audit/logs?limit=50&loginId=admin', 'https://narid-atdc-tracker.vercel.app')).toBe(
+      'https://narid-atdc-tracker.vercel.app/api/audit/logs?limit=50&loginId=admin'
+    );
+
+    // Rejects invalid URLs, extra path segments, embedded credentials, and unsupported protocols
+    expect(validateApiBaseUrl('ftp://narid-atdc-tracker.vercel.app')).toContain('Unsupported protocol');
+    expect(validateApiBaseUrl('javascript:alert(1)')).toContain('Unsupported protocol');
+    expect(validateApiBaseUrl('https://')).toContain('Invalid VITE_API_BASE_URL');
+    expect(validateApiBaseUrl('https://user:pass@narid-atdc-tracker.vercel.app')).toContain('credentials');
+    expect(validateApiBaseUrl('https://narid-atdc-tracker.vercel.app/v2')).toContain('backend origin only');
+    expect(() => resolveApiUrl('/api/auth/login', 'ftp://narid-atdc-tracker.vercel.app')).toThrow('Unsupported protocol');
+  });
+
+  it('allows exact AI Studio & Vercel origins with preflight and rejects untrusted/other Cloud Run origins without wildcards', async () => {
+    const { buildAllowedOriginsSet } = await import('../server.ts');
+
+    const prevAllowed = process.env.ALLOWED_ORIGINS;
+    try {
+      // Even if a wildcard entry is passed in ALLOWED_ORIGINS, it must be ignored
+      process.env.ALLOWED_ORIGINS = '*,https://*.run.app,https://custom.narid-tracker.com/';
+      const set = buildAllowedOriginsSet();
+      expect(set.has('*')).toBe(false);
+      expect(set.has('https://*.run.app')).toBe(false);
+      expect(set.has('https://custom.narid-tracker.com')).toBe(true);
+      expect(set.has('https://narid-atdc-tracker.vercel.app')).toBe(true);
+      expect(set.has('https://ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')).toBe(true);
+      expect(set.has('https://ais-pre-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')).toBe(true);
+    } finally {
+      if (prevAllowed === undefined) delete process.env.ALLOWED_ORIGINS;
+      else process.env.ALLOWED_ORIGINS = prevAllowed;
+    }
+
+    const db = new InMemoryFirestore();
+    const auth = new InMemoryAdminAuth();
+    const { app } = createApp({
+      db,
+      auth,
+      projectId: 'narid-atdc-tracker',
+      databaseId: 'ai-studio-manpowertracker-9b87a863-5c0d-4126-accb-7a3be802b10b',
+      credentialMode: 'SERVICE_ACCOUNT_ENV',
+      disableBackgroundBoot: true,
+    });
+
+    const aiStudioOrigin = 'https://ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app';
+    const aiPreviewOrigin = 'https://ais-pre-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app';
+    const vercelOrigin = 'https://narid-atdc-tracker.vercel.app';
+    const randomCloudRunOrigin = 'https://unrelated-service-12345.asia-southeast1.run.app';
+
+    for (const trustedOrigin of [aiStudioOrigin, aiPreviewOrigin, vercelOrigin]) {
+      const preflight = await request(app)
+        .options('/api/auth/login')
+        .set('Origin', trustedOrigin)
+        .set('Access-Control-Request-Method', 'POST')
+        .set('Access-Control-Request-Headers', 'Content-Type, Authorization');
+      expect(preflight.status).toBe(204);
+      expect(preflight.headers['access-control-allow-origin']).toBe(trustedOrigin);
+      expect(preflight.headers['access-control-allow-origin']).not.toBe('*');
+      expect(preflight.headers['access-control-allow-credentials']).toBe('true');
+
+      const health = await request(app).get('/api/health').set('Origin', trustedOrigin);
+      expect(health.status).toBe(200);
+      expect(health.headers['access-control-allow-origin']).toBe(trustedOrigin);
+      expect(health.headers['access-control-allow-credentials']).toBe('true');
+    }
+
+    const rejectedOtherRunApp = await request(app)
+      .options('/api/auth/login')
+      .set('Origin', randomCloudRunOrigin)
+      .set('Access-Control-Request-Method', 'POST');
+    expect(rejectedOtherRunApp.status).toBe(403);
+    expect(rejectedOtherRunApp.body.code).toBe('CORS_ORIGIN_FORBIDDEN');
+
+    const rejectedUntrustedPost = await request(app)
+      .post('/api/auth/login')
+      .set('Origin', 'https://evil-attacker.example.com')
+      .send({ loginId: 'admin', password: 'x' });
+    expect(rejectedUntrustedPost.status).toBe(403);
+    expect(rejectedUntrustedPost.body.code).toBe('CORS_ORIGIN_FORBIDDEN');
+  });
+
+  it('normalizes Vercel api/[...all].ts login paths, executes POST /api/auth/login (never 404), and returns JSON 404 for unknown endpoints', async () => {
+    const http = await import('http');
+    const crypto = await import('crypto');
+    const { deleteApp } = await import('firebase-admin/app');
+    const { hashPassword } = await import('../server.ts');
+    const { getFirebaseAdminContext } = await import('../serverFirebaseAdmin.ts');
+    const handlerMod = await import('../api/[...all].ts');
+
+    expect(handlerMod.normalizeServerlessRequestUrl('/api/auth/login')).toBe('/api/auth/login');
+    expect(handlerMod.normalizeServerlessRequestUrl('/auth/login')).toBe('/api/auth/login');
+    expect(handlerMod.normalizeServerlessRequestUrl('/api/api/auth/login')).toBe('/api/auth/login');
+    expect(handlerMod.normalizeServerlessRequestUrl('/api/audit/logs?limit=10')).toBe('/api/audit/logs?limit=10');
+
+    // Mount real Express app inside Vercel handler's URL normalizer to verify end-to-end login route without live network
+    const db = new InMemoryFirestore();
+    const auth = new InMemoryAdminAuth();
+    await db.collection('user_roles').doc('role_user').set({
+      id: 'role_user',
+      loginId: 'user',
+      name: 'Floor Operator',
+      email: 'user@narid.com',
+      authUid: 'existing-uid-user-001',
+      role: 'user',
+      status: 'Active',
+      passwordHash: hashPassword('CorrectPass#123'),
+      mustChangePassword: false,
+      modulesAllowed: ['dashboard', 'scanner'],
+    });
+    const { app } = createApp({
+      db,
+      auth,
+      projectId: 'narid-atdc-tracker',
+      databaseId: 'ai-studio-manpowertracker-9b87a863-5c0d-4126-accb-7a3be802b10b',
+      credentialMode: 'SERVICE_ACCOUNT_ENV',
+      disableBackgroundBoot: true,
+    });
+
+    const normalizedServer = http.createServer((req, res) => {
+      req.url = handlerMod.normalizeServerlessRequestUrl(req.url);
+      return app(req as any, res as any);
+    });
+
+    // Wrong password hits real login logic (401 INVALID_PASSWORD, never 404)
+    const badLogin = await request(normalizedServer)
+      .post('/api/auth/login')
+      .set('Origin', 'https://ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')
+      .send({ loginId: 'user', password: 'WrongPassword!' });
+    expect(badLogin.status).toBe(401);
+    expect(badLogin.body.code).toBe('INVALID_PASSWORD');
+    expect(badLogin.headers['access-control-allow-origin']).toBe(
+      'https://ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app'
+    );
+
+    // Valid password succeeds and preserves existing UID across /api/auth/login & normalized /api/api/auth/login
+    const goodLogin = await request(normalizedServer)
+      .post('/api/api/auth/login')
+      .set('Origin', 'https://narid-atdc-tracker.vercel.app')
+      .send({ loginId: 'user', password: 'CorrectPass#123' });
+    expect(goodLogin.status).toBe(200);
+    expect(goodLogin.body.success).toBe(true);
+    expect(goodLogin.body.profile.authUid).toBe('existing-uid-user-001');
+    expect(goodLogin.headers['access-control-allow-origin']).toBe('https://narid-atdc-tracker.vercel.app');
+
+    // Unknown API path returns 404 JSON (never HTML)
+    const unknownApi = await request(normalizedServer).get('/api/unknown-route-check');
+    expect(unknownApi.status).toBe(404);
+    expect(unknownApi.headers['content-type']).toContain('application/json');
+    expect(unknownApi.body).toEqual({ success: false, error: 'API endpoint not found.' });
+
+    // Confirm real handler with SERVICE_ACCOUNT_ENV returns 200 JSON on /api/health
+    const { privateKey } = crypto.generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+    });
+    const prevVercel = process.env.VERCEL;
+    const prevKey = process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
+    try {
+      process.env.VERCEL = '1';
+      process.env.FIREBASE_SERVICE_ACCOUNT_KEY = JSON.stringify({
+        type: 'service_account',
+        project_id: 'narid-atdc-tracker',
+        client_email: 'offline-test@narid-atdc-tracker.iam.gserviceaccount.com',
+        private_key: privateKey,
+      });
+      getFirebaseAdminContext(true);
+      handlerMod.resetServerlessAppHandlerForTests();
+      const realSrv = http.createServer((req, res) => handlerMod.default(req, res));
+      const hRes = await request(realSrv).get('/api/health');
+      expect(hRes.status).toBe(200);
+      expect(hRes.body.status).toBe('ok');
+    } finally {
+      const ctx = getFirebaseAdminContext(false);
+      if (ctx.app) await deleteApp(ctx.app).catch(() => {});
       handlerMod.resetServerlessAppHandlerForTests();
       if (prevVercel === undefined) delete process.env.VERCEL;
       else process.env.VERCEL = prevVercel;

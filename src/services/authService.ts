@@ -18,7 +18,6 @@ import {
 } from 'firebase/firestore';
 import { auth, db } from '../firebase';
 import {
-  API_BASE_URL,
   apiFetchJson,
   apiUrl,
   assertApiBaseConfigured,
@@ -101,11 +100,15 @@ export async function getUserProfileByLoginId(loginId: string): Promise<UserRole
   if (auth.currentUser && isApiBaseUsableForCurrentOrigin()) {
     try {
       const headers = await getAuthHeaders();
-      const res = await fetch(apiUrl('/api/auth/verify-session'), {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ loginId: cleanId }),
-      });
+      const res = await executeApiFetch(
+        apiUrl('/api/auth/verify-session'),
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ loginId: cleanId }),
+        },
+        'POST /api/auth/verify-session'
+      );
       const parsed = await safeParseJsonResponse<{ success?: boolean; profile?: UserRoleRecord }>(
         res,
         'POST /api/auth/verify-session'
@@ -202,11 +205,15 @@ export async function getUserProfileByEmail(email: string): Promise<UserRoleReco
     if (isApiBaseUsableForCurrentOrigin()) {
       try {
         const headers = await getAuthHeaders();
-        const res = await fetch(apiUrl('/api/auth/verify-session'), {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({}),
-        });
+        const res = await executeApiFetch(
+          apiUrl('/api/auth/verify-session'),
+          {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({}),
+          },
+          'POST /api/auth/verify-session'
+        );
         const parsed = await safeParseJsonResponse<{ success?: boolean; profile?: UserRoleRecord }>(
           res,
           'POST /api/auth/verify-session'
@@ -272,7 +279,7 @@ export async function loginWithLoginIdAndPassword(
   // Note: passwordInput is sent verbatim without trimming or transformation.
   assertApiBaseConfigured();
   const res = await executeApiFetch(
-    `${API_BASE_URL}/api/auth/login`,
+    apiUrl('/api/auth/login'),
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

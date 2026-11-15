@@ -16,7 +16,12 @@ import {
   getDefaultTabForRole, 
   isModuleAllowedForUser, 
 } from './services/authService';
-import { apiUrl, isApiBaseUsableForCurrentOrigin, safeParseJsonResponse } from './config/api';
+import {
+  apiUrl,
+  executeApiFetch,
+  isApiBaseUsableForCurrentOrigin,
+  safeParseJsonResponse,
+} from './config/api';
 import { getAuthHeaders } from './services/auditService';
 import { Employee, Floor, Section, Department, Shift, UserRoleRecord } from './types';
 
@@ -358,11 +363,15 @@ export default function App() {
       if (!auth.currentUser || !isApiBaseUsableForCurrentOrigin()) return;
       try {
         const headers = await getAuthHeaders();
-        const res = await fetch(apiUrl('/api/auth/verify-session'), {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ loginId: currentUserRole.loginId, userId: currentUserRole.id }),
-        });
+        const res = await executeApiFetch(
+          apiUrl('/api/auth/verify-session'),
+          {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ loginId: currentUserRole.loginId, userId: currentUserRole.id }),
+          },
+          'POST /api/auth/verify-session'
+        );
         if (res.status === 401) {
           console.warn('[Session Guard] Token rejected or revoked.');
           handleLogout('session_expired');

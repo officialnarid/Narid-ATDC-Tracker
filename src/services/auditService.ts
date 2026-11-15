@@ -1,5 +1,5 @@
 import { auth } from '../firebase';
-import { apiFetchJson, apiUrl, isApiBaseUsableForCurrentOrigin } from '../config/api';
+import { apiFetchJson, apiUrl, executeApiFetch, isApiBaseUsableForCurrentOrigin } from '../config/api';
 import { AuditDeletionRecord, AuditLog, LoginHistoryEntry } from '../types';
 
 export async function getAuthHeaders(extraHeaders?: Record<string, string>): Promise<Record<string, string>> {
@@ -51,14 +51,18 @@ export async function sendServerAuditEvent(payload: ServerAuditEventPayload): Pr
   try {
     const headers = await getAuthHeaders();
     if (!headers.Authorization) return;
-    await fetch(apiUrl('/api/audit/event'), {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        ...payload,
-        sessionId: getActiveSessionId(),
-      }),
-    });
+    await executeApiFetch(
+      apiUrl('/api/audit/event'),
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          ...payload,
+          sessionId: getActiveSessionId(),
+        }),
+      },
+      'POST /api/audit/event'
+    );
   } catch {
     // Non-blocking audit dispatch
   }
