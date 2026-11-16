@@ -645,7 +645,7 @@ export function createApp(options: ServerAppOptions = {}) {
       const permitted = Boolean(rawOrigin && isOriginPermitted(rawOrigin, req));
       callback(null, {
         origin: permitted ? normalizeAllowedOrigin(rawOrigin) || false : false,
-        credentials: true,
+        credentials: permitted,
         methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
         allowedHeaders: ['Content-Type', 'Authorization'],
         optionsSuccessStatus: 204,

@@ -541,19 +541,33 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
       getFirebaseAdminContext(true);
     }
   });
-  it('resolves dual-environment API URLs cleanly without double /api/api or malformed protocols', async () => {
+  it('resolves dual-environment API URLs cleanly without double /api/api, .env.development reliance, or malformed protocols', async () => {
     const {
       normalizeApiBaseUrl,
       validateApiBaseUrl,
       resolveApiUrl,
+      getEffectiveApiBaseUrl,
     } = await import('../src/config/api.ts');
 
-    // Empty / undefined -> same-origin /api/* (Vercel Production)
-    expect(resolveApiUrl('/api/auth/login', undefined)).toBe('/api/auth/login');
-    expect(resolveApiUrl('/api/auth/login', '')).toBe('/api/auth/login');
+    // Vercel Production: empty / undefined / accidentally pasted "" -> same-origin /api/*
+    expect(resolveApiUrl('/api/auth/login', undefined, 'narid-atdc-tracker.vercel.app')).toBe('/api/auth/login');
+    expect(resolveApiUrl('/api/auth/login', '', 'narid-atdc-tracker.vercel.app')).toBe('/api/auth/login');
+    expect(resolveApiUrl('/api/auth/login', '""', 'narid-atdc-tracker.vercel.app')).toBe('/api/auth/login');
+    expect(validateApiBaseUrl('""')).toBeNull();
     expect(resolveApiUrl('/api/health', '   ')).toBe('/api/health');
 
-    // Absolute HTTPS URL -> Google AI Studio Preview pointing at shared Vercel backend
+    // Hosted Google AI Studio Preview (even when VITE_API_BASE_URL is unset and .env.development does not exist)
+    expect(
+      getEffectiveApiBaseUrl(undefined, 'ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')
+    ).toBe('https://narid-atdc-tracker.vercel.app');
+    expect(
+      resolveApiUrl('/api/auth/login', undefined, 'ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')
+    ).toBe('https://narid-atdc-tracker.vercel.app/api/auth/login');
+    expect(
+      resolveApiUrl('/api/auth/login', '', 'ais-pre-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')
+    ).toBe('https://narid-atdc-tracker.vercel.app/api/auth/login');
+
+    // Explicit Absolute HTTPS URL -> Google AI Studio Preview pointing at shared Vercel backend
     expect(resolveApiUrl('/api/auth/login', 'https://narid-atdc-tracker.vercel.app')).toBe(
       'https://narid-atdc-tracker.vercel.app/api/auth/login'
     );
@@ -669,6 +683,7 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
     expect(handlerMod.normalizeServerlessRequestUrl('/api/auth/login')).toBe('/api/auth/login');
     expect(handlerMod.normalizeServerlessRequestUrl('/auth/login')).toBe('/api/auth/login');
     expect(handlerMod.normalizeServerlessRequestUrl('/api/api/auth/login')).toBe('/api/auth/login');
+    expect(handlerMod.normalizeServerlessRequestUrl('/api/[...all]?...all=auth/login')).toBe('/api/auth/login');
     expect(handlerMod.normalizeServerlessRequestUrl('/api/audit/logs?limit=10')).toBe('/api/audit/logs?limit=10');
 
     // Mount real Express app inside Vercel handler's URL normalizer to verify end-to-end login route without live network
@@ -711,7 +726,28 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
       'https://ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app'
     );
 
-    // Valid password succeeds and preserves existing UID across /api/auth/login & normalized /api/api/auth/login
+    // AI Studio cross-origin valid login succeeds and preserves existing UID
+    const aiCrossOriginLogin = await request(normalizedServer)
+      .post('/api/auth/login')
+      .set('Origin', 'https://ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')
+      .send({ loginId: 'user', password: 'CorrectPass#123' });
+    expect(aiCrossOriginLogin.status).toBe(200);
+    expect(aiCrossOriginLogin.body.success).toBe(true);
+    expect(aiCrossOriginLogin.body.profile.authUid).toBe('existing-uid-user-001');
+    expect(aiCrossOriginLogin.headers['access-control-allow-origin']).toBe(
+      'https://ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app'
+    );
+
+    // Vercel same-origin POST /api/auth/login (no Origin header or same-origin Host) succeeds and preserves existing UID
+    const vercelSameOriginLogin = await request(normalizedServer)
+      .post('/api/auth/login')
+      .set('Host', 'narid-atdc-tracker.vercel.app')
+      .send({ loginId: 'user', password: 'CorrectPass#123' });
+    expect(vercelSameOriginLogin.status).toBe(200);
+    expect(vercelSameOriginLogin.body.success).toBe(true);
+    expect(vercelSameOriginLogin.body.profile.authUid).toBe('existing-uid-user-001');
+
+    // Normalized duplicate /api/api/auth/login from Vercel origin also succeeds without 404
     const goodLogin = await request(normalizedServer)
       .post('/api/api/auth/login')
       .set('Origin', 'https://narid-atdc-tracker.vercel.app')

@@ -25,10 +25,28 @@ export function normalizeServerlessRequestUrl(rawUrl?: string): string {
 
   const queryIdx = rawUrl.indexOf('?');
   let pathPart = queryIdx >= 0 ? rawUrl.slice(0, queryIdx) : rawUrl;
-  const queryPart = queryIdx >= 0 ? rawUrl.slice(queryIdx) : '';
+  let queryPart = queryIdx >= 0 ? rawUrl.slice(queryIdx) : '';
 
   if (!pathPart.startsWith('/')) {
     pathPart = `/${pathPart}`;
+  }
+
+  // If Vercel invokes catch-all as /api/[...all]?...all=auth/login, reconstruct the true route path
+  const decodedPath = decodeURIComponent(pathPart);
+  if ((decodedPath === '/api/[...all]' || decodedPath === '/[...all]') && queryPart) {
+    const params = new URLSearchParams(queryPart.slice(1));
+    const catchAllSegments = params.getAll('...all').concat(params.getAll('all'));
+    if (catchAllSegments.length > 0) {
+      params.delete('...all');
+      params.delete('all');
+      const joined = catchAllSegments
+        .flatMap((s) => s.split('/'))
+        .filter(Boolean)
+        .join('/');
+      pathPart = joined ? `/api/${joined}` : '/api/health';
+      const remainingQuery = params.toString();
+      queryPart = remainingQuery ? `?${remainingQuery}` : '';
+    }
   }
 
   // Collapse repeated leading /api segments (e.g., /api/api/auth/login -> /api/auth/login)

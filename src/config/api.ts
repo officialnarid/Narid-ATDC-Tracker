@@ -1,5 +1,28 @@
-export function normalizeApiBaseUrl(raw?: string | null): string {
+export const AI_STUDIO_PREVIEW_HOSTNAMES = new Set<string>([
+  'ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app',
+  'ais-pre-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app',
+]);
+
+export const SHARED_VERCEL_BACKEND_URL = 'https://narid-atdc-tracker.vercel.app';
+
+function stripOptionalWrappingQuotes(raw?: string | null): string {
   let clean = String(raw || '').trim();
+  if (
+    (clean.startsWith('"') && clean.endsWith('"') && clean.length >= 2) ||
+    (clean.startsWith("'") && clean.endsWith("'") && clean.length >= 2)
+  ) {
+    clean = clean.slice(1, -1).trim();
+  }
+  return clean;
+}
+
+export function isAiStudioPreviewHostname(hostname?: string): boolean {
+  const cleanHost = String(hostname || '').trim().toLowerCase();
+  return Boolean(cleanHost && AI_STUDIO_PREVIEW_HOSTNAMES.has(cleanHost));
+}
+
+export function normalizeApiBaseUrl(raw?: string | null): string {
+  let clean = stripOptionalWrappingQuotes(raw);
   if (!clean) return '';
 
   // Only normalize trailing slashes / trailing /api on absolute http(s):// URLs;
@@ -14,10 +37,30 @@ export function normalizeApiBaseUrl(raw?: string | null): string {
   return clean;
 }
 
-export const API_BASE_URL = normalizeApiBaseUrl(import.meta.env.VITE_API_BASE_URL);
+export function getActiveHostname(): string | undefined {
+  return typeof window !== 'undefined' && window.location ? window.location.hostname : undefined;
+}
+
+export function getEffectiveApiBaseUrl(
+  rawBaseUrl: string | null | undefined = import.meta.env.VITE_API_BASE_URL,
+  hostname: string | undefined = getActiveHostname()
+): string {
+  const normalized = normalizeApiBaseUrl(rawBaseUrl);
+  if (normalized) {
+    return normalized;
+  }
+  // In hosted Google AI Studio Preview (where .env.development is not guaranteed),
+  // route API requests cleanly to the shared Vercel Serverless backend.
+  if (isAiStudioPreviewHostname(hostname)) {
+    return SHARED_VERCEL_BACKEND_URL;
+  }
+  return '';
+}
+
+export const API_BASE_URL = getEffectiveApiBaseUrl(import.meta.env.VITE_API_BASE_URL);
 
 export function validateApiBaseUrl(baseUrl?: string | null, _hostname?: string): string | null {
-  const raw = String(baseUrl || '').trim();
+  const raw = stripOptionalWrappingQuotes(baseUrl);
   if (!raw) return null; // Empty / undefined -> same-origin /api/* (Vercel Production)
 
   if (
@@ -59,28 +102,28 @@ export function validateApiBaseUrl(baseUrl?: string | null, _hostname?: string):
   return null;
 }
 
-export function getActiveHostname(): string | undefined {
-  return typeof window !== 'undefined' && window.location ? window.location.hostname : undefined;
-}
-
 export function isApiBaseUsableForCurrentOrigin(): boolean {
-  return validateApiBaseUrl(API_BASE_URL, getActiveHostname()) === null;
+  return validateApiBaseUrl(getEffectiveApiBaseUrl(), getActiveHostname()) === null;
 }
 
 export function assertApiBaseConfigured(): void {
-  const errorMsg = validateApiBaseUrl(API_BASE_URL, getActiveHostname());
+  const errorMsg = validateApiBaseUrl(getEffectiveApiBaseUrl(), getActiveHostname());
   if (errorMsg) {
     throw new Error(errorMsg);
   }
 }
 
-export function resolveApiUrl(path: string, baseUrl: string | null | undefined = API_BASE_URL): string {
-  const err = validateApiBaseUrl(baseUrl);
+export function resolveApiUrl(
+  path: string,
+  baseUrl: string | null | undefined = import.meta.env.VITE_API_BASE_URL,
+  hostname: string | undefined = getActiveHostname()
+): string {
+  const err = validateApiBaseUrl(baseUrl, hostname);
   if (err) {
     throw new Error(err);
   }
 
-  const cleanBase = normalizeApiBaseUrl(baseUrl);
+  const cleanBase = getEffectiveApiBaseUrl(baseUrl, hostname);
   const rawPath = String(path || '').trim();
   let cleanPath = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
 
@@ -96,7 +139,7 @@ export function resolveApiUrl(path: string, baseUrl: string | null | undefined =
 }
 
 export function apiUrl(path: string): string {
-  return resolveApiUrl(path, API_BASE_URL);
+  return resolveApiUrl(path, import.meta.env.VITE_API_BASE_URL, getActiveHostname());
 }
 
 export interface ParsedApiResponse<T = any> {
@@ -142,7 +185,8 @@ export async function executeApiFetch(
   } catch (err: any) {
     const label = endpointLabel || url;
     const targetDesc =
-      API_BASE_URL || (typeof window !== 'undefined' && window.location ? window.location.origin : 'backend API');
+      getEffectiveApiBaseUrl() ||
+      (typeof window !== 'undefined' && window.location ? window.location.origin : 'backend API');
     const detail = err?.message ? ` (${err.message})` : '';
     throw new Error(
       `Unable to reach ${label} at ${targetDesc}${detail}. Verify Vercel /api Serverless Functions (or VITE_API_BASE_URL) are deployed and reachable.`

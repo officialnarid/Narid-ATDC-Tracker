@@ -38,7 +38,7 @@ Configure the following environment variables in **Vercel Project Settings -> En
 - `APP_URL` = `https://narid-atdc-tracker.vercel.app`
 
 ### Vercel Production Frontend Variables
-- `VITE_API_BASE_URL` = `""` *(leave unset or empty for same-origin `/api/*` Vercel Serverless Functions)*
+- `VITE_API_BASE_URL` = *(leave unset or empty for same-origin `/api/*` Vercel Serverless Functions — do not enter literal `""` quotes in the Vercel UI)*
 - `VITE_FIREBASE_PROJECT_ID` = `narid-atdc-tracker`
 - `VITE_FIREBASE_API_KEY` = *(existing Firebase Web API key)*
 - `VITE_FIREBASE_AUTH_DOMAIN` = `narid-atdc-tracker.firebaseapp.com`
@@ -47,8 +47,8 @@ Configure the following environment variables in **Vercel Project Settings -> En
 - `VITE_FIREBASE_STORAGE_BUCKET` = `narid-atdc-tracker.firebasestorage.app`
 - `VITE_FIREBASE_MESSAGING_SENDER_ID` = `1060028696945`
 
-### Google AI Studio Preview Frontend Variable (`.env.development`)
-- `VITE_API_BASE_URL` = `https://narid-atdc-tracker.vercel.app` *(routes AI Studio Preview `/api/*` requests directly to the shared Vercel Serverless backend; ignored by `vite build` for Vercel Production)*
+### Google AI Studio Preview Frontend Variable (Runtime / Build Environment Settings)
+- Configure `VITE_API_BASE_URL=https://narid-atdc-tracker.vercel.app` in the Google AI Studio project environment/runtime configuration (hosted Preview environments also automatically detect the configured AI Studio Preview hostnames when `VITE_API_BASE_URL` is unset and route requests to `https://narid-atdc-tracker.vercel.app/api/*`, without depending on `.env.development`).
 
 ---
 
