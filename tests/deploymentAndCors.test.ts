@@ -189,10 +189,31 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
   it('uses centralized apiUrl/executeApiFetch in all frontend services without raw fetch(), raw res.json(), or external rewrites', () => {
     const vercelJson = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'vercel.json'), 'utf-8'));
     const rewrites = JSON.stringify(vercelJson.rewrites || []);
+    expect(rewrites).toContain('/api/((?!index(?:/|$)).*)');
     expect(rewrites).toContain('/api/index?__api_path=$1');
     expect(rewrites).toContain('(?!api');
     expect(rewrites).not.toContain('.run.app');
     expect(vercelJson.functions?.['api/index.ts']?.includeFiles).toContain('firebase-applet-config.json');
+
+    // Verify exact regex behavior of vercel.json rewrites (valid wrapped negative lookahead, zero loops, SPA vs static/API separation)
+    const apiRule = (vercelJson.rewrites || []).find((r: any) => r.destination === '/api/index?__api_path=$1');
+    const spaRule = (vercelJson.rewrites || []).find((r: any) => r.destination === '/index.html');
+    expect(apiRule?.source).toBe('/api/((?!index(?:/|$)).*)');
+    const apiRegex = new RegExp(`^${apiRule.source}$`);
+    expect('/api/health'.match(apiRegex)?.[1]).toBe('health');
+    expect('/api/auth/login'.match(apiRegex)?.[1]).toBe('auth/login');
+    expect('/api/attendance/scan'.match(apiRegex)?.[1]).toBe('attendance/scan');
+    expect('/api/indexed'.match(apiRegex)?.[1]).toBe('indexed');
+    expect('/api/index'.match(apiRegex)).toBeNull();
+    expect('/api/index/nested'.match(apiRegex)).toBeNull();
+
+    const spaRegex = new RegExp(`^${spaRule.source}$`);
+    expect('/dashboard'.match(spaRegex)).not.toBeNull();
+    expect('/api/auth/login'.match(spaRegex)).toBeNull();
+    expect('/api'.match(spaRegex)).toBeNull();
+    expect('/assets/index.js'.match(spaRegex)).toBeNull();
+    expect('/favicon.ico'.match(spaRegex)).toBeNull();
+    expect('/robots.txt'.match(spaRegex)).toBeNull();
 
     const authServiceSrc = fs.readFileSync(path.resolve(process.cwd(), 'src/services/authService.ts'), 'utf-8');
     expect(authServiceSrc).toContain("apiUrl('/api/auth/login')");
