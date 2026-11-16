@@ -653,23 +653,62 @@ export function createApp(options: ServerAppOptions = {}) {
     })
   );
 
-  app.use((req: Request, _res: Response, next: NextFunction) => {
-    // Preserve platform-parsed body if a serverless runtime already drained the stream
+  const jsonBodyParser = express.json({ limit: '2mb' });
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    // Preserve platform-parsed body if a serverless runtime (e.g. @vercel/node) already populated req.body
     const bodyDesc = Object.getOwnPropertyDescriptor(req, 'body');
-    if (
-      bodyDesc &&
-      'value' in bodyDesc &&
-      bodyDesc.value !== undefined &&
-      bodyDesc.value !== null &&
-      req.readableEnded &&
-      !(req as any)._body
-    ) {
-      (req as any)._body = true;
-    }
-    next();
-  });
+    const hasOwnBodyProp = Boolean(
+      bodyDesc && ('value' in bodyDesc || typeof bodyDesc.get === 'function')
+    );
 
-  app.use(express.json({ limit: '2mb' }));
+    if (hasOwnBodyProp) {
+      const existingBody = (req as any).body;
+      const isReadOnlyGetter = Boolean(bodyDesc && typeof bodyDesc.get === 'function' && !bodyDesc.set);
+
+      if (existingBody !== undefined && existingBody !== null) {
+        const isJsonHeader = String(req.headers['content-type'] || '')
+          .toLowerCase()
+          .includes('application/json');
+        let normalizedBody = existingBody;
+
+        if (isJsonHeader && (typeof existingBody === 'string' || Buffer.isBuffer(existingBody))) {
+          const rawText = Buffer.isBuffer(existingBody)
+            ? existingBody.toString('utf8')
+            : existingBody;
+          if (rawText.trim().length > 0) {
+            try {
+              normalizedBody = JSON.parse(rawText);
+            } catch {
+              // Leave malformed raw payload untouched
+            }
+          }
+        }
+
+        if (normalizedBody !== existingBody || isReadOnlyGetter) {
+          if (!bodyDesc || bodyDesc.writable || typeof bodyDesc.set === 'function') {
+            (req as any).body = normalizedBody;
+          } else if (bodyDesc.configurable) {
+            Object.defineProperty(req, 'body', {
+              value: normalizedBody,
+              writable: true,
+              enumerable: true,
+              configurable: true,
+            });
+          }
+        }
+        (req as any)._body = true;
+        return next();
+      }
+
+      // If runtime attached an empty read-only getter, skip body-parser's `req.body = {}` assignment
+      if (isReadOnlyGetter) {
+        (req as any)._body = true;
+        return next();
+      }
+    }
+
+    return jsonBodyParser(req, res, next);
+  });
 
   let runtimeFirestoreAccessError: string | null = null;
   const noteRuntimeFirestoreError = (err: unknown): boolean => {

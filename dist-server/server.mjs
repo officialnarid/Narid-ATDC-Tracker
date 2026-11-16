@@ -5088,14 +5088,49 @@ function createApp(options = {}) {
       });
     })
   );
-  app.use((req, _res, next) => {
+  const jsonBodyParser = express.json({ limit: "2mb" });
+  app.use((req, res, next) => {
     const bodyDesc = Object.getOwnPropertyDescriptor(req, "body");
-    if (bodyDesc && "value" in bodyDesc && bodyDesc.value !== void 0 && bodyDesc.value !== null && req.readableEnded && !req._body) {
-      req._body = true;
+    const hasOwnBodyProp = Boolean(
+      bodyDesc && ("value" in bodyDesc || typeof bodyDesc.get === "function")
+    );
+    if (hasOwnBodyProp) {
+      const existingBody = req.body;
+      const isReadOnlyGetter = Boolean(bodyDesc && typeof bodyDesc.get === "function" && !bodyDesc.set);
+      if (existingBody !== void 0 && existingBody !== null) {
+        const isJsonHeader = String(req.headers["content-type"] || "").toLowerCase().includes("application/json");
+        let normalizedBody = existingBody;
+        if (isJsonHeader && (typeof existingBody === "string" || Buffer.isBuffer(existingBody))) {
+          const rawText = Buffer.isBuffer(existingBody) ? existingBody.toString("utf8") : existingBody;
+          if (rawText.trim().length > 0) {
+            try {
+              normalizedBody = JSON.parse(rawText);
+            } catch {
+            }
+          }
+        }
+        if (normalizedBody !== existingBody || isReadOnlyGetter) {
+          if (!bodyDesc || bodyDesc.writable || typeof bodyDesc.set === "function") {
+            req.body = normalizedBody;
+          } else if (bodyDesc.configurable) {
+            Object.defineProperty(req, "body", {
+              value: normalizedBody,
+              writable: true,
+              enumerable: true,
+              configurable: true
+            });
+          }
+        }
+        req._body = true;
+        return next();
+      }
+      if (isReadOnlyGetter) {
+        req._body = true;
+        return next();
+      }
     }
-    next();
+    return jsonBodyParser(req, res, next);
   });
-  app.use(express.json({ limit: "2mb" }));
   let runtimeFirestoreAccessError = null;
   const noteRuntimeFirestoreError = (err) => {
     if (isFirestorePermissionDeniedError(err)) {

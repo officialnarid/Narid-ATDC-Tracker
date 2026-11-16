@@ -189,9 +189,10 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
   it('uses centralized apiUrl/executeApiFetch in all frontend services without raw fetch(), raw res.json(), or external rewrites', () => {
     const vercelJson = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'vercel.json'), 'utf-8'));
     const rewrites = JSON.stringify(vercelJson.rewrites || []);
+    expect(rewrites).toContain('/api/index?__api_path=$1');
     expect(rewrites).toContain('(?!api');
     expect(rewrites).not.toContain('.run.app');
-    expect(vercelJson.functions?.['api/[...all].ts']?.includeFiles).toContain('firebase-applet-config.json');
+    expect(vercelJson.functions?.['api/index.ts']?.includeFiles).toContain('firebase-applet-config.json');
 
     const authServiceSrc = fs.readFileSync(path.resolve(process.cwd(), 'src/services/authService.ts'), 'utf-8');
     expect(authServiceSrc).toContain("apiUrl('/api/auth/login')");
@@ -277,9 +278,9 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
     }
   });
 
-  it('routes Vercel api/[...all].ts catch-all requests cleanly and returns JSON responses (no HTML fallback)', async () => {
+  it('routes Vercel api/index.ts serverless requests cleanly and returns JSON responses (no HTML fallback)', async () => {
     const http = await import('http');
-    const handlerMod = await import('../api/[...all].ts');
+    const handlerMod = await import('../api/index.ts');
 
     const prevVercel = process.env.VERCEL;
     const prevKey = process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
@@ -362,7 +363,7 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
     } = await import('../serverFirebaseAdmin.ts');
 
     const backendFiles = [
-      'api/[...all].ts',
+      'api/index.ts',
       'server.ts',
       'serverFirebaseAdmin.ts',
       'serverSecurityAudit.ts',
@@ -432,7 +433,7 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
       require('jose');
       require('firebase-admin/auth');
       process.env.VERCEL = '1';
-      import('./api/[...all].ts').then(async (m) => {
+      import('./api/index.ts').then(async (m) => {
         const srv = http.createServer((req, res) => m.default(req, res));
         srv.listen(0, '127.0.0.1', async () => {
           const addr = srv.address();
@@ -456,11 +457,11 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
     expect(out).toContain('NO_ERR_REQUIRE_ESM_OK');
   });
 
-  it('initializes real api/[...all].ts Firebase Admin SDK with service-account credentials, returns 200 /api/health, and rejects unverified JWTs', async () => {
+  it('initializes real api/index.ts Firebase Admin SDK with service-account credentials, returns 200 /api/health, and rejects unverified JWTs', async () => {
     const crypto = await import('crypto');
     const http = await import('http');
     const { deleteApp } = await import('firebase-admin/app');
-    const handlerMod = await import('../api/[...all].ts');
+    const handlerMod = await import('../api/index.ts');
     const { getFirebaseAdminContext } = await import('../serverFirebaseAdmin.ts');
 
     const { privateKey } = crypto.generateKeyPairSync('rsa', {
@@ -672,17 +673,25 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
     expect(rejectedUntrustedPost.body.code).toBe('CORS_ORIGIN_FORBIDDEN');
   });
 
-  it('normalizes Vercel api/[...all].ts login paths, executes POST /api/auth/login (never 404), and returns JSON 404 for unknown endpoints', async () => {
+  it('normalizes Vercel api/index.ts rewrite paths, executes POST /api/auth/login via actual handler, and returns JSON 404 for unknown endpoints', async () => {
     const http = await import('http');
     const crypto = await import('crypto');
+    const { Readable } = await import('stream');
     const { deleteApp } = await import('firebase-admin/app');
     const { hashPassword } = await import('../server.ts');
     const { getFirebaseAdminContext } = await import('../serverFirebaseAdmin.ts');
-    const handlerMod = await import('../api/[...all].ts');
+    const handlerMod = await import('../api/index.ts');
 
     expect(handlerMod.normalizeServerlessRequestUrl('/api/auth/login')).toBe('/api/auth/login');
     expect(handlerMod.normalizeServerlessRequestUrl('/auth/login')).toBe('/api/auth/login');
     expect(handlerMod.normalizeServerlessRequestUrl('/api/api/auth/login')).toBe('/api/auth/login');
+    expect(handlerMod.normalizeServerlessRequestUrl('/api/index?__api_path=auth/login')).toBe('/api/auth/login');
+    expect(handlerMod.normalizeServerlessRequestUrl('/api/index?__api_path=health')).toBe('/api/health');
+    expect(handlerMod.normalizeServerlessRequestUrl('/api/index?__api_path=api/auth/login')).toBe('/api/auth/login');
+    expect(handlerMod.normalizeServerlessRequestUrl('/api/index?__api_path=audit/logs&limit=50&loginId=admin')).toBe(
+      '/api/audit/logs?limit=50&loginId=admin'
+    );
+    expect(handlerMod.normalizeServerlessRequestUrl('/api/index')).toBe('/api/index');
     expect(handlerMod.normalizeServerlessRequestUrl('/api/[...all]?...all=auth/login')).toBe('/api/auth/login');
     expect(handlerMod.normalizeServerlessRequestUrl('/api/audit/logs?limit=10')).toBe('/api/audit/logs?limit=10');
 
@@ -763,7 +772,7 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
     expect(unknownApi.headers['content-type']).toContain('application/json');
     expect(unknownApi.body).toEqual({ success: false, error: 'API endpoint not found.' });
 
-    // Confirm real handler with SERVICE_ACCOUNT_ENV returns 200 JSON on /api/health
+    // Confirm ACTUAL unmocked Vercel handler (handlerMod.default) dispatches GET/POST routes, preserves POST body, and reaches POST /api/auth/login
     const { privateKey } = crypto.generateKeyPairSync('rsa', {
       modulusLength: 2048,
       privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
@@ -782,9 +791,82 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
       getFirebaseAdminContext(true);
       handlerMod.resetServerlessAppHandlerForTests();
       const realSrv = http.createServer((req, res) => handlerMod.default(req, res));
+
+      // 1) GET /api/health and rewritten GET /api/index?__api_path=health -> 200 JSON
       const hRes = await request(realSrv).get('/api/health');
       expect(hRes.status).toBe(200);
       expect(hRes.body.status).toBe('ok');
+
+      const rewrittenHealth = await request(realSrv).get('/api/index?__api_path=health');
+      expect(rewrittenHealth.status).toBe(200);
+      expect(rewrittenHealth.body.status).toBe('ok');
+
+      // 2) Unsupported POST /api/health -> JSON 404 (not an artificial pre-routing failure)
+      const postHealth = await request(realSrv).post('/api/health').send({});
+      expect(postHealth.status).toBe(404);
+      expect(postHealth.headers['content-type']).toContain('application/json');
+      expect(postHealth.body).toEqual({ success: false, error: 'API endpoint not found.' });
+
+      // 3) Unknown rewritten API route -> JSON 404
+      const unknownRewritten = await request(realSrv).get('/api/index?__api_path=unknown/endpoint');
+      expect(unknownRewritten.status).toBe(404);
+      expect(unknownRewritten.headers['content-type']).toContain('application/json');
+      expect(unknownRewritten.body).toEqual({ success: false, error: 'API endpoint not found.' });
+
+      // 4) POST /api/auth/login & rewritten POST /api/index?__api_path=auth/login reach actual Express login handler with preserved POST body
+      const realLoginDirect = await request(realSrv)
+        .post('/api/auth/login')
+        .set('Origin', 'https://narid-atdc-tracker.vercel.app')
+        .send({ loginId: 'admin' });
+      expect(realLoginDirect.status).toBe(400);
+      expect(realLoginDirect.body).toEqual({ success: false, error: 'Please enter your password.' });
+      expect(realLoginDirect.headers['access-control-allow-origin']).toBe('https://narid-atdc-tracker.vercel.app');
+
+      const realLoginRewritten = await request(realSrv)
+        .post('/api/index?__api_path=auth/login')
+        .set('Origin', 'https://ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')
+        .send({ loginId: 'admin' });
+      expect(realLoginRewritten.status).toBe(400);
+      expect(realLoginRewritten.body).toEqual({ success: false, error: 'Please enter your password.' });
+      expect(realLoginRewritten.headers['access-control-allow-origin']).toBe(
+        'https://ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app'
+      );
+
+      // 5) Simulated @vercel/node getter-backed req.body with readableEnded=true reaches login handler cleanly
+      await new Promise<void>((resolve, reject) => {
+        const fakeReq = new Readable({ read() { this.push(null); } }) as any;
+        fakeReq.push(null);
+        fakeReq.method = 'POST';
+        fakeReq.url = '/api/index?__api_path=auth/login';
+        fakeReq.originalUrl = '/api/index?__api_path=auth/login';
+        fakeReq.headers = { 'content-type': 'application/json', host: 'narid-atdc-tracker.vercel.app' };
+        fakeReq.socket = { remoteAddress: '127.0.0.1', destroy: () => {} };
+        Object.defineProperty(fakeReq, 'body', {
+          get: () => JSON.stringify({ loginId: 'admin' }),
+          enumerable: true,
+          configurable: true,
+        });
+
+        const fakeRes: any = {
+          statusCode: 200,
+          headers: {} as Record<string, string>,
+          setHeader(k: string, v: string) { this.headers[k.toLowerCase()] = v; },
+          getHeader(k: string) { return this.headers[k.toLowerCase()]; },
+          removeHeader(k: string) { delete this.headers[k.toLowerCase()]; },
+          end(chunk?: any) {
+            try {
+              const payload = chunk ? JSON.parse(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)) : {};
+              expect(this.statusCode).toBe(400);
+              expect(payload).toEqual({ success: false, error: 'Please enter your password.' });
+              resolve();
+            } catch (err) {
+              reject(err);
+            }
+          },
+        };
+
+        handlerMod.default(fakeReq, fakeRes);
+      });
     } finally {
       const ctx = getFirebaseAdminContext(false);
       if (ctx.app) await deleteApp(ctx.app).catch(() => {});

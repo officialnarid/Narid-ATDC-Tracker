@@ -2,7 +2,7 @@
 
 Architecture:
 - **Frontend**: Vercel (React + TypeScript + Vite SPA)
-- **Backend API**: Vercel Serverless Functions (`api/[...all].ts` wrapping Express)
+- **Backend API**: Vercel Serverless Functions (`api/index.ts` wrapping Express)
 - **Database & Auth**: Existing Firebase Project `narid-atdc-tracker` / Database `ai-studio-manpowertracker-9b87a863-5c0d-4126-accb-7a3be802b10b` (Region: `asia-south1`)
 - **Backend Security**: Firebase Admin SDK using server-side Vercel Environment Variables
 
@@ -10,7 +10,7 @@ Architecture:
 
 ## 1. Pre-Deployment Verification (Preserves Existing Production Data)
 - Confirm zero changes to `firebase-applet-config.json` (`projectId`: `narid-atdc-tracker`, `firestoreDatabaseId`: `ai-studio-manpowertracker-9b87a863-5c0d-4126-accb-7a3be802b10b`).
-- On Vercel cold start (`api/[...all].ts`), automatic seeding and migrations are disabled (`disableBackgroundBoot: true`) so existing users, UIDs, scrypt password hashes, roles, employees, and attendance history are strictly preserved.
+- On Vercel cold start (`api/index.ts`), automatic seeding and migrations are disabled (`disableBackgroundBoot: true`) so existing users, UIDs, scrypt password hashes, roles, employees, and attendance history are strictly preserved.
 - Run local verification before deploying:
   ```bash
   npm test
@@ -66,4 +66,4 @@ Ensure your hardened `firestore.rules` (blocking direct client writes to `attend
 ```bash
 firebase deploy --only firestore:rules --project narid-atdc-tracker
 ```
-> **Important Order:** Deploy the Vercel backend (`api/[...all].ts`) **before** deploying `firestore.rules`, so all attendance scans, login telemetry, permission edits, and audit events run through Firebase Admin SDK APIs.
+> **Important Order:** Deploy the Vercel backend (`api/index.ts`) **before** deploying `firestore.rules`, so all attendance scans, login telemetry, permission edits, and audit events run through Firebase Admin SDK APIs.
