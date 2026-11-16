@@ -2,7 +2,6 @@ import {
   signInWithEmailAndPassword, 
   signOut, 
   sendPasswordResetEmail,
-  updatePassword,
   setPersistence,
   browserLocalPersistence,
   browserSessionPersistence,
@@ -375,35 +374,34 @@ export async function loginWithLoginIdAndPassword(
   };
 }
 
-// Change initial password on first login
+// Change initial password on first login via authoritative backend + fresh Firebase session sync
 export async function changeInitialPassword(newPassword: string, currentPassword?: string): Promise<void> {
+  if (!currentPassword || currentPassword.length === 0) {
+    throw new Error('Please enter your current password to verify your identity.');
+  }
   if (!newPassword || newPassword.length < 6) {
     throw new Error('Password must be at least 6 characters.');
+  }
+  if (newPassword === currentPassword) {
+    throw new Error('New password must be different from your current password.');
+  }
+  if (!auth.currentUser) {
+    throw new Error('Your session has expired. Please sign in again.');
   }
 
   const storedUser = getStoredActiveUser();
   const loginId = storedUser?.loginId || (auth.currentUser?.email ? auth.currentUser.email.split('@')[0] : 'admin');
-
-  let firebaseAuthUpdatedByClient = false;
-  if (auth.currentUser && auth.currentUser.email) {
-    const curEmail = auth.currentUser.email.toLowerCase();
-    const targetEmail = (storedUser?.email || `${loginId}@narid.com`).toLowerCase();
-    const matchesTarget =
-      (storedUser?.authUid && auth.currentUser.uid === storedUser.authUid) ||
-      curEmail === targetEmail ||
-      curEmail === `${loginId.toLowerCase()}@narid.com` ||
-      curEmail === `${loginId.toLowerCase()}_root@narid.com`;
-
-    if (matchesTarget) {
-      await updatePassword(auth.currentUser, newPassword);
-      await auth.currentUser.getIdToken(true);
-      firebaseAuthUpdatedByClient = true;
-    }
+  const headers = await getAuthHeaders();
+  if (!headers.Authorization) {
+    throw new Error('Authentication session token missing. Please sign out and sign in again.');
   }
 
-  const headers = await getAuthHeaders();
-
-  await apiFetchJson(
+  const resData = await apiFetchJson<{
+    success: boolean;
+    targetEmail?: string;
+    mustChangePassword?: boolean;
+    forcePasswordChange?: boolean;
+  }>(
     '/api/auth/change-password',
     {
       method: 'POST',
@@ -412,18 +410,44 @@ export async function changeInitialPassword(newPassword: string, currentPassword
         loginId,
         currentPassword,
         newPassword,
-        firebaseAuthUpdatedByClient,
       }),
     },
     'Failed to update password.'
   );
 
+  const canonicalEmail = `${String(loginId).trim().toLowerCase()}@narid.com`;
+  const signInEmail = (
+    resData?.targetEmail ||
+    auth.currentUser?.email ||
+    storedUser?.email ||
+    canonicalEmail
+  )
+    .trim()
+    .toLowerCase();
+
+  // Refresh client Firebase Auth session immediately so revoked old refresh tokens never break verify-session
+  try {
+    await signInWithEmailAndPassword(auth, signInEmail, newPassword);
+  } catch {
+    if (signInEmail !== canonicalEmail) {
+      await signInWithEmailAndPassword(auth, canonicalEmail, newPassword);
+    } else {
+      throw new Error('Password updated successfully, but session refresh failed. Please sign in again with your new password.');
+    }
+  }
+
   if (storedUser) {
     storedUser.mustChangePassword = false;
     storedUser.forcePasswordChange = false;
     storedUser.passwordLastChangedAt = new Date().toISOString();
-    localStorage.setItem('narid_active_user', JSON.stringify(storedUser));
-    sessionStorage.setItem('narid_active_user', JSON.stringify(storedUser));
+    const hadLocal = Boolean(localStorage.getItem('narid_active_user'));
+    const hadSession = Boolean(sessionStorage.getItem('narid_active_user'));
+    if (hadLocal || !hadSession) {
+      localStorage.setItem('narid_active_user', JSON.stringify(storedUser));
+    }
+    if (hadSession) {
+      sessionStorage.setItem('narid_active_user', JSON.stringify(storedUser));
+    }
   }
 }
 

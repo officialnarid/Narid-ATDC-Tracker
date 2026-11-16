@@ -239,4 +239,205 @@ describe('Authentication, Token Revocation & Strict UID-Only RBAC', () => {
     expect(userDocAfter.data()?.dashboardAccessMigratedV1).toBeUndefined();
     expect(userDocAfter.data()?.modulesAllowed).toEqual(['scanner']);
   });
+
+  it('completes Admin first-time password change authoritatively without auth/requires-recent-login while enforcing currentPassword, UID preservation, and role RBAC', async () => {
+    // Flag canonical admin account for mandatory first-time password change
+    await db.collection('user_roles').doc('role_admin').update({
+      mustChangePassword: true,
+      forcePasswordChange: true,
+    });
+    await db.collection('account_security').doc('sec_admin').set(
+      {
+        id: 'sec_admin',
+        loginId: 'admin',
+        role: 'ADMIN',
+        firebaseUid: TEST_CANONICAL_ACCOUNTS.admin.uid,
+        forcePasswordChange: true,
+      },
+      { merge: true }
+    );
+
+    // 1. Missing password rejected 400
+    const missingPassLogin = await request(app)
+      .post('/api/auth/login')
+      .send({ loginId: 'admin' });
+    expect(missingPassLogin.status).toBe(400);
+    expect(missingPassLogin.body.error).toBe('Please enter your password.');
+
+    // 2. Admin signs in with existing initial password -> mustChangePassword=true
+    const initialLogin = await request(app)
+      .post('/api/auth/login')
+      .set('X-Forwarded-For', '198.51.100.31')
+      .send({ loginId: 'admin', password: TEST_CANONICAL_ACCOUNTS.admin.password });
+    expect(initialLogin.status).toBe(200);
+    expect(initialLogin.body.success).toBe(true);
+    expect(initialLogin.body.profile.authUid).toBe(TEST_CANONICAL_ACCOUNTS.admin.uid);
+    expect(initialLogin.body.profile.mustChangePassword).toBe(true);
+
+    // Simulate a Firebase ID token whose auth_time is 2 hours old (would have failed client updatePassword with auth/requires-recent-login)
+    const staleAuthTimeSec = Math.floor(Date.now() / 1000) - 7200;
+    const staleAdminToken = auth.issueToken(TEST_CANONICAL_ACCOUNTS.admin.uid, {
+      authTimeSec: staleAuthTimeSec,
+    });
+
+    // 3. Reject missing currentPassword (400)
+    const noCurrentRes = await request(app)
+      .post('/api/auth/change-password')
+      .set('Authorization', `Bearer ${staleAdminToken}`)
+      .send({ loginId: 'admin', newPassword: 'BrandNewAdminPass#2026' });
+    expect(noCurrentRes.status).toBe(400);
+    expect(noCurrentRes.body.code).toBe('CURRENT_PASSWORD_REQUIRED');
+
+    // 4. Reject wrong currentPassword (401)
+    const wrongCurrentRes = await request(app)
+      .post('/api/auth/change-password')
+      .set('Authorization', `Bearer ${staleAdminToken}`)
+      .send({
+        loginId: 'admin',
+        currentPassword: 'WrongCurrentPass#999',
+        newPassword: 'BrandNewAdminPass#2026',
+      });
+    expect(wrongCurrentRes.status).toBe(401);
+    expect(wrongCurrentRes.body.code).toBe('INVALID_CURRENT_PASSWORD');
+
+    // 5. Reject reusing the exact same password (400)
+    const reuseRes = await request(app)
+      .post('/api/auth/change-password')
+      .set('Authorization', `Bearer ${staleAdminToken}`)
+      .send({
+        loginId: 'admin',
+        currentPassword: TEST_CANONICAL_ACCOUNTS.admin.password,
+        newPassword: TEST_CANONICAL_ACCOUNTS.admin.password,
+      });
+    expect(reuseRes.status).toBe(400);
+    expect(reuseRes.body.code).toBe('PASSWORD_REUSE_NOT_ALLOWED');
+
+    // 6. Reject changing another user's password via spoofed loginId (403)
+    const spoofTargetRes = await request(app)
+      .post('/api/auth/change-password')
+      .set('Authorization', `Bearer ${staleAdminToken}`)
+      .send({
+        loginId: 'superadmin',
+        currentPassword: TEST_CANONICAL_ACCOUNTS.admin.password,
+        newPassword: 'HackedSuperPass#2026',
+      });
+    expect(spoofTargetRes.status).toBe(403);
+
+    // 7. Valid Admin first-time password change with stale auth_time succeeds 200 (no auth/requires-recent-login)
+    const changeRes = await request(app)
+      .post('/api/auth/change-password')
+      .set('Authorization', `Bearer ${staleAdminToken}`)
+      .send({
+        loginId: 'admin',
+        currentPassword: TEST_CANONICAL_ACCOUNTS.admin.password,
+        newPassword: 'BrandNewAdminPass#2026',
+      });
+    expect(changeRes.status).toBe(200);
+    expect(changeRes.body.success).toBe(true);
+    expect(changeRes.body.mustChangePassword).toBe(false);
+    expect(changeRes.body.forcePasswordChange).toBe(false);
+    expect(changeRes.body.firebaseAuthSynced).toBe(true);
+    expect(auth.getUserPasswordUnsafe(TEST_CANONICAL_ACCOUNTS.admin.uid)).toBe('BrandNewAdminPass#2026');
+
+    const adminRoleAfter = await db.collection('user_roles').doc('role_admin').get();
+    expect(adminRoleAfter.data()?.authUid).toBe(TEST_CANONICAL_ACCOUNTS.admin.uid);
+    expect(adminRoleAfter.data()?.mustChangePassword).toBe(false);
+
+    // 8. Old pre-change token is revoked after password update (401); fresh post-signin token is blocked 403 once mustChangePassword is false
+    const revokedTokenRes = await request(app)
+      .post('/api/auth/change-password')
+      .set('Authorization', `Bearer ${staleAdminToken}`)
+      .send({
+        loginId: 'admin',
+        currentPassword: 'BrandNewAdminPass#2026',
+        newPassword: 'AnotherPass#2026',
+      });
+    expect(revokedTokenRes.status).toBe(401);
+
+    const freshAdminToken = auth.issueToken(TEST_CANONICAL_ACCOUNTS.admin.uid, {
+      authTimeSec: Math.floor(Date.now() / 1000) + 2,
+    });
+    const secondChangeRes = await request(app)
+      .post('/api/auth/change-password')
+      .set('Authorization', `Bearer ${freshAdminToken}`)
+      .send({
+        loginId: 'admin',
+        currentPassword: 'BrandNewAdminPass#2026',
+        newPassword: 'AnotherPass#2026',
+      });
+    expect(secondChangeRes.status).toBe(403);
+
+    // 9. Admin login with OLD password fails (401), and NEW password succeeds (200) -> accesses dashboard (200), blocked from Super Admin routes (403)
+    const oldPassRetry = await request(app)
+      .post('/api/auth/login')
+      .set('X-Forwarded-For', '198.51.100.32')
+      .send({ loginId: 'admin', password: TEST_CANONICAL_ACCOUNTS.admin.password });
+    expect(oldPassRetry.status).toBe(401);
+
+    const newPassLogin = await request(app)
+      .post('/api/auth/login')
+      .set('X-Forwarded-For', '198.51.100.33')
+      .send({ loginId: 'admin', password: 'BrandNewAdminPass#2026' });
+    expect(newPassLogin.status).toBe(200);
+    expect(newPassLogin.body.profile.mustChangePassword).toBe(false);
+    expect(newPassLogin.body.profile.authUid).toBe(TEST_CANONICAL_ACCOUNTS.admin.uid);
+
+    const adminDashRes = await request(app)
+      .get('/api/dashboard/summary')
+      .set('Authorization', `Bearer ${freshAdminToken}`);
+    expect(adminDashRes.status).toBe(200);
+    expect(adminDashRes.body.role).toBe('ADMIN');
+    expect(adminDashRes.body.readOnly).toBe(false);
+
+    const adminAuditDenied = await request(app)
+      .get('/api/audit/logs')
+      .set('Authorization', `Bearer ${freshAdminToken}`);
+    expect(adminAuditDenied.status).toBe(403);
+  });
+
+  it('verifies Super Admin & Normal User dashboard access, restricted routes, and logout/session-expiration audit recording', async () => {
+    const superToken = auth.issueToken(TEST_CANONICAL_ACCOUNTS.superadmin.uid);
+    const userToken = auth.issueToken(TEST_CANONICAL_ACCOUNTS.user.uid);
+
+    // Super Admin dashboard + privileged routes succeed
+    const superDash = await request(app)
+      .get('/api/dashboard/summary')
+      .set('Authorization', `Bearer ${superToken}`);
+    expect(superDash.status).toBe(200);
+    expect(superDash.body.role).toBe('SUPER_ADMIN');
+    expect(superDash.body.readOnly).toBe(false);
+
+    const superAudit = await request(app)
+      .get('/api/audit/logs')
+      .set('Authorization', `Bearer ${superToken}`);
+    expect(superAudit.status).toBe(200);
+
+    // Normal User dashboard succeeds read-only; admin/super_admin routes denied 403
+    const userDash = await request(app)
+      .get('/api/dashboard/summary')
+      .set('Authorization', `Bearer ${userToken}`);
+    expect(userDash.status).toBe(200);
+    expect(userDash.body.role).toBe('USER');
+    expect(userDash.body.readOnly).toBe(true);
+
+    const userClearDenied = await request(app)
+      .post('/api/attendance/clear')
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ confirmed: true, confirmationText: 'CLEAR_ALL_ATTENDANCE', reason: 'Attempt' });
+    expect(userClearDenied.status).toBe(403);
+
+    // Logout & session_expired audit capture succeeds while token is valid, and fails 401 after revocation
+    const logoutEvent = await request(app)
+      .post('/api/audit/event')
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ action: 'logout', category: 'AUTH', targetType: 'SESSION', success: true });
+    expect(logoutEvent.status).toBe(200);
+
+    await auth.revokeRefreshTokens(TEST_CANONICAL_ACCOUNTS.user.uid);
+    const expiredChange = await request(app)
+      .post('/api/auth/change-password')
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ currentPassword: TEST_CANONICAL_ACCOUNTS.user.password, newPassword: 'NewUserPass#1' });
+    expect(expiredChange.status).toBe(401);
+  });
 });

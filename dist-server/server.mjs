@@ -5600,15 +5600,15 @@ function createApp(options = {}) {
         "First-Time Password Change"
       );
       if (!caller) return;
-      const { loginId, currentPassword, newPassword, firebaseAuthUpdatedByClient } = req.body || {};
-      if (!loginId || !newPassword) {
-        return res.status(400).json({ success: false, error: "loginId and newPassword are required." });
-      }
+      const { loginId, currentPassword, newPassword } = req.body || {};
       if (typeof newPassword !== "string" || newPassword.length < 6) {
         return res.status(400).json({ success: false, error: "New password must be at least 6 characters." });
       }
-      const cleanId = String(loginId).trim().toLowerCase();
-      if (caller.role !== "super_admin" && caller.loginId !== cleanId) {
+      if (newPassword.length > 128) {
+        return res.status(400).json({ success: false, error: "New password must be 128 characters or fewer." });
+      }
+      const requestedLoginId = typeof loginId === "string" ? loginId.trim().toLowerCase() : "";
+      if (caller.role !== "super_admin" && requestedLoginId && requestedLoginId !== caller.loginId) {
         await logAuditEvent({
           req,
           action: "unauthorized_password_reset_attempt",
@@ -5618,12 +5618,12 @@ function createApp(options = {}) {
           performedByRole: caller.role.toUpperCase(),
           actionSource: "CHANGE_PASSWORD_GUARD",
           success: false,
-          details: `Blocked attempt by "${caller.loginId}" to change password for "${cleanId}".`
+          details: `Blocked attempt by "${caller.loginId}" to change password for "${requestedLoginId}".`
         });
         return res.status(403).json({ success: false, error: "Forbidden: You cannot modify another account password." });
       }
-      const docId = `role_${cleanId}`;
-      let userDoc = await adminDb.collection("user_roles").doc(docId).get();
+      const cleanId = caller.role === "super_admin" && requestedLoginId ? requestedLoginId : caller.loginId;
+      let userDoc = cleanId === caller.loginId && caller.profileDocId ? await adminDb.collection("user_roles").doc(caller.profileDocId).get() : await adminDb.collection("user_roles").doc(`role_${cleanId}`).get();
       if (!userDoc.exists) {
         const snap = await adminDb.collection("user_roles").where("loginId", "==", cleanId).limit(1).get();
         if (snap.empty) {
@@ -5658,18 +5658,57 @@ function createApp(options = {}) {
           error: "Forbidden: Password management is restricted to Super Admin only. Self-service password changes are disabled."
         });
       }
-      if (currentPassword && userData.passwordHash) {
-        if (!verifyPassword(String(currentPassword), String(userData.passwordHash))) {
-          return res.status(401).json({ success: false, error: "Invalid password, check again" });
+      const isSelfChange = caller.loginId === cleanId;
+      if ((isSelfChange || !isSuperAdmin) && userData.passwordHash) {
+        if (typeof currentPassword !== "string" || currentPassword.length === 0) {
+          return res.status(400).json({
+            success: false,
+            code: "CURRENT_PASSWORD_REQUIRED",
+            error: "Please enter your current password to verify your identity."
+          });
+        }
+        if (!verifyPassword(currentPassword, String(userData.passwordHash))) {
+          await logAuditEvent({
+            req,
+            action: "password_change_invalid_current",
+            targetUid: userDoc.id,
+            loginId: cleanId,
+            performedByUid: caller.uid,
+            performedByLoginId: caller.loginId,
+            performedByRole: caller.role.toUpperCase(),
+            actionSource: "CHANGE_PASSWORD_GUARD",
+            success: false,
+            details: `Rejected password change for "${cleanId}" due to invalid current password.`
+          });
+          return res.status(401).json({
+            success: false,
+            code: "INVALID_CURRENT_PASSWORD",
+            error: "Current password is incorrect. Please check and try again."
+          });
+        }
+        if (newPassword === currentPassword) {
+          return res.status(400).json({
+            success: false,
+            code: "PASSWORD_REUSE_NOT_ALLOWED",
+            error: "New password must be different from your current password."
+          });
+        }
+      } else if (typeof currentPassword === "string" && currentPassword.length > 0 && userData.passwordHash) {
+        if (!verifyPassword(currentPassword, String(userData.passwordHash))) {
+          return res.status(401).json({
+            success: false,
+            code: "INVALID_CURRENT_PASSWORD",
+            error: "Current password is incorrect. Please check and try again."
+          });
         }
       }
       const canonicalEmail = `${cleanId}@narid.com`;
       const rawTargetEmail = String(userData.email || canonicalEmail).trim().toLowerCase();
       const targetEmail = rawTargetEmail.endsWith("_root@narid.com") && Array.isArray(userData.emailAliases) && userData.emailAliases.includes(canonicalEmail) ? canonicalEmail : rawTargetEmail;
       const targetUid = String(userData.authUid || userData.uid || userDoc.id);
-      let firebaseAuthSynced = caller.uid === targetUid && firebaseAuthUpdatedByClient === true;
+      let firebaseAuthSynced = false;
       let syncErr = "";
-      if (!firebaseAuthSynced && targetUid && !targetUid.startsWith("role_")) {
+      if (targetUid && !targetUid.startsWith("role_")) {
         const adminAttempt = await tryAdminAuthUpdatePassword(projectId, targetUid, newPassword, auth);
         if (adminAttempt.updated) {
           firebaseAuthSynced = true;
@@ -5753,6 +5792,7 @@ function createApp(options = {}) {
       return res.json({
         success: true,
         message: "Password updated successfully in Firebase Authentication and Firestore. Access granted.",
+        targetEmail,
         mustChangePassword: false,
         forcePasswordChange: false,
         firebaseAuthSynced: true

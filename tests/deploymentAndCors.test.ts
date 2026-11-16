@@ -575,7 +575,12 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
     expect(resolveApiUrl('/api/auth/login', undefined, 'narid-atdc-tracker.vercel.app')).toBe('/api/auth/login');
     expect(resolveApiUrl('/api/auth/login', '', 'narid-atdc-tracker.vercel.app')).toBe('/api/auth/login');
     expect(resolveApiUrl('/api/auth/login', '""', 'narid-atdc-tracker.vercel.app')).toBe('/api/auth/login');
+    expect(resolveApiUrl('/api/auth/login', 'undefined', 'narid-atdc-tracker.vercel.app')).toBe('/api/auth/login');
+    expect(resolveApiUrl('/api/auth/login', 'null', 'ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')).toBe(
+      'https://narid-atdc-tracker.vercel.app/api/auth/login'
+    );
     expect(validateApiBaseUrl('""')).toBeNull();
+    expect(validateApiBaseUrl('undefined')).toBeNull();
     expect(resolveApiUrl('/api/health', '   ')).toBe('/api/health');
 
     // Hosted Google AI Studio Preview (even when VITE_API_BASE_URL is unset and .env.development does not exist)

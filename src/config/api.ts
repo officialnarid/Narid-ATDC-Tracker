@@ -13,6 +13,9 @@ function stripOptionalWrappingQuotes(raw?: string | null): string {
   ) {
     clean = clean.slice(1, -1).trim();
   }
+  if (clean === 'undefined' || clean === 'null') {
+    return '';
+  }
   return clean;
 }
 
