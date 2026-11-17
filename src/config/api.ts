@@ -6,14 +6,22 @@ export const AI_STUDIO_PREVIEW_HOSTNAMES = new Set<string>([
 export const SHARED_VERCEL_BACKEND_URL = 'https://narid-atdc-tracker.vercel.app';
 
 function stripOptionalWrappingQuotes(raw?: string | null): string {
-  let clean = String(raw || '').trim();
-  if (
-    (clean.startsWith('"') && clean.endsWith('"') && clean.length >= 2) ||
-    (clean.startsWith("'") && clean.endsWith("'") && clean.length >= 2)
-  ) {
-    clean = clean.slice(1, -1).trim();
+  if (raw === null || raw === undefined) return '';
+  let clean = String(raw).trim();
+  // Iteratively unwrap matching outer parentheses/quotes (e.g. `("")`, `''`, `()`, `("...")`)
+  while (clean.length >= 2) {
+    if (
+      (clean.startsWith('(') && clean.endsWith(')')) ||
+      (clean.startsWith('"') && clean.endsWith('"')) ||
+      (clean.startsWith("'") && clean.endsWith("'"))
+    ) {
+      clean = clean.slice(1, -1).trim();
+      continue;
+    }
+    break;
   }
-  if (clean === 'undefined' || clean === 'null') {
+  const lower = clean.toLowerCase();
+  if (!clean || lower === 'undefined' || lower === 'null') {
     return '';
   }
   return clean;

@@ -571,27 +571,51 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
       getEffectiveApiBaseUrl,
     } = await import('../src/config/api.ts');
 
-    // Vercel Production: empty / undefined / accidentally pasted "" -> same-origin /api/*
+    // Vercel Production: empty / undefined / null / whitespace / accidentally pasted "" or ("") -> same-origin /api/*
     expect(resolveApiUrl('/api/auth/login', undefined, 'narid-atdc-tracker.vercel.app')).toBe('/api/auth/login');
+    expect(resolveApiUrl('/api/auth/login', null, 'narid-atdc-tracker.vercel.app')).toBe('/api/auth/login');
     expect(resolveApiUrl('/api/auth/login', '', 'narid-atdc-tracker.vercel.app')).toBe('/api/auth/login');
     expect(resolveApiUrl('/api/auth/login', '""', 'narid-atdc-tracker.vercel.app')).toBe('/api/auth/login');
+    expect(resolveApiUrl('/api/auth/login', '("")', 'narid-atdc-tracker.vercel.app')).toBe('/api/auth/login');
+    expect(resolveApiUrl('/api/auth/login', '()', 'narid-atdc-tracker.vercel.app')).toBe('/api/auth/login');
     expect(resolveApiUrl('/api/auth/login', 'undefined', 'narid-atdc-tracker.vercel.app')).toBe('/api/auth/login');
     expect(resolveApiUrl('/api/auth/login', 'null', 'ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')).toBe(
       'https://narid-atdc-tracker.vercel.app/api/auth/login'
     );
     expect(validateApiBaseUrl('""')).toBeNull();
+    expect(validateApiBaseUrl('("")')).toBeNull();
+    expect(validateApiBaseUrl("('')")).toBeNull();
+    expect(validateApiBaseUrl('()')).toBeNull();
+    expect(validateApiBaseUrl('(null)')).toBeNull();
+    expect(validateApiBaseUrl('(undefined)')).toBeNull();
     expect(validateApiBaseUrl('undefined')).toBeNull();
+    expect(validateApiBaseUrl(null)).toBeNull();
     expect(resolveApiUrl('/api/health', '   ')).toBe('/api/health');
 
-    // Hosted Google AI Studio Preview (even when VITE_API_BASE_URL is unset and .env.development does not exist)
+    // Hosted Google AI Studio Preview (when VITE_API_BASE_URL is unset, whitespace, or injected as ("") / () / '')
     expect(
       getEffectiveApiBaseUrl(undefined, 'ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')
     ).toBe('https://narid-atdc-tracker.vercel.app');
+    expect(
+      getEffectiveApiBaseUrl('("")', 'ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')
+    ).toBe('https://narid-atdc-tracker.vercel.app');
+    expect(
+      resolveApiUrl('/api/auth/login', '("")', 'ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')
+    ).toBe('https://narid-atdc-tracker.vercel.app/api/auth/login');
+    expect(
+      resolveApiUrl('/api/health', '("")', 'ais-pre-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')
+    ).toBe('https://narid-atdc-tracker.vercel.app/api/health');
     expect(
       resolveApiUrl('/api/auth/login', undefined, 'ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')
     ).toBe('https://narid-atdc-tracker.vercel.app/api/auth/login');
     expect(
       resolveApiUrl('/api/auth/login', '', 'ais-pre-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')
+    ).toBe('https://narid-atdc-tracker.vercel.app/api/auth/login');
+    expect(
+      resolveApiUrl('/api/auth/login', '   ', 'ais-pre-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')
+    ).toBe('https://narid-atdc-tracker.vercel.app/api/auth/login');
+    expect(
+      resolveApiUrl('/api/auth/login', '("https://narid-atdc-tracker.vercel.app")', 'ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')
     ).toBe('https://narid-atdc-tracker.vercel.app/api/auth/login');
 
     // Explicit Absolute HTTPS URL -> Google AI Studio Preview pointing at shared Vercel backend
