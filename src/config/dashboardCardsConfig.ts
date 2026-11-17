@@ -55,41 +55,64 @@ const USER_DASHBOARD_CARDS: DashboardCardId[] = [
   'missed_punch_out',
 ];
 
-export const ROLE_CARD_VISIBILITY: Record<'SUPER_ADMIN' | 'ADMIN' | 'USER', DashboardCardId[]> = {
+export const ROLE_CARD_VISIBILITY: Record<string, DashboardCardId[]> = {
   SUPER_ADMIN: ALL_DASHBOARD_CARDS,
   ADMIN: ALL_DASHBOARD_CARDS,
   USER: USER_DASHBOARD_CARDS,
 };
 
 /**
- * Normalize role strings (case-insensitive and alias safe)
+ * Normalize role strings (preserves custom role identifiers cleanly)
  */
-export function normalizeUserRole(role?: UserRoleType | string | null): 'SUPER_ADMIN' | 'ADMIN' | 'USER' {
+export function normalizeUserRole(role?: UserRoleType | string | null): string {
   if (!role) return 'USER';
-  const clean = String(role).trim().toUpperCase();
+  const clean = String(role).trim().toUpperCase().replace(/[\s-]+/g, '_');
   if (clean === 'SUPER_ADMIN' || clean === 'SUPERADMIN') return 'SUPER_ADMIN';
   if (clean === 'ADMIN') return 'ADMIN';
-  return 'USER';
+  if (clean === 'USER') return 'USER';
+  return clean || 'USER';
 }
 
 /**
- * Check if a specific card is allowed for a user's verified role
+ * Check if a specific card is allowed for a user's verified role and module permissions
  */
 export function isDashboardCardVisible(
-  role: UserRoleType | string | null | undefined, 
-  cardId: DashboardCardId
+  role: UserRoleType | string | null | undefined,
+  cardId: DashboardCardId,
+  modulesAllowed?: string[] | null,
+  rolePermissions?: Record<string, { view?: boolean }> | null
 ): boolean {
-  const normalized = normalizeUserRole(role);
-  const allowedCards = ROLE_CARD_VISIBILITY[normalized] || [];
+  const allowedCards = getPermittedCardIdsForRole(role, modulesAllowed, rolePermissions);
   return allowedCards.includes(cardId);
 }
 
 /**
- * Get all permitted card IDs for a role
+ * Get all permitted card IDs for a role (exact legacy sets for SUPER_ADMIN, ADMIN, USER;
+ * dynamic permission-aware cards for future custom roles)
  */
 export function getPermittedCardIdsForRole(
-  role: UserRoleType | string | null | undefined
+  role: UserRoleType | string | null | undefined,
+  modulesAllowed?: string[] | null,
+  rolePermissions?: Record<string, { view?: boolean }> | null
 ): DashboardCardId[] {
   const normalized = normalizeUserRole(role);
-  return ROLE_CARD_VISIBILITY[normalized] || [];
+  if (ROLE_CARD_VISIBILITY[normalized]) {
+    return ROLE_CARD_VISIBILITY[normalized];
+  }
+
+  const mods = Array.isArray(modulesAllowed) ? modulesAllowed.map((m) => String(m).toLowerCase()) : [];
+  const hasOperationalAnalytics =
+    mods.includes('all') ||
+    mods.includes('reports') ||
+    mods.includes('history') ||
+    mods.includes('employees') ||
+    mods.includes('shifts') ||
+    Boolean(
+      rolePermissions?.reports?.view ||
+        rolePermissions?.history?.view ||
+        rolePermissions?.employees?.view ||
+        rolePermissions?.shifts?.view
+    );
+
+  return hasOperationalAnalytics ? ALL_DASHBOARD_CARDS : USER_DASHBOARD_CARDS;
 }

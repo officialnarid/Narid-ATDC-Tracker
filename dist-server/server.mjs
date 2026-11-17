@@ -285,11 +285,22 @@ var CRITICAL_PROTECTED_ACTIONS = /* @__PURE__ */ new Set([
   "login_locked_rate_limit",
   "audit_controlled_deleted"
 ]);
+var SYSTEM_ROLE_IDS = /* @__PURE__ */ new Set(["super_admin", "admin", "user"]);
+var VALID_ROLE_ID_REGEX = /^[a-z][a-z0-9_]{1,47}$/;
 function normalizeRoleValue(rawRole) {
-  const r = String(rawRole || "user").trim().toLowerCase();
-  if (r === "super_admin" || r === "superadmin") return "super_admin";
-  if (r === "admin") return "admin";
+  const cleaned = String(rawRole ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_").replace(/[^a-z0-9_]/g, "").replace(/^_+|_+$/g, "");
+  if (!cleaned) return "user";
+  if (cleaned === "superadmin" || cleaned === "super_admin") return "super_admin";
+  if (cleaned === "admin") return "admin";
+  if (cleaned === "user") return "user";
+  if (VALID_ROLE_ID_REGEX.test(cleaned)) return cleaned;
   return "user";
+}
+function deriveStrictRoleId(rawRole) {
+  const cleaned = String(rawRole ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_").replace(/[^a-z0-9_]/g, "").replace(/^_+|_+$/g, "");
+  if (!cleaned) return "";
+  if (cleaned === "superadmin" || cleaned === "super_admin") return "super_admin";
+  return VALID_ROLE_ID_REGEX.test(cleaned) ? cleaned : "";
 }
 async function syncUserUidIndex(db, params) {
   const uid = String(params.uid || "").trim();
@@ -408,6 +419,14 @@ async function verifyCallerIdentity(req, db, auth, _projectId) {
     }
   }
   const normalizedRole = normalizeRoleValue(matchedDoc.data.role);
+  if (!SYSTEM_ROLE_IDS.has(normalizedRole)) {
+    const roleDefSnap = await db.collection("roles").doc(normalizedRole).get();
+    if (roleDefSnap.exists && roleDefSnap.data()?.isActive === false) {
+      const err = new Error("Assigned role is currently inactive. Access denied.");
+      err.statusCode = 403;
+      throw err;
+    }
+  }
   const resolvedLoginId = String(
     matchedDoc.data.loginId || matchedDoc.id.replace(/^role_/, "")
   ).toLowerCase();
@@ -2223,15 +2242,23 @@ function registerLoginSecurityRoutes(app, deps) {
         const firebaseUid = String(userData.authUid || userDoc.id);
         const secRef = db.collection("account_security").doc(`sec_${cleanId}`);
         const userRef = db.collection("user_roles").doc(userDoc.id);
-        if (userData.status === "Inactive") {
+        const normalizedUserRole = normalizeRoleValue(userData.role);
+        let roleDeactivated = false;
+        if (!SYSTEM_ROLE_IDS.has(normalizedUserRole)) {
+          const roleDocSnap = await db.collection("roles").doc(normalizedUserRole).get();
+          if (roleDocSnap.exists && roleDocSnap.data()?.isActive === false) {
+            roleDeactivated = true;
+          }
+        }
+        if (userData.status === "Inactive" || roleDeactivated) {
           await recordLoginAttemptDoc(db, {
             loginId: cleanId,
             role: roleUpper,
             firebaseUid,
             success: false,
             outcome: "BLOCKED_INACTIVE",
-            failureReasonCategory: "ACCOUNT_INACTIVE",
-            failureReason: "Account status is Inactive",
+            failureReasonCategory: roleDeactivated ? "ROLE_INACTIVE" : "ACCOUNT_INACTIVE",
+            failureReason: roleDeactivated ? `Assigned role "${normalizedUserRole}" is Inactive` : "Account status is Inactive",
             telemetry
           });
           await recordLoginHistoryEntry(db, {
@@ -2241,14 +2268,14 @@ function registerLoginSecurityRoutes(app, deps) {
             authUid: firebaseUid,
             role: roleUpper,
             success: false,
-            failureReason: "Account is Inactive"
+            failureReason: roleDeactivated ? "Assigned role is Inactive" : "Account is Inactive"
           });
           return {
             status: 403,
             body: {
               success: false,
-              code: "ACCOUNT_INACTIVE",
-              error: "Account Deactivated. Please contact Super Admin."
+              code: roleDeactivated ? "ROLE_INACTIVE" : "ACCOUNT_INACTIVE",
+              error: roleDeactivated ? "Your assigned role is currently inactive. Please contact Super Admin." : "Account Deactivated. Please contact Super Admin."
             }
           };
         }
@@ -3233,19 +3260,20 @@ function registerLoginSecurityRoutes(app, deps) {
         }
         const userRef = db.collection("user_roles").doc(userDoc.id);
         const secRef = db.collection("account_security").doc(`sec_${cleanTargetId}`);
+        const tempPassUpdates = {
+          passwordHash: newHash,
+          mustChangePassword: true,
+          forcePasswordChange: true,
+          passwordLastChangedAt: now,
+          passwordResetBy: caller.loginId,
+          passwordResetAt: now,
+          sessionRevokedAt: now,
+          updatedAt: now
+        };
         await db.runTransaction(async (tx) => {
           const secSnap = await tx.get(secRef);
           const curSec = secSnap.exists ? secSnap.data() || {} : {};
-          tx.update(userRef, {
-            passwordHash: newHash,
-            mustChangePassword: true,
-            forcePasswordChange: true,
-            passwordLastChangedAt: now,
-            passwordResetBy: caller.loginId,
-            passwordResetAt: now,
-            sessionRevokedAt: now,
-            updatedAt: now
-          });
+          tx.update(userRef, tempPassUpdates);
           tx.set(
             secRef,
             {
@@ -3264,6 +3292,12 @@ function registerLoginSecurityRoutes(app, deps) {
             { merge: true }
           );
         });
+        const matchingDocs = await db.collection("user_roles").where("loginId", "==", cleanTargetId).get();
+        for (const mDoc of matchingDocs.docs) {
+          if (mDoc.id !== userDoc.id) {
+            await db.collection("user_roles").doc(mDoc.id).update(tempPassUpdates);
+          }
+        }
         const resetLogId = `reset_${Date.now()}_${crypto2.randomBytes(3).toString("hex")}`;
         await Promise.all([
           db.collection("password_reset_logs").doc(resetLogId).set({
@@ -3589,36 +3623,61 @@ var ClearAttendanceSchema = z2.object({
   }),
   reason: z2.string().trim().min(5, "Reason is required for audit trail.").max(500).optional()
 });
-async function callerHasScannerAccess(db, caller) {
+var ADMIN_FALLBACK_ACTIONS = {
+  dashboard: { view: true },
+  scanner: { view: true, add: true, edit: true },
+  employees: { view: true, add: true, edit: true },
+  excel_import: { view: true, add: true, edit: true },
+  qr_codes: { view: true, add: true, edit: true },
+  organization: { view: true, add: true, edit: true },
+  floors: { view: true, add: true, edit: true },
+  sections: { view: true, add: true, edit: true },
+  departments: { view: true, add: true, edit: true },
+  shifts: { view: true, add: true, edit: true },
+  history: { view: true, edit: true },
+  reports: { view: true }
+};
+async function callerHasModuleAction(db, caller, moduleKey, action) {
   if (caller.role === "super_admin") return true;
+  if (moduleKey === "user_rights" || moduleKey === "audit_logs" || moduleKey === "security_management") {
+    return false;
+  }
   try {
     const userPermSnap = await db.collection("user_permissions").doc(caller.profileDocId).get();
-    if (userPermSnap.exists) {
-      const mod = userPermSnap.data()?.permissions?.scanner;
-      if (mod && (mod.view === false || mod.add === false)) {
-        return false;
-      }
-      if (mod && mod.view === true) {
-        return true;
+    if (userPermSnap.exists && userPermSnap.data()?.isCustomOverride !== false) {
+      const mod = userPermSnap.data()?.permissions?.[moduleKey];
+      if (mod && typeof mod[action] === "boolean") {
+        return mod[action] === true && (action === "view" || mod.view !== false);
       }
     }
     const rolePermSnap = await db.collection("role_permissions").doc(caller.role).get();
     if (rolePermSnap.exists) {
-      const mod = rolePermSnap.data()?.modulePermissions?.scanner;
-      if (mod) {
-        return Boolean(mod.view && mod.add !== false);
+      const mod = rolePermSnap.data()?.modulePermissions?.[moduleKey];
+      if (mod && typeof mod[action] === "boolean") {
+        return mod[action] === true && (action === "view" || mod.view !== false);
       }
+    }
+    if (caller.role === "admin") {
+      return Boolean(ADMIN_FALLBACK_ACTIONS[moduleKey]?.[action]);
     }
     const userSnap = await db.collection("user_roles").doc(caller.profileDocId).get();
     if (userSnap.exists) {
       const mods = Array.isArray(userSnap.data()?.modulesAllowed) ? userSnap.data().modulesAllowed : [];
-      return mods.includes("all") || mods.includes("scanner");
+      if (mods.includes("all") || mods.includes(moduleKey)) {
+        if (action === "view") return true;
+        if (moduleKey === "scanner" && action === "add") return true;
+      }
     }
     return false;
   } catch (err) {
-    console.warn("[Scanner Permission Guard] Lookup failed; failing closed:", err?.message || err);
+    console.warn(`[Attendance Permission Guard] Lookup failed (${moduleKey}.${action}); failing closed:`, err?.message || err);
     return false;
   }
+}
+async function callerHasScannerAccess(db, caller) {
+  const canView = await callerHasModuleAction(db, caller, "scanner", "view");
+  if (!canView) return false;
+  return callerHasModuleAction(db, caller, "scanner", "add");
 }
 function registerAttendanceRoutes(app, deps) {
   const { db, requireVerifiedCaller } = deps;
@@ -3631,7 +3690,7 @@ function registerAttendanceRoutes(app, deps) {
       const caller = await requireVerifiedCaller(
         req,
         res,
-        ["super_admin", "admin", "user"],
+        "*",
         "Attendance Scan Processing"
       );
       if (!caller) return;
@@ -3667,11 +3726,14 @@ function registerAttendanceRoutes(app, deps) {
       }
       const { rawPayload, scannerDevice = "USB_SCANNER", customScanTime } = parsed.data;
       let { scannerType } = parsed.data;
-      if (customScanTime && caller.role === "user") {
-        return res.status(403).json({
-          success: false,
-          error: "Forbidden: Only Admin or Super Admin can submit custom scan timestamps."
-        });
+      if (customScanTime) {
+        const canCustomTime = await callerHasModuleAction(db, caller, "scanner", "edit") || await callerHasModuleAction(db, caller, "history", "edit");
+        if (!canCustomTime) {
+          return res.status(403).json({
+            success: false,
+            error: "Forbidden: Your role is not permitted to submit custom scan timestamps."
+          });
+        }
       }
       const now = customScanTime ? new Date(customScanTime) : /* @__PURE__ */ new Date();
       if (Number.isNaN(now.getTime())) {
@@ -4248,10 +4310,31 @@ function registerAttendanceRoutes(app, deps) {
       const caller = await requireVerifiedCaller(
         req,
         res,
-        ["super_admin", "admin"],
+        "*",
         "Auto Close Expired Shifts"
       );
       if (!caller) return;
+      const canAutoClose = await callerHasModuleAction(db, caller, "history", "edit") || await callerHasModuleAction(db, caller, "shifts", "edit");
+      if (!canAutoClose) {
+        await recordEnterpriseAuditEvent(db, {
+          req,
+          action: "unauthorized_access_attempt",
+          category: "SECURITY",
+          severity: "CRITICAL",
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: caller.role.toUpperCase(),
+          targetType: "ATTENDANCE_AUTO_CLOSE",
+          targetId: "/api/attendance/auto-close",
+          actionSource: "ATTENDANCE_PERMISSION_GUARD",
+          description: `Unauthorized auto-close attempt by "${caller.loginId}" (${caller.role}).`,
+          success: false
+        });
+        return res.status(403).json({
+          success: false,
+          error: `Forbidden: Role "${caller.role.toUpperCase()}" is not permitted for Auto Close Expired Shifts.`
+        });
+      }
       const now = /* @__PURE__ */ new Date();
       const [settingsSnap, shiftsSnap, openSnap] = await Promise.all([
         db.collection("system_settings").doc("global").get(),
@@ -4345,10 +4428,31 @@ function registerAttendanceRoutes(app, deps) {
       const caller = await requireVerifiedCaller(
         req,
         res,
-        ["super_admin", "admin"],
+        "*",
         "Manual Attendance Correction"
       );
       if (!caller) return;
+      const canCorrect = await callerHasModuleAction(db, caller, "history", "edit");
+      if (!canCorrect) {
+        await recordEnterpriseAuditEvent(db, {
+          req,
+          action: "unauthorized_access_attempt",
+          category: "SECURITY",
+          severity: "CRITICAL",
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: caller.role.toUpperCase(),
+          targetType: "ATTENDANCE_CORRECTION",
+          targetId: "/api/attendance/correct",
+          actionSource: "ATTENDANCE_PERMISSION_GUARD",
+          description: `Unauthorized attendance correction attempt by "${caller.loginId}" (${caller.role}).`,
+          success: false
+        });
+        return res.status(403).json({
+          success: false,
+          error: `Forbidden: Role "${caller.role.toUpperCase()}" is not permitted for Manual Attendance Correction.`
+        });
+      }
       const parsed = AttendanceCorrectSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({
@@ -4435,10 +4539,31 @@ function registerAttendanceRoutes(app, deps) {
       const caller = await requireVerifiedCaller(
         req,
         res,
-        ["super_admin", "admin"],
+        "*",
         "Generate Shift Roster"
       );
       if (!caller) return;
+      const canGenerateRoster = await callerHasModuleAction(db, caller, "shifts", "add") || await callerHasModuleAction(db, caller, "shifts", "edit") || caller.role === "admin" && await callerHasModuleAction(db, caller, "shifts", "view");
+      if (!canGenerateRoster) {
+        await recordEnterpriseAuditEvent(db, {
+          req,
+          action: "unauthorized_access_attempt",
+          category: "SECURITY",
+          severity: "CRITICAL",
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: caller.role.toUpperCase(),
+          targetType: "SHIFT_ROSTER",
+          targetId: "/api/attendance/roster",
+          actionSource: "ATTENDANCE_PERMISSION_GUARD",
+          description: `Unauthorized shift roster generation attempt by "${caller.loginId}" (${caller.role}).`,
+          success: false
+        });
+        return res.status(403).json({
+          success: false,
+          error: `Forbidden: Role "${caller.role.toUpperCase()}" is not permitted for Generate Shift Roster.`
+        });
+      }
       const parsed = GenerateRosterSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({
@@ -4658,12 +4783,37 @@ var AdminSetPasswordInputSchema = z3.object({
   revokeSessions: z3.boolean().optional(),
   currentTargetPassword: z3.string().optional()
 });
+var RESERVED_CUSTOM_ROLE_ALIASES = /* @__PURE__ */ new Set([
+  "superadmin",
+  "super_admin",
+  "root",
+  "system",
+  "super_admin_root"
+]);
+var DynamicRoleIdSchema = z3.string().trim().min(2, "Role ID must be at least 2 characters.").max(64, "Role ID must be 64 characters or fewer.").transform((val) => deriveStrictRoleId(val)).refine((val) => VALID_ROLE_ID_REGEX.test(val), {
+  message: "Role ID must start with a letter and contain only lowercase letters, numbers, or underscores."
+});
+var RoleDefinitionInputSchema = z3.object({
+  roleId: z3.string().trim().max(64).optional(),
+  roleName: z3.string().trim().min(2, "Role name must be at least 2 characters.").max(48, "Role name must be 48 characters or fewer."),
+  description: z3.string().trim().min(3, "Role description must be at least 3 characters.").max(500, "Role description must be 500 characters or fewer."),
+  isActive: z3.boolean().default(true),
+  defaultPermissions: z3.record(
+    z3.string(),
+    z3.object({
+      view: z3.boolean().optional(),
+      add: z3.boolean().optional(),
+      edit: z3.boolean().optional(),
+      delete: z3.boolean().optional()
+    })
+  ).optional()
+});
 var CreateUserInputSchema = z3.object({
   callerLoginId: z3.string().trim().min(1).max(64).optional(),
   loginId: z3.string().trim().min(2, "Login ID must be at least 2 characters.").max(64).regex(/^[a-zA-Z0-9_.-]+$/, "Login ID can only contain letters, numbers, hyphens, underscores, and dots."),
   name: z3.string().trim().min(1, "Name is required.").max(128),
   email: z3.string().trim().email("Valid email is required.").max(128),
-  role: z3.enum(["super_admin", "admin", "user"]),
+  role: DynamicRoleIdSchema,
   password: z3.string().min(6, "Password must be at least 6 characters.").max(128),
   modulesAllowed: z3.array(z3.string().max(64)).optional(),
   status: z3.enum(["Active", "Inactive"]).default("Active"),
@@ -4677,7 +4827,7 @@ var DeleteUserInputSchema = z3.object({
 var SetUserPermissionsInputSchema = z3.object({
   callerLoginId: z3.string().trim().min(1).max(64).optional(),
   targetId: z3.string().trim().min(1).max(128),
-  role: z3.enum(["super_admin", "admin", "user"]).optional(),
+  role: DynamicRoleIdSchema.optional(),
   status: z3.enum(["Active", "Inactive"]).optional(),
   modulesAllowed: z3.array(z3.string().max(64)).optional(),
   permissions: z3.record(
@@ -4692,7 +4842,7 @@ var SetUserPermissionsInputSchema = z3.object({
 });
 var RolePermissionsInputSchema = z3.object({
   callerLoginId: z3.string().trim().min(1).max(64).optional(),
-  roleId: z3.enum(["super_admin", "admin", "user"]),
+  roleId: DynamicRoleIdSchema,
   modulePermissions: z3.record(
     z3.string(),
     z3.object({
@@ -4812,27 +4962,61 @@ var DEFAULT_ROLE_PERMISSIONS = {
     settings: { view: false, add: false, edit: false, delete: false }
   }
 };
+var RESTRICTED_SUPER_ADMIN_MODULES = /* @__PURE__ */ new Set([
+  "user_rights",
+  "audit_logs",
+  "security_management"
+]);
+function sanitizeRoleModulePermissions(roleId, rawPerms) {
+  const normalizedRole = normalizeRoleValue(roleId);
+  if (normalizedRole === "super_admin") {
+    return Object.fromEntries(
+      Object.entries(DEFAULT_ROLE_PERMISSIONS.super_admin).map(([k, v]) => [k, { ...v }])
+    );
+  }
+  const baseKeys = /* @__PURE__ */ new Set([
+    ...Object.keys(DEFAULT_ROLE_PERMISSIONS.user),
+    ...Object.keys(rawPerms || {})
+  ]);
+  const sanitized = {};
+  for (const modKey of baseKeys) {
+    if (RESTRICTED_SUPER_ADMIN_MODULES.has(modKey)) {
+      sanitized[modKey] = { view: false, add: false, edit: false, delete: false };
+      continue;
+    }
+    const entry = rawPerms?.[modKey];
+    const add = Boolean(entry?.add);
+    const edit = Boolean(entry?.edit);
+    const del = Boolean(entry?.delete);
+    const view = Boolean(entry?.view) || add || edit || del;
+    sanitized[modKey] = { view, add, edit, delete: del };
+  }
+  return sanitized;
+}
 var PREDEFINED_ROLES = [
   {
     roleId: "super_admin",
     roleName: "SUPER_ADMIN",
     description: "Complete access to all application modules, account management, role permissions, system settings and administrative controls.",
     defaultPermissions: DEFAULT_ROLE_PERMISSIONS.super_admin,
-    isActive: true
+    isActive: true,
+    isSystemRole: true
   },
   {
     roleId: "admin",
     roleName: "ADMIN",
     description: "Operational dashboard, attendance management, employee records, reports and other specifically authorized modules.",
     defaultPermissions: DEFAULT_ROLE_PERMISSIONS.admin,
-    isActive: true
+    isActive: true,
+    isSystemRole: true
   },
   {
     roleId: "user",
     roleName: "USER",
     description: "Read-only Dashboard monitoring and Attendance Scanner access, according to assigned permissions.",
     defaultPermissions: DEFAULT_ROLE_PERMISSIONS.user,
-    isActive: true
+    isActive: true,
+    isSystemRole: true
   }
 ];
 async function seedPredefinedRoles(db) {
@@ -5213,7 +5397,7 @@ function createApp(options = {}) {
         });
         return null;
       }
-      if (!allowedRoles.includes(caller.role)) {
+      if (allowedRoles !== "*" && !allowedRoles.includes(caller.role)) {
         await logAuditEvent({
           req,
           action: "unauthorized_access_attempt",
@@ -5248,6 +5432,46 @@ function createApp(options = {}) {
       return null;
     }
   }
+  async function getCallerEffectiveDashboardAccess(caller) {
+    if (caller.role === "super_admin") {
+      return { allowed: true, readOnly: false };
+    }
+    const [userPermSnap, rolePermSnap, userRoleSnap] = await Promise.all([
+      caller.profileDocId ? adminDb.collection("user_permissions").doc(caller.profileDocId).get() : Promise.resolve(null),
+      adminDb.collection("role_permissions").doc(caller.role).get(),
+      caller.profileDocId ? adminDb.collection("user_roles").doc(caller.profileDocId).get() : Promise.resolve(null)
+    ]);
+    const hasUserOverride = userPermSnap?.exists && userPermSnap.data()?.isCustomOverride !== false;
+    const userPerms = hasUserOverride ? userPermSnap?.data()?.permissions || {} : null;
+    const rolePerms = rolePermSnap?.exists ? rolePermSnap.data()?.modulePermissions || {} : null;
+    const userData = userRoleSnap?.exists ? userRoleSnap.data() || {} : {};
+    const modulesAllowed = Array.isArray(userData.modulesAllowed) ? userData.modulesAllowed.map((m) => String(m).trim().toLowerCase()) : [];
+    let dashboardAllowed;
+    if (userPerms?.dashboard && typeof userPerms.dashboard.view === "boolean") {
+      dashboardAllowed = userPerms.dashboard.view;
+    } else if (rolePerms?.dashboard && typeof rolePerms.dashboard.view === "boolean") {
+      dashboardAllowed = rolePerms.dashboard.view;
+    } else if (modulesAllowed.length > 0) {
+      dashboardAllowed = modulesAllowed.includes("all") || modulesAllowed.includes("dashboard");
+    } else {
+      dashboardAllowed = caller.role === "admin" || caller.role === "user";
+    }
+    if (caller.role === "user") {
+      return { allowed: dashboardAllowed, readOnly: true };
+    }
+    if (caller.role === "admin") {
+      return { allowed: dashboardAllowed, readOnly: false };
+    }
+    const effectivePerms = userPerms || rolePerms || {};
+    const hasOperationalWrite = Object.entries(effectivePerms).some(([modKey, perms]) => {
+      if (modKey === "dashboard" || RESTRICTED_SUPER_ADMIN_MODULES.has(modKey)) return false;
+      return Boolean(perms?.add || perms?.edit || perms?.delete);
+    });
+    return {
+      allowed: dashboardAllowed,
+      readOnly: !hasOperationalWrite
+    };
+  }
   registerSecurityAuditRoutes(app, adminDb, auth, projectId);
   registerLoginSecurityRoutes(app, {
     db: adminDb,
@@ -5267,7 +5491,7 @@ function createApp(options = {}) {
       const caller = await requireVerifiedCaller(
         req,
         res,
-        ["super_admin", "admin", "user"],
+        "*",
         "Verify Active Session"
       );
       if (!caller) return;
@@ -5596,7 +5820,7 @@ function createApp(options = {}) {
       const caller = await requireVerifiedCaller(
         req,
         res,
-        ["super_admin", "admin", "user"],
+        "*",
         "First-Time Password Change"
       );
       if (!caller) return;
@@ -5832,7 +6056,28 @@ function createApp(options = {}) {
       if (!emailSnap.empty) {
         return res.status(400).json({ success: false, error: `Email address "${cleanEmail}" is already registered to another account.` });
       }
-      const assignedRole = role.toLowerCase();
+      const assignedRole = deriveStrictRoleId(role);
+      if (!assignedRole || !VALID_ROLE_ID_REGEX.test(assignedRole)) {
+        return res.status(400).json({ success: false, error: "Invalid role ID specified." });
+      }
+      const [roleDocSnap, rolePermSnap] = await Promise.all([
+        adminDb.collection("roles").doc(assignedRole).get(),
+        adminDb.collection("role_permissions").doc(assignedRole).get()
+      ]);
+      if (!SYSTEM_ROLE_IDS.has(assignedRole) && !roleDocSnap.exists) {
+        return res.status(400).json({
+          success: false,
+          error: `Role "${assignedRole}" does not exist. Create the role in Role Management first.`
+        });
+      }
+      if (roleDocSnap.exists && roleDocSnap.data()?.isActive === false) {
+        return res.status(400).json({
+          success: false,
+          error: `Role "${assignedRole}" is currently inactive and cannot be assigned to new users.`
+        });
+      }
+      const roleDocData = roleDocSnap.exists ? roleDocSnap.data() || {} : null;
+      const rolePermData = rolePermSnap.exists ? rolePermSnap.data() || {} : null;
       const now = (/* @__PURE__ */ new Date()).toISOString();
       const passwordHash = hashPassword(password);
       const upperName = name.trim().toUpperCase();
@@ -5843,10 +6088,18 @@ function createApp(options = {}) {
         disabled: status === "Inactive"
       });
       try {
-        let finalModules = modulesAllowed;
-        if (!finalModules || finalModules.length === 0) {
-          if (assignedRole === "super_admin") finalModules = ["all"];
-          else if (assignedRole === "admin") {
+        let finalModules = Array.isArray(modulesAllowed) ? [...modulesAllowed] : [];
+        if (assignedRole !== "super_admin") {
+          finalModules = finalModules.filter((m) => !RESTRICTED_SUPER_ADMIN_MODULES.has(m));
+        }
+        if (finalModules.length === 0) {
+          if (assignedRole === "super_admin") {
+            finalModules = ["all"];
+          } else if (rolePermData?.modulePermissions) {
+            finalModules = Object.entries(rolePermData.modulePermissions).filter(([modKey, perms]) => Boolean(perms?.view) && !RESTRICTED_SUPER_ADMIN_MODULES.has(modKey)).map(([modKey]) => modKey);
+          } else if (roleDocData?.defaultPermissions) {
+            finalModules = Object.entries(roleDocData.defaultPermissions).filter(([modKey, perms]) => Boolean(perms?.view) && !RESTRICTED_SUPER_ADMIN_MODULES.has(modKey)).map(([modKey]) => modKey);
+          } else if (assignedRole === "admin") {
             finalModules = [
               "dashboard",
               "scanner",
@@ -5860,7 +6113,7 @@ function createApp(options = {}) {
               "history",
               "reports"
             ];
-          } else {
+          } else if (assignedRole === "user") {
             finalModules = ["dashboard", "scanner"];
           }
         }
@@ -5888,12 +6141,14 @@ function createApp(options = {}) {
           updatedAt: now
         };
         await adminDb.collection("user_roles").doc(docId).set(newRecord);
-        const defaultRolePerms = DEFAULT_ROLE_PERMISSIONS[assignedRole] || DEFAULT_ROLE_PERMISSIONS.user;
+        const rawDefaultPerms = rolePermData?.modulePermissions || roleDocData?.defaultPermissions || DEFAULT_ROLE_PERMISSIONS[assignedRole] || null;
+        const defaultRolePerms = sanitizeRoleModulePermissions(assignedRole, rawDefaultPerms);
         await adminDb.collection("user_permissions").doc(docId).set({
           id: docId,
           userId: docId,
           loginId: cleanId,
           role: assignedRole,
+          isCustomOverride: false,
           permissions: defaultRolePerms,
           updatedAt: now,
           updatedBy: cleanCallerId
@@ -6072,19 +6327,42 @@ function createApp(options = {}) {
       }
       const oldData = targetSnap.data() || {};
       const now = (/* @__PURE__ */ new Date()).toISOString();
-      const effectiveRole = String(role || oldData.role || "user").toLowerCase();
-      const restrictedMods = /* @__PURE__ */ new Set(["security_management", "audit_logs", "user_rights"]);
-      const safeModules = effectiveRole === "super_admin" ? modulesAllowed : modulesAllowed?.filter((m) => !restrictedMods.has(m));
+      const oldLoginId = String(oldData.loginId || "").trim().toLowerCase();
+      const targetUid = String(oldData.authUid || oldData.uid || "");
+      const requestedRole = role ? deriveStrictRoleId(role) : "";
+      if (requestedRole && requestedRole !== "super_admin" && (oldLoginId === "superadmin" || targetId === "role_superadmin" || CANONICAL_PROTECTED_UIDS.has(targetUid))) {
+        return res.status(400).json({
+          success: false,
+          error: "Action denied: Protected canonical system accounts cannot have their role downgraded."
+        });
+      }
+      if (requestedRole && !SYSTEM_ROLE_IDS.has(requestedRole)) {
+        const customRoleSnap = await adminDb.collection("roles").doc(requestedRole).get();
+        if (!customRoleSnap.exists) {
+          return res.status(400).json({
+            success: false,
+            error: `Role "${requestedRole}" does not exist.`
+          });
+        }
+        if (customRoleSnap.data()?.isActive === false) {
+          return res.status(400).json({
+            success: false,
+            error: `Role "${requestedRole}" is currently inactive.`
+          });
+        }
+      }
+      const effectiveRole = normalizeRoleValue(requestedRole || oldData.role || "user");
+      const safeModules = effectiveRole === "super_admin" ? modulesAllowed : modulesAllowed?.filter((m) => !RESTRICTED_SUPER_ADMIN_MODULES.has(m));
       const updatePayload = { updatedAt: now };
       if (safeModules) updatePayload.modulesAllowed = safeModules;
-      if (role) updatePayload.role = role;
+      if (requestedRole) updatePayload.role = requestedRole;
       if (status) updatePayload.status = status;
       await targetDocRef.update(updatePayload);
       if (oldData.authUid) {
         await syncUserUidIndex(adminDb, {
           uid: String(oldData.authUid),
           roleDocId: targetId,
-          role: role || String(oldData.role || "user"),
+          role: requestedRole || normalizeRoleValue(oldData.role || "user"),
           status: status || String(oldData.status || "Active"),
           lockStatus: oldData.isLocked || oldData.lockStatus === "LOCKED" ? "LOCKED" : "ACTIVE",
           loginId: String(oldData.loginId || "")
@@ -6099,18 +6377,14 @@ function createApp(options = {}) {
         }
       }
       if (permissions) {
-        const sanitizedPerms = { ...permissions };
-        if (effectiveRole !== "super_admin") {
-          sanitizedPerms.security_management = { view: false, add: false, edit: false, delete: false };
-          sanitizedPerms.audit_logs = { view: false, add: false, edit: false, delete: false };
-          sanitizedPerms.user_rights = { view: false, add: false, edit: false, delete: false };
-        }
+        const sanitizedPerms = sanitizeRoleModulePermissions(effectiveRole, permissions);
         await adminDb.collection("user_permissions").doc(targetId).set(
           {
             id: targetId,
             userId: targetId,
             loginId: oldData.loginId || "",
-            role: role || oldData.role || "user",
+            role: effectiveRole,
+            isCustomOverride: true,
             permissions: sanitizedPerms,
             updatedAt: now,
             updatedBy: cleanCallerId
@@ -6133,7 +6407,7 @@ function createApp(options = {}) {
           status: oldData.status
         },
         newValue: {
-          role: role || oldData.role,
+          role: effectiveRole,
           modulesAllowed: safeModules || oldData.modulesAllowed,
           status: status || oldData.status
         },
@@ -6157,18 +6431,18 @@ function createApp(options = {}) {
       if (roleId === "super_admin") {
         return res.status(400).json({ success: false, error: "Super Admin permissions are complete and permanent." });
       }
+      const roleDocSnap = await adminDb.collection("roles").doc(roleId).get();
+      if (!SYSTEM_ROLE_IDS.has(roleId) && !roleDocSnap.exists) {
+        return res.status(404).json({ success: false, error: `Role "${roleId}" does not exist.` });
+      }
+      const resolvedRoleName = String(roleDocSnap.exists ? roleDocSnap.data()?.roleName || "" : "").trim() || (roleId === "admin" ? "Admin" : roleId === "user" ? "User" : roleId.toUpperCase());
       const cleanCallerId = caller.loginId;
       const now = (/* @__PURE__ */ new Date()).toISOString();
-      const sanitizedModulePermissions = {
-        ...modulePermissions,
-        security_management: { view: false, add: false, edit: false, delete: false },
-        audit_logs: { view: false, add: false, edit: false, delete: false },
-        user_rights: { view: false, add: false, edit: false, delete: false }
-      };
+      const sanitizedModulePermissions = sanitizeRoleModulePermissions(roleId, modulePermissions);
       await adminDb.collection("role_permissions").doc(roleId).set(
         {
           roleId,
-          roleName: roleId === "admin" ? "Admin" : "User",
+          roleName: resolvedRoleName,
           modulePermissions: sanitizedModulePermissions,
           updatedAt: now,
           updatedBy: cleanCallerId
@@ -6177,6 +6451,8 @@ function createApp(options = {}) {
       );
       await adminDb.collection("roles").doc(roleId).set(
         {
+          roleId,
+          roleName: resolvedRoleName,
           defaultPermissions: sanitizedModulePermissions,
           updatedAt: now
         },
@@ -6188,12 +6464,29 @@ function createApp(options = {}) {
       });
       const usersSnap = await adminDb.collection("user_roles").where("role", "==", roleId).get();
       await Promise.all(
-        usersSnap.docs.map(
-          (uDoc) => adminDb.collection("user_roles").doc(uDoc.id).update({
+        usersSnap.docs.map(async (uDoc) => {
+          await adminDb.collection("user_roles").doc(uDoc.id).update({
             modulesAllowed: allowedModules,
             updatedAt: now
-          })
-        )
+          });
+          const userPermRef = adminDb.collection("user_permissions").doc(uDoc.id);
+          const userPermSnap = await userPermRef.get();
+          if (!userPermSnap.exists || userPermSnap.data()?.isCustomOverride !== true) {
+            await userPermRef.set(
+              {
+                id: uDoc.id,
+                userId: uDoc.id,
+                loginId: uDoc.data()?.loginId || "",
+                role: roleId,
+                isCustomOverride: false,
+                permissions: sanitizedModulePermissions,
+                updatedAt: now,
+                updatedBy: cleanCallerId
+              },
+              { merge: true }
+            );
+          }
+        })
       );
       await logAuditEvent({
         req,
@@ -6209,12 +6502,241 @@ function createApp(options = {}) {
       });
       return res.json({
         success: true,
-        message: `Role permissions for ${roleId.toUpperCase()} saved successfully.`,
+        message: `Role permissions for ${resolvedRoleName} saved successfully.`,
+        modulePermissions: sanitizedModulePermissions,
         updatedAt: now
       });
     } catch (err) {
       console.error("[Save Role Permissions] Error:", err);
       return res.status(500).json({ success: false, error: err?.message || "Failed to save role permissions." });
+    }
+  });
+  app.get("/api/admin/roles", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "List System and Custom Roles");
+      if (!caller) return;
+      const snap = await adminDb.collection("roles").get();
+      const map = /* @__PURE__ */ new Map();
+      PREDEFINED_ROLES.forEach((def) => {
+        map.set(def.roleId, { ...def });
+      });
+      snap.docs.forEach((d) => {
+        const data = d.data() || {};
+        const roleId = normalizeRoleValue(data.roleId || d.id);
+        map.set(roleId, {
+          ...data,
+          roleId,
+          roleName: String(data.roleName || roleId.toUpperCase()),
+          isActive: data.isActive !== false,
+          isSystemRole: SYSTEM_ROLE_IDS.has(roleId)
+        });
+      });
+      const orderPriority = { super_admin: 0, admin: 1, user: 2 };
+      const roles = Array.from(map.values()).sort((a, b) => {
+        const pA = orderPriority[a.roleId] ?? 10;
+        const pB = orderPriority[b.roleId] ?? 10;
+        if (pA !== pB) return pA - pB;
+        return String(a.roleName || a.roleId).localeCompare(String(b.roleName || b.roleId));
+      });
+      return res.json({ success: true, roles });
+    } catch (err) {
+      console.error("[Roles API] List error:", err);
+      return res.status(500).json({ success: false, error: "Failed to load role definitions." });
+    }
+  });
+  app.post("/api/admin/roles", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, ["super_admin"], "Create or Update Role");
+      if (!caller) return;
+      const parsed = RoleDefinitionInputSchema.safeParse(req.body || {});
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || "Invalid role definition payload."
+        });
+      }
+      const rawIdCandidate = parsed.data.roleId || parsed.data.roleName;
+      const derivedId = deriveStrictRoleId(rawIdCandidate);
+      const isCreatingFromName = !parsed.data.roleId;
+      if (!derivedId || !VALID_ROLE_ID_REGEX.test(derivedId)) {
+        return res.status(400).json({
+          success: false,
+          error: "Role ID must start with a letter and use lowercase letters, numbers, or underscores."
+        });
+      }
+      if (isCreatingFromName && (SYSTEM_ROLE_IDS.has(derivedId) || RESERVED_CUSTOM_ROLE_ALIASES.has(derivedId))) {
+        return res.status(400).json({
+          success: false,
+          error: `Role name "${parsed.data.roleName}" conflicts with a reserved system role.`
+        });
+      }
+      if (parsed.data.roleId && RESERVED_CUSTOM_ROLE_ALIASES.has(derivedId) && derivedId !== "super_admin") {
+        return res.status(400).json({
+          success: false,
+          error: `Role ID "${derivedId}" is reserved and cannot be used for a custom role.`
+        });
+      }
+      if (derivedId === "super_admin") {
+        return res.status(400).json({
+          success: false,
+          error: "Super Admin system role configuration is protected and immutable."
+        });
+      }
+      const isSystem = SYSTEM_ROLE_IDS.has(derivedId);
+      if (isSystem && parsed.data.isActive === false) {
+        return res.status(400).json({
+          success: false,
+          error: "Built-in system roles cannot be deactivated."
+        });
+      }
+      const roleRef = adminDb.collection("roles").doc(derivedId);
+      const existingSnap = await roleRef.get();
+      const existingData = existingSnap.exists ? existingSnap.data() || {} : null;
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      const cleanCallerId = caller.loginId;
+      const sanitizedDefaultPerms = sanitizeRoleModulePermissions(
+        derivedId,
+        parsed.data.defaultPermissions || existingData?.defaultPermissions || DEFAULT_ROLE_PERMISSIONS[derivedId] || null
+      );
+      const roleDoc = {
+        roleId: derivedId,
+        roleName: parsed.data.roleName.trim(),
+        description: parsed.data.description.trim(),
+        isActive: isSystem ? true : Boolean(parsed.data.isActive),
+        isSystemRole: isSystem,
+        defaultPermissions: sanitizedDefaultPerms,
+        createdAt: existingData?.createdAt || now,
+        createdBy: existingData?.createdBy || cleanCallerId,
+        updatedAt: now,
+        updatedBy: cleanCallerId
+      };
+      await roleRef.set(roleDoc, { merge: true });
+      await adminDb.collection("role_permissions").doc(derivedId).set(
+        {
+          roleId: derivedId,
+          roleName: roleDoc.roleName,
+          modulePermissions: sanitizedDefaultPerms,
+          updatedAt: now,
+          updatedBy: cleanCallerId
+        },
+        { merge: true }
+      );
+      if (parsed.data.defaultPermissions) {
+        const allowedModules = Object.entries(sanitizedDefaultPerms).filter(([, perms]) => Boolean(perms?.view)).map(([modKey]) => modKey);
+        const usersSnap = await adminDb.collection("user_roles").where("role", "==", derivedId).get();
+        await Promise.all(
+          usersSnap.docs.map(async (uDoc) => {
+            await adminDb.collection("user_roles").doc(uDoc.id).update({
+              modulesAllowed: allowedModules,
+              updatedAt: now
+            });
+            const userPermRef = adminDb.collection("user_permissions").doc(uDoc.id);
+            const userPermSnap = await userPermRef.get();
+            if (!userPermSnap.exists || userPermSnap.data()?.isCustomOverride !== true) {
+              await userPermRef.set(
+                {
+                  id: uDoc.id,
+                  userId: uDoc.id,
+                  loginId: uDoc.data()?.loginId || "",
+                  role: derivedId,
+                  isCustomOverride: false,
+                  permissions: sanitizedDefaultPerms,
+                  updatedAt: now,
+                  updatedBy: cleanCallerId
+                },
+                { merge: true }
+              );
+            }
+          })
+        );
+      }
+      await logAuditEvent({
+        req,
+        action: existingSnap.exists ? "role_updated" : "role_created",
+        targetUid: derivedId,
+        loginId: derivedId,
+        performedByUid: caller.uid,
+        performedByLoginId: cleanCallerId,
+        performedByRole: "SUPER_ADMIN",
+        actionSource: "ROLE_MANAGEMENT",
+        previousValue: existingData ? {
+          roleName: existingData.roleName,
+          description: existingData.description,
+          isActive: existingData.isActive
+        } : void 0,
+        newValue: {
+          roleId: derivedId,
+          roleName: roleDoc.roleName,
+          description: roleDoc.description,
+          isActive: roleDoc.isActive
+        },
+        details: `${existingSnap.exists ? "Updated" : "Created"} role "${roleDoc.roleName}" (${derivedId}).`
+      });
+      return res.json({
+        success: true,
+        created: !existingSnap.exists,
+        role: roleDoc,
+        modulePermissions: sanitizedDefaultPerms
+      });
+    } catch (err) {
+      console.error("[Save Role Definition] Error:", err);
+      return res.status(500).json({ success: false, error: err?.message || "Failed to save role definition." });
+    }
+  });
+  app.delete("/api/admin/roles/:roleId", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, ["super_admin"], "Delete Custom Role");
+      if (!caller) return;
+      const roleId = deriveStrictRoleId(req.params.roleId);
+      if (!roleId || !VALID_ROLE_ID_REGEX.test(roleId)) {
+        return res.status(400).json({ success: false, error: "Invalid role ID." });
+      }
+      if (SYSTEM_ROLE_IDS.has(roleId)) {
+        return res.status(400).json({
+          success: false,
+          error: `Built-in system role "${roleId}" cannot be deleted.`
+        });
+      }
+      const roleSnap = await adminDb.collection("roles").doc(roleId).get();
+      if (!roleSnap.exists) {
+        return res.status(404).json({ success: false, error: `Role "${roleId}" not found.` });
+      }
+      const assignedUsersSnap = await adminDb.collection("user_roles").where("role", "==", roleId).limit(1).get();
+      if (!assignedUsersSnap.empty) {
+        return res.status(400).json({
+          success: false,
+          error: `Cannot delete role "${roleId}" while one or more user accounts are assigned to it.`
+        });
+      }
+      const prevRoleData = roleSnap.data() || {};
+      await Promise.all([
+        adminDb.collection("roles").doc(roleId).delete(),
+        adminDb.collection("role_permissions").doc(roleId).delete().catch(() => {
+        })
+      ]);
+      await logAuditEvent({
+        req,
+        action: "role_deleted",
+        targetUid: roleId,
+        loginId: roleId,
+        performedByUid: caller.uid,
+        performedByLoginId: caller.loginId,
+        performedByRole: "SUPER_ADMIN",
+        actionSource: "ROLE_MANAGEMENT",
+        previousValue: {
+          roleId,
+          roleName: prevRoleData.roleName,
+          description: prevRoleData.description
+        },
+        details: `Deleted custom role "${prevRoleData.roleName || roleId}" (${roleId}).`
+      });
+      return res.json({
+        success: true,
+        message: `Custom role "${prevRoleData.roleName || roleId}" deleted successfully.`
+      });
+    } catch (err) {
+      console.error("[Delete Custom Role] Error:", err);
+      return res.status(500).json({ success: false, error: err?.message || "Failed to delete role." });
     }
   });
   app.get("/api/admin/duplicate-accounts-report", async (req, res) => {
@@ -6449,10 +6971,17 @@ function createApp(options = {}) {
       const caller = await requireVerifiedCaller(
         req,
         res,
-        ["super_admin", "admin", "user"],
+        "*",
         "Dashboard Summary"
       );
       if (!caller) return;
+      const access = await getCallerEffectiveDashboardAccess(caller);
+      if (!access.allowed) {
+        return res.status(403).json({
+          success: false,
+          error: `Forbidden: Role "${caller.role.toUpperCase()}" does not have Dashboard view permission.`
+        });
+      }
       const date = req.query.date || (/* @__PURE__ */ new Date()).toISOString().substring(0, 10);
       const [attSnap, empSnap, rosterSnap] = await Promise.all([
         adminDb.collection("attendance").where("shiftDate", "==", date).get(),
@@ -6484,7 +7013,7 @@ function createApp(options = {}) {
       return res.json({
         success: true,
         role: caller.role.toUpperCase(),
-        readOnly: caller.role === "user",
+        readOnly: access.readOnly,
         metrics: {
           activeTotal,
           totalPresent,
@@ -6510,7 +7039,7 @@ function createApp(options = {}) {
       const caller = await requireVerifiedCaller(
         req,
         res,
-        ["super_admin", "admin", "user"],
+        "*",
         "View Role Permissions"
       );
       if (!caller) return;
@@ -6579,11 +7108,13 @@ if (!process.env.VITEST && !process.env.VERCEL) {
 export {
   AI_STUDIO_DEV_ORIGIN,
   AI_STUDIO_PREVIEW_ORIGIN,
+  RESTRICTED_SUPER_ADMIN_MODULES,
   VERCEL_PRODUCTION_ORIGIN,
   buildAllowedOriginsSet,
   createApp,
   hashPassword,
   normalizeAllowedOrigin,
+  sanitizeRoleModulePermissions,
   startServer,
   syncExistingFirebaseAuthPassword,
   verifyPassword

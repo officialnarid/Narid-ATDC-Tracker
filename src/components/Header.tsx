@@ -26,7 +26,14 @@ export const Header: React.FC<HeaderProps> = ({
   const [autoCloseMessage, setAutoCloseMessage] = useState<string | null>(null);
 
   const normalizedRole = String(currentUserRole?.role || 'USER').toUpperCase();
-  const canRunAutoClose = normalizedRole === 'SUPER_ADMIN' || normalizedRole === 'ADMIN';
+  const canRunAutoClose =
+    normalizedRole === 'SUPER_ADMIN' ||
+    normalizedRole === 'ADMIN' ||
+    (normalizedRole !== 'USER' &&
+      Array.isArray(currentUserRole?.modulesAllowed) &&
+      (currentUserRole.modulesAllowed.includes('all') ||
+        currentUserRole.modulesAllowed.includes('shifts') ||
+        currentUserRole.modulesAllowed.includes('history')));
   const canOpenScanner = isModuleAllowedForUser(currentUserRole, 'scanner');
 
   // Live Clock (Asia/Kolkata)

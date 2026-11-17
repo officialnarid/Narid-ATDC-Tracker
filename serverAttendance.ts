@@ -274,29 +274,54 @@ const ClearAttendanceSchema = z.object({
 });
 
 // ============================================================================
-// Module Permission Evaluator for Scanner Enforcement (Strictly Fail-Closed)
+// Centralized Module Permission Evaluator (Strictly Fail-Closed for All Roles)
 // ============================================================================
-async function callerHasScannerAccess(db: AdminFirestoreLike, caller: VerifiedCaller): Promise<boolean> {
+const ADMIN_FALLBACK_ACTIONS: Record<string, { view?: boolean; add?: boolean; edit?: boolean; delete?: boolean }> = {
+  dashboard: { view: true },
+  scanner: { view: true, add: true, edit: true },
+  employees: { view: true, add: true, edit: true },
+  excel_import: { view: true, add: true, edit: true },
+  qr_codes: { view: true, add: true, edit: true },
+  organization: { view: true, add: true, edit: true },
+  floors: { view: true, add: true, edit: true },
+  sections: { view: true, add: true, edit: true },
+  departments: { view: true, add: true, edit: true },
+  shifts: { view: true, add: true, edit: true },
+  history: { view: true, edit: true },
+  reports: { view: true },
+};
+
+async function callerHasModuleAction(
+  db: AdminFirestoreLike,
+  caller: VerifiedCaller,
+  moduleKey: string,
+  action: 'view' | 'add' | 'edit' | 'delete'
+): Promise<boolean> {
   if (caller.role === 'super_admin') return true;
+  if (moduleKey === 'user_rights' || moduleKey === 'audit_logs' || moduleKey === 'security_management') {
+    return false;
+  }
 
   try {
     const userPermSnap = await db.collection('user_permissions').doc(caller.profileDocId).get();
-    if (userPermSnap.exists) {
-      const mod = userPermSnap.data()?.permissions?.scanner;
-      if (mod && (mod.view === false || mod.add === false)) {
-        return false;
-      }
-      if (mod && mod.view === true) {
-        return true;
+    if (userPermSnap.exists && userPermSnap.data()?.isCustomOverride !== false) {
+      const mod = userPermSnap.data()?.permissions?.[moduleKey];
+      if (mod && typeof mod[action] === 'boolean') {
+        return mod[action] === true && (action === 'view' || mod.view !== false);
       }
     }
 
     const rolePermSnap = await db.collection('role_permissions').doc(caller.role).get();
     if (rolePermSnap.exists) {
-      const mod = rolePermSnap.data()?.modulePermissions?.scanner;
-      if (mod) {
-        return Boolean(mod.view && mod.add !== false);
+      const mod = rolePermSnap.data()?.modulePermissions?.[moduleKey];
+      if (mod && typeof mod[action] === 'boolean') {
+        return mod[action] === true && (action === 'view' || mod.view !== false);
       }
+    }
+
+    // Legacy / unseeded built-in defaults & modulesAllowed compatibility
+    if (caller.role === 'admin') {
+      return Boolean(ADMIN_FALLBACK_ACTIONS[moduleKey]?.[action]);
     }
 
     const userSnap = await db.collection('user_roles').doc(caller.profileDocId).get();
@@ -304,15 +329,23 @@ async function callerHasScannerAccess(db: AdminFirestoreLike, caller: VerifiedCa
       const mods: any[] = Array.isArray(userSnap.data()?.modulesAllowed)
         ? userSnap.data()!.modulesAllowed
         : [];
-      return mods.includes('all') || mods.includes('scanner');
+      if (mods.includes('all') || mods.includes(moduleKey)) {
+        if (action === 'view') return true;
+        if (moduleKey === 'scanner' && action === 'add') return true;
+      }
     }
 
-    // No explicit user_roles or permissions document resolved -> fail closed
     return false;
   } catch (err) {
-    console.warn('[Scanner Permission Guard] Lookup failed; failing closed:', (err as any)?.message || err);
+    console.warn(`[Attendance Permission Guard] Lookup failed (${moduleKey}.${action}); failing closed:`, (err as any)?.message || err);
     return false;
   }
+}
+
+async function callerHasScannerAccess(db: AdminFirestoreLike, caller: VerifiedCaller): Promise<boolean> {
+  const canView = await callerHasModuleAction(db, caller, 'scanner', 'view');
+  if (!canView) return false;
+  return callerHasModuleAction(db, caller, 'scanner', 'add');
 }
 
 export interface AttendanceRoutesDeps {
@@ -320,7 +353,7 @@ export interface AttendanceRoutesDeps {
   requireVerifiedCaller: (
     req: Request,
     res: Response,
-    allowedRoles: Array<'super_admin' | 'admin' | 'user'>,
+    allowedRoles: string[] | '*',
     actionLabel: string
   ) => Promise<VerifiedCaller | null>;
 }
@@ -344,7 +377,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
       const caller = await requireVerifiedCaller(
         req,
         res,
-        ['super_admin', 'admin', 'user'],
+        '*',
         'Attendance Scan Processing'
       );
       if (!caller) return;
@@ -384,12 +417,17 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
       const { rawPayload, scannerDevice = 'USB_SCANNER', customScanTime } = parsed.data;
       let { scannerType } = parsed.data;
 
-      // Only ADMIN or SUPER_ADMIN can specify customScanTime (prevents floor operator timestamp spoofing)
-      if (customScanTime && caller.role === 'user') {
-        return res.status(403).json({
-          success: false,
-          error: 'Forbidden: Only Admin or Super Admin can submit custom scan timestamps.',
-        });
+      // Only roles permitted scanner.edit or history.edit can submit customScanTime (prevents operator timestamp spoofing)
+      if (customScanTime) {
+        const canCustomTime =
+          (await callerHasModuleAction(db, caller, 'scanner', 'edit')) ||
+          (await callerHasModuleAction(db, caller, 'history', 'edit'));
+        if (!canCustomTime) {
+          return res.status(403).json({
+            success: false,
+            error: 'Forbidden: Your role is not permitted to submit custom scan timestamps.',
+          });
+        }
       }
 
       const now = customScanTime ? new Date(customScanTime) : new Date();
@@ -1059,10 +1097,34 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
       const caller = await requireVerifiedCaller(
         req,
         res,
-        ['super_admin', 'admin'],
+        '*',
         'Auto Close Expired Shifts'
       );
       if (!caller) return;
+
+      const canAutoClose =
+        (await callerHasModuleAction(db, caller, 'history', 'edit')) ||
+        (await callerHasModuleAction(db, caller, 'shifts', 'edit'));
+      if (!canAutoClose) {
+        await recordEnterpriseAuditEvent(db, {
+          req,
+          action: 'unauthorized_access_attempt',
+          category: 'SECURITY',
+          severity: 'CRITICAL',
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: caller.role.toUpperCase(),
+          targetType: 'ATTENDANCE_AUTO_CLOSE',
+          targetId: '/api/attendance/auto-close',
+          actionSource: 'ATTENDANCE_PERMISSION_GUARD',
+          description: `Unauthorized auto-close attempt by "${caller.loginId}" (${caller.role}).`,
+          success: false,
+        });
+        return res.status(403).json({
+          success: false,
+          error: `Forbidden: Role "${caller.role.toUpperCase()}" is not permitted for Auto Close Expired Shifts.`,
+        });
+      }
 
       const now = new Date();
       const [settingsSnap, shiftsSnap, openSnap] = await Promise.all([
@@ -1170,10 +1232,32 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
       const caller = await requireVerifiedCaller(
         req,
         res,
-        ['super_admin', 'admin'],
+        '*',
         'Manual Attendance Correction'
       );
       if (!caller) return;
+
+      const canCorrect = await callerHasModuleAction(db, caller, 'history', 'edit');
+      if (!canCorrect) {
+        await recordEnterpriseAuditEvent(db, {
+          req,
+          action: 'unauthorized_access_attempt',
+          category: 'SECURITY',
+          severity: 'CRITICAL',
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: caller.role.toUpperCase(),
+          targetType: 'ATTENDANCE_CORRECTION',
+          targetId: '/api/attendance/correct',
+          actionSource: 'ATTENDANCE_PERMISSION_GUARD',
+          description: `Unauthorized attendance correction attempt by "${caller.loginId}" (${caller.role}).`,
+          success: false,
+        });
+        return res.status(403).json({
+          success: false,
+          error: `Forbidden: Role "${caller.role.toUpperCase()}" is not permitted for Manual Attendance Correction.`,
+        });
+      }
 
       const parsed = AttendanceCorrectSchema.safeParse(req.body);
       if (!parsed.success) {
@@ -1273,10 +1357,35 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
       const caller = await requireVerifiedCaller(
         req,
         res,
-        ['super_admin', 'admin'],
+        '*',
         'Generate Shift Roster'
       );
       if (!caller) return;
+
+      const canGenerateRoster =
+        (await callerHasModuleAction(db, caller, 'shifts', 'add')) ||
+        (await callerHasModuleAction(db, caller, 'shifts', 'edit')) ||
+        (caller.role === 'admin' && (await callerHasModuleAction(db, caller, 'shifts', 'view')));
+      if (!canGenerateRoster) {
+        await recordEnterpriseAuditEvent(db, {
+          req,
+          action: 'unauthorized_access_attempt',
+          category: 'SECURITY',
+          severity: 'CRITICAL',
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: caller.role.toUpperCase(),
+          targetType: 'SHIFT_ROSTER',
+          targetId: '/api/attendance/roster',
+          actionSource: 'ATTENDANCE_PERMISSION_GUARD',
+          description: `Unauthorized shift roster generation attempt by "${caller.loginId}" (${caller.role}).`,
+          success: false,
+        });
+        return res.status(403).json({
+          success: false,
+          error: `Forbidden: Role "${caller.role.toUpperCase()}" is not permitted for Generate Shift Roster.`,
+        });
+      }
 
       const parsed = GenerateRosterSchema.safeParse(req.body);
       if (!parsed.success) {

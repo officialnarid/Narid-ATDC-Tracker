@@ -223,7 +223,7 @@ export default function App() {
     setCurrentUser(fbUser);
     setCurrentUserRole(profile);
     const requestedUrlTab = getTabFromLocation();
-    const destinationTab = requestedUrlTab || getDefaultTabForRole(profile.role);
+    const destinationTab = requestedUrlTab || getDefaultTabForRole(profile.role, profile);
     setCurrentTab(destinationTab);
     try {
       window.history.replaceState(null, '', `/${destinationTab}`);
@@ -424,7 +424,7 @@ export default function App() {
           localStorage.setItem('narid_active_user', JSON.stringify(cleanProfile));
           sessionStorage.setItem('narid_active_user', JSON.stringify(cleanProfile));
           setCurrentUserRole(cleanProfile);
-          const nextTab = getDefaultTabForRole(cleanProfile.role);
+          const nextTab = getDefaultTabForRole(cleanProfile.role, cleanProfile);
           setCurrentTab(nextTab);
           try {
             window.history.replaceState(null, '', `/${nextTab}`);
@@ -490,7 +490,7 @@ export default function App() {
             <UnauthorizedAccess 
               currentTab={currentTab} 
               currentUserRole={currentUserRole} 
-              onGoHome={() => handleSelectTab(getDefaultTabForRole(currentUserRole.role))} 
+              onGoHome={() => handleSelectTab(getDefaultTabForRole(currentUserRole.role, currentUserRole))} 
             />
           ) : (
             <>
@@ -505,6 +505,7 @@ export default function App() {
                   onNavigateToReports={() => handleSelectTab('reports')}
                   onRefreshData={() => loadAllMasterData(false)}
                   currentUserRole={currentUserRole}
+                  rolePermissions={rolePermissions}
                   isFullscreen={isFullscreenDashboard}
                   onToggleFullscreen={() => handleToggleFullscreen('dashboard')}
                   onExitFullscreen={handleExitFullscreen}
@@ -616,7 +617,7 @@ export default function App() {
                   <UnauthorizedAccess
                     currentTab={currentTab}
                     currentUserRole={currentUserRole}
-                    onGoHome={() => setCurrentTab(getDefaultTabForRole(currentUserRole.role))}
+                    onGoHome={() => setCurrentTab(getDefaultTabForRole(currentUserRole.role, currentUserRole))}
                   />
                 )
               )}
@@ -628,7 +629,7 @@ export default function App() {
                   <UnauthorizedAccess
                     currentTab={currentTab}
                     currentUserRole={currentUserRole}
-                    onGoHome={() => setCurrentTab(getDefaultTabForRole(currentUserRole.role))}
+                    onGoHome={() => setCurrentTab(getDefaultTabForRole(currentUserRole.role, currentUserRole))}
                   />
                 )
               )}

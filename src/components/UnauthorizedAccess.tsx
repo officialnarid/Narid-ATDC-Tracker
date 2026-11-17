@@ -12,6 +12,11 @@ interface UnauthorizedAccessProps {
 export function UnauthorizedAccess({ currentTab, currentUserRole, onGoHome }: UnauthorizedAccessProps) {
   const roleDisplay = (currentUserRole.role || 'user').toUpperCase().replace('_', ' ');
 
+  const isSuperAdminRestrictedTab =
+    currentTab === 'user_rights' ||
+    currentTab === 'audit_logs' ||
+    currentTab === 'security_management';
+
   return (
     <div className="h-full w-full flex items-center justify-center p-6 bg-slate-900 text-white">
       <div className="max-w-md w-full bg-slate-950 border border-red-500/30 rounded-2xl p-8 shadow-2xl text-center flex flex-col items-center">
@@ -42,7 +47,9 @@ export function UnauthorizedAccess({ currentTab, currentUserRole, onGoHome }: Un
           </div>
           <div className="flex justify-between">
             <span>Required Authorization:</span>
-            <span className="font-mono text-amber-300">SUPER_ADMIN / ADMIN</span>
+            <span className="font-mono text-amber-300">
+              {isSuperAdminRestrictedTab ? 'SUPER_ADMIN Only' : 'SUPER_ADMIN / Authorized Role'}
+            </span>
           </div>
         </div>
 

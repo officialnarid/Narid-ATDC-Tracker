@@ -485,27 +485,47 @@ export async function logoutUser(reason: 'logout' | 'session_expired' = 'logout'
   } catch {}
 }
 
-// Determine default redirect tab for role
-export function getDefaultTabForRole(role: UserRoleType): NavItem {
+const LANDING_TAB_PRIORITY: NavItem[] = [
+  'dashboard',
+  'scanner',
+  'employees',
+  'history',
+  'reports',
+  'floors',
+  'sections',
+  'departments',
+  'shifts',
+  'qr_codes',
+  'excel_import',
+  'settings',
+];
+
+// Determine default redirect tab for role (supports future custom roles without dashboard permission)
+export function getDefaultTabForRole(role: UserRoleType, profile?: UserRoleRecord | null): NavItem {
   const normalized = (role || '').toUpperCase();
-  switch (normalized) {
-    case 'SUPER_ADMIN':
-      return 'dashboard';
-    case 'ADMIN':
-      return 'dashboard';
-    case 'USER':
-      return 'dashboard';
-    default:
-      return 'dashboard';
+  if (normalized === 'SUPER_ADMIN') {
+    return 'dashboard';
   }
+
+  if (profile && Array.isArray(profile.modulesAllowed)) {
+    if (profile.modulesAllowed.includes('all') || profile.modulesAllowed.includes('dashboard')) {
+      return 'dashboard';
+    }
+    const firstAllowed = LANDING_TAB_PRIORITY.find((tab) => isModuleAllowedForUser(profile, tab));
+    if (firstAllowed) {
+      return firstAllowed;
+    }
+  }
+
+  return 'dashboard';
 }
 
 // Dynamic user-level access validation checking custom Firestore permissions
 export function isModuleAllowedForUser(profile: UserRoleRecord | null | undefined, tab: NavItem): boolean {
   if (!profile) return false;
 
-  const normalized = (profile.role || '').toUpperCase();
-  if (normalized === 'SUPER_ADMIN') {
+  const normalized = (profile.role || '').trim().toUpperCase();
+  if (normalized === 'SUPER_ADMIN' || normalized === 'SUPERADMIN') {
     return true; // Super Admin always has full access
   }
 
@@ -522,7 +542,7 @@ export function isModuleAllowedForUser(profile: UserRoleRecord | null | undefine
     return profile.modulesAllowed.includes(tab);
   }
 
-  // Default fallback if modulesAllowed is not set
+  // Default fallback ONLY for built-in system roles if modulesAllowed is not set
   if (normalized === 'ADMIN') {
     return tab !== 'settings';
   }
@@ -534,8 +554,8 @@ export function isModuleAllowedForUser(profile: UserRoleRecord | null | undefine
 
 // Role-based access validation for navigation (legacy wrapper)
 export function isModuleAllowedForRole(role: UserRoleType, tab: NavItem): boolean {
-  const normalized = (role || '').toUpperCase();
-  if (normalized === 'SUPER_ADMIN') {
+  const normalized = (role || '').trim().toUpperCase();
+  if (normalized === 'SUPER_ADMIN' || normalized === 'SUPERADMIN') {
     return true; // Full access
   }
   if (tab === 'security_management' || tab === 'audit_logs' || tab === 'user_rights') {

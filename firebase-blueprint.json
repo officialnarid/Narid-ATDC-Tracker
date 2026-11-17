@@ -261,12 +261,12 @@
     },
     "UserRole": {
       "title": "UserRole",
-      "description": "RBAC user role structure",
+      "description": "RBAC user role structure supporting built-in and dynamic custom roles",
       "type": "object",
       "properties": {
         "id": { "type": "string" },
         "name": { "type": "string" },
-        "role": { "type": "string", "enum": ["SUPER_ADMIN", "ADMIN", "USER", "super_admin", "admin", "user"] },
+        "role": { "type": "string", "description": "Canonical role identifier (super_admin, admin, user, or custom roleId)" },
         "status": { "type": "string", "enum": ["Active", "Inactive"] },
         "modulesAllowed": { "type": "string" }
       },
@@ -274,11 +274,12 @@
     },
     "RolePermission": {
       "title": "RolePermission",
-      "description": "Role-based granular module permissions (View, Add, Edit, Delete)",
+      "description": "Role-based granular module permissions (View, Add, Edit, Delete) for built-in and custom roles",
       "type": "object",
       "properties": {
-        "roleId": { "type": "string", "enum": ["super_admin", "admin", "user"] },
-        "modulePermissions": { "type": "string", "description": "JSON map of module permissions" },
+        "roleId": { "type": "string", "description": "Canonical role identifier (system or custom role)" },
+        "roleName": { "type": "string" },
+        "modulePermissions": { "type": "string", "description": "Module permissions map (View, Add, Edit, Delete per module)" },
         "updatedAt": { "type": "string", "format": "date-time" },
         "updatedBy": { "type": "string", "description": "Login ID of Super Admin who updated" }
       },
@@ -286,14 +287,16 @@
     },
     "Role": {
       "title": "Role",
-      "description": "Predefined system role definitions (super_admin, admin, user)",
+      "description": "System role definitions (super_admin, admin, user) and future Super Admin created custom roles",
       "type": "object",
       "properties": {
-        "roleId": { "type": "string", "enum": ["super_admin", "admin", "user"] },
+        "roleId": { "type": "string", "description": "Canonical lowercase role identifier" },
         "roleName": { "type": "string" },
         "description": { "type": "string" },
         "defaultPermissions": { "type": "string" },
+        "isSystemRole": { "type": "boolean" },
         "isActive": { "type": "boolean" },
+        "createdBy": { "type": "string" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["roleId", "roleName", "description", "isActive", "updatedAt"]

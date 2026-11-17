@@ -40,6 +40,7 @@ import {
   isDashboardCardVisible, 
   normalizeUserRole 
 } from '../config/dashboardCardsConfig';
+import { RolePermissionRecord, normalizeRoleId } from '../services/permissionService';
 
 interface DashboardProps {
   employees: Employee[];
@@ -51,6 +52,7 @@ interface DashboardProps {
   onNavigateToReports: () => void;
   onRefreshData?: () => void;
   currentUserRole?: UserRoleRecord | null;
+  rolePermissions?: Record<string, RolePermissionRecord>;
   isFullscreen?: boolean;
   onToggleFullscreen?: () => void;
   onExitFullscreen?: () => void;
@@ -66,12 +68,13 @@ export const Dashboard: React.FC<DashboardProps> = ({
   onNavigateToReports,
   onRefreshData,
   currentUserRole,
+  rolePermissions,
   isFullscreen = false,
   onToggleFullscreen,
   onExitFullscreen,
 }) => {
   // Authoritative Role Resolution directly from Firestore
-  const [verifiedRole, setVerifiedRole] = useState<'SUPER_ADMIN' | 'ADMIN' | 'USER'>(() => {
+  const [verifiedRole, setVerifiedRole] = useState<string>(() => {
     return normalizeUserRole(currentUserRole?.role);
   });
 
@@ -268,6 +271,13 @@ export const Dashboard: React.FC<DashboardProps> = ({
     ? Math.max(0, expectedManpower - presentCount)
     : Math.max(0, activeEmployees.length - presentCount);
 
+  const activeRoleModulePerms = rolePermissions?.[normalizeRoleId(verifiedRole)]?.modulePermissions || null;
+  const permittedCardIds = getPermittedCardIdsForRole(
+    verifiedRole,
+    currentUserRole?.modulesAllowed,
+    activeRoleModulePerms
+  );
+
   // Protected Drilldown handler
   const handleOpenDrilldown = (
     cardId: DashboardCardId,
@@ -275,7 +285,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
     filterFn: (emp: Employee, att?: AttendanceRecord) => boolean
   ) => {
     // Role Authorization Check: block drilldown if card is hidden for this role
-    if (!isDashboardCardVisible(verifiedRole, cardId)) {
+    if (!isDashboardCardVisible(verifiedRole, cardId, currentUserRole?.modulesAllowed, activeRoleModulePerms)) {
       console.warn(`[Security] Drilldown for ${cardId} is unauthorized for role ${verifiedRole}`);
       return;
     }
@@ -512,13 +522,17 @@ export const Dashboard: React.FC<DashboardProps> = ({
                 ? 'bg-red-100 text-red-700 border border-red-200'
                 : verifiedRole === 'ADMIN'
                   ? 'bg-blue-100 text-blue-700 border border-blue-200'
-                  : 'bg-emerald-100 text-emerald-700 border border-emerald-200'
+                  : verifiedRole === 'USER'
+                    ? 'bg-emerald-100 text-emerald-700 border border-emerald-200'
+                    : 'bg-indigo-100 text-indigo-700 border border-indigo-200'
             }`}>
               {verifiedRole === 'SUPER_ADMIN'
                 ? 'Super Admin View (All 12 Cards)'
                 : verifiedRole === 'ADMIN'
                   ? 'Admin View (All 12 Cards)'
-                  : 'User View (Read-Only)'}
+                  : verifiedRole === 'USER'
+                    ? 'User View (Read-Only)'
+                    : `${verifiedRole.replace(/_/g, ' ')} View (${permittedCardIds.length} Cards)`}
             </span>
           </div>
           <p className="text-xs text-slate-500 mt-0.5">
@@ -664,7 +678,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         - USER (Read-Only): Strictly 6 permitted KPIs (Active Total, Total Present, Absent, Duty Hours, OT Hours, Missed Punch Out)
       */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-        {getPermittedCardIdsForRole(verifiedRole).map(cardId => (
+        {permittedCardIds.map(cardId => (
           renderCard(cardId)
         ))}
       </div>

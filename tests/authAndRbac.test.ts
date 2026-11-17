@@ -440,4 +440,390 @@ describe('Authentication, Token Revocation & Strict UID-Only RBAC', () => {
       .send({ currentPassword: TEST_CANONICAL_ACCOUNTS.user.password, newPassword: 'NewUserPass#1' });
     expect(expiredChange.status).toBe(401);
   });
+
+  it('completes full Super Admin temp-password reset -> temporary password login -> Admin first-time password change -> normal login flow', async () => {
+    const superToken = auth.issueToken(TEST_CANONICAL_ACCOUNTS.superadmin.uid);
+
+    // 1. Super Admin resets Admin password and system generates a temporary password
+    const resetRes = await request(app)
+      .post('/api/security/generate-temp-password')
+      .set('Authorization', `Bearer ${superToken}`)
+      .send({
+        targetLoginId: 'admin',
+        reason: 'Admin forgot password and requested supervised reset',
+        freshSuperAdminPassword: TEST_CANONICAL_ACCOUNTS.superadmin.password,
+      });
+
+    expect(resetRes.status).toBe(200);
+    expect(resetRes.body.success).toBe(true);
+    expect(resetRes.body.targetLoginId).toBe('admin');
+    expect(resetRes.body.firebaseUid).toBe(TEST_CANONICAL_ACCOUNTS.admin.uid);
+    expect(resetRes.body.forcePasswordChange).toBe(true);
+    expect(resetRes.body.firebaseAuthSynced).toBe(true);
+
+    const tempPassword = String(resetRes.body.temporaryPassword || '');
+    expect(tempPassword.length).toBeGreaterThanOrEqual(12);
+    expect(auth.getUserPasswordUnsafe(TEST_CANONICAL_ACCOUNTS.admin.uid)).toBe(tempPassword);
+
+    // 2. Old Admin password is invalid; Admin logs in with temporary password -> mustChangePassword=true
+    const oldLoginRes = await request(app)
+      .post('/api/auth/login')
+      .set('X-Forwarded-For', '198.51.100.41')
+      .send({ loginId: 'admin', password: TEST_CANONICAL_ACCOUNTS.admin.password });
+    expect(oldLoginRes.status).toBe(401);
+
+    const tempLoginRes = await request(app)
+      .post('/api/auth/login')
+      .set('X-Forwarded-For', '198.51.100.42')
+      .send({ loginId: 'admin', password: tempPassword });
+    expect(tempLoginRes.status).toBe(200);
+    expect(tempLoginRes.body.success).toBe(true);
+    expect(tempLoginRes.body.profile.authUid).toBe(TEST_CANONICAL_ACCOUNTS.admin.uid);
+    expect(tempLoginRes.body.profile.mustChangePassword).toBe(true);
+    expect(tempLoginRes.body.profile.forcePasswordChange).toBe(true);
+
+    const adminTempToken = auth.issueToken(TEST_CANONICAL_ACCOUNTS.admin.uid, {
+      authTimeSec: Math.floor(Date.now() / 1000) + 2,
+    });
+
+    // 3. Missing or wrong currentPassword keeps mustChangePassword=true and does not modify password
+    const missingCurrentRes = await request(app)
+      .post('/api/auth/change-password')
+      .set('Authorization', `Bearer ${adminTempToken}`)
+      .send({ loginId: 'admin', newPassword: 'UpdatedAdminSecret#2026' });
+    expect(missingCurrentRes.status).toBe(400);
+    expect(missingCurrentRes.body.code).toBe('CURRENT_PASSWORD_REQUIRED');
+
+    const wrongTempRes = await request(app)
+      .post('/api/auth/change-password')
+      .set('Authorization', `Bearer ${adminTempToken}`)
+      .send({
+        loginId: 'admin',
+        currentPassword: 'WrongTempPassword#99',
+        newPassword: 'UpdatedAdminSecret#2026',
+      });
+    expect(wrongTempRes.status).toBe(401);
+    expect(wrongTempRes.body.code).toBe('INVALID_CURRENT_PASSWORD');
+
+    const stillFlaggedDoc = await db.collection('user_roles').doc('role_admin').get();
+    expect(stillFlaggedDoc.data()?.mustChangePassword).toBe(true);
+
+    // 4. Admin enters temporary password as currentPassword and sets a new password -> UID preserved & flags cleared
+    const completeChangeRes = await request(app)
+      .post('/api/auth/change-password')
+      .set('Authorization', `Bearer ${adminTempToken}`)
+      .send({
+        loginId: 'admin',
+        currentPassword: tempPassword,
+        newPassword: 'UpdatedAdminSecret#2026',
+      });
+    expect(completeChangeRes.status).toBe(200);
+    expect(completeChangeRes.body.success).toBe(true);
+    expect(completeChangeRes.body.mustChangePassword).toBe(false);
+    expect(completeChangeRes.body.forcePasswordChange).toBe(false);
+    expect(completeChangeRes.body.firebaseAuthSynced).toBe(true);
+    expect(auth.getUserPasswordUnsafe(TEST_CANONICAL_ACCOUNTS.admin.uid)).toBe('UpdatedAdminSecret#2026');
+
+    const updatedRoleDoc = await db.collection('user_roles').doc('role_admin').get();
+    expect(updatedRoleDoc.data()?.authUid).toBe(TEST_CANONICAL_ACCOUNTS.admin.uid);
+    expect(updatedRoleDoc.data()?.mustChangePassword).toBe(false);
+    expect(updatedRoleDoc.data()?.forcePasswordChange).toBe(false);
+
+    const updatedSecDoc = await db.collection('account_security').doc('sec_admin').get();
+    expect(updatedSecDoc.data()?.firebaseUid).toBe(TEST_CANONICAL_ACCOUNTS.admin.uid);
+    expect(updatedSecDoc.data()?.forcePasswordChange).toBe(false);
+
+    // 5. Temporary password is no longer accepted; Admin logs in normally with the new password and accesses dashboard
+    const retryTempLogin = await request(app)
+      .post('/api/auth/login')
+      .set('X-Forwarded-For', '198.51.100.43')
+      .send({ loginId: 'admin', password: tempPassword });
+    expect(retryTempLogin.status).toBe(401);
+
+    const normalLoginRes = await request(app)
+      .post('/api/auth/login')
+      .set('X-Forwarded-For', '198.51.100.44')
+      .send({ loginId: 'admin', password: 'UpdatedAdminSecret#2026' });
+    expect(normalLoginRes.status).toBe(200);
+    expect(normalLoginRes.body.success).toBe(true);
+    expect(normalLoginRes.body.profile.authUid).toBe(TEST_CANONICAL_ACCOUNTS.admin.uid);
+    expect(normalLoginRes.body.profile.mustChangePassword).toBe(false);
+    expect(normalLoginRes.body.profile.forcePasswordChange).toBe(false);
+
+    const postChangeToken = auth.issueToken(TEST_CANONICAL_ACCOUNTS.admin.uid, {
+      authTimeSec: Math.floor(Date.now() / 1000) + 4,
+    });
+    const dashRes = await request(app)
+      .get('/api/dashboard/summary')
+      .set('Authorization', `Bearer ${postChangeToken}`);
+    expect(dashRes.status).toBe(200);
+    expect(dashRes.body.role).toBe('ADMIN');
+    expect(dashRes.body.readOnly).toBe(false);
+  });
+
+  it('preserves strictly only super_admin, admin, and user roles by default without seeding any unapproved future roles', async () => {
+    const superToken = auth.issueToken(TEST_CANONICAL_ACCOUNTS.superadmin.uid);
+    const rolesRes = await request(app)
+      .get('/api/admin/roles')
+      .set('Authorization', `Bearer ${superToken}`);
+
+    expect(rolesRes.status).toBe(200);
+    expect(rolesRes.body.success).toBe(true);
+    const roleIds = (rolesRes.body.roles as Array<{ roleId: string }>).map((r) => r.roleId);
+    expect(roleIds).toEqual(['super_admin', 'admin', 'user']);
+    expect(roleIds).not.toContain('supervisor');
+    expect(roleIds).not.toContain('production');
+    expect(roleIds).not.toContain('quality');
+  });
+
+  it('supports full future dynamic role lifecycle (create, assign, centralized login, temp reset, first-time password change, granular RBAC, deactivate, delete) without altering Super Admin exclusives', async () => {
+    const superToken = auth.issueToken(TEST_CANONICAL_ACCOUNTS.superadmin.uid);
+    const adminToken = auth.issueToken(TEST_CANONICAL_ACCOUNTS.admin.uid);
+
+    // 1. Non-Super Admin cannot create or delete roles
+    const adminCreateRole = await request(app)
+      .post('/api/admin/roles')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ roleName: 'Line Coordinator', description: 'Should fail' });
+    expect(adminCreateRole.status).toBe(403);
+
+    // 2. Spoofing reserved role names or deleting system roles is blocked
+    const reservedSpoof = await request(app)
+      .post('/api/admin/roles')
+      .set('Authorization', `Bearer ${superToken}`)
+      .send({ roleName: 'SuperAdmin', description: 'Spoof attempt' });
+    expect(reservedSpoof.status).toBe(400);
+
+    const deleteSystemRole = await request(app)
+      .delete('/api/admin/roles/admin')
+      .set('Authorization', `Bearer ${superToken}`);
+    expect(deleteSystemRole.status).toBe(400);
+
+    // 3. Super Admin creates a custom dynamic role in memory (including an attempted escalation to user_rights)
+    const createRoleRes = await request(app)
+      .post('/api/admin/roles')
+      .set('Authorization', `Bearer ${superToken}`)
+      .send({
+        roleName: 'Line Coordinator',
+        description: 'Coordinates line punch scanning and attendance verification',
+        defaultPermissions: {
+          dashboard: { view: false, add: false, edit: false, delete: false },
+          scanner: { view: true, add: true, edit: false, delete: false },
+          history: { view: true, add: false, edit: true, delete: false },
+          user_rights: { view: true, add: true, edit: true, delete: true },
+          audit_logs: { view: true, add: true, edit: true, delete: true },
+          security_management: { view: true, add: true, edit: true, delete: true },
+        },
+      });
+    expect(createRoleRes.status).toBe(200);
+    expect(createRoleRes.body.success).toBe(true);
+    expect(createRoleRes.body.role.roleId).toBe('line_coordinator');
+    // Restricted Super Admin modules MUST be stripped server-side
+    expect(createRoleRes.body.modulePermissions.user_rights).toEqual({
+      view: false,
+      add: false,
+      edit: false,
+      delete: false,
+    });
+    expect(createRoleRes.body.modulePermissions.audit_logs.view).toBe(false);
+    expect(createRoleRes.body.modulePermissions.security_management.view).toBe(false);
+    const savedPermSnap = await db.collection('role_permissions').doc('line_coordinator').get();
+    expect(savedPermSnap.exists).toBe(true);
+    expect(savedPermSnap.data()?.modulePermissions?.user_rights?.view).toBe(false);
+
+    // 4. Super Admin creates a user assigned to the new custom role with mandatory first-time password change
+    const createUserRes = await request(app)
+      .post('/api/admin/create-user')
+      .set('Authorization', `Bearer ${superToken}`)
+      .send({
+        loginId: 'coord1',
+        name: 'Line Coordinator One',
+        email: 'coord1@narid.com',
+        role: 'line_coordinator',
+        password: 'InitCoordPass#2026',
+        mustChangePassword: true,
+      });
+    expect(createUserRes.status).toBe(200);
+    expect(createUserRes.body.success).toBe(true);
+    expect(createUserRes.body.profile.role).toBe('line_coordinator');
+    const coordUid = createUserRes.body.profile.authUid;
+
+    const uidIndexDoc = await db.collection('user_uid_index').doc(coordUid).get();
+    expect(uidIndexDoc.data()?.role).toBe('line_coordinator');
+
+    // 5. Custom role user logs in via centralized /api/auth/login -> forced password change
+    const firstLogin = await request(app)
+      .post('/api/auth/login')
+      .set('X-Forwarded-For', '198.51.100.71')
+      .send({ loginId: 'coord1', password: 'InitCoordPass#2026' });
+    expect(firstLogin.status).toBe(200);
+    expect(firstLogin.body.profile.role).toBe('line_coordinator');
+    expect(firstLogin.body.profile.mustChangePassword).toBe(true);
+
+    const coordToken = auth.issueToken(coordUid, { authTimeSec: Math.floor(Date.now() / 1000) });
+    const changePassRes = await request(app)
+      .post('/api/auth/change-password')
+      .set('Authorization', `Bearer ${coordToken}`)
+      .send({
+        loginId: 'coord1',
+        currentPassword: 'InitCoordPass#2026',
+        newPassword: 'UpdatedCoordPass#2026',
+      });
+    expect(changePassRes.status).toBe(200);
+    expect(changePassRes.body.mustChangePassword).toBe(false);
+    expect(auth.getUserPasswordUnsafe(coordUid)).toBe('UpdatedCoordPass#2026');
+
+    // 5b. Super Admin temp-password reset also works uniformly for custom roles & preserves UID
+    const coordResetRes = await request(app)
+      .post('/api/security/generate-temp-password')
+      .set('Authorization', `Bearer ${superToken}`)
+      .send({
+        targetLoginId: 'coord1',
+        reason: 'Routine coordinator reset check',
+        freshSuperAdminPassword: TEST_CANONICAL_ACCOUNTS.superadmin.password,
+      });
+    expect(coordResetRes.status).toBe(200);
+    expect(coordResetRes.body.firebaseUid).toBe(coordUid);
+    const coordTempPass = String(coordResetRes.body.temporaryPassword || '');
+
+    const coordTempChange = await request(app)
+      .post('/api/auth/change-password')
+      .set('Authorization', `Bearer ${auth.issueToken(coordUid, { authTimeSec: Math.floor(Date.now() / 1000) + 3 })}`)
+      .send({
+        loginId: 'coord1',
+        currentPassword: coordTempPass,
+        newPassword: 'UpdatedCoordPass#2026',
+      });
+    expect(coordTempChange.status).toBe(200);
+
+    // 6. Fresh token verifies session & enforces granular dynamic permissions
+    const activeCoordToken = auth.issueToken(coordUid, { authTimeSec: Math.floor(Date.now() / 1000) + 5 });
+    const verifyRes = await request(app)
+      .post('/api/auth/verify-session')
+      .set('Authorization', `Bearer ${activeCoordToken}`)
+      .send({ loginId: 'coord1' });
+    expect(verifyRes.status).toBe(200);
+    expect(verifyRes.body.role).toBe('line_coordinator');
+
+    // Dashboard view is initially false -> 403
+    const deniedDash = await request(app)
+      .get('/api/dashboard/summary')
+      .set('Authorization', `Bearer ${activeCoordToken}`);
+    expect(deniedDash.status).toBe(403);
+
+    // Grant view-only dashboard access first -> dashboard readOnly=true
+    const viewOnlyPermsRes = await request(app)
+      .post('/api/admin/role-permissions')
+      .set('Authorization', `Bearer ${superToken}`)
+      .send({
+        roleId: 'line_coordinator',
+        modulePermissions: {
+          dashboard: { view: true, add: false, edit: false, delete: false },
+          scanner: { view: true, add: false, edit: false, delete: false },
+        },
+      });
+    expect(viewOnlyPermsRes.status).toBe(200);
+
+    const viewOnlyDash = await request(app)
+      .get('/api/dashboard/summary')
+      .set('Authorization', `Bearer ${activeCoordToken}`);
+    expect(viewOnlyDash.status).toBe(200);
+    expect(viewOnlyDash.body.role).toBe('LINE_COORDINATOR');
+    expect(viewOnlyDash.body.readOnly).toBe(true);
+
+    // Without history.edit or shifts.edit, auto-close and roster mutations must be denied (403)
+    const autoCloseDenied = await request(app)
+      .post('/api/attendance/auto-close')
+      .set('Authorization', `Bearer ${activeCoordToken}`)
+      .send({});
+    expect(autoCloseDenied.status).toBe(403);
+
+    // Grant operational write permission on scanner/history & confirm Super Admin module remains stripped -> readOnly=false
+    const updatePermsRes = await request(app)
+      .post('/api/admin/role-permissions')
+      .set('Authorization', `Bearer ${superToken}`)
+      .send({
+        roleId: 'line_coordinator',
+        modulePermissions: {
+          dashboard: { view: true, add: false, edit: false, delete: false },
+          scanner: { view: true, add: true, edit: false, delete: false },
+          history: { view: true, add: false, edit: true, delete: false },
+          user_rights: { view: true, add: true, edit: true, delete: true },
+        },
+      });
+    expect(updatePermsRes.status).toBe(200);
+    expect(updatePermsRes.body.modulePermissions.user_rights.view).toBe(false);
+
+    const allowedDash = await request(app)
+      .get('/api/dashboard/summary')
+      .set('Authorization', `Bearer ${activeCoordToken}`);
+    expect(allowedDash.status).toBe(200);
+    expect(allowedDash.body.role).toBe('LINE_COORDINATOR');
+    expect(allowedDash.body.readOnly).toBe(false);
+
+    // Allowed attendance scan succeeds; denied roster (requires shifts add/edit) and Super Admin routes return 403
+    const scanRes = await request(app)
+      .post('/api/attendance/scan')
+      .set('Authorization', `Bearer ${activeCoordToken}`)
+      .send({ rawPayload: 'QR_EMP001_VALID', scannerType: 'IN' });
+    expect(scanRes.status).toBe(200);
+
+    const rosterDenied = await request(app)
+      .post('/api/attendance/roster')
+      .set('Authorization', `Bearer ${activeCoordToken}`)
+      .send({ shiftDate: '2026-11-16', shiftId: 'DAY', employeeId: 'EMP001', rosterStatus: 'SCHEDULED' });
+    expect(rosterDenied.status).toBe(403);
+
+    const clearDenied = await request(app)
+      .post('/api/attendance/clear')
+      .set('Authorization', `Bearer ${activeCoordToken}`)
+      .send({ confirmed: true, confirmationText: 'CLEAR_ALL_ATTENDANCE', reason: 'Denied check' });
+    expect(clearDenied.status).toBe(403);
+
+    const auditDenied = await request(app)
+      .get('/api/audit/logs')
+      .set('Authorization', `Bearer ${activeCoordToken}`);
+    expect(auditDenied.status).toBe(403);
+
+    // 7. Deactivating the custom role immediately blocks login and active API calls
+    const deactivateRes = await request(app)
+      .post('/api/admin/roles')
+      .set('Authorization', `Bearer ${superToken}`)
+      .send({
+        roleId: 'line_coordinator',
+        roleName: 'Line Coordinator',
+        description: 'Temporarily paused role',
+        isActive: false,
+      });
+    expect(deactivateRes.status).toBe(200);
+
+    const deactivatedLogin = await request(app)
+      .post('/api/auth/login')
+      .set('X-Forwarded-For', '198.51.100.72')
+      .send({ loginId: 'coord1', password: 'UpdatedCoordPass#2026' });
+    expect(deactivatedLogin.status).toBe(403);
+    expect(deactivatedLogin.body.code).toBe('ROLE_INACTIVE');
+
+    const deactivatedApi = await request(app)
+      .get('/api/dashboard/summary')
+      .set('Authorization', `Bearer ${activeCoordToken}`);
+    expect(deactivatedApi.status).toBe(403);
+
+    // 8. Cannot delete custom role while users remain assigned; succeeds after user deletion
+    const deleteInUse = await request(app)
+      .delete('/api/admin/roles/line_coordinator')
+      .set('Authorization', `Bearer ${superToken}`);
+    expect(deleteInUse.status).toBe(400);
+
+    const deleteCoordUser = await request(app)
+      .post('/api/admin/delete-user')
+      .set('Authorization', `Bearer ${superToken}`)
+      .send({ targetId: createUserRes.body.profile.id });
+    expect(deleteCoordUser.status).toBe(200);
+
+    const deleteUnusedRole = await request(app)
+      .delete('/api/admin/roles/line_coordinator')
+      .set('Authorization', `Bearer ${superToken}`);
+    expect(deleteUnusedRole.status).toBe(200);
+  });
 });

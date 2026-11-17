@@ -46,7 +46,7 @@ export const PasswordChangeModal: React.FC<PasswordChangeModalProps> = ({
     setErrorMessage(null);
 
     if (!hasCurrentPassword) {
-      setErrorMessage('Please enter your current password to verify your identity.');
+      setErrorMessage('Please enter your current or temporary password to verify your identity.');
       return;
     }
     if (!hasMinLength) {
@@ -93,7 +93,7 @@ export const PasswordChangeModal: React.FC<PasswordChangeModalProps> = ({
             First-Time Login Security
           </h2>
           <p className="text-xs text-blue-200/90 mt-1 max-w-xs mx-auto leading-relaxed">
-            For security compliance, verify your current credentials and set a new password before accessing the system.
+            For security compliance, enter your current or temporary password and set a new confidential password before accessing the system.
           </p>
 
           <div className="mt-3 inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-900/60 border border-blue-400/30 text-xs font-mono text-cyan-300">
@@ -113,10 +113,10 @@ export const PasswordChangeModal: React.FC<PasswordChangeModalProps> = ({
           )}
 
           <form onSubmit={handleSubmit} className="space-y-4">
-            {/* Current Password */}
+            {/* Current / Temporary Password */}
             <div>
               <label className="block text-xs font-semibold text-slate-700 mb-1.5 uppercase tracking-wider">
-                Current Password
+                Current / Temporary Password
               </label>
               <div className="relative flex items-center rounded-xl border border-slate-200 bg-slate-50 focus-within:bg-white focus-within:border-blue-600 focus-within:ring-2 focus-within:ring-blue-100 transition-all">
                 <div className="pl-3.5 pr-2 text-slate-400">
@@ -126,7 +126,7 @@ export const PasswordChangeModal: React.FC<PasswordChangeModalProps> = ({
                   type={showCurrentPassword ? 'text' : 'password'}
                   value={currentPassword}
                   onChange={(e) => setCurrentPassword(e.target.value)}
-                  placeholder="Enter your current password"
+                  placeholder="Enter your current or temporary password"
                   autoComplete="current-password"
                   required
                   className="w-full py-2.5 pr-10 text-sm text-slate-900 bg-transparent border-none focus:outline-hidden font-medium placeholder:text-slate-400"
@@ -206,7 +206,7 @@ export const PasswordChangeModal: React.FC<PasswordChangeModalProps> = ({
                   <div className="w-3.5 h-3.5 rounded-full border border-slate-300 shrink-0" />
                 )}
                 <span className={hasCurrentPassword ? 'text-emerald-700 font-medium' : 'text-slate-500'}>
-                  Current password entered
+                  Current or temporary password entered
                 </span>
               </div>
 

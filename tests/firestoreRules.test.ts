@@ -75,4 +75,27 @@ describe('Firestore Security Rules (Strict Zero-Trust UID RBAC)', () => {
     expect(rateBlock).toMatch(/allow\s+read,\s*write:\s*if\s+false;/);
     expect(rulesContent).toMatch(/match \/\{document=\*\*\}[\s\S]*allow\s+read,\s*write:\s*if\s+false;/);
   });
+
+  it('supports future dynamic roles via active-role and role_permissions helpers without unapproved hardcoded future roles', () => {
+    expect(rulesContent).toContain('function callerRoleId()');
+    expect(rulesContent).toContain('function isRoleActive()');
+    expect(rulesContent).toContain('function hasRoleModuleAction(mod, act)');
+    expect(rulesContent).toContain("!(mod in ['user_rights', 'audit_logs', 'security_management'])");
+    expect(rulesContent).toContain("isSystemRole(callerRoleId())");
+
+    // Verify dynamic role module action wiring for operational master collections
+    const employeesBlock = extractMatchBlock('employees');
+    expect(employeesBlock).toContain("hasRoleModuleAction('employees', 'add')");
+    expect(employeesBlock).toContain("hasRoleModuleAction('employees', 'edit')");
+    expect(employeesBlock).toContain("hasRoleModuleAction('employees', 'delete')");
+
+    const shiftsBlock = extractMatchBlock('shifts');
+    expect(shiftsBlock).toContain("hasRoleModuleAction('shifts', 'add')");
+
+    // Verify no unapproved future roles are hardcoded in security rules
+    const lowerRules = rulesContent.toLowerCase();
+    for (const unapproved of ['supervisor', 'production', 'quality']) {
+      expect(lowerRules).not.toContain(`'${unapproved}'`);
+    }
+  });
 });

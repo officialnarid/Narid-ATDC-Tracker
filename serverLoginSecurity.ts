@@ -11,6 +11,8 @@ import {
   type AdminAuthLike,
   type AdminFirestoreLike,
   type VerifiedCaller,
+  normalizeRoleValue,
+  SYSTEM_ROLE_IDS,
   extractTrustedClientIp,
   parseUserAgent,
   resolveIpGeoLocation,
@@ -511,6 +513,7 @@ export async function recordLoginAttemptDoc(
       | 'RATE_LIMITED'
       | 'FIREBASE_ABUSE_PROTECTION'
       | 'ACCOUNT_INACTIVE'
+      | 'ROLE_INACTIVE'
       | 'ACCOUNT_NOT_FOUND';
     failureReason?: string | null;
     attemptNumber?: number | null;
@@ -720,7 +723,7 @@ export interface LoginSecurityDeps {
   requireVerifiedCaller: (
     req: Request,
     res: Response,
-    allowedRoles: Array<'super_admin' | 'admin' | 'user'>,
+    allowedRoles: string[] | '*',
     actionLabel: string
   ) => Promise<VerifiedCaller | null>;
 }
@@ -862,15 +865,26 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
         const secRef = db.collection('account_security').doc(`sec_${cleanId}`);
         const userRef = db.collection('user_roles').doc(userDoc.id);
 
-        if (userData.status === 'Inactive') {
+        const normalizedUserRole = normalizeRoleValue(userData.role);
+        let roleDeactivated = false;
+        if (!SYSTEM_ROLE_IDS.has(normalizedUserRole)) {
+          const roleDocSnap = await db.collection('roles').doc(normalizedUserRole).get();
+          if (roleDocSnap.exists && roleDocSnap.data()?.isActive === false) {
+            roleDeactivated = true;
+          }
+        }
+
+        if (userData.status === 'Inactive' || roleDeactivated) {
           await recordLoginAttemptDoc(db, {
             loginId: cleanId,
             role: roleUpper,
             firebaseUid,
             success: false,
             outcome: 'BLOCKED_INACTIVE',
-            failureReasonCategory: 'ACCOUNT_INACTIVE',
-            failureReason: 'Account status is Inactive',
+            failureReasonCategory: roleDeactivated ? 'ROLE_INACTIVE' : 'ACCOUNT_INACTIVE',
+            failureReason: roleDeactivated
+              ? `Assigned role "${normalizedUserRole}" is Inactive`
+              : 'Account status is Inactive',
             telemetry,
           });
           await recordLoginHistoryEntry(db, {
@@ -880,14 +894,16 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
             authUid: firebaseUid,
             role: roleUpper,
             success: false,
-            failureReason: 'Account is Inactive',
+            failureReason: roleDeactivated ? 'Assigned role is Inactive' : 'Account is Inactive',
           });
           return {
             status: 403,
             body: {
               success: false,
-              code: 'ACCOUNT_INACTIVE',
-              error: 'Account Deactivated. Please contact Super Admin.',
+              code: roleDeactivated ? 'ROLE_INACTIVE' : 'ACCOUNT_INACTIVE',
+              error: roleDeactivated
+                ? 'Your assigned role is currently inactive. Please contact Super Admin.'
+                : 'Account Deactivated. Please contact Super Admin.',
             },
           };
         }
@@ -2011,20 +2027,22 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
         const userRef = db.collection('user_roles').doc(userDoc.id);
         const secRef = db.collection('account_security').doc(`sec_${cleanTargetId}`);
 
+        const tempPassUpdates = {
+          passwordHash: newHash,
+          mustChangePassword: true,
+          forcePasswordChange: true,
+          passwordLastChangedAt: now,
+          passwordResetBy: caller.loginId,
+          passwordResetAt: now,
+          sessionRevokedAt: now,
+          updatedAt: now,
+        };
+
         await db.runTransaction(async (tx) => {
           const secSnap = await tx.get(secRef);
           const curSec = secSnap.exists ? (secSnap.data() || {}) : {};
 
-          tx.update(userRef, {
-            passwordHash: newHash,
-            mustChangePassword: true,
-            forcePasswordChange: true,
-            passwordLastChangedAt: now,
-            passwordResetBy: caller.loginId,
-            passwordResetAt: now,
-            sessionRevokedAt: now,
-            updatedAt: now,
-          });
+          tx.update(userRef, tempPassUpdates);
 
           tx.set(
             secRef,
@@ -2044,6 +2062,16 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
             { merge: true }
           );
         });
+
+        const matchingDocs = await db
+          .collection('user_roles')
+          .where('loginId', '==', cleanTargetId)
+          .get();
+        for (const mDoc of matchingDocs.docs) {
+          if (mDoc.id !== userDoc.id) {
+            await db.collection('user_roles').doc(mDoc.id).update(tempPassUpdates);
+          }
+        }
 
         const resetLogId = `reset_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
         await Promise.all([

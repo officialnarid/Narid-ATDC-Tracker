@@ -28,7 +28,10 @@ import {
   RotateCcw,
   Copy,
   Globe,
-  Monitor
+  Monitor,
+  PlusCircle,
+  Edit3,
+  Power
 } from 'lucide-react';
 import { RolePermissionsManagement } from './RolePermissionsManagement';
 import { onSnapshot, collection } from 'firebase/firestore';
@@ -69,7 +72,13 @@ import {
   subscribeToUserPermissions,
   subscribeToAllRolePermissions,
   saveUserIndividualPermissions,
+  saveRoleDefinition,
+  deleteCustomRole,
   getEffectiveModulePermissions,
+  normalizeRoleId,
+  deriveRoleIdFromName,
+  SYSTEM_ROLE_IDS,
+  EMPTY_MODULE_PERMISSIONS,
   DEFAULT_SUPER_ADMIN_PERMISSIONS,
   DEFAULT_ADMIN_PERMISSIONS,
   DEFAULT_USER_PERMISSIONS
@@ -209,7 +218,41 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
   const [workingUserPerms, setWorkingUserPerms] = useState<Record<string, ModulePermission>>({});
   const [isSavingUserMatrix, setIsSavingUserMatrix] = useState<boolean>(false);
 
+  // Dynamic Role Management Modal State (Create / Edit / Delete Custom Role)
+  const [isRoleModalOpen, setIsRoleModalOpen] = useState(false);
+  const [editingRoleId, setEditingRoleId] = useState<string | null>(null);
+  const [roleFormName, setRoleFormName] = useState('');
+  const [roleFormDescription, setRoleFormDescription] = useState('');
+  const [roleFormIsActive, setRoleFormIsActive] = useState(true);
+  const [roleFormPermissions, setRoleFormPermissions] = useState<Record<string, ModulePermission>>(
+    JSON.parse(JSON.stringify(EMPTY_MODULE_PERMISSIONS))
+  );
+  const [isSubmittingRole, setIsSubmittingRole] = useState(false);
+  const [roleToDelete, setRoleToDelete] = useState<RoleRecord | null>(null);
+  const [isDeletingRole, setIsDeletingRole] = useState(false);
+
   const isSuperAdmin = currentUserRole?.role?.toUpperCase() === 'SUPER_ADMIN' || currentUserRole?.loginId === 'superadmin';
+
+  const getDefaultModulesForRole = (roleIdInput: string): string[] => {
+    const cleanRole = normalizeRoleId(roleIdInput);
+    if (cleanRole === 'super_admin') return ['all'];
+    const restricted = new Set(['user_rights', 'audit_logs', 'security_management']);
+    const livePerms =
+      rolePermissionsMap[cleanRole]?.modulePermissions ||
+      rolesList.find((r) => r.roleId === cleanRole)?.defaultPermissions;
+    if (livePerms) {
+      return Object.entries(livePerms)
+        .filter(([modKey, p]) => Boolean(p?.view) && !restricted.has(modKey))
+        .map(([modKey]) => modKey);
+    }
+    if (cleanRole === 'admin') {
+      return ['dashboard', 'scanner', 'employees', 'history', 'reports', 'qr_codes'];
+    }
+    if (cleanRole === 'user') {
+      return ['dashboard', 'scanner'];
+    }
+    return [];
+  };
 
   // Real-time synchronization with Firestore collection 'user_roles'
   useEffect(() => {
@@ -238,11 +281,11 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
         });
         const deduplicated = Array.from(uniqueMap.values());
 
-        // Sort: Super Admin first, then admin, then user
+        // Sort: Super Admin first, then admin, then user, then custom roles alphabetically
         const order: Record<string, number> = { super_admin: 0, admin: 1, user: 2 };
         deduplicated.sort((a, b) => {
-          const aOrder = order[a.role?.toLowerCase()] ?? 3;
-          const bOrder = order[b.role?.toLowerCase()] ?? 3;
+          const aOrder = order[normalizeRoleId(a.role)] ?? 10;
+          const bOrder = order[normalizeRoleId(b.role)] ?? 10;
           if (aOrder !== bOrder) return aOrder - bOrder;
           return (a.loginId || '').localeCompare(b.loginId || '');
         });
@@ -300,7 +343,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
     if (!targetUser) return;
 
     const userOverride = userPermissionsMap[selectedMatrixUserId];
-    const roleDefault = rolePermissionsMap[targetUser.role?.toLowerCase()];
+    const roleDefault = rolePermissionsMap[normalizeRoleId(targetUser.role)];
     const effective = getEffectiveModulePermissions(targetUser.role, userOverride, roleDefault);
     setWorkingUserPerms(JSON.parse(JSON.stringify(effective)));
   }, [selectedMatrixUserId, userPermissionsMap, rolePermissionsMap, users]);
@@ -718,6 +761,121 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
     }
   };
 
+  // Dynamic Role Management Handlers (Future-Ready Role Creation & Lifecycle)
+  const handleOpenCreateRoleModal = () => {
+    setEditingRoleId(null);
+    setRoleFormName('');
+    setRoleFormDescription('');
+    setRoleFormIsActive(true);
+    setRoleFormPermissions(JSON.parse(JSON.stringify(EMPTY_MODULE_PERMISSIONS)));
+    setIsRoleModalOpen(true);
+  };
+
+  const handleOpenEditRoleModal = (roleObj: RoleRecord) => {
+    if (roleObj.roleId === 'super_admin') return;
+    setEditingRoleId(roleObj.roleId);
+    setRoleFormName(roleObj.roleName || roleObj.roleId.toUpperCase());
+    setRoleFormDescription(roleObj.description || '');
+    setRoleFormIsActive(roleObj.isActive !== false);
+    const existingPerms =
+      rolePermissionsMap[roleObj.roleId]?.modulePermissions ||
+      roleObj.defaultPermissions ||
+      EMPTY_MODULE_PERMISSIONS;
+    setRoleFormPermissions(JSON.parse(JSON.stringify(existingPerms)));
+    setIsRoleModalOpen(true);
+  };
+
+  const handleToggleRoleFormModule = (moduleKey: string, action: ModuleAction) => {
+    if (moduleKey === 'user_rights' || moduleKey === 'audit_logs' || moduleKey === 'security_management') {
+      return;
+    }
+    setRoleFormPermissions((prev) => {
+      const curr = prev[moduleKey] || { view: false, add: false, edit: false, delete: false };
+      const nextVal = !curr[action];
+      const updated = { ...curr, [action]: nextVal };
+      if (nextVal && (action === 'add' || action === 'edit' || action === 'delete')) {
+        updated.view = true;
+      }
+      if (!nextVal && action === 'view') {
+        updated.add = false;
+        updated.edit = false;
+        updated.delete = false;
+      }
+      return { ...prev, [moduleKey]: updated };
+    });
+  };
+
+  const handleSaveRoleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!roleFormName.trim() || roleFormName.trim().length < 2) {
+      showToast('error', 'Role Name must be at least 2 characters.');
+      return;
+    }
+    if (!roleFormDescription.trim() || roleFormDescription.trim().length < 3) {
+      showToast('error', 'Please enter a brief role description.');
+      return;
+    }
+
+    setIsSubmittingRole(true);
+    try {
+      const res = await saveRoleDefinition({
+        ...(editingRoleId ? { roleId: editingRoleId } : {}),
+        roleName: roleFormName.trim(),
+        description: roleFormDescription.trim(),
+        isActive: roleFormIsActive,
+        defaultPermissions: roleFormPermissions,
+      });
+      showToast(
+        'success',
+        res.created
+          ? `Custom role "${res.role.roleName}" (${res.role.roleId}) created! Users can now be assigned to it.`
+          : `Role "${res.role.roleName}" (${res.role.roleId}) updated successfully.`
+      );
+      setIsRoleModalOpen(false);
+    } catch (err: any) {
+      showToast('error', err.message || 'Failed to save role definition.');
+    } finally {
+      setIsSubmittingRole(false);
+    }
+  };
+
+  const handleToggleRoleActive = async (roleObj: RoleRecord) => {
+    if (SYSTEM_ROLE_IDS.has(roleObj.roleId)) return;
+    try {
+      const currentPerms =
+        rolePermissionsMap[roleObj.roleId]?.modulePermissions ||
+        roleObj.defaultPermissions ||
+        EMPTY_MODULE_PERMISSIONS;
+      await saveRoleDefinition({
+        roleId: roleObj.roleId,
+        roleName: roleObj.roleName,
+        description: roleObj.description,
+        isActive: !roleObj.isActive,
+        defaultPermissions: currentPerms,
+      });
+      showToast(
+        'success',
+        `Custom role "${roleObj.roleName}" ${!roleObj.isActive ? 'activated' : 'deactivated'}.`
+      );
+    } catch (err: any) {
+      showToast('error', err.message || 'Failed to update role status.');
+    }
+  };
+
+  const handleConfirmDeleteRole = async () => {
+    if (!roleToDelete) return;
+    setIsDeletingRole(true);
+    try {
+      await deleteCustomRole(roleToDelete.roleId);
+      showToast('success', `Custom role "${roleToDelete.roleName}" deleted.`);
+      setRoleToDelete(null);
+    } catch (err: any) {
+      showToast('error', err.message || 'Failed to delete custom role.');
+    } finally {
+      setIsDeletingRole(false);
+    }
+  };
+
   return (
     <div className="p-6 bg-slate-50 min-h-full flex flex-col gap-6">
       {/* Top Banner / Actions Bar */}
@@ -941,8 +1099,14 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                   </tr>
                 ) : (
                   users.map(u => {
-                    const isSuper = u.role?.toLowerCase() === 'super_admin';
-                    const isAdmin = u.role?.toLowerCase() === 'admin';
+                    const normalizedRole = normalizeRoleId(u.role);
+                    const isSuper = normalizedRole === 'super_admin';
+                    const isAdmin = normalizedRole === 'admin';
+                    const isStdUser = normalizedRole === 'user';
+                    const roleDisplayName =
+                      rolesList.find((r) => r.roleId === normalizedRole)?.roleName ||
+                      (isSuper ? 'SUPER ADMIN' : isAdmin ? 'ADMIN' : isStdUser ? 'USER' : normalizedRole.replace(/_/g, ' ').toUpperCase());
+
                     return (
                       <tr key={u.id} className="hover:bg-slate-50 transition">
                         <td className="py-3 px-4 font-mono font-bold text-blue-700">
@@ -958,9 +1122,10 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                           <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
                             isSuper ? 'bg-red-100 text-red-800' :
                             isAdmin ? 'bg-blue-100 text-blue-800' :
-                            'bg-slate-100 text-slate-700'
+                            isStdUser ? 'bg-slate-100 text-slate-700' :
+                            'bg-indigo-100 text-indigo-800'
                           }`}>
-                            {isSuper ? 'SUPER ADMIN' : isAdmin ? 'ADMIN' : 'USER'}
+                            {roleDisplayName}
                           </span>
                         </td>
                         <td className="py-3 px-4">
@@ -1125,9 +1290,11 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                   <th className="py-3 px-4 w-1/3">Module Name</th>
                   {matrixViewMode === 'roles' ? (
                     <>
-                      <th className="py-3 px-4 text-center">SUPER ADMIN</th>
-                      <th className="py-3 px-4 text-center">ADMIN</th>
-                      <th className="py-3 px-4 text-center">USER</th>
+                      {rolesList.map((roleObj) => (
+                        <th key={roleObj.roleId} className="py-3 px-4 text-center">
+                          {roleObj.roleName || roleObj.roleId.toUpperCase()}
+                        </th>
+                      ))}
                     </>
                   ) : (
                     <>
@@ -1142,10 +1309,6 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
               <tbody className="divide-y divide-slate-100">
                 {PERMISSION_MODULES.map(mod => {
                   if (matrixViewMode === 'roles') {
-                    const superPerm = DEFAULT_SUPER_ADMIN_PERMISSIONS[mod.key] || { view: true, add: true, edit: true, delete: true };
-                    const adminPerm = rolePermissionsMap['admin']?.modulePermissions[mod.key] || DEFAULT_ADMIN_PERMISSIONS[mod.key] || { view: false, add: false, edit: false, delete: false };
-                    const userPerm = rolePermissionsMap['user']?.modulePermissions[mod.key] || DEFAULT_USER_PERMISSIONS[mod.key] || { view: false, add: false, edit: false, delete: false };
-
                     const renderPermPills = (p: ModulePermission) => (
                       <div className="flex items-center justify-center gap-1">
                         <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${p.view ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-400'}`}>V</span>
@@ -1161,9 +1324,23 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                           <span className="font-bold text-slate-800 block">{mod.label}</span>
                           <span className="text-[10px] text-slate-400">{mod.description}</span>
                         </td>
-                        <td className="py-3 px-4 text-center">{renderPermPills(superPerm)}</td>
-                        <td className="py-3 px-4 text-center">{renderPermPills(adminPerm)}</td>
-                        <td className="py-3 px-4 text-center">{renderPermPills(userPerm)}</td>
+                        {rolesList.map((roleObj) => {
+                          const rolePerm =
+                            roleObj.roleId === 'super_admin'
+                              ? DEFAULT_SUPER_ADMIN_PERMISSIONS[mod.key] || { view: true, add: true, edit: true, delete: true }
+                              : rolePermissionsMap[roleObj.roleId]?.modulePermissions?.[mod.key] ||
+                                roleObj.defaultPermissions?.[mod.key] ||
+                                (roleObj.roleId === 'admin'
+                                  ? DEFAULT_ADMIN_PERMISSIONS[mod.key]
+                                  : roleObj.roleId === 'user'
+                                    ? DEFAULT_USER_PERMISSIONS[mod.key]
+                                    : EMPTY_MODULE_PERMISSIONS[mod.key]) || { view: false, add: false, edit: false, delete: false };
+                          return (
+                            <td key={roleObj.roleId} className="py-3 px-4 text-center">
+                              {renderPermPills(rolePerm)}
+                            </td>
+                          );
+                        })}
                       </tr>
                     );
                   } else {
@@ -1208,83 +1385,188 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       )}
 
       {/* ========================================================================= */}
-      {/* TAB 4: ROLE DESCRIPTIONS (Section 3 - Stored and Retrieved from Firestore) */}
+      {/* TAB 4: ROLE DESCRIPTIONS & DYNAMIC ROLE MANAGEMENT (Firestore roles)      */}
       {/* ========================================================================= */}
       {activeTab === 'roles' && (
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          {rolesList.map(r => {
-            const count = users.filter(u => u.role?.toLowerCase() === r.roleId).length;
-            const isSuper = r.roleId === 'super_admin';
-            const isAdmin = r.roleId === 'admin';
-
-            return (
-              <div 
-                key={r.roleId} 
-                className={`bg-white rounded-2xl border p-6 shadow-xs flex flex-col justify-between transition-all ${
-                  isSuper ? 'border-red-200 hover:border-red-300' :
-                  isAdmin ? 'border-blue-200 hover:border-blue-300' :
-                  'border-slate-200 hover:border-slate-300'
-                }`}
+        <div className="space-y-5">
+          <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-extrabold text-slate-900 uppercase tracking-tight flex items-center gap-2">
+                <Building className="w-4 h-4 text-blue-600" />
+                <span>System &amp; Custom Role Registry ({rolesList.length})</span>
+              </h3>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Core system roles (SUPER_ADMIN, ADMIN, USER) are preserved permanently. Super Admin can create future custom roles on demand without code changes.
+              </p>
+            </div>
+            {isSuperAdmin && (
+              <button
+                type="button"
+                onClick={handleOpenCreateRoleModal}
+                className="px-4 py-2 rounded-xl bg-gradient-to-r from-indigo-600 to-blue-600 hover:from-indigo-700 hover:to-blue-700 text-white font-bold text-xs flex items-center gap-2 shadow-sm transition cursor-pointer shrink-0"
               >
-                <div>
-                  <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+                <PlusCircle className="w-4 h-4" />
+                <span>Create New Role</span>
+              </button>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            {rolesList.map(r => {
+              const count = users.filter(u => normalizeRoleId(u.role) === r.roleId).length;
+              const isSuper = r.roleId === 'super_admin';
+              const isAdmin = r.roleId === 'admin';
+              const isStdUser = r.roleId === 'user';
+              const isSystem = SYSTEM_ROLE_IDS.has(r.roleId);
+
+              const liveModulePerms =
+                rolePermissionsMap[r.roleId]?.modulePermissions ||
+                r.defaultPermissions ||
+                (isSuper
+                  ? DEFAULT_SUPER_ADMIN_PERMISSIONS
+                  : isAdmin
+                    ? DEFAULT_ADMIN_PERMISSIONS
+                    : isStdUser
+                      ? DEFAULT_USER_PERMISSIONS
+                      : EMPTY_MODULE_PERMISSIONS);
+
+              const enabledModules = PERMISSION_MODULES.filter(
+                (m) => !m.isParent && Boolean(liveModulePerms?.[m.key]?.view)
+              );
+
+              return (
+                <div 
+                  key={r.roleId} 
+                  className={`bg-white rounded-2xl border p-6 shadow-xs flex flex-col justify-between transition-all ${
+                    isSuper ? 'border-red-200 hover:border-red-300' :
+                    isAdmin ? 'border-blue-200 hover:border-blue-300' :
+                    isStdUser ? 'border-slate-200 hover:border-slate-300' :
+                    'border-indigo-200 hover:border-indigo-300'
+                  }`}
+                >
+                  <div>
+                    <div className="flex items-start justify-between pb-3 border-b border-slate-100 gap-2">
+                      <div>
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <h3 className="font-black text-slate-900 text-base tracking-wide">
+                            {r.roleName}
+                          </h3>
+                          <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold uppercase ${
+                            isSystem ? 'bg-slate-100 text-slate-600' : 'bg-indigo-100 text-indigo-700'
+                          }`}>
+                            {isSystem ? 'System' : 'Custom'}
+                          </span>
+                        </div>
+                        <span className="text-[10px] text-slate-400 font-mono">
+                          roles/{r.roleId}
+                        </span>
+                      </div>
+
+                      <div className="flex flex-col items-end gap-1 shrink-0">
+                        <span className={`text-[10px] px-2.5 py-0.5 rounded-full font-bold uppercase tracking-wider ${
+                          !r.isActive ? 'bg-amber-100 text-amber-800' :
+                          isSuper ? 'bg-red-100 text-red-800' :
+                          isAdmin ? 'bg-blue-100 text-blue-800' :
+                          isStdUser ? 'bg-slate-100 text-slate-700' :
+                          'bg-emerald-100 text-emerald-800'
+                        }`}>
+                          {r.isActive ? 'Active' : 'Inactive'}
+                        </span>
+                        <span className="text-[11px] font-bold text-slate-600 bg-slate-100 px-2 py-0.5 rounded-md">
+                          {count} {count === 1 ? 'Account' : 'Accounts'}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Role Description from Firestore */}
+                    <p className="text-xs text-slate-600 mt-4 leading-relaxed font-normal">
+                      {r.description}
+                    </p>
+                  </div>
+
+                  <div className="mt-6 pt-4 border-t border-slate-100 space-y-3">
                     <div>
-                      <h3 className="font-black text-slate-900 text-base tracking-wide">
-                        {r.roleName}
-                      </h3>
-                      <span className="text-[10px] text-slate-400 font-mono">
-                        roles/{r.roleId}
-                      </span>
+                      <div className="text-[11px] font-bold text-slate-700 mb-1.5">
+                        Default Capabilities:
+                      </div>
+                      <div className="flex flex-wrap gap-1">
+                        {isSuper ? (
+                          <span className="text-[10px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 px-2 py-0.5 rounded">
+                            Full Unrestricted Access
+                          </span>
+                        ) : enabledModules.length > 0 ? (
+                          <>
+                            {enabledModules.slice(0, 6).map((mod) => (
+                              <span
+                                key={mod.key}
+                                className={`text-[10px] font-semibold border px-2 py-0.5 rounded ${
+                                  isAdmin
+                                    ? 'bg-blue-50 text-blue-800 border-blue-200'
+                                    : isStdUser
+                                      ? 'bg-slate-50 text-slate-800 border-slate-200'
+                                      : 'bg-indigo-50 text-indigo-800 border-indigo-200'
+                                }`}
+                              >
+                                {modLabelShort(mod.label)}
+                              </span>
+                            ))}
+                            {enabledModules.length > 6 && (
+                              <span className="text-[10px] font-semibold bg-slate-100 text-slate-600 border border-slate-200 px-2 py-0.5 rounded">
+                                +{enabledModules.length - 6} more
+                              </span>
+                            )}
+                          </>
+                        ) : (
+                          <span className="text-[10px] font-semibold bg-slate-50 text-slate-500 border border-slate-200 px-2 py-0.5 rounded">
+                            No modules enabled
+                          </span>
+                        )}
+                      </div>
                     </div>
 
-                    <div className="flex flex-col items-end gap-1">
-                      <span className={`text-[10px] px-2.5 py-0.5 rounded-full font-bold uppercase tracking-wider ${
-                        isSuper ? 'bg-red-100 text-red-800' :
-                        isAdmin ? 'bg-blue-100 text-blue-800' :
-                        'bg-slate-100 text-slate-700'
-                      }`}>
-                        {r.isActive ? 'Active' : 'Inactive'}
-                      </span>
-                      <span className="text-[11px] font-bold text-slate-600 bg-slate-100 px-2 py-0.5 rounded-md">
-                        {count} {count === 1 ? 'Account' : 'Accounts'}
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Role Description from Firestore */}
-                  <p className="text-xs text-slate-600 mt-4 leading-relaxed font-normal">
-                    {r.description}
-                  </p>
-                </div>
-
-                <div className="mt-6 pt-4 border-t border-slate-100">
-                  <div className="text-[11px] font-bold text-slate-700 mb-1.5">
-                    Default Capabilities:
-                  </div>
-                  <div className="flex flex-wrap gap-1">
-                    {isSuper && (
-                      <span className="text-[10px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 px-2 py-0.5 rounded">
-                        Full Unrestricted Access
-                      </span>
-                    )}
-                    {isAdmin && (
-                      <>
-                        <span className="text-[10px] font-semibold bg-blue-50 text-blue-800 border border-blue-200 px-2 py-0.5 rounded">Dashboard</span>
-                        <span className="text-[10px] font-semibold bg-blue-50 text-blue-800 border border-blue-200 px-2 py-0.5 rounded">Scanner</span>
-                        <span className="text-[10px] font-semibold bg-blue-50 text-blue-800 border border-blue-200 px-2 py-0.5 rounded">Employee Master</span>
-                        <span className="text-[10px] font-semibold bg-blue-50 text-blue-800 border border-blue-200 px-2 py-0.5 rounded">Reports</span>
-                      </>
-                    )}
-                    {!isSuper && !isAdmin && (
-                      <span className="text-[10px] font-semibold bg-slate-50 text-slate-800 border border-slate-200 px-2 py-0.5 rounded">
-                        Attendance Scanner Only
-                      </span>
+                    {isSuperAdmin && !isSuper && (
+                      <div className="flex items-center justify-between pt-2 border-t border-slate-100 gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleOpenEditRoleModal(r)}
+                          className="px-2.5 py-1.5 rounded-lg border border-slate-200 hover:border-blue-400 hover:bg-blue-50 text-slate-700 hover:text-blue-700 text-[11px] font-semibold flex items-center gap-1 transition cursor-pointer"
+                        >
+                          <Edit3 className="w-3 h-3" />
+                          <span>Edit Role</span>
+                        </button>
+                        {!isSystem && (
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => handleToggleRoleActive(r)}
+                              className="px-2.5 py-1.5 rounded-lg border border-slate-200 hover:border-amber-400 hover:bg-amber-50 text-slate-700 hover:text-amber-700 text-[11px] font-semibold flex items-center gap-1 transition cursor-pointer"
+                              title={r.isActive ? 'Deactivate custom role' : 'Activate custom role'}
+                            >
+                              <Power className="w-3 h-3" />
+                              <span>{r.isActive ? 'Disable' : 'Enable'}</span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={count > 0}
+                              onClick={() => setRoleToDelete(r)}
+                              className="p-1.5 rounded-lg border border-slate-200 hover:border-red-400 hover:bg-red-50 text-slate-600 hover:text-red-700 disabled:opacity-40 disabled:cursor-not-allowed transition cursor-pointer"
+                              title={
+                                count > 0
+                                  ? `Cannot delete while ${count} account(s) are assigned to this role`
+                                  : `Delete custom role ${r.roleName}`
+                              }
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        )}
+                      </div>
                     )}
                   </div>
                 </div>
-              </div>
-            );
-          })}
+              );
+            })}
+          </div>
         </div>
       )}
 
@@ -1791,16 +2073,29 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                       setCreateFormData({
                         ...createFormData,
                         role: newRole,
-                        modulesAllowed: newRole === 'super_admin' ? ['all'] :
-                                       newRole === 'admin' ? ['dashboard', 'scanner', 'employees', 'history', 'reports', 'qr_codes'] :
-                                       ['dashboard', 'scanner']
+                        modulesAllowed: getDefaultModulesForRole(newRole),
                       });
                     }}
                     className="w-full text-xs px-3 py-2 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 font-semibold"
                   >
-                    <option value="user">USER (Gate Operator / Scanner)</option>
-                    <option value="admin">ADMIN (Line Supervisor)</option>
-                    <option value="super_admin">SUPER ADMIN (Full Access)</option>
+                    {(rolesList.length > 0
+                      ? rolesList.filter((r) => r.isActive !== false)
+                      : [
+                          { roleId: 'user', roleName: 'USER' },
+                          { roleId: 'admin', roleName: 'ADMIN' },
+                          { roleId: 'super_admin', roleName: 'SUPER_ADMIN' },
+                        ]
+                    ).map((r) => (
+                      <option key={r.roleId} value={r.roleId}>
+                        {r.roleId === 'user'
+                          ? 'USER (Gate Operator / Scanner)'
+                          : r.roleId === 'admin'
+                            ? 'ADMIN (Line Supervisor)'
+                            : r.roleId === 'super_admin'
+                              ? 'SUPER ADMIN (Full Access)'
+                              : `${r.roleName} (${r.roleId})`}
+                      </option>
+                    ))}
                   </select>
                 </div>
 
@@ -2059,19 +2354,37 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                     System Role
                   </label>
                   <select
-                    value={editRole}
+                    value={normalizeRoleId(editRole)}
+                    disabled={selectedUser.loginId === 'superadmin' || selectedUser.id === 'role_superadmin'}
                     onChange={e => {
                       const newRole = e.target.value as UserRoleType;
                       setEditRole(newRole);
                       if (newRole === 'super_admin') {
                         setEditModulesAllowed(PERMISSION_MODULES.map(m => m.key));
+                      } else {
+                        setEditModulesAllowed(getDefaultModulesForRole(newRole));
                       }
                     }}
-                    className="w-full text-xs px-3 py-2 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 font-semibold"
+                    className="w-full text-xs px-3 py-2 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 font-semibold disabled:bg-slate-100 disabled:text-slate-500"
                   >
-                    <option value="user">USER (Operator)</option>
-                    <option value="admin">ADMIN (Supervisor)</option>
-                    <option value="super_admin">SUPER ADMIN (Full Access)</option>
+                    {(rolesList.length > 0
+                      ? rolesList.filter((r) => r.isActive !== false || r.roleId === normalizeRoleId(editRole))
+                      : [
+                          { roleId: 'user', roleName: 'USER', isActive: true },
+                          { roleId: 'admin', roleName: 'ADMIN', isActive: true },
+                          { roleId: 'super_admin', roleName: 'SUPER_ADMIN', isActive: true },
+                        ]
+                    ).map((r) => (
+                      <option key={r.roleId} value={r.roleId}>
+                        {r.roleId === 'user'
+                          ? 'USER (Operator)'
+                          : r.roleId === 'admin'
+                            ? 'ADMIN (Supervisor)'
+                            : r.roleId === 'super_admin'
+                              ? 'SUPER ADMIN (Full Access)'
+                              : `${r.roleName}${r.isActive === false ? ' (Inactive)' : ''}`}
+                      </option>
+                    ))}
                   </select>
                 </div>
 
@@ -2150,6 +2463,210 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================= */}
+      {/* MODAL 3.5: CREATE / EDIT CUSTOM ROLE (SUPER ADMIN ONLY)   */}
+      {/* ========================================================= */}
+      {isRoleModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-2xl max-h-[92vh] flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+            <div className="p-5 border-b border-slate-100 bg-slate-50 flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-indigo-600 text-white flex items-center justify-center font-bold">
+                  <Building className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-900 text-base">
+                    {editingRoleId ? `Edit Role: ${editingRoleId}` : 'Create New Custom Role'}
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    Define role metadata and default module permissions in Firestore &amp; Backend RBAC
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsRoleModalOpen(false)}
+                className="p-1 rounded-lg hover:bg-slate-200 text-slate-500 transition cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveRoleSubmit} className="flex-1 overflow-y-auto p-6 space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1">
+                    Role Name *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    minLength={2}
+                    maxLength={48}
+                    placeholder="e.g. Shift Coordinator"
+                    value={roleFormName}
+                    onChange={(e) => setRoleFormName(e.target.value)}
+                    className="w-full text-xs px-3 py-2 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 font-semibold"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1">
+                    Canonical Role ID Preview
+                  </label>
+                  <input
+                    type="text"
+                    readOnly
+                    value={editingRoleId || deriveRoleIdFromName(roleFormName) || 'enter_role_name'}
+                    className="w-full text-xs px-3 py-2 border border-slate-200 bg-slate-50 rounded-xl font-mono font-bold text-indigo-700"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  Role Description *
+                </label>
+                <textarea
+                  required
+                  minLength={3}
+                  maxLength={500}
+                  rows={2}
+                  placeholder="Describe the responsibilities and scope for this role..."
+                  value={roleFormDescription}
+                  onChange={(e) => setRoleFormDescription(e.target.value)}
+                  className="w-full text-xs px-3 py-2 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                />
+              </div>
+
+              {(!editingRoleId || !SYSTEM_ROLE_IDS.has(editingRoleId)) && (
+                <label className="flex items-center gap-2 cursor-pointer text-xs font-medium text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={roleFormIsActive}
+                    onChange={(e) => setRoleFormIsActive(e.target.checked)}
+                    className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500 w-4 h-4"
+                  />
+                  <span>Active Role (users assigned to this role can sign in)</span>
+                </label>
+              )}
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-2">
+                  Default Module Permissions (View / Add / Edit / Delete)
+                </label>
+                <div className="border border-slate-200 rounded-xl overflow-hidden max-h-60 overflow-y-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-slate-50 text-slate-600 font-bold border-b border-slate-200 sticky top-0">
+                      <tr>
+                        <th className="py-2 px-3">Module</th>
+                        <th className="py-2 px-2 text-center">View</th>
+                        <th className="py-2 px-2 text-center">Add</th>
+                        <th className="py-2 px-2 text-center">Edit</th>
+                        <th className="py-2 px-2 text-center">Delete</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {PERMISSION_MODULES.map((m) => {
+                        const isRestricted =
+                          m.key === 'user_rights' || m.key === 'audit_logs' || m.key === 'security_management';
+                        const perms = roleFormPermissions[m.key] || { view: false, add: false, edit: false, delete: false };
+                        return (
+                          <tr key={m.key} className={isRestricted ? 'bg-slate-50/70 opacity-60' : 'hover:bg-slate-50'}>
+                            <td className="py-2 px-3">
+                              <span className="font-semibold text-slate-800">{modLabelShort(m.label)}</span>
+                              {isRestricted && (
+                                <span className="ml-1.5 text-[9px] font-mono text-red-600">(Super Admin Only)</span>
+                              )}
+                            </td>
+                            {(['view', 'add', 'edit', 'delete'] as ModuleAction[]).map((action) => (
+                              <td key={action} className="py-2 px-2 text-center">
+                                <input
+                                  type="checkbox"
+                                  disabled={isRestricted}
+                                  checked={isRestricted ? false : Boolean(perms[action])}
+                                  onChange={() => handleToggleRoleFormModule(m.key, action)}
+                                  className="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer disabled:cursor-not-allowed"
+                                />
+                              </td>
+                            ))}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div className="pt-3 border-t border-slate-100 flex items-center justify-end gap-3">
+                <button
+                  type="button"
+                  onClick={() => setIsRoleModalOpen(false)}
+                  className="px-4 py-2 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-100 text-xs font-semibold cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSubmittingRole}
+                  className="px-5 py-2 rounded-xl bg-indigo-600 text-white font-bold text-xs flex items-center gap-2 hover:bg-indigo-700 shadow-md disabled:opacity-50 cursor-pointer"
+                >
+                  <Save className="w-3.5 h-3.5" />
+                  <span>{isSubmittingRole ? 'Saving Role...' : editingRoleId ? 'Save Role Changes' : 'Create Role'}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================= */}
+      {/* MODAL 3.6: CONFIRM CUSTOM ROLE DELETION                   */}
+      {/* ========================================================= */}
+      {roleToDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
+          <div className="bg-white rounded-2xl border border-red-200 shadow-2xl w-full max-w-md overflow-hidden">
+            <div className="p-5 border-b border-red-100 bg-red-50 flex items-center justify-between">
+              <div className="flex items-center gap-2 text-red-900 font-bold text-sm">
+                <ShieldAlert className="w-5 h-5 text-red-600" />
+                <span>Delete Custom Role</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setRoleToDelete(null)}
+                className="p-1 rounded-lg hover:bg-red-200 text-red-600 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-5 text-xs text-slate-700 space-y-3">
+              <p>
+                Delete custom role <strong>{roleToDelete.roleName}</strong> (<code className="font-mono">{roleToDelete.roleId}</code>)?
+              </p>
+              <p className="text-slate-500">
+                Built-in system roles and roles currently assigned to user accounts cannot be deleted.
+              </p>
+            </div>
+            <div className="p-4 border-t border-slate-100 bg-slate-50 flex justify-end gap-2.5">
+              <button
+                type="button"
+                onClick={() => setRoleToDelete(null)}
+                className="px-4 py-2 rounded-xl border border-slate-200 text-slate-700 text-xs font-semibold cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingRole}
+                onClick={handleConfirmDeleteRole}
+                className="px-4 py-2 rounded-xl bg-red-600 hover:bg-red-700 text-white text-xs font-bold cursor-pointer disabled:opacity-50"
+              >
+                {isDeletingRole ? 'Deleting...' : 'Delete Role'}
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -268,7 +268,7 @@ export interface SystemSetting {
   failedLoginAlertThreshold?: number;
 }
 
-export type UserRoleType = 'SUPER_ADMIN' | 'ADMIN' | 'USER' | 'super_admin' | 'admin' | 'user';
+export type UserRoleType = 'SUPER_ADMIN' | 'ADMIN' | 'USER' | 'super_admin' | 'admin' | 'user' | (string & {});
 
 export interface UserRoleRecord {
   id: string;

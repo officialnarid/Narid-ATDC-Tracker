@@ -8,6 +8,35 @@ import { apiFetchJson } from '../config/api';
 import { UserRoleRecord, UserRoleType } from '../types';
 import { getAuthHeaders } from './auditService';
 
+export const SYSTEM_ROLE_IDS = new Set(['super_admin', 'admin', 'user']);
+export const VALID_ROLE_ID_REGEX = /^[a-z][a-z0-9_]{1,47}$/;
+
+export function normalizeRoleId(role: UserRoleType | string | null | undefined): string {
+  const cleaned = String(role ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_')
+    .replace(/[^a-z0-9_]/g, '')
+    .replace(/^_+|_+$/g, '');
+  if (!cleaned) return 'user';
+  if (cleaned === 'superadmin' || cleaned === 'super_admin') return 'super_admin';
+  if (cleaned === 'admin') return 'admin';
+  if (cleaned === 'user') return 'user';
+  return VALID_ROLE_ID_REGEX.test(cleaned) ? cleaned : 'user';
+}
+
+export function deriveRoleIdFromName(roleName: string): string {
+  const cleaned = String(roleName ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_')
+    .replace(/[^a-z0-9_]/g, '')
+    .replace(/^_+|_+$/g, '');
+  if (!cleaned) return '';
+  if (cleaned === 'superadmin' || cleaned === 'super_admin') return 'super_admin';
+  return VALID_ROLE_ID_REGEX.test(cleaned) ? cleaned : '';
+}
+
 export type ModuleAction = 'view' | 'add' | 'edit' | 'delete';
 
 export interface ModulePermission {
@@ -18,7 +47,7 @@ export interface ModulePermission {
 }
 
 export interface RolePermissionRecord {
-  roleId: 'super_admin' | 'admin' | 'user';
+  roleId: string;
   roleName: string;
   modulePermissions: Record<string, ModulePermission>;
   updatedAt: string;
@@ -26,11 +55,13 @@ export interface RolePermissionRecord {
 }
 
 export interface RoleRecord {
-  roleId: 'super_admin' | 'admin' | 'user';
-  roleName: 'SUPER_ADMIN' | 'ADMIN' | 'USER';
+  roleId: string;
+  roleName: string;
   description: string;
   defaultPermissions?: Record<string, ModulePermission>;
   isActive: boolean;
+  isSystemRole?: boolean;
+  createdBy?: string;
   updatedAt: string;
 }
 
@@ -187,6 +218,11 @@ export const DEFAULT_ADMIN_PERMISSIONS: Record<string, ModulePermission> = {
   settings: { view: false, add: false, edit: false, delete: false },
 };
 
+export const EMPTY_MODULE_PERMISSIONS: Record<string, ModulePermission> = PERMISSION_MODULES.reduce((acc, m) => {
+  acc[m.key] = { view: false, add: false, edit: false, delete: false };
+  return acc;
+}, {} as Record<string, ModulePermission>);
+
 export const DEFAULT_USER_PERMISSIONS: Record<string, ModulePermission> = {
   dashboard: { view: true, add: false, edit: false, delete: false },
   scanner: { view: true, add: true, edit: false, delete: false },
@@ -320,13 +356,14 @@ export function subscribeToAllRolePermissions(
 }
 
 /**
- * Super Admin saves configured permissions for Admin or User
+ * Super Admin saves configured permissions for any non-super_admin role (system or custom)
  */
 export async function saveRolePermissions(
   callerLoginId: string,
-  targetRoleId: 'admin' | 'user',
+  targetRoleId: string,
   modulePermissions: Record<string, ModulePermission>
 ): Promise<void> {
+  const normalizedTarget = normalizeRoleId(targetRoleId);
   const headers = await getAuthHeaders();
   await apiFetchJson(
     '/api/admin/role-permissions',
@@ -335,7 +372,7 @@ export async function saveRolePermissions(
       headers,
       body: JSON.stringify({
         callerLoginId,
-        roleId: targetRoleId,
+        roleId: normalizedTarget,
         modulePermissions,
       }),
     },
@@ -344,8 +381,45 @@ export async function saveRolePermissions(
 }
 
 /**
+ * Super Admin creates or updates a role definition (system or future custom role)
+ */
+export async function saveRoleDefinition(payload: {
+  roleId?: string;
+  roleName: string;
+  description: string;
+  isActive: boolean;
+  defaultPermissions?: Record<string, ModulePermission>;
+}): Promise<{ success: boolean; created: boolean; role: RoleRecord }> {
+  const headers = await getAuthHeaders();
+  return apiFetchJson<{ success: boolean; created: boolean; role: RoleRecord }>(
+    '/api/admin/roles',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    },
+    'Failed to save role definition.'
+  );
+}
+
+/**
+ * Super Admin deletes an unused custom role
+ */
+export async function deleteCustomRole(roleId: string): Promise<void> {
+  const headers = await getAuthHeaders();
+  await apiFetchJson(
+    `/api/admin/roles/${encodeURIComponent(roleId)}`,
+    {
+      method: 'DELETE',
+      headers,
+    },
+    'Failed to delete custom role.'
+  );
+}
+
+/**
  * Check if a role has a specific permission on a module
- * Super Admin ALWAYS returns true.
+ * Super Admin ALWAYS returns true. Custom roles fail closed unless granted.
  */
 export function hasModulePermission(
   role: UserRoleType | string | null | undefined,
@@ -354,16 +428,19 @@ export function hasModulePermission(
   activePermissions?: Record<string, RolePermissionRecord> | null
 ): boolean {
   if (!role) return false;
-  const cleanRole = String(role).trim().toLowerCase();
+  const roleKey = normalizeRoleId(role);
 
   // Super Admin permissions must always remain complete and unrestricted
-  if (cleanRole === 'super_admin' || cleanRole === 'superadmin') {
+  if (roleKey === 'super_admin') {
     return true;
   }
 
-  const roleKey = cleanRole === 'admin' ? 'admin' : 'user';
+  // Restricted administrative modules are never allowed for non-Super Admin roles
+  if (moduleKey === 'user_rights' || moduleKey === 'audit_logs' || moduleKey === 'security_management') {
+    return false;
+  }
 
-  // Check from live permissions store
+  // Check from live permissions store first (works for both system and custom roles)
   if (activePermissions && activePermissions[roleKey]) {
     const perms = activePermissions[roleKey].modulePermissions;
     if (perms && perms[moduleKey]) {
@@ -371,28 +448,38 @@ export function hasModulePermission(
     }
   }
 
-  // Fallback to static defaults
+  // Fallback to static defaults ONLY for built-in system roles
   if (roleKey === 'admin') {
     return !!DEFAULT_ADMIN_PERMISSIONS[moduleKey]?.[action];
   }
+  if (roleKey === 'user') {
+    return !!DEFAULT_USER_PERMISSIONS[moduleKey]?.[action];
+  }
 
-  return !!DEFAULT_USER_PERMISSIONS[moduleKey]?.[action];
+  return false;
 }
 
 /**
- * Real-time listener for roles collection (Predefined roles)
+ * Real-time listener for roles collection (built-in system roles + future custom roles)
  */
 export function subscribeToRoles(
   callback: (roles: RoleRecord[]) => void
 ): () => void {
   const colRef = collection(db, 'roles');
   return onSnapshot(colRef, (snap) => {
-    const list: RoleRecord[] = snap.docs.map(d => ({
-      ...(d.data() as RoleRecord),
-      roleId: d.id as any,
-    }));
+    const list: RoleRecord[] = snap.docs.map(d => {
+      const data = d.data() as RoleRecord;
+      const roleId = normalizeRoleId(data.roleId || d.id);
+      return {
+        ...data,
+        roleId,
+        roleName: data.roleName || roleId.toUpperCase(),
+        isActive: data.isActive !== false,
+        isSystemRole: SYSTEM_ROLE_IDS.has(roleId),
+      };
+    });
 
-    // Ensure all 3 predefined roles are present
+    // Ensure all 3 built-in system roles are always present without auto-seeding custom roles
     const order: Record<string, number> = { super_admin: 0, admin: 1, user: 2 };
     const defaultDescriptions: Record<string, string> = {
       super_admin: 'Complete access to all application modules, account management, role permissions, system settings and administrative controls.',
@@ -407,9 +494,10 @@ export function subscribeToRoles(
       if (!rolesMap.has(roleId)) {
         rolesMap.set(roleId, {
           roleId,
-          roleName: roleId.toUpperCase() as any,
+          roleName: roleId.toUpperCase(),
           description: defaultDescriptions[roleId],
           isActive: true,
+          isSystemRole: true,
           updatedAt: new Date().toISOString(),
           defaultPermissions: roleId === 'super_admin' ? DEFAULT_SUPER_ADMIN_PERMISSIONS :
                               roleId === 'admin' ? DEFAULT_ADMIN_PERMISSIONS : DEFAULT_USER_PERMISSIONS,
@@ -418,7 +506,12 @@ export function subscribeToRoles(
     });
 
     const finalList = Array.from(rolesMap.values());
-    finalList.sort((a, b) => (order[a.roleId] ?? 9) - (order[b.roleId] ?? 9));
+    finalList.sort((a, b) => {
+      const pA = order[a.roleId] ?? 10;
+      const pB = order[b.roleId] ?? 10;
+      if (pA !== pB) return pA - pB;
+      return String(a.roleName || a.roleId).localeCompare(String(b.roleName || b.roleId));
+    });
     callback(finalList);
   }, (err) => {
     console.warn('[PermissionService] Roles subscription notice:', err);
@@ -482,13 +575,17 @@ export function getEffectiveModulePermissions(
   userPermissionOverride?: UserPermissionRecord | null,
   rolePermissionDefault?: RolePermissionRecord | null
 ): Record<string, ModulePermission> {
-  const cleanRole = (role || 'user').toLowerCase();
-  if (cleanRole === 'super_admin' || cleanRole === 'superadmin') {
+  const cleanRole = normalizeRoleId(role);
+  if (cleanRole === 'super_admin') {
     return DEFAULT_SUPER_ADMIN_PERMISSIONS;
   }
 
-  const roleDefaults = rolePermissionDefault?.modulePermissions || 
-    (cleanRole === 'admin' ? DEFAULT_ADMIN_PERMISSIONS : DEFAULT_USER_PERMISSIONS);
+  const roleDefaults = rolePermissionDefault?.modulePermissions ||
+    (cleanRole === 'admin'
+      ? DEFAULT_ADMIN_PERMISSIONS
+      : cleanRole === 'user'
+        ? DEFAULT_USER_PERMISSIONS
+        : EMPTY_MODULE_PERMISSIONS);
 
   if (!userPermissionOverride?.permissions) {
     return roleDefaults;

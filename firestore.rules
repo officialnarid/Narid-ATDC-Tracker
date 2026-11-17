@@ -36,6 +36,24 @@ service cloud.firestore {
         (!hasDirectUidRole() || (directUidRole().lockStatus != 'LOCKED' && directUidRole().isLocked != true));
     }
 
+    function callerRoleId() {
+      return hasUidIndex() && uidIndex().role is string
+        ? uidIndex().role.lower()
+        : (hasDirectUidRole() && directUidRole().role is string ? directUidRole().role.lower() : '');
+    }
+
+    function isSystemRole(roleId) {
+      return roleId in ['super_admin', 'admin', 'user'];
+    }
+
+    function isRoleActive() {
+      return isSystemRole(callerRoleId()) ||
+        (callerRoleId() != '' && (
+          !exists(/databases/$(database)/documents/roles/$(callerRoleId())) ||
+          get(/databases/$(database)/documents/roles/$(callerRoleId())).data.isActive != false
+        ));
+    }
+
     function isSuperAdmin() {
       return isSignedIn() && isNotLocked() && (
         (hasUidIndex() &&
@@ -60,10 +78,24 @@ service cloud.firestore {
     }
 
     function isActiveUser() {
-      return isSignedIn() && isNotLocked() && (
+      return isSignedIn() && isNotLocked() && isRoleActive() && (
         isAdmin() ||
         (hasUidIndex() && uidIndex().status == 'Active') ||
         (hasDirectUidRole() && directUidRole().status == 'Active')
+      );
+    }
+
+    function hasRoleModuleAction(mod, act) {
+      return isSuperAdmin() || (
+        isActiveUser() &&
+        !(mod in ['user_rights', 'audit_logs', 'security_management']) &&
+        callerRoleId() != '' &&
+        exists(/databases/$(database)/documents/role_permissions/$(callerRoleId())) &&
+        get(/databases/$(database)/documents/role_permissions/$(callerRoleId())).data.modulePermissions is map &&
+        mod in get(/databases/$(database)/documents/role_permissions/$(callerRoleId())).data.modulePermissions &&
+        get(/databases/$(database)/documents/role_permissions/$(callerRoleId())).data.modulePermissions[mod] is map &&
+        act in get(/databases/$(database)/documents/role_permissions/$(callerRoleId())).data.modulePermissions[mod] &&
+        get(/databases/$(database)/documents/role_permissions/$(callerRoleId())).data.modulePermissions[mod][act] == true
       );
     }
 
@@ -117,11 +149,15 @@ service cloud.firestore {
     // 5. Employees Master Directory
     match /employees/{employeeId} {
       allow list, get: if isActiveUser();
-      allow create, update: if isAdmin() && isValidId(employeeId) &&
+      allow create: if (isAdmin() || hasRoleModuleAction('employees', 'add')) && isValidId(employeeId) &&
         request.resource.data.employeeId is string &&
         request.resource.data.employeeName is string &&
         request.resource.data.employeeStatus in ['Active', 'Inactive'];
-      allow delete: if isAdmin() && isValidId(employeeId);
+      allow update: if (isAdmin() || hasRoleModuleAction('employees', 'edit')) && isValidId(employeeId) &&
+        request.resource.data.employeeId is string &&
+        request.resource.data.employeeName is string &&
+        request.resource.data.employeeStatus in ['Active', 'Inactive'];
+      allow delete: if (isAdmin() || hasRoleModuleAction('employees', 'delete')) && isValidId(employeeId);
     }
 
     // 6. Attendance Daily Records (Server-Authoritative Backend API Only Writes)
@@ -132,13 +168,13 @@ service cloud.firestore {
 
     // 7. Individual Punch Events (Server-Authoritative Backend API Only Writes)
     match /punch_events/{eventId} {
-      allow list, get: if isAdmin();
+      allow list, get: if isAdmin() || hasRoleModuleAction('scanner', 'view') || hasRoleModuleAction('history', 'view');
       allow create, update, delete: if false; // Strictly via authenticated backend API (Admin SDK)
     }
 
     // 8. Raw Punch Activity Logs (Server-Authoritative Backend API Only Writes)
     match /punch_logs/{logId} {
-      allow list, get: if isAdmin();
+      allow list, get: if isAdmin() || hasRoleModuleAction('scanner', 'view') || hasRoleModuleAction('history', 'view');
       allow create, update, delete: if false; // Strictly via authenticated backend API (Admin SDK)
     }
 
@@ -175,28 +211,38 @@ service cloud.firestore {
     // 10. Organization Hierarchy (Departments, Floors/Lines, Sections, Lines)
     match /departments/{departmentId} {
       allow list, get: if isActiveUser();
-      allow create, update, delete: if isAdmin() && isValidId(departmentId);
+      allow create: if (isAdmin() || hasRoleModuleAction('organization', 'add')) && isValidId(departmentId);
+      allow update: if (isAdmin() || hasRoleModuleAction('organization', 'edit')) && isValidId(departmentId);
+      allow delete: if (isAdmin() || hasRoleModuleAction('organization', 'delete')) && isValidId(departmentId);
     }
 
     match /floors/{floorId} {
       allow list, get: if isActiveUser();
-      allow create, update, delete: if isAdmin() && isValidId(floorId);
+      allow create: if (isAdmin() || hasRoleModuleAction('organization', 'add')) && isValidId(floorId);
+      allow update: if (isAdmin() || hasRoleModuleAction('organization', 'edit')) && isValidId(floorId);
+      allow delete: if (isAdmin() || hasRoleModuleAction('organization', 'delete')) && isValidId(floorId);
     }
 
     match /sections/{sectionId} {
       allow list, get: if isActiveUser();
-      allow create, update, delete: if isAdmin() && isValidId(sectionId);
+      allow create: if (isAdmin() || hasRoleModuleAction('organization', 'add')) && isValidId(sectionId);
+      allow update: if (isAdmin() || hasRoleModuleAction('organization', 'edit')) && isValidId(sectionId);
+      allow delete: if (isAdmin() || hasRoleModuleAction('organization', 'delete')) && isValidId(sectionId);
     }
 
     match /lines/{lineId} {
       allow list, get: if isActiveUser();
-      allow create, update, delete: if isAdmin() && isValidId(lineId);
+      allow create: if (isAdmin() || hasRoleModuleAction('organization', 'add')) && isValidId(lineId);
+      allow update: if (isAdmin() || hasRoleModuleAction('organization', 'edit')) && isValidId(lineId);
+      allow delete: if (isAdmin() || hasRoleModuleAction('organization', 'delete')) && isValidId(lineId);
     }
 
     // 11. Shift Schedules & Server-Managed Rosters
     match /shifts/{shiftId} {
       allow list, get: if isActiveUser();
-      allow create, update, delete: if isAdmin() && isValidId(shiftId);
+      allow create: if (isAdmin() || hasRoleModuleAction('shifts', 'add')) && isValidId(shiftId);
+      allow update: if (isAdmin() || hasRoleModuleAction('shifts', 'edit')) && isValidId(shiftId);
+      allow delete: if (isAdmin() || hasRoleModuleAction('shifts', 'delete')) && isValidId(shiftId);
     }
 
     match /shift_rosters/{rosterId} {

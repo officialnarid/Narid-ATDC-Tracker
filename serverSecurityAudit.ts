@@ -87,7 +87,7 @@ export interface VerifiedCaller {
   uid: string;
   email: string;
   loginId: string;
-  role: 'super_admin' | 'admin' | 'user';
+  role: string;
   profileDocId: string;
   authTime?: number;
 }
@@ -120,11 +120,34 @@ export const CRITICAL_PROTECTED_ACTIONS = new Set([
   'audit_controlled_deleted',
 ]);
 
-export function normalizeRoleValue(rawRole: unknown): 'super_admin' | 'admin' | 'user' {
-  const r = String(rawRole || 'user').trim().toLowerCase();
-  if (r === 'super_admin' || r === 'superadmin') return 'super_admin';
-  if (r === 'admin') return 'admin';
+export const SYSTEM_ROLE_IDS = new Set(['super_admin', 'admin', 'user']);
+export const VALID_ROLE_ID_REGEX = /^[a-z][a-z0-9_]{1,47}$/;
+
+export function normalizeRoleValue(rawRole: unknown): string {
+  const cleaned = String(rawRole ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_')
+    .replace(/[^a-z0-9_]/g, '')
+    .replace(/^_+|_+$/g, '');
+  if (!cleaned) return 'user';
+  if (cleaned === 'superadmin' || cleaned === 'super_admin') return 'super_admin';
+  if (cleaned === 'admin') return 'admin';
+  if (cleaned === 'user') return 'user';
+  if (VALID_ROLE_ID_REGEX.test(cleaned)) return cleaned;
   return 'user';
+}
+
+export function deriveStrictRoleId(rawRole: unknown): string {
+  const cleaned = String(rawRole ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_')
+    .replace(/[^a-z0-9_]/g, '')
+    .replace(/^_+|_+$/g, '');
+  if (!cleaned) return '';
+  if (cleaned === 'superadmin' || cleaned === 'super_admin') return 'super_admin';
+  return VALID_ROLE_ID_REGEX.test(cleaned) ? cleaned : '';
 }
 
 // ============================================================================
@@ -309,6 +332,15 @@ export async function verifyCallerIdentity(
   }
 
   const normalizedRole = normalizeRoleValue(matchedDoc.data.role);
+  if (!SYSTEM_ROLE_IDS.has(normalizedRole)) {
+    const roleDefSnap = await db.collection('roles').doc(normalizedRole).get();
+    if (roleDefSnap.exists && roleDefSnap.data()?.isActive === false) {
+      const err: any = new Error('Assigned role is currently inactive. Access denied.');
+      err.statusCode = 403;
+      throw err;
+    }
+  }
+
   const resolvedLoginId = String(
     matchedDoc.data.loginId || matchedDoc.id.replace(/^role_/, '')
   ).toLowerCase();
