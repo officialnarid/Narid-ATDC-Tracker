@@ -81,7 +81,13 @@ import {
   EMPTY_MODULE_PERMISSIONS,
   DEFAULT_SUPER_ADMIN_PERMISSIONS,
   DEFAULT_ADMIN_PERMISSIONS,
-  DEFAULT_USER_PERMISSIONS
+  DEFAULT_USER_PERMISSIONS,
+  SCANNER_CAPABILITY_KEYS,
+  isScannerCapabilityEntryEnabled,
+  DASHBOARD_CARDS,
+  DASHBOARD_SECTIONS,
+  DASHBOARD_VISIBILITY_KEYS,
+  resolveDashboardVisibility
 } from '../services/permissionService';
 
 const safeStr = (v: any, fallback = ''): string => {
@@ -242,7 +248,13 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       rolesList.find((r) => r.roleId === cleanRole)?.defaultPermissions;
     if (livePerms) {
       return Object.entries(livePerms)
-        .filter(([modKey, p]) => Boolean(p?.view) && !restricted.has(modKey))
+        .filter(
+          ([modKey, p]) =>
+            Boolean(p?.view) &&
+            !restricted.has(modKey) &&
+            !SCANNER_CAPABILITY_KEYS.has(modKey) &&
+            !DASHBOARD_VISIBILITY_KEYS.has(modKey)
+        )
         .map(([modKey]) => modKey);
     }
     if (cleanRole === 'admin') {
@@ -640,9 +652,15 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
     setEditRole(user.role);
     setEditStatus(user.status || 'Active');
     if (user.modulesAllowed?.includes('all') || user.role === 'super_admin') {
-      setEditModulesAllowed(PERMISSION_MODULES.map(m => m.key));
+      setEditModulesAllowed(
+        PERMISSION_MODULES.filter((m) => !m.isCapability && !m.isVisibilityOnly).map((m) => m.key)
+      );
     } else {
-      setEditModulesAllowed(user.modulesAllowed || []);
+      setEditModulesAllowed(
+        (user.modulesAllowed || []).filter(
+          (k) => !SCANNER_CAPABILITY_KEYS.has(k) && !DASHBOARD_VISIBILITY_KEYS.has(k)
+        )
+      );
     }
     setIsPermissionsModalOpen(true);
   };
@@ -715,6 +733,60 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
     if (targetUser?.role?.toLowerCase() === 'super_admin') return;
 
     setWorkingUserPerms(prev => {
+      if (SCANNER_CAPABILITY_KEYS.has(moduleKey)) {
+        const entry = prev[moduleKey];
+        const hasExplicit =
+          Boolean(entry) && (typeof entry?.view === 'boolean' || typeof entry?.add === 'boolean');
+        const currentlyAllowed =
+          moduleKey === 'attendance.qr.scan'
+            ? hasExplicit
+              ? isScannerCapabilityEntryEnabled(entry)
+              : isScannerCapabilityEntryEnabled(prev.scanner)
+            : isScannerCapabilityEntryEnabled(entry);
+        const nextAllowed = !currentlyAllowed;
+        const nextState: Record<string, ModulePermission> = {
+          ...prev,
+          [moduleKey]: { view: nextAllowed, add: nextAllowed, edit: false, delete: false },
+        };
+        if (nextAllowed && !prev.scanner?.view) {
+          nextState.scanner = {
+            ...(prev.scanner || { view: false, add: false, edit: false, delete: false }),
+            view: true,
+          };
+        }
+        return nextState;
+      }
+
+      if (DASHBOARD_VISIBILITY_KEYS.has(moduleKey)) {
+        const targetUserObj = users.find(u => u.id === selectedMatrixUserId);
+        const roleKey = normalizeRoleId(targetUserObj?.role || 'user');
+        const resolved = resolveDashboardVisibility({
+          role: roleKey,
+          rolePermissions: rolePermissionsMap[roleKey]?.modulePermissions || null,
+          userPermissionOverride: { isCustomOverride: true, permissions: prev },
+        });
+        const cardSet = new Set(resolved.permittedCards);
+        const sectionSet = new Set(resolved.permittedSections);
+        const nextState: Record<string, ModulePermission> = { ...prev };
+        DASHBOARD_CARDS.forEach((c) => {
+          const cur = cardSet.has(c.id);
+          const val = c.permissionKey === moduleKey ? !cur : cur;
+          nextState[c.permissionKey] = { view: val, add: false, edit: false, delete: false };
+        });
+        DASHBOARD_SECTIONS.forEach((s) => {
+          const cur = sectionSet.has(s.id);
+          const val = s.permissionKey === moduleKey ? !cur : cur;
+          nextState[s.permissionKey] = { view: val, add: false, edit: false, delete: false };
+        });
+        if (nextState[moduleKey]?.view && !prev.dashboard?.view) {
+          nextState.dashboard = {
+            ...(prev.dashboard || { view: false, add: false, edit: false, delete: false }),
+            view: true,
+          };
+        }
+        return nextState;
+      }
+
       const current = prev[moduleKey] || { view: false, add: false, edit: false, delete: false };
       const nextVal = !current[action];
       const updated = { ...current, [action]: nextVal };
@@ -726,7 +798,17 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
         updated.edit = false;
         updated.delete = false;
       }
-      return { ...prev, [moduleKey]: updated };
+      const nextState: Record<string, ModulePermission> = { ...prev, [moduleKey]: updated };
+      if (moduleKey === 'scanner' && !nextVal && action === 'view') {
+        nextState['attendance.qr.scan'] = { view: false, add: false, edit: false, delete: false };
+        nextState['attendance.manual.entry'] = { view: false, add: false, edit: false, delete: false };
+      }
+      if (moduleKey === 'dashboard' && !nextVal && action === 'view') {
+        DASHBOARD_VISIBILITY_KEYS.forEach((visKey) => {
+          nextState[visKey] = { view: false, add: false, edit: false, delete: false };
+        });
+      }
+      return nextState;
     });
   };
 
@@ -739,10 +821,19 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
     setIsSavingUserMatrix(true);
     try {
       const callerId = currentUserRole?.loginId || 'superadmin';
-      // Calculate allowed module keys based on view permission
+      // Calculate allowed module keys based on view permission (excluding dotted capability & visibility keys)
       const allowedKeys = Object.entries(workingUserPerms)
-        .filter(([_, p]) => p.view)
-        .map(([k, _]) => k);
+        .filter(
+          ([k, p]) =>
+            p.view && !SCANNER_CAPABILITY_KEYS.has(k) && !DASHBOARD_VISIBILITY_KEYS.has(k)
+        )
+        .map(([k]) => k);
+      if (
+        (workingUserPerms['attendance.qr.scan']?.view || workingUserPerms['attendance.manual.entry']?.view) &&
+        !allowedKeys.includes('scanner')
+      ) {
+        allowedKeys.push('scanner');
+      }
 
       await saveUserIndividualPermissions(
         callerId,
@@ -790,6 +881,57 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       return;
     }
     setRoleFormPermissions((prev) => {
+      if (SCANNER_CAPABILITY_KEYS.has(moduleKey)) {
+        const entry = prev[moduleKey];
+        const hasExplicit =
+          Boolean(entry) && (typeof entry?.view === 'boolean' || typeof entry?.add === 'boolean');
+        const currentlyAllowed =
+          moduleKey === 'attendance.qr.scan'
+            ? hasExplicit
+              ? isScannerCapabilityEntryEnabled(entry)
+              : isScannerCapabilityEntryEnabled(prev.scanner)
+            : isScannerCapabilityEntryEnabled(entry);
+        const nextAllowed = !currentlyAllowed;
+        const nextState: Record<string, ModulePermission> = {
+          ...prev,
+          [moduleKey]: { view: nextAllowed, add: nextAllowed, edit: false, delete: false },
+        };
+        if (nextAllowed && !prev.scanner?.view) {
+          nextState.scanner = {
+            ...(prev.scanner || { view: false, add: false, edit: false, delete: false }),
+            view: true,
+          };
+        }
+        return nextState;
+      }
+
+      if (DASHBOARD_VISIBILITY_KEYS.has(moduleKey)) {
+        const resolved = resolveDashboardVisibility({
+          role: editingRoleId || 'custom_role',
+          rolePermissions: prev,
+        });
+        const cardSet = new Set(resolved.permittedCards);
+        const sectionSet = new Set(resolved.permittedSections);
+        const nextState: Record<string, ModulePermission> = { ...prev };
+        DASHBOARD_CARDS.forEach((c) => {
+          const cur = cardSet.has(c.id);
+          const val = c.permissionKey === moduleKey ? !cur : cur;
+          nextState[c.permissionKey] = { view: val, add: false, edit: false, delete: false };
+        });
+        DASHBOARD_SECTIONS.forEach((s) => {
+          const cur = sectionSet.has(s.id);
+          const val = s.permissionKey === moduleKey ? !cur : cur;
+          nextState[s.permissionKey] = { view: val, add: false, edit: false, delete: false };
+        });
+        if (nextState[moduleKey]?.view && !prev.dashboard?.view) {
+          nextState.dashboard = {
+            ...(prev.dashboard || { view: false, add: false, edit: false, delete: false }),
+            view: true,
+          };
+        }
+        return nextState;
+      }
+
       const curr = prev[moduleKey] || { view: false, add: false, edit: false, delete: false };
       const nextVal = !curr[action];
       const updated = { ...curr, [action]: nextVal };
@@ -801,7 +943,17 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
         updated.edit = false;
         updated.delete = false;
       }
-      return { ...prev, [moduleKey]: updated };
+      const nextState: Record<string, ModulePermission> = { ...prev, [moduleKey]: updated };
+      if (moduleKey === 'scanner' && !nextVal && action === 'view') {
+        nextState['attendance.qr.scan'] = { view: false, add: false, edit: false, delete: false };
+        nextState['attendance.manual.entry'] = { view: false, add: false, edit: false, delete: false };
+      }
+      if (moduleKey === 'dashboard' && !nextVal && action === 'view') {
+        DASHBOARD_VISIBILITY_KEYS.forEach((visKey) => {
+          nextState[visKey] = { view: false, add: false, edit: false, delete: false };
+        });
+      }
+      return nextState;
     });
   };
 
@@ -1308,6 +1460,9 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {PERMISSION_MODULES.map(mod => {
+                  const isCapability = Boolean(mod.isCapability);
+                  const isVisibilityOnly = Boolean(mod.isVisibilityOnly);
+                  const isSingleToggle = isCapability || isVisibilityOnly;
                   if (matrixViewMode === 'roles') {
                     const renderPermPills = (p: ModulePermission) => (
                       <div className="flex items-center justify-center gap-1">
@@ -1319,36 +1474,107 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                     );
 
                     return (
-                      <tr key={mod.key} className="hover:bg-slate-50">
+                      <tr key={mod.key} className={`hover:bg-slate-50 ${mod.submodule ? 'bg-slate-50/40' : ''}`}>
                         <td className="py-3 px-4">
-                          <span className="font-bold text-slate-800 block">{mod.label}</span>
-                          <span className="text-[10px] text-slate-400">{mod.description}</span>
+                          <span className={`font-bold text-slate-800 block ${mod.submodule ? 'pl-4' : ''}`}>{mod.label}</span>
+                          <span className={`text-[10px] text-slate-400 block ${mod.submodule ? 'pl-4' : ''}`}>{mod.description}</span>
                         </td>
                         {rolesList.map((roleObj) => {
-                          const rolePerm =
+                          const roleModuleMap =
                             roleObj.roleId === 'super_admin'
-                              ? DEFAULT_SUPER_ADMIN_PERMISSIONS[mod.key] || { view: true, add: true, edit: true, delete: true }
-                              : rolePermissionsMap[roleObj.roleId]?.modulePermissions?.[mod.key] ||
-                                roleObj.defaultPermissions?.[mod.key] ||
+                              ? DEFAULT_SUPER_ADMIN_PERMISSIONS
+                              : rolePermissionsMap[roleObj.roleId]?.modulePermissions ||
+                                roleObj.defaultPermissions ||
                                 (roleObj.roleId === 'admin'
-                                  ? DEFAULT_ADMIN_PERMISSIONS[mod.key]
+                                  ? DEFAULT_ADMIN_PERMISSIONS
                                   : roleObj.roleId === 'user'
-                                    ? DEFAULT_USER_PERMISSIONS[mod.key]
-                                    : EMPTY_MODULE_PERMISSIONS[mod.key]) || { view: false, add: false, edit: false, delete: false };
+                                    ? DEFAULT_USER_PERMISSIONS
+                                    : EMPTY_MODULE_PERMISSIONS);
+
+                          let rolePerm = roleModuleMap[mod.key] || { view: false, add: false, edit: false, delete: false };
+                          if (isCapability && roleObj.roleId !== 'super_admin') {
+                            const explicit = roleModuleMap[mod.key];
+                            const hasExplicit =
+                              Boolean(explicit) &&
+                              (typeof explicit?.view === 'boolean' || typeof explicit?.add === 'boolean');
+                            const allowed =
+                              mod.key === 'attendance.qr.scan'
+                                ? hasExplicit
+                                  ? isScannerCapabilityEntryEnabled(explicit)
+                                  : isScannerCapabilityEntryEnabled(roleModuleMap.scanner)
+                                : isScannerCapabilityEntryEnabled(explicit);
+                            rolePerm = { view: allowed, add: allowed, edit: false, delete: false };
+                          } else if (isVisibilityOnly) {
+                            const vis = resolveDashboardVisibility({
+                              role: roleObj.roleId,
+                              rolePermissions: roleModuleMap,
+                            });
+                            const visKeyAllowed =
+                              mod.visibilityGroup === 'card'
+                                ? vis.permittedCards.some((id) => `dashboard.card.${id}` === mod.key)
+                                : vis.permittedSections.some((id) => `dashboard.section.${id}` === mod.key);
+                            rolePerm = { view: visKeyAllowed, add: false, edit: false, delete: false };
+                          }
+
                           return (
                             <td key={roleObj.roleId} className="py-3 px-4 text-center">
-                              {renderPermPills(rolePerm)}
+                              {isSingleToggle ? (
+                                <span
+                                  className={`text-[10px] px-2 py-0.5 rounded-full font-bold uppercase ${
+                                    rolePerm.view
+                                      ? 'bg-emerald-100 text-emerald-800'
+                                      : 'bg-slate-100 text-slate-500'
+                                  }`}
+                                >
+                                  {isVisibilityOnly ? (rolePerm.view ? 'Visible' : 'Hidden') : (rolePerm.view ? 'Allowed' : 'Denied')}
+                                </span>
+                              ) : (
+                                renderPermPills(rolePerm)
+                              )}
                             </td>
                           );
                         })}
                       </tr>
                     );
                   } else {
-                    const currentPerm = workingUserPerms[mod.key] || { view: false, add: false, edit: false, delete: false };
                     const targetUser = users.find(u => u.id === selectedMatrixUserId);
                     const isTargetSuper = targetUser?.role?.toLowerCase() === 'super_admin';
+                    const rawPerm = workingUserPerms[mod.key];
+                    const hasExplicit =
+                      Boolean(rawPerm) &&
+                      (typeof rawPerm?.view === 'boolean' || typeof rawPerm?.add === 'boolean');
+                    const capAllowed = isCapability
+                      ? mod.key === 'attendance.qr.scan'
+                        ? hasExplicit
+                          ? isScannerCapabilityEntryEnabled(rawPerm)
+                          : isScannerCapabilityEntryEnabled(workingUserPerms.scanner)
+                        : isScannerCapabilityEntryEnabled(rawPerm)
+                      : false;
+                    let currentPerm = isCapability
+                      ? { view: capAllowed, add: capAllowed, edit: false, delete: false }
+                      : rawPerm || { view: false, add: false, edit: false, delete: false };
+
+                    if (isVisibilityOnly) {
+                      const roleKey = normalizeRoleId(targetUser?.role || 'user');
+                      const resolvedVis = resolveDashboardVisibility({
+                        role: roleKey,
+                        rolePermissions: rolePermissionsMap[roleKey]?.modulePermissions || null,
+                        userPermissionOverride: { isCustomOverride: true, permissions: workingUserPerms },
+                      });
+                      const visAllowed =
+                        mod.visibilityGroup === 'card'
+                          ? resolvedVis.permittedCards.some((id) => `dashboard.card.${id}` === mod.key)
+                          : resolvedVis.permittedSections.some((id) => `dashboard.section.${id}` === mod.key);
+                      currentPerm = { view: visAllowed, add: false, edit: false, delete: false };
+                    }
 
                     const renderActionCheckbox = (action: ModuleAction) => {
+                      if (isCapability && (action === 'edit' || action === 'delete')) {
+                        return <span className="text-slate-300 font-mono">—</span>;
+                      }
+                      if (isVisibilityOnly && action !== 'view') {
+                        return <span className="text-slate-300 font-mono">—</span>;
+                      }
                       const checked = isTargetSuper ? true : !!currentPerm[action];
                       return (
                         <button
@@ -1365,10 +1591,10 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                     };
 
                     return (
-                      <tr key={mod.key} className="hover:bg-slate-50">
+                      <tr key={mod.key} className={`hover:bg-slate-50 ${mod.submodule ? 'bg-slate-50/40' : ''}`}>
                         <td className="py-3 px-4">
-                          <span className="font-bold text-slate-800 block">{mod.label}</span>
-                          <span className="text-[10px] text-slate-400">{mod.description}</span>
+                          <span className={`font-bold text-slate-800 block ${mod.submodule ? 'pl-4' : ''}`}>{mod.label}</span>
+                          <span className={`text-[10px] text-slate-400 block ${mod.submodule ? 'pl-4' : ''}`}>{mod.description}</span>
                         </td>
                         <td className="py-3 px-4 text-center">{renderActionCheckbox('view')}</td>
                         <td className="py-3 px-4 text-center">{renderActionCheckbox('add')}</td>
@@ -1431,7 +1657,11 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                       : EMPTY_MODULE_PERMISSIONS);
 
               const enabledModules = PERMISSION_MODULES.filter(
-                (m) => !m.isParent && Boolean(liveModulePerms?.[m.key]?.view)
+                (m) =>
+                  !m.isParent &&
+                  !m.isCapability &&
+                  !m.isVisibilityOnly &&
+                  Boolean(liveModulePerms?.[m.key]?.view)
               );
 
               return (
@@ -2360,7 +2590,11 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                       const newRole = e.target.value as UserRoleType;
                       setEditRole(newRole);
                       if (newRole === 'super_admin') {
-                        setEditModulesAllowed(PERMISSION_MODULES.map(m => m.key));
+                        setEditModulesAllowed(
+                          PERMISSION_MODULES.filter((m) => !m.isCapability && !m.isVisibilityOnly).map(
+                            (m) => m.key
+                          )
+                        );
                       } else {
                         setEditModulesAllowed(getDefaultModulesForRole(newRole));
                       }
@@ -2410,7 +2644,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                   Allowed Modules ({editModulesAllowed.length} Selected)
                 </label>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-56 overflow-y-auto p-1 bg-slate-50 rounded-xl border border-slate-200">
-                  {PERMISSION_MODULES.map(m => {
+                  {PERMISSION_MODULES.filter((m) => !m.isCapability && !m.isVisibilityOnly).map(m => {
                     const isChecked = editRole === 'super_admin' || editModulesAllowed.includes(m.key);
                     return (
                       <label
@@ -2555,14 +2789,52 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
               )}
 
               <div>
-                <label className="block text-xs font-bold text-slate-700 mb-2">
-                  Default Module Permissions (View / Add / Edit / Delete)
-                </label>
+                <div className="flex items-center justify-between gap-2 mb-2 flex-wrap">
+                  <label className="block text-xs font-bold text-slate-700">
+                    Default Module &amp; Dashboard Visibility Permissions
+                  </label>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setRoleFormPermissions((prev) => {
+                          const next = { ...prev };
+                          DASHBOARD_VISIBILITY_KEYS.forEach((k) => {
+                            next[k] = { view: true, add: false, edit: false, delete: false };
+                          });
+                          next.dashboard = {
+                            ...(next.dashboard || { view: false, add: false, edit: false, delete: false }),
+                            view: true,
+                          };
+                          return next;
+                        })
+                      }
+                      className="px-2 py-1 rounded-md border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-[10px] font-bold cursor-pointer"
+                    >
+                      Select All Dashboard
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setRoleFormPermissions((prev) => {
+                          const next = { ...prev };
+                          DASHBOARD_VISIBILITY_KEYS.forEach((k) => {
+                            next[k] = { view: false, add: false, edit: false, delete: false };
+                          });
+                          return next;
+                        })
+                      }
+                      className="px-2 py-1 rounded-md border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-600 text-[10px] font-bold cursor-pointer"
+                    >
+                      Deselect All Dashboard
+                    </button>
+                  </div>
+                </div>
                 <div className="border border-slate-200 rounded-xl overflow-hidden max-h-60 overflow-y-auto">
                   <table className="w-full text-left text-xs">
                     <thead className="bg-slate-50 text-slate-600 font-bold border-b border-slate-200 sticky top-0">
                       <tr>
-                        <th className="py-2 px-3">Module</th>
+                        <th className="py-2 px-3">Module / Visibility</th>
                         <th className="py-2 px-2 text-center">View</th>
                         <th className="py-2 px-2 text-center">Add</th>
                         <th className="py-2 px-2 text-center">Edit</th>
@@ -2573,24 +2845,60 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                       {PERMISSION_MODULES.map((m) => {
                         const isRestricted =
                           m.key === 'user_rights' || m.key === 'audit_logs' || m.key === 'security_management';
-                        const perms = roleFormPermissions[m.key] || { view: false, add: false, edit: false, delete: false };
+                        const isCapability = Boolean(m.isCapability);
+                        const isVisibilityOnly = Boolean(m.isVisibilityOnly);
+                        const rawPerms = roleFormPermissions[m.key];
+                        const hasExplicit =
+                          Boolean(rawPerms) &&
+                          (typeof rawPerms?.view === 'boolean' || typeof rawPerms?.add === 'boolean');
+                        const capAllowed = isCapability
+                          ? m.key === 'attendance.qr.scan'
+                            ? hasExplicit
+                              ? isScannerCapabilityEntryEnabled(rawPerms)
+                              : isScannerCapabilityEntryEnabled(roleFormPermissions.scanner)
+                            : isScannerCapabilityEntryEnabled(rawPerms)
+                          : false;
+                        let perms = isCapability
+                          ? { view: capAllowed, add: capAllowed, edit: false, delete: false }
+                          : rawPerms || { view: false, add: false, edit: false, delete: false };
+                        if (isVisibilityOnly) {
+                          const resolvedVis = resolveDashboardVisibility({
+                            role: editingRoleId || 'custom_role',
+                            rolePermissions: roleFormPermissions,
+                          });
+                          const visAllowed =
+                            m.visibilityGroup === 'card'
+                              ? resolvedVis.permittedCards.some((id) => `dashboard.card.${id}` === m.key)
+                              : resolvedVis.permittedSections.some((id) => `dashboard.section.${id}` === m.key);
+                          perms = { view: visAllowed, add: false, edit: false, delete: false };
+                        }
                         return (
-                          <tr key={m.key} className={isRestricted ? 'bg-slate-50/70 opacity-60' : 'hover:bg-slate-50'}>
+                          <tr key={m.key} className={isRestricted ? 'bg-slate-50/70 opacity-60' : m.submodule ? 'bg-slate-50/30 hover:bg-slate-50' : 'hover:bg-slate-50'}>
                             <td className="py-2 px-3">
-                              <span className="font-semibold text-slate-800">{modLabelShort(m.label)}</span>
+                              <span className={`font-semibold text-slate-800 ${m.submodule ? 'pl-3' : ''}`}>
+                                {isCapability || isVisibilityOnly ? m.label : modLabelShort(m.label)}
+                              </span>
+                              {(isCapability || isVisibilityOnly) && (
+                                <span className="ml-1.5 text-[9px] font-mono text-indigo-600">({m.key})</span>
+                              )}
                               {isRestricted && (
                                 <span className="ml-1.5 text-[9px] font-mono text-red-600">(Super Admin Only)</span>
                               )}
                             </td>
                             {(['view', 'add', 'edit', 'delete'] as ModuleAction[]).map((action) => (
                               <td key={action} className="py-2 px-2 text-center">
-                                <input
-                                  type="checkbox"
-                                  disabled={isRestricted}
-                                  checked={isRestricted ? false : Boolean(perms[action])}
-                                  onChange={() => handleToggleRoleFormModule(m.key, action)}
-                                  className="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer disabled:cursor-not-allowed"
-                                />
+                                {(isCapability && (action === 'edit' || action === 'delete')) ||
+                                (isVisibilityOnly && action !== 'view') ? (
+                                  <span className="text-slate-300 font-mono">—</span>
+                                ) : (
+                                  <input
+                                    type="checkbox"
+                                    disabled={isRestricted}
+                                    checked={isRestricted ? false : Boolean(perms[action])}
+                                    onChange={() => handleToggleRoleFormModule(m.key, action)}
+                                    className="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer disabled:cursor-not-allowed"
+                                  />
+                                )}
                               </td>
                             ))}
                           </tr>

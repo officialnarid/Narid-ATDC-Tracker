@@ -34,7 +34,13 @@ import {
   DEFAULT_USER_PERMISSIONS,
   EMPTY_MODULE_PERMISSIONS,
   normalizeRoleId,
-  seedInitialRolePermissions
+  seedInitialRolePermissions,
+  isScannerCapabilityEntryEnabled,
+  SCANNER_CAPABILITY_KEYS,
+  DASHBOARD_CARDS,
+  DASHBOARD_SECTIONS,
+  DASHBOARD_VISIBILITY_KEYS,
+  resolveDashboardVisibility
 } from '../services/permissionService';
 
 interface RolePermissionsManagementProps {
@@ -127,6 +133,12 @@ export const RolePermissionsManagement: React.FC<RolePermissionsManagementProps>
   const handleToggle = (moduleKey: string, action: ModuleAction) => {
     if (!isSuperAdmin || selectedRole === 'super_admin') return;
 
+    if (SCANNER_CAPABILITY_KEYS.has(moduleKey)) {
+      const capKey = moduleKey as 'attendance.qr.scan' | 'attendance.manual.entry';
+      handleToggleScannerCapability(capKey);
+      return;
+    }
+
     setWorkingPermissions(prev => {
       const currentMod = prev[moduleKey] || { view: false, add: false, edit: false, delete: false };
       const nextValue = !currentMod[action];
@@ -148,10 +160,128 @@ export const RolePermissionsManagement: React.FC<RolePermissionsManagementProps>
         updated.delete = false;
       }
 
-      return {
+      const nextState: Record<string, ModulePermission> = {
         ...prev,
         [moduleKey]: updated,
       };
+
+      // If parent Attendance Scanner View is turned off, disable both independent scanner methods
+      if (moduleKey === 'scanner' && !nextValue && action === 'view') {
+        nextState['attendance.qr.scan'] = { view: false, add: false, edit: false, delete: false };
+        nextState['attendance.manual.entry'] = { view: false, add: false, edit: false, delete: false };
+      }
+
+      // If parent Dashboard View is turned off, disable configured dashboard visibility items
+      if (moduleKey === 'dashboard' && !nextValue && action === 'view') {
+        DASHBOARD_VISIBILITY_KEYS.forEach((visKey) => {
+          nextState[visKey] = { view: false, add: false, edit: false, delete: false };
+        });
+      }
+
+      return nextState;
+    });
+  };
+
+  // Dedicated independent toggle for Dashboard Cards & Sections visibility
+  const handleToggleDashboardVisibility = (permKey: string) => {
+    if (!isSuperAdmin || selectedRole === 'super_admin') return;
+
+    setWorkingPermissions(prev => {
+      const resolved = resolveDashboardVisibility({
+        role: selectedRole,
+        rolePermissions: prev,
+      });
+      const permittedCardSet = new Set(resolved.permittedCards);
+      const permittedSectionSet = new Set(resolved.permittedSections);
+
+      const nextState: Record<string, ModulePermission> = { ...prev };
+      DASHBOARD_CARDS.forEach((c) => {
+        const curAllowed = permittedCardSet.has(c.id);
+        const val = c.permissionKey === permKey ? !curAllowed : curAllowed;
+        nextState[c.permissionKey] = { view: val, add: false, edit: false, delete: false };
+      });
+      DASHBOARD_SECTIONS.forEach((s) => {
+        const curAllowed = permittedSectionSet.has(s.id);
+        const val = s.permissionKey === permKey ? !curAllowed : curAllowed;
+        nextState[s.permissionKey] = { view: val, add: false, edit: false, delete: false };
+      });
+
+      if (nextState[permKey]?.view && !prev.dashboard?.view) {
+        nextState.dashboard = {
+          ...(prev.dashboard || { view: false, add: false, edit: false, delete: false }),
+          view: true,
+        };
+      }
+
+      return nextState;
+    });
+  };
+
+  const handleSelectAllDashboardVisibility = () => {
+    if (!isSuperAdmin || selectedRole === 'super_admin') return;
+    setWorkingPermissions(prev => {
+      const nextState: Record<string, ModulePermission> = { ...prev };
+      DASHBOARD_VISIBILITY_KEYS.forEach((visKey) => {
+        nextState[visKey] = { view: true, add: false, edit: false, delete: false };
+      });
+      if (!prev.dashboard?.view) {
+        nextState.dashboard = {
+          ...(prev.dashboard || { view: false, add: false, edit: false, delete: false }),
+          view: true,
+        };
+      }
+      return nextState;
+    });
+  };
+
+  const handleDeselectAllDashboardVisibility = () => {
+    if (!isSuperAdmin || selectedRole === 'super_admin') return;
+    setWorkingPermissions(prev => {
+      const nextState: Record<string, ModulePermission> = { ...prev };
+      DASHBOARD_VISIBILITY_KEYS.forEach((visKey) => {
+        nextState[visKey] = { view: false, add: false, edit: false, delete: false };
+      });
+      return nextState;
+    });
+  };
+
+  // Dedicated independent toggle for attendance.qr.scan and attendance.manual.entry
+  const handleToggleScannerCapability = (capKey: 'attendance.qr.scan' | 'attendance.manual.entry') => {
+    if (!isSuperAdmin || selectedRole === 'super_admin') return;
+
+    setWorkingPermissions(prev => {
+      const currentEntry = prev[capKey];
+      const hasExplicit =
+        Boolean(currentEntry) &&
+        (typeof currentEntry?.view === 'boolean' || typeof currentEntry?.add === 'boolean');
+
+      const currentlyAllowed =
+        capKey === 'attendance.qr.scan'
+          ? hasExplicit
+            ? isScannerCapabilityEntryEnabled(currentEntry)
+            : isScannerCapabilityEntryEnabled(prev.scanner)
+          : isScannerCapabilityEntryEnabled(currentEntry);
+
+      const nextAllowed = !currentlyAllowed;
+      const nextState: Record<string, ModulePermission> = {
+        ...prev,
+        [capKey]: {
+          view: nextAllowed,
+          add: nextAllowed,
+          edit: false,
+          delete: false,
+        },
+      };
+
+      // Enabling either method requires Attendance Scanner page visibility (without enabling the other method)
+      if (nextAllowed) {
+        const currentScanner = prev.scanner || { view: false, add: false, edit: false, delete: false };
+        if (!currentScanner.view) {
+          nextState.scanner = { ...currentScanner, view: true };
+        }
+      }
+
+      return nextState;
     });
   };
 
@@ -161,7 +291,9 @@ export const RolePermissionsManagement: React.FC<RolePermissionsManagementProps>
 
     const allSelected: Record<string, ModulePermission> = {};
     PERMISSION_MODULES.forEach(m => {
-      allSelected[m.key] = { view: true, add: true, edit: true, delete: true };
+      allSelected[m.key] = m.isVisibilityOnly
+        ? { view: true, add: false, edit: false, delete: false }
+        : { view: true, add: true, edit: true, delete: true };
     });
     setWorkingPermissions(allSelected);
   };
@@ -181,13 +313,26 @@ export const RolePermissionsManagement: React.FC<RolePermissionsManagementProps>
   const handleResetToDefault = () => {
     if (!isSuperAdmin || selectedRole === 'super_admin') return;
 
-    const defaults =
+    const baseDefaults =
       selectedRole === 'admin'
         ? DEFAULT_ADMIN_PERMISSIONS
         : selectedRole === 'user'
           ? DEFAULT_USER_PERMISSIONS
           : selectedRoleRecord?.defaultPermissions || EMPTY_MODULE_PERMISSIONS;
-    setWorkingPermissions(JSON.parse(JSON.stringify(defaults)));
+    const cloned: Record<string, ModulePermission> = JSON.parse(JSON.stringify(baseDefaults));
+    const defaultResolved = resolveDashboardVisibility({
+      role: selectedRole,
+      rolePermissions: cloned,
+    });
+    const cardSet = new Set(defaultResolved.permittedCards);
+    const secSet = new Set(defaultResolved.permittedSections);
+    DASHBOARD_CARDS.forEach((c) => {
+      cloned[c.permissionKey] = { view: cardSet.has(c.id), add: false, edit: false, delete: false };
+    });
+    DASHBOARD_SECTIONS.forEach((s) => {
+      cloned[s.permissionKey] = { view: secSet.has(s.id), add: false, edit: false, delete: false };
+    });
+    setWorkingPermissions(cloned);
     setStatusMessage({
       type: 'success',
       text: `Reset working matrix to default for ${selectedRoleLabel.toUpperCase()}. Click "Save Permissions" to persist.`,
@@ -420,9 +565,256 @@ export const RolePermissionsManagement: React.FC<RolePermissionsManagementProps>
             </p>
           </div>
           <span className="text-[11px] text-slate-400 font-mono">
-            {PERMISSION_MODULES.length} modules configured
+            {PERMISSION_MODULES.filter((m) => !m.isVisibilityOnly).length} modules • {DASHBOARD_VISIBILITY_KEYS.size} dashboard controls
           </span>
         </div>
+
+        {/* Dedicated Independent Attendance Scanner Controls */}
+        {(() => {
+          const isSuper = selectedRole === 'super_admin';
+          const isReadOnly = !isSuperAdmin || isSuper;
+          const qrExplicit = workingPermissions['attendance.qr.scan'];
+          const qrIsExplicit =
+            Boolean(qrExplicit) &&
+            (typeof qrExplicit?.view === 'boolean' || typeof qrExplicit?.add === 'boolean');
+          const qrAllowed = isSuper
+            ? true
+            : qrIsExplicit
+              ? isScannerCapabilityEntryEnabled(qrExplicit)
+              : isScannerCapabilityEntryEnabled(workingPermissions.scanner);
+          const manualAllowed = isSuper
+            ? true
+            : isScannerCapabilityEntryEnabled(workingPermissions['attendance.manual.entry']);
+
+          return (
+            <div className="p-4 border-b border-slate-200 bg-slate-50/40">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+                <div>
+                  <h4 className="text-xs font-extrabold text-slate-800 uppercase tracking-wider">
+                    Attendance Scanner Method Controls (Independently Configurable)
+                  </h4>
+                  <p className="text-[11px] text-slate-500">
+                    Grant or revoke QR Code Scanning (<code className="font-mono">attendance.qr.scan</code>) and Manual Employee ID Entry (<code className="font-mono">attendance.manual.entry</code>) separately.
+                  </p>
+                </div>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <label
+                  className={`flex items-start justify-between gap-3 p-3.5 rounded-xl border transition ${
+                    qrAllowed
+                      ? 'bg-emerald-50/70 border-emerald-300'
+                      : 'bg-white border-slate-200'
+                  } ${isReadOnly ? 'opacity-80 cursor-not-allowed' : 'cursor-pointer hover:border-emerald-400'}`}
+                >
+                  <div className="space-y-0.5">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-xs font-bold text-slate-900">Allow QR Code Scanning</span>
+                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">
+                        attendance.qr.scan
+                      </span>
+                      {!isSuper && !qrIsExplicit && (
+                        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">
+                          Inherited
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-slate-500">
+                      Camera QR scanning, USB QR scanner input, secure QR validation, QR Punch In &amp; Out.
+                    </p>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={qrAllowed}
+                    disabled={isReadOnly}
+                    onChange={() => handleToggleScannerCapability('attendance.qr.scan')}
+                    className="mt-0.5 w-4 h-4 text-emerald-600 rounded border-slate-300 focus:ring-emerald-500 cursor-pointer disabled:cursor-not-allowed shrink-0"
+                  />
+                </label>
+
+                <label
+                  className={`flex items-start justify-between gap-3 p-3.5 rounded-xl border transition ${
+                    manualAllowed
+                      ? 'bg-blue-50/70 border-blue-300'
+                      : 'bg-white border-slate-200'
+                  } ${isReadOnly ? 'opacity-80 cursor-not-allowed' : 'cursor-pointer hover:border-blue-400'}`}
+                >
+                  <div className="space-y-0.5">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-xs font-bold text-slate-900">Allow Manual Employee ID Entry</span>
+                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">
+                        attendance.manual.entry
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-500">
+                      Manually typing Employee ID for Manual Punch In and Manual Punch Out.
+                    </p>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={manualAllowed}
+                    disabled={isReadOnly}
+                    onChange={() => handleToggleScannerCapability('attendance.manual.entry')}
+                    className="mt-0.5 w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-blue-500 cursor-pointer disabled:cursor-not-allowed shrink-0"
+                  />
+                </label>
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* Dedicated Dashboard Visibility Controls (12 KPI Cards + 5 Sections) */}
+        {(() => {
+          const isSuper = selectedRole === 'super_admin';
+          const isReadOnly = !isSuperAdmin || isSuper;
+          const resolvedDash = resolveDashboardVisibility({
+            role: selectedRole,
+            rolePermissions: workingPermissions,
+          });
+          const cardSet = new Set(resolvedDash.permittedCards);
+          const sectionSet = new Set(resolvedDash.permittedSections);
+
+          return (
+            <div className="p-4 border-b border-slate-200 bg-indigo-50/25 space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h4 className="text-xs font-extrabold text-slate-800 uppercase tracking-wider">
+                      Dashboard Visibility
+                    </h4>
+                    <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 font-semibold">
+                      {resolvedDash.permittedCards.length}/{DASHBOARD_CARDS.length} Cards •{' '}
+                      {resolvedDash.permittedSections.length}/{DASHBOARD_SECTIONS.length} Sections
+                    </span>
+                    {!isSuper && !resolvedDash.dashboardViewAllowed && (
+                      <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-red-100 text-red-700">
+                        Dashboard Module Disabled
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Configure which individual KPI cards and Dashboard sections are visible to{' '}
+                    <strong>{selectedRoleLabel}</strong>. Unauthorized items are omitted from UI and API summary payloads.
+                  </p>
+                </div>
+
+                {!isReadOnly && (
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={handleSelectAllDashboardVisibility}
+                      className="px-2.5 py-1.5 rounded-lg bg-white hover:bg-indigo-50 text-indigo-700 text-[11px] font-semibold flex items-center gap-1 border border-indigo-200 transition cursor-pointer"
+                    >
+                      <CheckSquare className="w-3.5 h-3.5" />
+                      <span>Select All</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleDeselectAllDashboardVisibility}
+                      className="px-2.5 py-1.5 rounded-lg bg-white hover:bg-slate-100 text-slate-700 text-[11px] font-semibold flex items-center gap-1 border border-slate-200 transition cursor-pointer"
+                    >
+                      <Square className="w-3.5 h-3.5" />
+                      <span>Deselect All</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* KPI Cards (12) */}
+              <div>
+                <div className="text-[11px] font-bold text-slate-700 uppercase tracking-wider mb-2">
+                  Dashboard KPI Cards ({DASHBOARD_CARDS.length})
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2.5">
+                  {DASHBOARD_CARDS.map((card) => {
+                    const isChecked = isSuper ? true : cardSet.has(card.id);
+                    const isExplicit = isSuper || Boolean(resolvedDash.explicitCardKeys[card.id]);
+                    return (
+                      <label
+                        key={card.permissionKey}
+                        className={`flex items-start justify-between gap-2.5 p-3 rounded-xl border transition ${
+                          isChecked
+                            ? 'bg-white border-indigo-300 shadow-2xs'
+                            : 'bg-slate-50/80 border-slate-200'
+                        } ${isReadOnly ? 'opacity-80 cursor-not-allowed' : 'cursor-pointer hover:border-indigo-400'}`}
+                      >
+                        <div className="space-y-0.5 min-w-0">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="text-xs font-bold text-slate-900">{card.label}</span>
+                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 truncate">
+                              {card.permissionKey}
+                            </span>
+                            {!isSuper && !isExplicit && (
+                              <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">
+                                Inherited
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[11px] text-slate-500 leading-snug">
+                            {card.description}
+                          </p>
+                        </div>
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          disabled={isReadOnly}
+                          onChange={() => handleToggleDashboardVisibility(card.permissionKey)}
+                          className="mt-0.5 w-4 h-4 text-indigo-600 rounded border-slate-300 focus:ring-indigo-500 cursor-pointer disabled:cursor-not-allowed shrink-0"
+                        />
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Dashboard Sections (5) */}
+              <div>
+                <div className="text-[11px] font-bold text-slate-700 uppercase tracking-wider mb-2">
+                  Dashboard Sections ({DASHBOARD_SECTIONS.length})
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                  {DASHBOARD_SECTIONS.map((sec) => {
+                    const isChecked = isSuper ? true : sectionSet.has(sec.id);
+                    const isExplicit = isSuper || Boolean(resolvedDash.explicitSectionKeys[sec.id]);
+                    return (
+                      <label
+                        key={sec.permissionKey}
+                        className={`flex items-start justify-between gap-2.5 p-3 rounded-xl border transition ${
+                          isChecked
+                            ? 'bg-white border-emerald-300 shadow-2xs'
+                            : 'bg-slate-50/80 border-slate-200'
+                        } ${isReadOnly ? 'opacity-80 cursor-not-allowed' : 'cursor-pointer hover:border-emerald-400'}`}
+                      >
+                        <div className="space-y-0.5 min-w-0">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="text-xs font-bold text-slate-900">{sec.label}</span>
+                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 truncate">
+                              {sec.permissionKey}
+                            </span>
+                            {!isSuper && !isExplicit && (
+                              <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">
+                                Inherited
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[11px] text-slate-500 leading-snug">
+                            {sec.description}
+                          </p>
+                        </div>
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          disabled={isReadOnly}
+                          onChange={() => handleToggleDashboardVisibility(sec.permissionKey)}
+                          className="mt-0.5 w-4 h-4 text-emerald-600 rounded border-slate-300 focus:ring-emerald-500 cursor-pointer disabled:cursor-not-allowed shrink-0"
+                        />
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          );
+        })()}
 
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs border-collapse">
@@ -456,10 +848,26 @@ export const RolePermissionsManagement: React.FC<RolePermissionsManagementProps>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {PERMISSION_MODULES.map((module) => {
-                const perms = workingPermissions[module.key] || { view: false, add: false, edit: false, delete: false };
+              {PERMISSION_MODULES.filter((module) => !module.isVisibilityOnly).map((module) => {
+                const rawPerms = workingPermissions[module.key];
+                const isCapability = Boolean(module.isCapability);
                 const isSuper = selectedRole === 'super_admin';
                 const isReadOnly = !isSuperAdmin || isSuper;
+
+                let perms = rawPerms || { view: false, add: false, edit: false, delete: false };
+                if (isCapability) {
+                  const hasExplicit =
+                    Boolean(rawPerms) &&
+                    (typeof rawPerms?.view === 'boolean' || typeof rawPerms?.add === 'boolean');
+                  const capAllowed = isSuper
+                    ? true
+                    : module.key === 'attendance.qr.scan'
+                      ? hasExplicit
+                        ? isScannerCapabilityEntryEnabled(rawPerms)
+                        : isScannerCapabilityEntryEnabled(workingPermissions.scanner)
+                      : isScannerCapabilityEntryEnabled(rawPerms);
+                  perms = { view: capAllowed, add: capAllowed, edit: false, delete: false };
+                }
 
                 return (
                   <tr 
@@ -474,7 +882,7 @@ export const RolePermissionsManagement: React.FC<RolePermissionsManagementProps>
                             {module.label}
                           </span>
                           <span className="text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 font-mono">
-                            {module.category}
+                            {isCapability ? module.key : module.category}
                           </span>
                         </div>
                         <span className="text-[11px] text-slate-400 mt-0.5">
@@ -511,28 +919,36 @@ export const RolePermissionsManagement: React.FC<RolePermissionsManagementProps>
 
                     {/* EDIT TOGGLE */}
                     <td className="py-3 px-4 text-center">
-                      <label className="inline-flex items-center justify-center cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={isSuper ? true : perms.edit}
-                          disabled={isReadOnly}
-                          onChange={() => handleToggle(module.key, 'edit')}
-                          className="w-4 h-4 text-amber-600 rounded border-slate-300 focus:ring-amber-500 cursor-pointer disabled:cursor-not-allowed"
-                        />
-                      </label>
+                      {isCapability ? (
+                        <span className="text-slate-300 font-mono">—</span>
+                      ) : (
+                        <label className="inline-flex items-center justify-center cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={isSuper ? true : perms.edit}
+                            disabled={isReadOnly}
+                            onChange={() => handleToggle(module.key, 'edit')}
+                            className="w-4 h-4 text-amber-600 rounded border-slate-300 focus:ring-amber-500 cursor-pointer disabled:cursor-not-allowed"
+                          />
+                        </label>
+                      )}
                     </td>
 
                     {/* DELETE TOGGLE */}
                     <td className="py-3 px-4 text-center">
-                      <label className="inline-flex items-center justify-center cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={isSuper ? true : perms.delete}
-                          disabled={isReadOnly}
-                          onChange={() => handleToggle(module.key, 'delete')}
-                          className="w-4 h-4 text-red-600 rounded border-slate-300 focus:ring-red-500 cursor-pointer disabled:cursor-not-allowed"
-                        />
-                      </label>
+                      {isCapability ? (
+                        <span className="text-slate-300 font-mono">—</span>
+                      ) : (
+                        <label className="inline-flex items-center justify-center cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={isSuper ? true : perms.delete}
+                            disabled={isReadOnly}
+                            onChange={() => handleToggle(module.key, 'delete')}
+                            className="w-4 h-4 text-red-600 rounded border-slate-300 focus:ring-red-500 cursor-pointer disabled:cursor-not-allowed"
+                          />
+                        </label>
+                      )}
                     </td>
                   </tr>
                 );

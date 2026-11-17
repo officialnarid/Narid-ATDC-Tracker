@@ -37,6 +37,14 @@ import {
   MAX_CONSECUTIVE_FAILED_ATTEMPTS,
 } from './serverLoginSecurity.ts';
 import { registerAttendanceRoutes } from './serverAttendance.ts';
+import {
+  DASHBOARD_CARDS,
+  DASHBOARD_VISIBILITY_KEYS,
+  resolveDashboardVisibility,
+  type DashboardCardId,
+  type DashboardSectionId,
+  type DashboardSummaryMetricKey,
+} from './src/config/dashboardCardsConfig.ts';
 
 // ============================================================================
 // Cryptographic Password Hashing (Single Source of Truth - Scrypt memory-hard)
@@ -313,6 +321,8 @@ const DEFAULT_ROLE_PERMISSIONS: Record<
   super_admin: {
     dashboard: { view: true, add: true, edit: true, delete: true },
     scanner: { view: true, add: true, edit: true, delete: true },
+    'attendance.qr.scan': { view: true, add: true, edit: true, delete: true },
+    'attendance.manual.entry': { view: true, add: true, edit: true, delete: true },
     employees: { view: true, add: true, edit: true, delete: true },
     excel_import: { view: true, add: true, edit: true, delete: true },
     qr_codes: { view: true, add: true, edit: true, delete: true },
@@ -327,10 +337,18 @@ const DEFAULT_ROLE_PERMISSIONS: Record<
     audit_logs: { view: true, add: true, edit: true, delete: true },
     security_management: { view: true, add: true, edit: true, delete: true },
     settings: { view: true, add: true, edit: true, delete: true },
+    ...Object.fromEntries(
+      Array.from(DASHBOARD_VISIBILITY_KEYS).map((k) => [
+        k,
+        { view: true, add: true, edit: true, delete: true },
+      ])
+    ),
   },
   admin: {
     dashboard: { view: true, add: false, edit: false, delete: false },
     scanner: { view: true, add: true, edit: true, delete: false },
+    'attendance.qr.scan': { view: false, add: false, edit: false, delete: false },
+    'attendance.manual.entry': { view: false, add: false, edit: false, delete: false },
     employees: { view: true, add: true, edit: true, delete: false },
     excel_import: { view: true, add: true, edit: true, delete: false },
     qr_codes: { view: true, add: true, edit: true, delete: false },
@@ -349,6 +367,8 @@ const DEFAULT_ROLE_PERMISSIONS: Record<
   user: {
     dashboard: { view: true, add: false, edit: false, delete: false },
     scanner: { view: true, add: true, edit: false, delete: false },
+    'attendance.qr.scan': { view: false, add: false, edit: false, delete: false },
+    'attendance.manual.entry': { view: false, add: false, edit: false, delete: false },
     employees: { view: false, add: false, edit: false, delete: false },
     excel_import: { view: false, add: false, edit: false, delete: false },
     qr_codes: { view: false, add: false, edit: false, delete: false },
@@ -372,6 +392,11 @@ export const RESTRICTED_SUPER_ADMIN_MODULES = new Set([
   'security_management',
 ]);
 
+export const SCANNER_CAPABILITY_KEYS = new Set([
+  'attendance.qr.scan',
+  'attendance.manual.entry',
+]);
+
 export function sanitizeRoleModulePermissions(
   roleId: string,
   rawPerms?: Record<string, { view?: boolean; add?: boolean; edit?: boolean; delete?: boolean }> | null
@@ -382,6 +407,9 @@ export function sanitizeRoleModulePermissions(
       Object.entries(DEFAULT_ROLE_PERMISSIONS.super_admin).map(([k, v]) => [k, { ...v }])
     );
   }
+
+  const hasExplicitQrKey =
+    Boolean(rawPerms) && Object.prototype.hasOwnProperty.call(rawPerms, 'attendance.qr.scan');
 
   const baseKeys = new Set([
     ...Object.keys(DEFAULT_ROLE_PERMISSIONS.user),
@@ -394,12 +422,59 @@ export function sanitizeRoleModulePermissions(
       sanitized[modKey] = { view: false, add: false, edit: false, delete: false };
       continue;
     }
+    // Preserve unconfigured legacy QR behavior until attendance.qr.scan is explicitly configured
+    if (modKey === 'attendance.qr.scan' && !hasExplicitQrKey) {
+      continue;
+    }
+    // Preserve unconfigured legacy Dashboard Card/Section behavior unless explicitly provided
+    if (DASHBOARD_VISIBILITY_KEYS.has(modKey)) {
+      if (!rawPerms || !Object.prototype.hasOwnProperty.call(rawPerms, modKey)) {
+        continue;
+      }
+      const visEntry = rawPerms[modKey];
+      sanitized[modKey] = {
+        view: Boolean(visEntry?.view),
+        add: false,
+        edit: false,
+        delete: false,
+      };
+      continue;
+    }
     const entry = rawPerms?.[modKey];
     const add = Boolean(entry?.add);
     const edit = Boolean(entry?.edit);
     const del = Boolean(entry?.delete);
     const view = Boolean(entry?.view) || add || edit || del;
     sanitized[modKey] = { view, add, edit, delete: del };
+  }
+
+  // If scanner module key was omitted while a scanner sub-capability was enabled,
+  // grant Scanner page view visibility without granting scanner.add (prevents QR/manual bleed-over).
+  if (
+    rawPerms &&
+    !Object.prototype.hasOwnProperty.call(rawPerms, 'scanner') &&
+    (sanitized['attendance.qr.scan']?.view || sanitized['attendance.manual.entry']?.view)
+  ) {
+    sanitized.scanner = { view: true, add: false, edit: false, delete: false };
+  }
+
+  const anyDashSubEnabled = Array.from(DASHBOARD_VISIBILITY_KEYS).some(
+    (k) => sanitized[k]?.view === true
+  );
+  if (
+    rawPerms &&
+    !Object.prototype.hasOwnProperty.call(rawPerms, 'dashboard') &&
+    anyDashSubEnabled
+  ) {
+    sanitized.dashboard = { view: true, add: false, edit: false, delete: false };
+  }
+
+  if (rawPerms && Object.prototype.hasOwnProperty.call(rawPerms, 'dashboard') && sanitized.dashboard?.view === false) {
+    for (const visKey of DASHBOARD_VISIBILITY_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(sanitized, visKey)) {
+        sanitized[visKey] = { view: false, add: false, edit: false, delete: false };
+      }
+    }
   }
 
   return sanitized;
@@ -951,16 +1026,28 @@ export function createApp(options: ServerAppOptions = {}) {
 
   async function getCallerEffectiveDashboardAccess(
     caller: VerifiedCaller
-  ): Promise<{ allowed: boolean; readOnly: boolean }> {
+  ): Promise<{
+    allowed: boolean;
+    readOnly: boolean;
+    permittedCards: DashboardCardId[];
+    permittedSections: DashboardSectionId[];
+  }> {
     if (caller.role === 'super_admin') {
-      return { allowed: true, readOnly: false };
+      const visibility = resolveDashboardVisibility({ role: 'super_admin' });
+      return {
+        allowed: true,
+        readOnly: false,
+        permittedCards: visibility.permittedCards,
+        permittedSections: visibility.permittedSections,
+      };
     }
 
-    const [userPermSnap, rolePermSnap, userRoleSnap] = await Promise.all([
+    const [userPermSnap, rolePermSnap, roleDefSnap, userRoleSnap] = await Promise.all([
       caller.profileDocId
         ? adminDb.collection('user_permissions').doc(caller.profileDocId).get()
         : Promise.resolve(null),
       adminDb.collection('role_permissions').doc(caller.role).get(),
+      adminDb.collection('roles').doc(caller.role).get(),
       caller.profileDocId
         ? adminDb.collection('user_roles').doc(caller.profileDocId).get()
         : Promise.resolve(null),
@@ -969,39 +1056,57 @@ export function createApp(options: ServerAppOptions = {}) {
     const hasUserOverride = userPermSnap?.exists && userPermSnap.data()?.isCustomOverride !== false;
     const userPerms = hasUserOverride ? userPermSnap?.data()?.permissions || {} : null;
     const rolePerms = rolePermSnap?.exists ? rolePermSnap.data()?.modulePermissions || {} : null;
+    const roleDefaultPerms = roleDefSnap?.exists ? roleDefSnap.data()?.defaultPermissions || {} : null;
     const userData = userRoleSnap?.exists ? userRoleSnap.data() || {} : {};
     const modulesAllowed = Array.isArray(userData.modulesAllowed)
       ? userData.modulesAllowed.map((m: any) => String(m).trim().toLowerCase())
       : [];
 
-    let dashboardAllowed: boolean;
-    if (userPerms?.dashboard && typeof userPerms.dashboard.view === 'boolean') {
-      dashboardAllowed = userPerms.dashboard.view;
-    } else if (rolePerms?.dashboard && typeof rolePerms.dashboard.view === 'boolean') {
-      dashboardAllowed = rolePerms.dashboard.view;
-    } else if (modulesAllowed.length > 0) {
-      dashboardAllowed = modulesAllowed.includes('all') || modulesAllowed.includes('dashboard');
-    } else {
-      dashboardAllowed = caller.role === 'admin' || caller.role === 'user';
-    }
+    const visibility = resolveDashboardVisibility({
+      role: caller.role,
+      modulesAllowed,
+      rolePermissions: rolePerms,
+      roleDefaultPermissions: roleDefaultPerms,
+      userPermissionOverride: hasUserOverride
+        ? { isCustomOverride: true, permissions: userPerms }
+        : null,
+    });
 
     if (caller.role === 'user') {
-      return { allowed: dashboardAllowed, readOnly: true };
+      return {
+        allowed: visibility.dashboardViewAllowed,
+        readOnly: true,
+        permittedCards: visibility.permittedCards,
+        permittedSections: visibility.permittedSections,
+      };
     }
     if (caller.role === 'admin') {
-      return { allowed: dashboardAllowed, readOnly: false };
+      return {
+        allowed: visibility.dashboardViewAllowed,
+        readOnly: false,
+        permittedCards: visibility.permittedCards,
+        permittedSections: visibility.permittedSections,
+      };
     }
 
     // Dynamic custom roles: readOnly=false when the role/user holds any non-dashboard operational write permission
-    const effectivePerms = userPerms || rolePerms || {};
+    const effectivePerms = userPerms || rolePerms || roleDefaultPerms || {};
     const hasOperationalWrite = Object.entries(effectivePerms).some(([modKey, perms]: [string, any]) => {
-      if (modKey === 'dashboard' || RESTRICTED_SUPER_ADMIN_MODULES.has(modKey)) return false;
+      if (
+        modKey === 'dashboard' ||
+        DASHBOARD_VISIBILITY_KEYS.has(modKey) ||
+        RESTRICTED_SUPER_ADMIN_MODULES.has(modKey)
+      ) {
+        return false;
+      }
       return Boolean(perms?.add || perms?.edit || perms?.delete);
     });
 
     return {
-      allowed: dashboardAllowed,
+      allowed: visibility.dashboardViewAllowed,
       readOnly: !hasOperationalWrite,
+      permittedCards: visibility.permittedCards,
+      permittedSections: visibility.permittedSections,
     };
   }
 
@@ -1775,11 +1880,23 @@ export function createApp(options: ServerAppOptions = {}) {
             finalModules = ['all'];
           } else if (rolePermData?.modulePermissions) {
             finalModules = Object.entries(rolePermData.modulePermissions)
-              .filter(([modKey, perms]: [string, any]) => Boolean(perms?.view) && !RESTRICTED_SUPER_ADMIN_MODULES.has(modKey))
+              .filter(
+                ([modKey, perms]: [string, any]) =>
+                  Boolean(perms?.view) &&
+                  !RESTRICTED_SUPER_ADMIN_MODULES.has(modKey) &&
+                  !SCANNER_CAPABILITY_KEYS.has(modKey) &&
+                  !DASHBOARD_VISIBILITY_KEYS.has(modKey)
+              )
               .map(([modKey]) => modKey);
           } else if (roleDocData?.defaultPermissions) {
             finalModules = Object.entries(roleDocData.defaultPermissions)
-              .filter(([modKey, perms]: [string, any]) => Boolean(perms?.view) && !RESTRICTED_SUPER_ADMIN_MODULES.has(modKey))
+              .filter(
+                ([modKey, perms]: [string, any]) =>
+                  Boolean(perms?.view) &&
+                  !RESTRICTED_SUPER_ADMIN_MODULES.has(modKey) &&
+                  !SCANNER_CAPABILITY_KEYS.has(modKey) &&
+                  !DASHBOARD_VISIBILITY_KEYS.has(modKey)
+              )
               .map(([modKey]) => modKey);
           } else if (assignedRole === 'admin') {
             finalModules = [
@@ -2113,19 +2230,23 @@ export function createApp(options: ServerAppOptions = {}) {
 
       if (permissions) {
         const sanitizedPerms = sanitizeRoleModulePermissions(effectiveRole, permissions);
-        await adminDb.collection('user_permissions').doc(targetId).set(
-          {
-            id: targetId,
-            userId: targetId,
-            loginId: oldData.loginId || '',
-            role: effectiveRole,
-            isCustomOverride: true,
-            permissions: sanitizedPerms,
-            updatedAt: now,
-            updatedBy: cleanCallerId,
-          },
-          { merge: true }
-        );
+        const userPermRef = adminDb.collection('user_permissions').doc(targetId);
+        const userPermExisting = await userPermRef.get();
+        const userPermPayload = {
+          id: targetId,
+          userId: targetId,
+          loginId: oldData.loginId || '',
+          role: effectiveRole,
+          isCustomOverride: true,
+          permissions: sanitizedPerms,
+          updatedAt: now,
+          updatedBy: cleanCallerId,
+        };
+        if (userPermExisting.exists) {
+          await userPermRef.update(userPermPayload);
+        } else {
+          await userPermRef.set(userPermPayload);
+        }
       }
 
       await logAuditEvent({
@@ -2191,30 +2312,43 @@ export function createApp(options: ServerAppOptions = {}) {
 
       const sanitizedModulePermissions = sanitizeRoleModulePermissions(roleId, modulePermissions);
 
-      await adminDb.collection('role_permissions').doc(roleId).set(
-        {
-          roleId,
-          roleName: resolvedRoleName,
-          modulePermissions: sanitizedModulePermissions,
-          updatedAt: now,
-          updatedBy: cleanCallerId,
-        },
-        { merge: true }
-      );
+      const rolePermRef = adminDb.collection('role_permissions').doc(roleId);
+      const rolePermExisting = await rolePermRef.get();
+      const rolePermPayload = {
+        roleId,
+        roleName: resolvedRoleName,
+        modulePermissions: sanitizedModulePermissions,
+        updatedAt: now,
+        updatedBy: cleanCallerId,
+      };
+      if (rolePermExisting.exists) {
+        await rolePermRef.update(rolePermPayload);
+      } else {
+        await rolePermRef.set(rolePermPayload);
+      }
 
-      await adminDb.collection('roles').doc(roleId).set(
-        {
-          roleId,
-          roleName: resolvedRoleName,
-          defaultPermissions: sanitizedModulePermissions,
-          updatedAt: now,
-        },
-        { merge: true }
-      );
+      const roleRefForUpdate = adminDb.collection('roles').doc(roleId);
+      const roleUpdatePayload = {
+        roleId,
+        roleName: resolvedRoleName,
+        defaultPermissions: sanitizedModulePermissions,
+        updatedAt: now,
+      };
+      if (roleDocSnap.exists) {
+        await roleRefForUpdate.update(roleUpdatePayload);
+      } else {
+        await roleRefForUpdate.set(roleUpdatePayload, { merge: true });
+      }
 
       const allowedModules: string[] = [];
       Object.entries(sanitizedModulePermissions).forEach(([modKey, perms]: [string, any]) => {
-        if (perms?.view) allowedModules.push(modKey);
+        if (
+          perms?.view &&
+          !SCANNER_CAPABILITY_KEYS.has(modKey) &&
+          !DASHBOARD_VISIBILITY_KEYS.has(modKey)
+        ) {
+          allowedModules.push(modKey);
+        }
       });
       const usersSnap = await adminDb.collection('user_roles').where('role', '==', roleId).get();
       await Promise.all(
@@ -2226,19 +2360,21 @@ export function createApp(options: ServerAppOptions = {}) {
           const userPermRef = adminDb.collection('user_permissions').doc(uDoc.id);
           const userPermSnap = await userPermRef.get();
           if (!userPermSnap.exists || userPermSnap.data()?.isCustomOverride !== true) {
-            await userPermRef.set(
-              {
-                id: uDoc.id,
-                userId: uDoc.id,
-                loginId: uDoc.data()?.loginId || '',
-                role: roleId,
-                isCustomOverride: false,
-                permissions: sanitizedModulePermissions,
-                updatedAt: now,
-                updatedBy: cleanCallerId,
-              },
-              { merge: true }
-            );
+            const inheritedPayload = {
+              id: uDoc.id,
+              userId: uDoc.id,
+              loginId: uDoc.data()?.loginId || '',
+              role: roleId,
+              isCustomOverride: false,
+              permissions: sanitizedModulePermissions,
+              updatedAt: now,
+              updatedBy: cleanCallerId,
+            };
+            if (userPermSnap.exists) {
+              await userPermRef.update(inheritedPayload);
+            } else {
+              await userPermRef.set(inheritedPayload);
+            }
           }
         })
       );
@@ -2390,21 +2526,34 @@ export function createApp(options: ServerAppOptions = {}) {
         updatedBy: cleanCallerId,
       };
 
-      await roleRef.set(roleDoc, { merge: true });
-      await adminDb.collection('role_permissions').doc(derivedId).set(
-        {
-          roleId: derivedId,
-          roleName: roleDoc.roleName,
-          modulePermissions: sanitizedDefaultPerms,
-          updatedAt: now,
-          updatedBy: cleanCallerId,
-        },
-        { merge: true }
-      );
+      if (existingSnap.exists) {
+        await roleRef.update(roleDoc);
+      } else {
+        await roleRef.set(roleDoc);
+      }
+      const rolePermRef = adminDb.collection('role_permissions').doc(derivedId);
+      const rolePermSnap = await rolePermRef.get();
+      const rolePermDocPayload = {
+        roleId: derivedId,
+        roleName: roleDoc.roleName,
+        modulePermissions: sanitizedDefaultPerms,
+        updatedAt: now,
+        updatedBy: cleanCallerId,
+      };
+      if (rolePermSnap.exists) {
+        await rolePermRef.update(rolePermDocPayload);
+      } else {
+        await rolePermRef.set(rolePermDocPayload);
+      }
 
       if (parsed.data.defaultPermissions) {
         const allowedModules = Object.entries(sanitizedDefaultPerms)
-          .filter(([, perms]) => Boolean(perms?.view))
+          .filter(
+            ([modKey, perms]) =>
+              Boolean(perms?.view) &&
+              !SCANNER_CAPABILITY_KEYS.has(modKey) &&
+              !DASHBOARD_VISIBILITY_KEYS.has(modKey)
+          )
           .map(([modKey]) => modKey);
         const usersSnap = await adminDb.collection('user_roles').where('role', '==', derivedId).get();
         await Promise.all(
@@ -2416,19 +2565,21 @@ export function createApp(options: ServerAppOptions = {}) {
             const userPermRef = adminDb.collection('user_permissions').doc(uDoc.id);
             const userPermSnap = await userPermRef.get();
             if (!userPermSnap.exists || userPermSnap.data()?.isCustomOverride !== true) {
-              await userPermRef.set(
-                {
-                  id: uDoc.id,
-                  userId: uDoc.id,
-                  loginId: uDoc.data()?.loginId || '',
-                  role: derivedId,
-                  isCustomOverride: false,
-                  permissions: sanitizedDefaultPerms,
-                  updatedAt: now,
-                  updatedBy: cleanCallerId,
-                },
-                { merge: true }
-              );
+              const inheritedPayload = {
+                id: uDoc.id,
+                userId: uDoc.id,
+                loginId: uDoc.data()?.loginId || '',
+                role: derivedId,
+                isCustomOverride: false,
+                permissions: sanitizedDefaultPerms,
+                updatedAt: now,
+                updatedBy: cleanCallerId,
+              };
+              if (userPermSnap.exists) {
+                await userPermRef.update(inheritedPayload);
+              } else {
+                await userPermRef.set(inheritedPayload);
+              }
             }
           })
         );
@@ -2859,24 +3010,35 @@ export function createApp(options: ServerAppOptions = {}) {
       ).length;
       const onLeave = rosterSnap.size;
 
+      const allMetrics: Record<DashboardSummaryMetricKey, number> = {
+        activeTotal,
+        totalPresent,
+        currentlyInside,
+        currentlyOutside,
+        absent,
+        onLeave,
+        firstIn,
+        finalOut,
+        dutyHoursMins,
+        otHoursMins,
+        autoClosed,
+        missedPunchOut,
+      };
+      const permittedCardSet = new Set(access.permittedCards);
+      const filteredMetrics: Partial<Record<DashboardSummaryMetricKey, number>> = {};
+      for (const card of DASHBOARD_CARDS) {
+        if (permittedCardSet.has(card.id)) {
+          filteredMetrics[card.metricKey] = allMetrics[card.metricKey];
+        }
+      }
+
       return res.json({
         success: true,
         role: caller.role.toUpperCase(),
         readOnly: access.readOnly,
-        metrics: {
-          activeTotal,
-          totalPresent,
-          currentlyInside,
-          currentlyOutside,
-          absent,
-          onLeave,
-          firstIn,
-          finalOut,
-          dutyHoursMins,
-          otHoursMins,
-          autoClosed,
-          missedPunchOut,
-        },
+        permittedCards: access.permittedCards,
+        permittedSections: access.permittedSections,
+        metrics: filteredMetrics,
       });
     } catch (err: any) {
       console.error('[Dashboard Summary API] Error:', err);

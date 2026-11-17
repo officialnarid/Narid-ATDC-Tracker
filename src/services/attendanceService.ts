@@ -144,28 +144,63 @@ export function formatTimeDisplay(isoString: string | null): string {
   });
 }
 
+export type QrPayloadFormat = 'JSON_TOKEN' | 'TOKEN_STRING' | 'LEGACY_EMPLOYEE_ID' | 'INVALID';
+
+const EMPLOYEE_ID_PATTERN = /^[A-Z0-9][A-Z0-9_-]{1,31}$/;
+
 // Parse QR code payload.
-// Payloads can be JSON {"id":"JMD12345","token":"..."}, or raw "JMD12345" or "QR_JMD12345_..."
-export function parseQrPayload(raw: string): { employeeId: string; token?: string } {
-  const trimmed = raw.trim();
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (parsed.employeeId || parsed.id) {
-      return {
-        employeeId: (parsed.employeeId || parsed.id).toUpperCase(),
-        token: parsed.token || parsed.qrToken,
-      };
-    }
-  } catch {
-    // Not JSON, check if token pattern e.g. QR_JMD12345_...
-    if (trimmed.startsWith('QR_')) {
-      const parts = trimmed.split('_');
-      if (parts.length >= 2) {
-        return { employeeId: parts[1].toUpperCase(), token: trimmed };
+// Payloads can be JSON {"employeeId":"JMD12345","token":"..."}, raw "QR_JMD12345_...", or legacy plain "JMD12345"
+export function parseQrPayload(raw: string): { employeeId: string; token?: string; format: QrPayloadFormat } {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) {
+    return { employeeId: '', format: 'INVALID' };
+  }
+
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return { employeeId: '', format: 'INVALID' };
       }
+      const rawId = parsed.employeeId ?? parsed.id;
+      if (typeof rawId !== 'string') {
+        return { employeeId: '', format: 'INVALID' };
+      }
+      const cleanId = rawId.trim().toUpperCase();
+      if (!EMPLOYEE_ID_PATTERN.test(cleanId)) {
+        return { employeeId: '', format: 'INVALID' };
+      }
+      const rawToken = parsed.token ?? parsed.qrToken;
+      const cleanToken = typeof rawToken === 'string' && rawToken.trim() ? rawToken.trim() : undefined;
+      return {
+        employeeId: cleanId,
+        token: cleanToken,
+        format: 'JSON_TOKEN',
+      };
+    } catch {
+      return { employeeId: '', format: 'INVALID' };
     }
   }
-  return { employeeId: trimmed.toUpperCase() };
+
+  if (trimmed.startsWith('QR_')) {
+    const parts = trimmed.split('_');
+    const cleanId = (parts[1] || '').trim().toUpperCase();
+    if (!cleanId || !EMPLOYEE_ID_PATTERN.test(cleanId)) {
+      return { employeeId: '', format: 'INVALID' };
+    }
+    const tokenSuffix = parts.slice(2).join('_').trim();
+    return {
+      employeeId: cleanId,
+      token: parts.length >= 3 && tokenSuffix.length > 0 ? trimmed : undefined,
+      format: 'TOKEN_STRING',
+    };
+  }
+
+  const cleanLegacyId = trimmed.toUpperCase();
+  if (!EMPLOYEE_ID_PATTERN.test(cleanLegacyId)) {
+    return { employeeId: '', format: 'INVALID' };
+  }
+  return { employeeId: cleanLegacyId, format: 'LEGACY_EMPLOYEE_ID' };
 }
 
 /**
@@ -287,6 +322,61 @@ export async function processDualAttendanceScan({
   };
 }
 
+export interface ManualPunchParams {
+  employeeId: string;
+  scannerType: 'IN' | 'OUT';
+  reason?: string;
+  customScanTime?: Date;
+}
+
+/**
+ * Dedicated Authorized Manual Employee ID Punch Flow
+ * Separate from QR token scanning; validates operator authorization and employee record on the backend.
+ */
+export async function processManualAttendancePunch({
+  employeeId,
+  scannerType,
+  reason,
+  customScanTime,
+}: ManualPunchParams): Promise<ScanResult> {
+  const now = customScanTime || new Date();
+  const timeDisplay = getKolkataTimeParts(now).timeWithSeconds;
+
+  assertApiBaseConfigured();
+  const headers = await getAuthHeaders();
+  const res = await executeApiFetch(
+    apiUrl('/api/attendance/manual-punch'),
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        employeeId: employeeId.trim().toUpperCase(),
+        scannerType,
+        ...(reason ? { reason: reason.trim() } : {}),
+        ...(customScanTime ? { customScanTime: customScanTime.toISOString() } : {}),
+      }),
+    },
+    'POST /api/attendance/manual-punch'
+  );
+
+  const parsed = await safeParseJsonResponse<any>(res, 'POST /api/attendance/manual-punch');
+  const data = parsed.data || {};
+  return {
+    success: Boolean(parsed.ok && data?.success),
+    action: data?.action || 'REJECTED',
+    scannerType: data?.scannerType || scannerType,
+    currentState: data?.currentState,
+    employee: data?.employee,
+    attendance: data?.attendance,
+    shift: data?.shift,
+    message: data?.message || parsed.errorMessage || data?.error || 'Manual Employee ID punch rejected.',
+    time: data?.time || timeDisplay,
+    dutyFormatted: data?.dutyFormatted,
+    otFormatted: data?.otFormatted,
+    punchCount: data?.punchCount,
+  };
+}
+
 /**
  * Server-Authoritative Attendance Scan with optional auto-direction detection
  */
@@ -337,15 +427,23 @@ export async function processAttendanceScan(
 /**
  * Server-Authoritative Automatic Shift Closing Engine (ADMIN / SUPER_ADMIN only)
  */
-export async function runAutoCloseShiftsEngine(): Promise<{
+export async function runAutoCloseShiftsEngine(options?: {
+  silent?: boolean;
+}): Promise<{
   closedCount: number;
   closedRecords: AttendanceRecord[];
 }> {
   if (!isApiBaseUsableForCurrentOrigin()) {
     return { closedCount: 0, closedRecords: [] };
   }
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return { closedCount: 0, closedRecords: [] };
+  }
   try {
     const headers = await getAuthHeaders();
+    if (!headers.Authorization) {
+      return { closedCount: 0, closedRecords: [] };
+    }
     const res = await executeApiFetch(
       apiUrl('/api/attendance/auto-close'),
       {
@@ -364,7 +462,11 @@ export async function runAutoCloseShiftsEngine(): Promise<{
       closedRecords: Array.isArray(parsed.data.closedRecords) ? parsed.data.closedRecords : [],
     };
   } catch (error) {
-    console.error('Error during auto shift closing execution:', error);
+    if (options?.silent) {
+      console.warn('Auto shift closing check skipped due to transient network error:', error);
+    } else {
+      console.error('Error during auto shift closing execution:', error);
+    }
     return { closedCount: 0, closedRecords: [] };
   }
 }

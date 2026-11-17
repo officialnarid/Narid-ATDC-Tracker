@@ -36,11 +36,15 @@ import { formatDateKey, formatMinutes } from '../services/attendanceService';
 import { isModuleAllowedForUser } from '../services/authService';
 import { 
   DashboardCardId, 
-  getPermittedCardIdsForRole,
-  isDashboardCardVisible, 
+  DashboardSectionId,
+  resolveDashboardVisibility,
   normalizeUserRole 
 } from '../config/dashboardCardsConfig';
-import { RolePermissionRecord, normalizeRoleId } from '../services/permissionService';
+import {
+  RolePermissionRecord,
+  UserPermissionRecordWithOverride,
+  normalizeRoleId,
+} from '../services/permissionService';
 
 interface DashboardProps {
   employees: Employee[];
@@ -53,6 +57,7 @@ interface DashboardProps {
   onRefreshData?: () => void;
   currentUserRole?: UserRoleRecord | null;
   rolePermissions?: Record<string, RolePermissionRecord>;
+  userPermissionOverride?: UserPermissionRecordWithOverride | null;
   isFullscreen?: boolean;
   onToggleFullscreen?: () => void;
   onExitFullscreen?: () => void;
@@ -69,6 +74,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
   onRefreshData,
   currentUserRole,
   rolePermissions,
+  userPermissionOverride,
   isFullscreen = false,
   onToggleFullscreen,
   onExitFullscreen,
@@ -272,21 +278,32 @@ export const Dashboard: React.FC<DashboardProps> = ({
     : Math.max(0, activeEmployees.length - presentCount);
 
   const activeRoleModulePerms = rolePermissions?.[normalizeRoleId(verifiedRole)]?.modulePermissions || null;
-  const permittedCardIds = getPermittedCardIdsForRole(
-    verifiedRole,
-    currentUserRole?.modulesAllowed,
-    activeRoleModulePerms
-  );
+  const resolvedVisibility = resolveDashboardVisibility({
+    role: verifiedRole,
+    modulesAllowed: currentUserRole?.modulesAllowed,
+    rolePermissions: activeRoleModulePerms,
+    userPermissionOverride,
+  });
+  const permittedCardIds = resolvedVisibility.permittedCards;
+  const visibleCardSet = new Set<DashboardCardId>(permittedCardIds);
+  const visibleSectionSet = new Set<DashboardSectionId>(resolvedVisibility.permittedSections);
+  const canShowDutyHours = visibleCardSet.has('duty_hours');
+  const canShowOtHours = visibleCardSet.has('ot_hours');
 
   // Protected Drilldown handler
   const handleOpenDrilldown = (
-    cardId: DashboardCardId,
+    source: { type: 'card'; cardId: DashboardCardId } | { type: 'section'; sectionId: DashboardSectionId },
     title: string,
     filterFn: (emp: Employee, att?: AttendanceRecord) => boolean
   ) => {
-    // Role Authorization Check: block drilldown if card is hidden for this role
-    if (!isDashboardCardVisible(verifiedRole, cardId, currentUserRole?.modulesAllowed, activeRoleModulePerms)) {
-      console.warn(`[Security] Drilldown for ${cardId} is unauthorized for role ${verifiedRole}`);
+    // Role Authorization Check: block drilldown if card/section is hidden for this role
+    const isAuthorized =
+      source.type === 'card'
+        ? visibleCardSet.has(source.cardId)
+        : visibleSectionSet.has(source.sectionId);
+    if (!isAuthorized) {
+      const targetId = source.type === 'card' ? source.cardId : source.sectionId;
+      console.warn(`[Security] Drilldown for ${targetId} is unauthorized for role ${verifiedRole}`);
       return;
     }
 
@@ -318,7 +335,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         return (
           <div 
             key="active_total"
-            onClick={() => handleOpenDrilldown('active_total', 'Total Active Manpower', (emp) => emp.employeeStatus === 'Active')}
+            onClick={() => handleOpenDrilldown({ type: 'card', cardId: 'active_total' }, 'Total Active Manpower', (emp) => emp.employeeStatus === 'Active')}
             className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-2xs hover:border-blue-400 cursor-pointer transition"
           >
             <div className="text-[11px] font-medium text-slate-500 uppercase">Active Total</div>
@@ -333,7 +350,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         return (
           <div 
             key="total_present"
-            onClick={() => handleOpenDrilldown('total_present', 'Total Present Manpower', (emp, att) => !!att)}
+            onClick={() => handleOpenDrilldown({ type: 'card', cardId: 'total_present' }, 'Total Present Manpower', (emp, att) => !!att)}
             className="bg-emerald-50/70 p-3.5 rounded-xl border border-emerald-300 shadow-2xs hover:border-emerald-500 cursor-pointer transition"
           >
             <div className="text-[11px] font-semibold text-emerald-800 uppercase">Total Present</div>
@@ -348,7 +365,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         return (
           <div 
             key="currently_inside"
-            onClick={() => handleOpenDrilldown('currently_inside', 'Currently Inside Factory', (emp, att) => !!att && (att.currentState === 'INSIDE' || (!att.actualPunchOut && att.punchOutType === 'NONE')))}
+            onClick={() => handleOpenDrilldown({ type: 'card', cardId: 'currently_inside' }, 'Currently Inside Factory', (emp, att) => !!att && (att.currentState === 'INSIDE' || (!att.actualPunchOut && att.punchOutType === 'NONE')))}
             className="bg-teal-50/70 p-3.5 rounded-xl border border-teal-300 shadow-2xs hover:border-teal-500 cursor-pointer transition"
           >
             <div className="text-[11px] font-semibold text-teal-800 uppercase flex items-center gap-1">
@@ -364,7 +381,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         return (
           <div 
             key="currently_outside"
-            onClick={() => handleOpenDrilldown('currently_outside', 'Currently Outside Factory', (emp, att) => !!att && (att.currentState === 'OUTSIDE' || !!att.actualPunchOut || att.punchOutType === 'ACTUAL'))}
+            onClick={() => handleOpenDrilldown({ type: 'card', cardId: 'currently_outside' }, 'Currently Outside Factory', (emp, att) => !!att && (att.currentState === 'OUTSIDE' || !!att.actualPunchOut || att.punchOutType === 'ACTUAL'))}
             className="bg-slate-50 p-3.5 rounded-xl border border-slate-300 shadow-2xs hover:border-slate-500 cursor-pointer transition"
           >
             <div className="text-[11px] font-semibold text-slate-700 uppercase">Currently Outside</div>
@@ -377,7 +394,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         return (
           <div 
             key="absent"
-            onClick={() => handleOpenDrilldown('absent', 'Absent Manpower', (emp, att) => !att)}
+            onClick={() => handleOpenDrilldown({ type: 'card', cardId: 'absent' }, 'Absent Manpower', (emp, att) => !att)}
             className="bg-red-50/70 p-3.5 rounded-xl border border-red-300 shadow-2xs hover:border-red-500 cursor-pointer transition"
           >
             <div className="text-[11px] font-semibold text-red-800 uppercase">Absent</div>
@@ -390,7 +407,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         return (
           <div 
             key="on_leave"
-            onClick={() => handleOpenDrilldown('on_leave', 'Employees On Leave', (emp) => {
+            onClick={() => handleOpenDrilldown({ type: 'card', cardId: 'on_leave' }, 'Employees On Leave', (emp) => {
               const r = rosterMap.get(emp.employeeId);
               return r?.rosterStatus === 'LEAVE';
             })}
@@ -406,7 +423,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         return (
           <div 
             key="first_in"
-            onClick={() => handleOpenDrilldown('first_in', 'First Punch In Recorded', (emp, att) => !!(att?.firstPunchIn || att?.punchIn))}
+            onClick={() => handleOpenDrilldown({ type: 'card', cardId: 'first_in' }, 'First Punch In Recorded', (emp, att) => !!(att?.firstPunchIn || att?.punchIn))}
             className="bg-emerald-50/50 p-3.5 rounded-xl border border-emerald-200 shadow-2xs hover:border-emerald-400 cursor-pointer transition"
           >
             <div className="text-[11px] font-semibold text-emerald-800 uppercase">First In</div>
@@ -419,7 +436,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         return (
           <div 
             key="final_out"
-            onClick={() => handleOpenDrilldown('final_out', 'Final Punch Out Recorded', (emp, att) => !!(att?.lastPunchOut || att?.actualPunchOut))}
+            onClick={() => handleOpenDrilldown({ type: 'card', cardId: 'final_out' }, 'Final Punch Out Recorded', (emp, att) => !!(att?.lastPunchOut || att?.actualPunchOut))}
             className="bg-indigo-50/50 p-3.5 rounded-xl border border-indigo-200 shadow-2xs hover:border-indigo-400 cursor-pointer transition"
           >
             <div className="text-[11px] font-semibold text-indigo-800 uppercase">Final Out</div>
@@ -432,7 +449,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         return (
           <div 
             key="duty_hours"
-            onClick={() => handleOpenDrilldown('duty_hours', 'Employees with Completed Duty', (emp, att) => (att?.totalDutyMinutes || att?.regularDutyMinutes || 0) > 0)}
+            onClick={() => handleOpenDrilldown({ type: 'card', cardId: 'duty_hours' }, 'Employees with Completed Duty', (emp, att) => (att?.totalDutyMinutes || att?.regularDutyMinutes || 0) > 0)}
             className="bg-blue-50/50 p-3.5 rounded-xl border border-blue-200 shadow-2xs hover:border-blue-400 cursor-pointer transition"
           >
             <div className="text-[11px] font-semibold text-blue-800 uppercase">Duty Hours</div>
@@ -447,7 +464,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         return (
           <div 
             key="ot_hours"
-            onClick={() => handleOpenDrilldown('ot_hours', 'Employees with Overtime', (emp, att) => (att?.overtimeMinutes || 0) > 0)}
+            onClick={() => handleOpenDrilldown({ type: 'card', cardId: 'ot_hours' }, 'Employees with Overtime', (emp, att) => (att?.overtimeMinutes || 0) > 0)}
             className="bg-amber-50/50 p-3.5 rounded-xl border border-amber-200 shadow-2xs hover:border-amber-400 cursor-pointer transition"
           >
             <div className="text-[11px] font-semibold text-amber-800 uppercase">OT Hours</div>
@@ -462,7 +479,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         return (
           <div 
             key="auto_closed"
-            onClick={() => handleOpenDrilldown('auto_closed', 'Auto-Closed Attendance', (emp, att) => att?.punchOutType === 'AUTO' || !!att?.autoClosed)}
+            onClick={() => handleOpenDrilldown({ type: 'card', cardId: 'auto_closed' }, 'Auto-Closed Attendance', (emp, att) => att?.punchOutType === 'AUTO' || !!att?.autoClosed)}
             className="bg-purple-50/50 p-3.5 rounded-xl border border-purple-200 shadow-2xs hover:border-purple-400 cursor-pointer transition"
           >
             <div className="text-[11px] font-semibold text-purple-800 uppercase">Auto Closed</div>
@@ -475,7 +492,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         return (
           <div 
             key="missed_punch_out"
-            onClick={() => handleOpenDrilldown('missed_punch_out', 'Missed Punch Out', (emp, att) => !!att?.missedPunchOut || att?.attendanceStatus === 'MISSED PUNCH OUT')}
+            onClick={() => handleOpenDrilldown({ type: 'card', cardId: 'missed_punch_out' }, 'Missed Punch Out', (emp, att) => !!att?.missedPunchOut || att?.attendanceStatus === 'MISSED PUNCH OUT')}
             className="bg-orange-50/50 p-3.5 rounded-xl border border-orange-200 shadow-2xs hover:border-orange-400 cursor-pointer transition"
           >
             <div className="text-[11px] font-semibold text-orange-800 uppercase">Missed Punch Out</div>
@@ -529,9 +546,13 @@ export const Dashboard: React.FC<DashboardProps> = ({
               {verifiedRole === 'SUPER_ADMIN'
                 ? 'Super Admin View (All 12 Cards)'
                 : verifiedRole === 'ADMIN'
-                  ? 'Admin View (All 12 Cards)'
+                  ? permittedCardIds.length === 12
+                    ? 'Admin View (All 12 Cards)'
+                    : `Admin View (${permittedCardIds.length} Cards)`
                   : verifiedRole === 'USER'
-                    ? 'User View (Read-Only)'
+                    ? permittedCardIds.length === 6 && visibleSectionSet.size === 5
+                      ? 'User View (Read-Only)'
+                      : `User View (${permittedCardIds.length} Cards)`
                     : `${verifiedRole.replace(/_/g, ' ')} View (${permittedCardIds.length} Cards)`}
             </span>
           </div>
@@ -650,42 +671,73 @@ export const Dashboard: React.FC<DashboardProps> = ({
       </div>
 
       {/* Automatic Shift Allocation Banner */}
-      <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-blue-900 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 shadow-2xs">
-        <div className="flex items-center gap-2">
-          <CheckCircle2 className="w-4 h-4 text-blue-600 shrink-0" />
-          <span>
-            <strong>Automatic Shift Allocation Active:</strong> Shifts are identified automatically based on QR Punch-In time. (<strong>Day Shift:</strong> 09:00 AM – 08:00 PM | <strong>Night Shift:</strong> 08:00 PM – 09:00 AM next day).
-          </span>
+      {visibleSectionSet.has('shift_banner') && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-blue-900 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 shadow-2xs">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-blue-600 shrink-0" />
+            <span>
+              <strong>Automatic Shift Allocation Active:</strong> Shifts are identified automatically based on QR Punch-In time. (<strong>Day Shift:</strong> 09:00 AM – 08:00 PM | <strong>Night Shift:</strong> 08:00 PM – 09:00 AM next day).
+            </span>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <span className="inline-flex items-center gap-1 bg-white border border-blue-300 text-blue-700 font-mono text-[11px] px-2 py-0.5 rounded font-medium">
+              <Clock className="w-3 h-3 text-blue-500" /> Auto-Closing: Enabled
+            </span>
+            {canOpenScanner && (
+              <button
+                onClick={onNavigateToScanner}
+                className="bg-blue-600 hover:bg-blue-700 text-white font-medium px-2.5 py-1 rounded text-xs transition flex items-center gap-1 shadow-xs cursor-pointer"
+              >
+                Open Scanner
+              </button>
+            )}
+          </div>
         </div>
-        <div className="flex items-center gap-2 shrink-0">
-          <span className="inline-flex items-center gap-1 bg-white border border-blue-300 text-blue-700 font-mono text-[11px] px-2 py-0.5 rounded font-medium">
-            <Clock className="w-3 h-3 text-blue-500" /> Auto-Closing: Enabled
-          </span>
-          {canOpenScanner && (
-            <button
-              onClick={onNavigateToScanner}
-              className="bg-blue-600 hover:bg-blue-700 text-white font-medium px-2.5 py-1 rounded text-xs transition flex items-center gap-1 shadow-xs cursor-pointer"
-            >
-              Open Scanner
-            </button>
-          )}
-        </div>
-      </div>
+      )}
 
-      {/*
-        REAL-TIME ATTENDANCE MONITORING CARDS
-        - SUPER_ADMIN & ADMIN: All 12 KPIs across 2 rows of 6
-        - USER (Read-Only): Strictly 6 permitted KPIs (Active Total, Total Present, Absent, Duty Hours, OT Hours, Missed Punch Out)
-      */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-        {permittedCardIds.map(cardId => (
-          renderCard(cardId)
-        ))}
-      </div>
+      {/* REAL-TIME ATTENDANCE MONITORING CARDS (Filtered dynamically by Role / User Visibility Permissions) */}
+      {permittedCardIds.length > 0 && (
+        <div
+          className={
+            permittedCardIds.length === 1
+              ? 'grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3'
+              : permittedCardIds.length === 2
+                ? 'grid grid-cols-1 sm:grid-cols-2 gap-3'
+                : permittedCardIds.length <= 4
+                  ? 'grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-3'
+                  : 'grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3'
+          }
+        >
+          {permittedCardIds.map(cardId => renderCard(cardId))}
+        </div>
+      )}
 
       {/* INDUSTRIAL BREAKDOWN TABLES (Floor, Section, Department, Employee Type) */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      {(() => {
+        const visibleBreakdownCount = (
+          ['line_wise', 'section_wise', 'department_wise', 'employee_type_wise'] as DashboardSectionId[]
+        ).filter((id) => visibleSectionSet.has(id)).length;
+
+        if (permittedCardIds.length === 0 && visibleSectionSet.size === 0) {
+          return (
+            <div className="bg-white rounded-xl border border-slate-200 p-8 text-center shadow-2xs">
+              <ShieldAlert className="w-8 h-8 text-slate-400 mx-auto mb-2" />
+              <h3 className="text-sm font-bold text-slate-800">No Dashboard Cards or Sections Enabled</h3>
+              <p className="text-xs text-slate-500 mt-1">
+                Dashboard KPI cards and breakdown sections are currently hidden for your role. Contact Super Admin if access is required.
+              </p>
+            </div>
+          );
+        }
+
+        if (visibleBreakdownCount === 0) {
+          return null;
+        }
+
+        return (
+          <div className={visibleBreakdownCount === 1 ? 'grid grid-cols-1 gap-6' : 'grid grid-cols-1 lg:grid-cols-2 gap-6'}>
         {/* FLOOR-WISE REPORT */}
+        {visibleSectionSet.has('line_wise') && (
         <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-2xs">
           <div className="flex items-center justify-between pb-3 border-b border-slate-100">
             <div className="flex items-center gap-2">
@@ -718,7 +770,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                   return (
                     <tr
                       key={floor.id}
-                      onClick={() => handleOpenDrilldown('active_total', `${floor.name} Line Manpower`, (emp) => emp.floor === floor.name)}
+                      onClick={() => handleOpenDrilldown({ type: 'section', sectionId: 'line_wise' }, `${floor.name} Line Manpower`, (emp) => emp.floor === floor.name)}
                       className="hover:bg-blue-50/50 cursor-pointer transition font-medium"
                     >
                       <td className="py-2.5 px-3 font-semibold text-slate-800">{floor.name}</td>
@@ -740,8 +792,10 @@ export const Dashboard: React.FC<DashboardProps> = ({
             </table>
           </div>
         </div>
+        )}
 
         {/* SECTION-WISE REPORT */}
+        {visibleSectionSet.has('section_wise') && (
         <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-2xs">
           <div className="flex items-center justify-between pb-3 border-b border-slate-100">
             <div className="flex items-center gap-2">
@@ -774,7 +828,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                   return (
                     <tr
                       key={sec.id}
-                      onClick={() => handleOpenDrilldown('active_total', `${sec.name} Section Manpower`, (emp) => emp.section === sec.name)}
+                      onClick={() => handleOpenDrilldown({ type: 'section', sectionId: 'section_wise' }, `${sec.name} Section Manpower`, (emp) => emp.section === sec.name)}
                       className="hover:bg-indigo-50/50 cursor-pointer transition font-medium"
                     >
                       <td className="py-2.5 px-3 font-semibold text-slate-800">{sec.name}</td>
@@ -796,8 +850,10 @@ export const Dashboard: React.FC<DashboardProps> = ({
             </table>
           </div>
         </div>
+        )}
 
         {/* DEPARTMENT-WISE REPORT */}
+        {visibleSectionSet.has('department_wise') && (
         <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-2xs">
           <div className="flex items-center justify-between pb-3 border-b border-slate-100">
             <div className="flex items-center gap-2">
@@ -830,7 +886,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                   return (
                     <tr
                       key={dept.id}
-                      onClick={() => handleOpenDrilldown('active_total', `${dept.name} Dept Manpower`, (emp) => emp.department === dept.name)}
+                      onClick={() => handleOpenDrilldown({ type: 'section', sectionId: 'department_wise' }, `${dept.name} Dept Manpower`, (emp) => emp.department === dept.name)}
                       className="hover:bg-cyan-50/50 cursor-pointer transition font-medium"
                     >
                       <td className="py-2.5 px-3 font-semibold text-slate-800">{dept.name}</td>
@@ -852,8 +908,10 @@ export const Dashboard: React.FC<DashboardProps> = ({
             </table>
           </div>
         </div>
+        )}
 
         {/* EMPLOYEE TYPE WISE REPORT */}
+        {visibleSectionSet.has('employee_type_wise') && (
         <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-2xs">
           <div className="flex items-center justify-between pb-3 border-b border-slate-100">
             <div className="flex items-center gap-2">
@@ -886,7 +944,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                   return (
                     <tr
                       key={type}
-                      onClick={() => handleOpenDrilldown('active_total', `${type} Employees List`, (emp) => emp.employeeType === type)}
+                      onClick={() => handleOpenDrilldown({ type: 'section', sectionId: 'employee_type_wise' }, `${type} Employees List`, (emp) => emp.employeeType === type)}
                       className="hover:bg-purple-50/50 cursor-pointer transition font-medium"
                     >
                       <td className="py-2.5 px-3 font-semibold text-slate-800">{type}</td>
@@ -908,7 +966,10 @@ export const Dashboard: React.FC<DashboardProps> = ({
             </table>
           </div>
         </div>
-      </div>
+        )}
+          </div>
+        );
+      })()}
 
       {/* DRILLDOWN MODAL */}
       {drilldownTitle && (
@@ -937,7 +998,15 @@ export const Dashboard: React.FC<DashboardProps> = ({
                     <th className="py-2 px-3">Department</th>
                     <th className="py-2 px-3">Type</th>
                     <th className="py-2 px-3">Status</th>
-                    <th className="py-2 px-3 text-right">Duty / OT</th>
+                    <th className="py-2 px-3 text-right">
+                      {canShowDutyHours && canShowOtHours
+                        ? 'Duty / OT'
+                        : canShowDutyHours
+                          ? 'Duty'
+                          : canShowOtHours
+                            ? 'OT'
+                            : 'Attendance'}
+                    </th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
@@ -962,13 +1031,15 @@ export const Dashboard: React.FC<DashboardProps> = ({
                         <td className="py-2 px-3 text-right font-mono text-[11px]">
                           {attendance ? (
                             <span>
-                              {isDashboardCardVisible(verifiedRole, 'duty_hours') && (
+                              {canShowDutyHours && (
                                 <span>{formatMinutes(attendance.regularDutyMinutes).replace(' Hours', 'h')}</span>
                               )}
-                              {attendance.overtimeMinutes > 0 && (
-                                <span className="text-amber-600 ml-1">+{formatMinutes(attendance.overtimeMinutes).replace(' Hours', 'h')} OT</span>
+                              {canShowOtHours && attendance.overtimeMinutes > 0 && (
+                                <span className={`text-amber-600 ${canShowDutyHours ? 'ml-1' : ''}`}>
+                                  +{formatMinutes(attendance.overtimeMinutes).replace(' Hours', 'h')} OT
+                                </span>
                               )}
-                              {!isDashboardCardVisible(verifiedRole, 'duty_hours') && attendance.overtimeMinutes <= 0 && (
+                              {!canShowDutyHours && (!canShowOtHours || attendance.overtimeMinutes <= 0) && (
                                 <span className="text-slate-400">Recorded</span>
                               )}
                             </span>

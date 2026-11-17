@@ -191,9 +191,40 @@ export async function executeApiFetch(
   init?: RequestInit,
   endpointLabel?: string
 ): Promise<Response> {
+  const isPreviewToVercel =
+    typeof window !== 'undefined' &&
+    isAiStudioPreviewHostname(window.location?.hostname) &&
+    url.startsWith(SHARED_VERCEL_BACKEND_URL);
+  const sameOriginPath = isPreviewToVercel
+    ? url.slice(SHARED_VERCEL_BACKEND_URL.length) || '/api/health'
+    : '';
+
   try {
-    return await fetch(url, init);
+    const res = await fetch(url, init);
+    if (isPreviewToVercel && res.status === 404 && sameOriginPath) {
+      try {
+        const clonedBody = await res.clone().json();
+        if (clonedBody && clonedBody.error === 'API endpoint not found.') {
+          return await fetch(sameOriginPath, init);
+        }
+      } catch {
+        // Non-JSON 404: return original response cleanly
+      }
+    }
+    return res;
   } catch (err: any) {
+    // In Google AI Studio Preview, both the shared Vercel backend and the local Express server (/api/*)
+    // connect to the same Firebase project/Firestore database. If a cross-origin request to Vercel fails
+    // at the network/CORS layer (e.g., transient gateway timeout or preview browser restriction),
+    // transparently retry against same-origin /api/* once.
+    if (isPreviewToVercel && sameOriginPath) {
+      try {
+        return await fetch(sameOriginPath, init);
+      } catch {
+        // Fall through to structured connectivity error below
+      }
+    }
+
     const label = endpointLabel || url;
     const targetDesc =
       getEffectiveApiBaseUrl() ||

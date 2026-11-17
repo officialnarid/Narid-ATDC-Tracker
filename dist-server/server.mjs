@@ -3541,25 +3541,55 @@ function formatTimeDisplay(isoString) {
     hour12: true
   });
 }
+var EMPLOYEE_ID_PATTERN = /^[A-Z0-9][A-Z0-9_-]{1,31}$/;
 function parseQrPayload(raw) {
-  const trimmed = raw.trim();
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (parsed.employeeId || parsed.id) {
-      return {
-        employeeId: String(parsed.employeeId || parsed.id).trim().toUpperCase(),
-        token: parsed.token || parsed.qrToken
-      };
-    }
-  } catch {
-    if (trimmed.startsWith("QR_")) {
-      const parts = trimmed.split("_");
-      if (parts.length >= 2) {
-        return { employeeId: parts[1].trim().toUpperCase(), token: trimmed };
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) {
+    return { employeeId: "", format: "INVALID" };
+  }
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return { employeeId: "", format: "INVALID" };
       }
+      const rawId = parsed.employeeId ?? parsed.id;
+      if (typeof rawId !== "string") {
+        return { employeeId: "", format: "INVALID" };
+      }
+      const cleanId = rawId.trim().toUpperCase();
+      if (!EMPLOYEE_ID_PATTERN.test(cleanId)) {
+        return { employeeId: "", format: "INVALID" };
+      }
+      const rawToken = parsed.token ?? parsed.qrToken;
+      const cleanToken = typeof rawToken === "string" && rawToken.trim() ? rawToken.trim() : void 0;
+      return {
+        employeeId: cleanId,
+        token: cleanToken,
+        format: "JSON_TOKEN"
+      };
+    } catch {
+      return { employeeId: "", format: "INVALID" };
     }
   }
-  return { employeeId: trimmed.toUpperCase() };
+  if (trimmed.startsWith("QR_")) {
+    const parts = trimmed.split("_");
+    const cleanId = (parts[1] || "").trim().toUpperCase();
+    if (!cleanId || !EMPLOYEE_ID_PATTERN.test(cleanId)) {
+      return { employeeId: "", format: "INVALID" };
+    }
+    const tokenSuffix = parts.slice(2).join("_").trim();
+    return {
+      employeeId: cleanId,
+      token: parts.length >= 3 && tokenSuffix.length > 0 ? trimmed : void 0,
+      format: "TOKEN_STRING"
+    };
+  }
+  const cleanLegacyId = trimmed.toUpperCase();
+  if (!EMPLOYEE_ID_PATTERN.test(cleanLegacyId)) {
+    return { employeeId: "", format: "INVALID" };
+  }
+  return { employeeId: cleanLegacyId, format: "LEGACY_EMPLOYEE_ID" };
 }
 function identifyShiftForPunchIn(shifts, now = /* @__PURE__ */ new Date()) {
   const kolkata = getKolkataTimeParts(now);
@@ -3594,6 +3624,14 @@ var AttendanceScanSchema = z2.object({
   rawPayload: z2.string().trim().min(1, "Scan payload cannot be empty.").max(256),
   scannerType: z2.enum(["IN", "OUT"]).optional(),
   scannerDevice: z2.enum(["USB_SCANNER", "WEBCAM", "MANUAL", "SYSTEM_AUTO"]).optional(),
+  customScanTime: z2.string().datetime({ offset: true }).or(z2.string().datetime()).optional()
+});
+var ManualPunchSchema = z2.object({
+  employeeId: z2.string().trim().min(2, "Please enter a valid Employee ID.").max(32, "Employee ID cannot exceed 32 characters.").transform((v) => v.toUpperCase()).refine((v) => EMPLOYEE_ID_PATTERN.test(v), {
+    message: "Invalid Employee ID format. Use letters, numbers, hyphens, or underscores only."
+  }),
+  scannerType: z2.enum(["IN", "OUT"]).optional(),
+  reason: z2.string().trim().max(250).optional(),
   customScanTime: z2.string().datetime({ offset: true }).or(z2.string().datetime()).optional()
 });
 var AttendanceCorrectSchema = z2.object({
@@ -3674,10 +3712,77 @@ async function callerHasModuleAction(db, caller, moduleKey, action) {
     return false;
   }
 }
+function isScannerCapabilityEntryEnabled(entry) {
+  if (!entry || typeof entry !== "object") return false;
+  if (entry.view === false) return false;
+  if (typeof entry.add === "boolean") {
+    return entry.add === true;
+  }
+  return entry.view === true;
+}
 async function callerHasScannerAccess(db, caller) {
   const canView = await callerHasModuleAction(db, caller, "scanner", "view");
   if (!canView) return false;
   return callerHasModuleAction(db, caller, "scanner", "add");
+}
+async function callerHasQrScanAccess(db, caller) {
+  if (caller.role === "super_admin") return true;
+  try {
+    const userPermSnap = await db.collection("user_permissions").doc(caller.profileDocId).get();
+    if (userPermSnap.exists && userPermSnap.data()?.isCustomOverride !== false) {
+      const perms = userPermSnap.data()?.permissions || {};
+      const qrEntry = perms["attendance.qr.scan"];
+      if (qrEntry && typeof qrEntry === "object" && (typeof qrEntry.view === "boolean" || typeof qrEntry.add === "boolean")) {
+        return isScannerCapabilityEntryEnabled(qrEntry);
+      }
+      if (perms.scanner && typeof perms.scanner === "object") {
+        return isScannerCapabilityEntryEnabled(perms.scanner);
+      }
+    }
+    const rolePermSnap = await db.collection("role_permissions").doc(caller.role).get();
+    if (rolePermSnap.exists) {
+      const modPerms = rolePermSnap.data()?.modulePermissions || {};
+      const qrEntry = modPerms["attendance.qr.scan"];
+      if (qrEntry && typeof qrEntry === "object" && (typeof qrEntry.view === "boolean" || typeof qrEntry.add === "boolean")) {
+        return isScannerCapabilityEntryEnabled(qrEntry);
+      }
+      if (modPerms.scanner && typeof modPerms.scanner === "object") {
+        return isScannerCapabilityEntryEnabled(modPerms.scanner);
+      }
+    }
+    return callerHasScannerAccess(db, caller);
+  } catch (err) {
+    console.warn("[Attendance QR Permission Guard] Lookup failed; failing closed:", err?.message || err);
+    return false;
+  }
+}
+async function callerHasManualEntryAccess(db, caller) {
+  if (caller.role === "super_admin") return true;
+  try {
+    const userPermSnap = await db.collection("user_permissions").doc(caller.profileDocId).get();
+    if (userPermSnap.exists && userPermSnap.data()?.isCustomOverride !== false) {
+      const perms = userPermSnap.data()?.permissions || {};
+      const manualEntry = perms["attendance.manual.entry"];
+      if (manualEntry && typeof manualEntry === "object" && (typeof manualEntry.view === "boolean" || typeof manualEntry.add === "boolean")) {
+        return isScannerCapabilityEntryEnabled(manualEntry);
+      }
+      if (perms.scanner?.view === false) {
+        return false;
+      }
+    }
+    const rolePermSnap = await db.collection("role_permissions").doc(caller.role).get();
+    if (rolePermSnap.exists) {
+      const modPerms = rolePermSnap.data()?.modulePermissions || {};
+      const manualEntry = modPerms["attendance.manual.entry"];
+      if (manualEntry && typeof manualEntry === "object" && (typeof manualEntry.view === "boolean" || typeof manualEntry.add === "boolean")) {
+        return isScannerCapabilityEntryEnabled(manualEntry);
+      }
+    }
+    return false;
+  } catch (err) {
+    console.warn("[Attendance Manual Entry Permission Guard] Lookup failed; failing closed:", err?.message || err);
+    return false;
+  }
 }
 function registerAttendanceRoutes(app, deps) {
   const { db, requireVerifiedCaller } = deps;
@@ -3694,7 +3799,7 @@ function registerAttendanceRoutes(app, deps) {
         "Attendance Scan Processing"
       );
       if (!caller) return;
-      const canScan = await callerHasScannerAccess(db, caller);
+      const canScan = await callerHasQrScanAccess(db, caller);
       if (!canScan) {
         await recordEnterpriseAuditEvent(db, {
           req,
@@ -3707,12 +3812,14 @@ function registerAttendanceRoutes(app, deps) {
           targetType: "ATTENDANCE_SCANNER",
           targetId: "/api/attendance/scan",
           actionSource: "ATTENDANCE_PERMISSION_GUARD",
-          description: `User "${caller.loginId}" (${caller.role}) blocked from /api/attendance/scan due to missing scanner permission.`,
+          description: `User "${caller.loginId}" (${caller.role}) blocked from /api/attendance/scan due to missing attendance.qr.scan permission.`,
           success: false
         });
         return res.status(403).json({
           success: false,
-          error: "Forbidden: Your account does not have Attendance Scanner permission."
+          action: "REJECTED",
+          error: "Forbidden: Your role does not have QR Code Scanning permission (attendance.qr.scan).",
+          message: "Forbidden: Your role does not have QR Code Scanning permission (attendance.qr.scan)."
         });
       }
       const parsed = AttendanceScanSchema.safeParse(req.body);
@@ -3741,8 +3848,8 @@ function registerAttendanceRoutes(app, deps) {
       }
       const kolkata = getKolkataTimeParts(now);
       const timeDisplay = kolkata.timeWithSeconds;
-      const { employeeId, token } = parseQrPayload(rawPayload);
-      if (!employeeId) {
+      const { employeeId, token, format } = parseQrPayload(rawPayload);
+      if (format === "INVALID" || !employeeId) {
         await writePunchLog({
           employeeId: "UNKNOWN",
           timestamp: now.toISOString(),
@@ -3751,14 +3858,14 @@ function registerAttendanceRoutes(app, deps) {
           scannerDevice,
           performedByUid: caller.uid,
           performedByLoginId: caller.loginId,
-          message: "Invalid QR Code payload or empty Employee ID."
+          message: "Invalid QR Code payload format."
         });
         return res.status(400).json({
           success: false,
           action: "REJECTED",
           scannerType: scannerType || "IN",
-          error: "Invalid QR Code. Employee Not Found.",
-          message: "Invalid QR Code. Employee Not Found.",
+          error: "Invalid QR payload. Please scan a valid Employee QR code or Employee ID.",
+          message: "Invalid QR payload. Please scan a valid Employee QR code or Employee ID.",
           time: timeDisplay
         });
       }
@@ -3821,6 +3928,7 @@ function registerAttendanceRoutes(app, deps) {
             action: "REJECTED_TOKEN",
             rawPayload,
             scannerDevice,
+            qrVerificationMode: "TOKEN_REJECTED",
             performedByUid: caller.uid,
             performedByLoginId: caller.loginId,
             message: token ? `Token mismatch: provided ${token}, expected configured qrCodeToken` : "Missing required QR security token for employee with configured qrCodeToken"
@@ -3838,461 +3946,18 @@ function registerAttendanceRoutes(app, deps) {
             }
           };
         }
-        const [shiftsSnap, settingsSnap] = await Promise.all([
-          db.collection("shifts").get(),
-          db.collection("system_settings").doc("global").get()
-        ]);
-        const shifts = shiftsSnap.empty ? DEFAULT_SHIFTS : shiftsSnap.docs.map((d) => d.data());
-        const settings = settingsSnap.exists ? settingsSnap.data() || DEFAULT_SETTINGS : DEFAULT_SETTINGS;
-        const shiftsMap = new Map(shifts.map((s) => [s.id, s]));
-        const todayKey = kolkata.dateKey;
-        const yesterdayKey = getYesterdayKolkataDateKey(now);
-        const currentMins = kolkata.totalMinutes;
-        const candidateSnap = await db.collection("attendance").where("employeeId", "==", employee.employeeId).where("shiftDate", ">=", yesterdayKey).get();
-        const existingRecords = candidateSnap.docs.map((d) => d.data()).sort((a, b) => new Date(b.punchIn).getTime() - new Date(a.punchIn).getTime());
-        let activeRecord = null;
-        if (currentMins < 540) {
-          const yesterdayNight = existingRecords.find(
-            (r) => r.shiftDate === yesterdayKey && (r.shiftId === "NIGHT" || String(r.shiftNameSnapshot || "").toUpperCase().includes("NIGHT"))
-          );
-          if (yesterdayNight) {
-            activeRecord = yesterdayNight;
-          }
-        }
-        if (!activeRecord) {
-          activeRecord = existingRecords.find((r) => r.shiftDate === todayKey) || null;
-        }
-        if (!scannerType) {
-          const derivedState = activeRecord?.currentState || (activeRecord?.actualPunchOut ? "OUTSIDE" : activeRecord ? "INSIDE" : "OUTSIDE");
-          scannerType = derivedState === "INSIDE" ? "OUT" : "IN";
-        }
-        if (scannerType === "IN") {
-          if (activeRecord) {
-            const docRef3 = db.collection("attendance").doc(activeRecord.id);
-            const eventId3 = `pe_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
-            const logId3 = `log_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
-            const txRes2 = await db.runTransaction(async (tx) => {
-              const snap = await tx.get(docRef3);
-              const currentData = snap.exists ? snap.data() : activeRecord;
-              const currentState = currentData.currentState || (currentData.actualPunchOut || currentData.punchOutType === "ACTUAL" ? "OUTSIDE" : "INSIDE");
-              if (currentState === "INSIDE") {
-                return { kind: "CONSECUTIVE_IN", record: currentData };
-              }
-              const lastPunchTime = Array.isArray(currentData.punches) && currentData.punches.length > 0 ? new Date(currentData.punches[currentData.punches.length - 1].timestamp).getTime() : new Date(currentData.updatedAt || currentData.punchIn).getTime();
-              if (Math.abs(now.getTime() - lastPunchTime) < 3e3) {
-                return { kind: "BOUNCE", record: currentData };
-              }
-              const punchEvent = {
-                id: eventId3,
-                employeeId: employee.employeeId,
-                employeeName: employee.employeeName,
-                eventType: "IN",
-                timestamp: now.toISOString(),
-                displayTime: timeDisplay,
-                shiftDate: currentData.shiftDate,
-                shiftId: currentData.shiftId,
-                shiftName: currentData.shiftNameSnapshot,
-                floor: employee.floor,
-                section: employee.section,
-                department: employee.department,
-                scannerType: "IN",
-                scannerDevice,
-                status: "SUBSEQUENT_IN",
-                recordedByUid: caller.uid,
-                recordedByLoginId: caller.loginId
-              };
-              const existingPunches = Array.isArray(currentData.punches) ? currentData.punches : [];
-              const updatedAttendance = {
-                ...currentData,
-                currentState: "INSIDE",
-                punchOutType: "NONE",
-                punches: [...existingPunches, punchEvent],
-                updatedAt: now.toISOString()
-              };
-              tx.set(docRef3, updatedAttendance);
-              tx.set(db.collection("punch_events").doc(eventId3), punchEvent);
-              tx.set(db.collection("punch_logs").doc(logId3), {
-                id: logId3,
-                employeeId: employee.employeeId,
-                employeeName: employee.employeeName,
-                timestamp: now.toISOString(),
-                action: "PUNCH_IN",
-                rawPayload,
-                scannerDevice,
-                performedByUid: caller.uid,
-                performedByLoginId: caller.loginId,
-                message: `Subsequent Punch In (Event #${updatedAttendance.punches.length}). Status: INSIDE.`
-              });
-              return { kind: "RECORDED", record: updatedAttendance };
-            });
-            if (txRes2.kind === "CONSECUTIVE_IN") {
-              await writePunchLog({
-                employeeId: employee.employeeId,
-                employeeName: employee.employeeName,
-                timestamp: now.toISOString(),
-                action: "REJECTED_DUPLICATE",
-                rawPayload,
-                scannerDevice,
-                performedByUid: caller.uid,
-                performedByLoginId: caller.loginId,
-                message: `Consecutive Punch In rejected. Employee already Punched In at ${formatTimeDisplay(txRes2.record.punchIn)}.`
-              });
-              return {
-                httpStatus: 409,
-                body: {
-                  success: false,
-                  action: "REJECTED_DUPLICATE",
-                  scannerType: "IN",
-                  currentState: "INSIDE",
-                  employee,
-                  attendance: txRes2.record,
-                  message: "Consecutive Punch In rejected. Employee is already Punched In (Status: INSIDE).",
-                  time: timeDisplay,
-                  punchCount: txRes2.record.punches?.length || 1
-                }
-              };
-            }
-            if (txRes2.kind === "BOUNCE") {
-              return {
-                httpStatus: 429,
-                body: {
-                  success: false,
-                  action: "REJECTED_DUPLICATE",
-                  scannerType: "IN",
-                  currentState: "OUTSIDE",
-                  employee,
-                  attendance: txRes2.record,
-                  message: "Duplicate scan prevented. Please wait a few seconds before scanning again.",
-                  time: timeDisplay
-                }
-              };
-            }
-            const shift3 = shiftsMap.get(txRes2.record.shiftId) || shifts[0];
-            return {
-              httpStatus: 200,
-              body: {
-                success: true,
-                action: "PUNCH_IN",
-                scannerType: "IN",
-                currentState: "INSIDE",
-                employee,
-                attendance: txRes2.record,
-                shift: shift3,
-                message: `Punch In Successfully Recorded (Re-entry #${txRes2.record.punches.length}).`,
-                time: timeDisplay,
-                punchCount: txRes2.record.punches.length
-              }
-            };
-          }
-          const shiftMatch = identifyShiftForPunchIn(shifts, now);
-          if (!shiftMatch) {
-            await writePunchLog({
-              employeeId: employee.employeeId,
-              employeeName: employee.employeeName,
-              timestamp: now.toISOString(),
-              action: "REJECTED_SHIFT",
-              rawPayload,
-              scannerDevice,
-              performedByUid: caller.uid,
-              performedByLoginId: caller.loginId,
-              message: "No shift window matched the punch-in time."
-            });
-            return {
-              httpStatus: 400,
-              body: {
-                success: false,
-                action: "REJECTED",
-                scannerType: "IN",
-                employee,
-                message: "No Valid Shift Found For This Punch-In Time.",
-                time: timeDisplay
-              }
-            };
-          }
-          const { shift: shift2, shiftDate } = shiftMatch;
-          const attendanceId = `att_${employee.employeeId}_${shiftDate}_${shift2.id}`;
-          const shiftStartMins = timeStringToMinutes(shift2.startTime);
-          const grace = shift2.gracePeriodMinutes ?? settings.lateGraceMinutes ?? 15;
-          const isLate = !shift2.isOvernight ? currentMins > shiftStartMins + grace : currentMins >= 1200 ? currentMins > shiftStartMins + grace : true;
-          const initialStatus = isLate ? "LATE" : "PRESENT";
-          const eventId2 = `pe_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
-          const logId2 = `log_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
-          const firstPunchEvent = {
-            id: eventId2,
-            employeeId: employee.employeeId,
-            employeeName: employee.employeeName,
-            eventType: "IN",
-            timestamp: now.toISOString(),
-            displayTime: timeDisplay,
-            shiftDate,
-            shiftId: shift2.id,
-            shiftName: shift2.name,
-            floor: employee.floor,
-            section: employee.section,
-            department: employee.department,
-            scannerType: "IN",
-            scannerDevice,
-            status: isLate ? "FIRST_IN_LATE" : "FIRST_IN",
-            recordedByUid: caller.uid,
-            recordedByLoginId: caller.loginId
-          };
-          const newAttendanceRecord = {
-            id: attendanceId,
-            employeeId: employee.employeeId,
-            employeeNameSnapshot: employee.employeeName,
-            employeeTypeSnapshot: employee.employeeType,
-            floorIdSnapshot: employee.floor,
-            lineIdSnapshot: employee.floor,
-            sectionIdSnapshot: employee.section,
-            departmentIdSnapshot: employee.department,
-            shiftId: shift2.id,
-            shiftNameSnapshot: shift2.name,
-            shiftDate,
-            punchIn: now.toISOString(),
-            firstPunchIn: now.toISOString(),
-            scheduledPunchOut: shift2.endTime,
-            actualPunchOut: null,
-            lastPunchOut: null,
-            effectivePunchOut: null,
-            punchOutType: "NONE",
-            currentState: "INSIDE",
-            punches: [firstPunchEvent],
-            totalDutyMinutes: 0,
-            regularDutyMinutes: 0,
-            overtimeMinutes: 0,
-            attendanceStatus: initialStatus,
-            missedPunchOut: false,
-            autoClosed: false,
-            qrTokenReference: employee.qrCodeToken || "",
-            createdByUid: caller.uid,
-            createdByLoginId: caller.loginId,
-            createdAt: now.toISOString(),
-            updatedAt: now.toISOString()
-          };
-          const docRef2 = db.collection("attendance").doc(attendanceId);
-          const txRes = await db.runTransaction(async (tx) => {
-            const existing = await tx.get(docRef2);
-            if (existing.exists) {
-              const data = existing.data();
-              if (data.currentState === "INSIDE" || !data.actualPunchOut && data.punchOutType === "NONE") {
-                return { kind: "CONSECUTIVE_IN", record: data };
-              }
-            }
-            tx.set(docRef2, newAttendanceRecord);
-            tx.set(db.collection("punch_events").doc(eventId2), firstPunchEvent);
-            tx.set(db.collection("punch_logs").doc(logId2), {
-              id: logId2,
-              employeeId: employee.employeeId,
-              employeeName: employee.employeeName,
-              timestamp: now.toISOString(),
-              action: "PUNCH_IN",
-              rawPayload,
-              scannerDevice,
-              performedByUid: caller.uid,
-              performedByLoginId: caller.loginId,
-              message: `First Punch In recorded for ${shift2.name} (${shiftDate}). Status: ${initialStatus}.`
-            });
-            return { kind: "RECORDED", record: newAttendanceRecord };
-          });
-          if (txRes.kind === "CONSECUTIVE_IN") {
-            return {
-              httpStatus: 409,
-              body: {
-                success: false,
-                action: "REJECTED_DUPLICATE",
-                scannerType: "IN",
-                currentState: "INSIDE",
-                employee,
-                attendance: txRes.record,
-                message: "Consecutive Punch In rejected. Employee is already Punched In (Status: INSIDE).",
-                time: timeDisplay
-              }
-            };
-          }
-          return {
-            httpStatus: 200,
-            body: {
-              success: true,
-              action: "PUNCH_IN",
-              scannerType: "IN",
-              currentState: "INSIDE",
-              employee,
-              attendance: newAttendanceRecord,
-              shift: shift2,
-              message: isLate ? `First Punch In Recorded for ${shift2.name} (Marked LATE).` : `First Punch In Recorded for ${shift2.name}.`,
-              time: timeDisplay,
-              punchCount: 1
-            }
-          };
-        }
-        if (!activeRecord) {
-          await writePunchLog({
-            employeeId: employee.employeeId,
-            employeeName: employee.employeeName,
-            timestamp: now.toISOString(),
-            action: "REJECTED_TOKEN",
-            rawPayload,
-            scannerDevice,
-            performedByUid: caller.uid,
-            performedByLoginId: caller.loginId,
-            message: "Punch Out rejected: No valid Punch In found for employee today."
-          });
-          return {
-            httpStatus: 400,
-            body: {
-              success: false,
-              action: "REJECTED",
-              scannerType: "OUT",
-              employee,
-              message: "Punch Out rejected: No valid Punch In found for employee. Please Punch In first.",
-              time: timeDisplay
-            }
-          };
-        }
-        const docRef = db.collection("attendance").doc(activeRecord.id);
-        const eventId = `pe_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
-        const logId = `log_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
-        const txOutRes = await db.runTransaction(async (tx) => {
-          const snap = await tx.get(docRef);
-          const currentData = snap.exists ? snap.data() : activeRecord;
-          const currentState = currentData.currentState || (currentData.actualPunchOut || currentData.punchOutType === "ACTUAL" ? "OUTSIDE" : "INSIDE");
-          if (currentState === "OUTSIDE") {
-            return { kind: "CONSECUTIVE_OUT", record: currentData };
-          }
-          const lastPunchTime = Array.isArray(currentData.punches) && currentData.punches.length > 0 ? new Date(currentData.punches[currentData.punches.length - 1].timestamp).getTime() : new Date(currentData.updatedAt || currentData.punchIn).getTime();
-          if (Math.abs(now.getTime() - lastPunchTime) < 3e3) {
-            return { kind: "BOUNCE", record: currentData };
-          }
-          const firstInIso = currentData.firstPunchIn || currentData.punchIn;
-          const firstInDate = new Date(firstInIso);
-          const totalDutyMinutes = Math.max(
-            0,
-            Math.floor((now.getTime() - firstInDate.getTime()) / (1e3 * 60))
-          );
-          const scheduledStandardDutyMinutes = 510;
-          const regularDutyMinutes = Math.min(totalDutyMinutes, scheduledStandardDutyMinutes);
-          const overtimeMinutes = Math.max(0, totalDutyMinutes - scheduledStandardDutyMinutes);
-          const outEvent = {
-            id: eventId,
-            employeeId: employee.employeeId,
-            employeeName: employee.employeeName,
-            eventType: "OUT",
-            timestamp: now.toISOString(),
-            displayTime: timeDisplay,
-            shiftDate: currentData.shiftDate,
-            shiftId: currentData.shiftId,
-            shiftName: currentData.shiftNameSnapshot,
-            floor: employee.floor,
-            section: employee.section,
-            department: employee.department,
-            scannerType: "OUT",
-            scannerDevice,
-            dutyDurationMinutes: totalDutyMinutes,
-            overtimeMinutes,
-            status: "VALID_OUT",
-            recordedByUid: caller.uid,
-            recordedByLoginId: caller.loginId
-          };
-          const existingPunches = Array.isArray(currentData.punches) ? currentData.punches : [];
-          const updatedAttendance = {
-            ...currentData,
-            actualPunchOut: now.toISOString(),
-            lastPunchOut: now.toISOString(),
-            effectivePunchOut: now.toISOString(),
-            punchOutType: "ACTUAL",
-            currentState: "OUTSIDE",
-            punches: [...existingPunches, outEvent],
-            totalDutyMinutes,
-            regularDutyMinutes,
-            overtimeMinutes,
-            attendanceStatus: "COMPLETED",
-            missedPunchOut: false,
-            autoClosed: false,
-            updatedByUid: caller.uid,
-            updatedByLoginId: caller.loginId,
-            updatedAt: now.toISOString()
-          };
-          tx.set(docRef, updatedAttendance);
-          tx.set(db.collection("punch_events").doc(eventId), outEvent);
-          tx.set(db.collection("punch_logs").doc(logId), {
-            id: logId,
-            employeeId: employee.employeeId,
-            employeeName: employee.employeeName,
-            timestamp: now.toISOString(),
-            action: "PUNCH_OUT",
-            rawPayload,
-            scannerDevice,
-            performedByUid: caller.uid,
-            performedByLoginId: caller.loginId,
-            message: `Punch Out recorded. Duty: ${formatMinutes(regularDutyMinutes)}, OT: ${formatMinutes(overtimeMinutes)}. Total: ${formatMinutes(totalDutyMinutes)}.`
-          });
-          return {
-            kind: "RECORDED",
-            record: updatedAttendance,
-            regularDutyMinutes,
-            overtimeMinutes
-          };
+        const qrVerificationMode = token ? "TOKEN_VERIFIED" : "UNTOKENIZED_EMPLOYEE";
+        return executePunchForVerifiedEmployee({
+          employee,
+          caller,
+          now,
+          kolkata,
+          timeDisplay,
+          scannerType,
+          scannerDevice,
+          rawPayload,
+          qrVerificationMode
         });
-        if (txOutRes.kind === "CONSECUTIVE_OUT") {
-          await writePunchLog({
-            employeeId: employee.employeeId,
-            employeeName: employee.employeeName,
-            timestamp: now.toISOString(),
-            action: "REJECTED_DUPLICATE",
-            rawPayload,
-            scannerDevice,
-            performedByUid: caller.uid,
-            performedByLoginId: caller.loginId,
-            message: "Consecutive Punch Out rejected. Employee has already Punched Out."
-          });
-          return {
-            httpStatus: 409,
-            body: {
-              success: false,
-              action: "REJECTED_DUPLICATE",
-              scannerType: "OUT",
-              currentState: "OUTSIDE",
-              employee,
-              attendance: txOutRes.record,
-              message: "Consecutive Punch Out rejected. Employee has already Punched Out (Status: OUTSIDE).",
-              time: timeDisplay,
-              punchCount: txOutRes.record.punches?.length || 1
-            }
-          };
-        }
-        if (txOutRes.kind === "BOUNCE") {
-          return {
-            httpStatus: 429,
-            body: {
-              success: false,
-              action: "REJECTED_DUPLICATE",
-              scannerType: "OUT",
-              currentState: "INSIDE",
-              employee,
-              attendance: txOutRes.record,
-              message: "Duplicate scan prevented. Please wait a few seconds before scanning again.",
-              time: timeDisplay
-            }
-          };
-        }
-        const shift = shiftsMap.get(txOutRes.record.shiftId) || shifts[0];
-        return {
-          httpStatus: 200,
-          body: {
-            success: true,
-            action: "PUNCH_OUT",
-            scannerType: "OUT",
-            currentState: "OUTSIDE",
-            employee,
-            attendance: txOutRes.record,
-            shift,
-            message: "Punch Out Successfully Recorded.",
-            time: timeDisplay,
-            dutyFormatted: formatMinutes(txOutRes.regularDutyMinutes),
-            otFormatted: formatMinutes(txOutRes.overtimeMinutes),
-            punchCount: txOutRes.record.punches.length
-          }
-        };
       });
       return res.status(outcome.httpStatus).json(outcome.body);
     } catch (err) {
@@ -4305,6 +3970,630 @@ function registerAttendanceRoutes(app, deps) {
       });
     }
   });
+  app.post("/api/attendance/manual-punch", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        "*",
+        "Manual Employee ID Punch"
+      );
+      if (!caller) return;
+      const canManualPunch = await callerHasManualEntryAccess(db, caller);
+      if (!canManualPunch) {
+        await recordEnterpriseAuditEvent(db, {
+          req,
+          action: "unauthorized_access_attempt",
+          category: "SECURITY",
+          severity: "CRITICAL",
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: caller.role.toUpperCase(),
+          targetType: "ATTENDANCE_MANUAL_PUNCH",
+          targetId: "/api/attendance/manual-punch",
+          actionSource: "ATTENDANCE_PERMISSION_GUARD",
+          description: `User "${caller.loginId}" (${caller.role}) blocked from /api/attendance/manual-punch due to missing attendance.manual.entry permission.`,
+          success: false
+        });
+        return res.status(403).json({
+          success: false,
+          action: "REJECTED",
+          error: "Forbidden: Your role does not have Manual Employee ID Entry permission (attendance.manual.entry).",
+          message: "Forbidden: Your role does not have Manual Employee ID Entry permission (attendance.manual.entry)."
+        });
+      }
+      const parsed = ManualPunchSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          action: "REJECTED",
+          error: parsed.error.issues[0]?.message || "Invalid Employee ID.",
+          message: parsed.error.issues[0]?.message || "Invalid Employee ID."
+        });
+      }
+      const { employeeId, scannerType, reason, customScanTime } = parsed.data;
+      if (customScanTime) {
+        const canCustomTime = await callerHasModuleAction(db, caller, "scanner", "edit") || await callerHasModuleAction(db, caller, "history", "edit");
+        if (!canCustomTime) {
+          return res.status(403).json({
+            success: false,
+            error: "Forbidden: Your role is not permitted to submit custom punch timestamps."
+          });
+        }
+      }
+      const now = customScanTime ? new Date(customScanTime) : /* @__PURE__ */ new Date();
+      if (Number.isNaN(now.getTime())) {
+        return res.status(400).json({ success: false, error: "Invalid customScanTime timestamp." });
+      }
+      const kolkata = getKolkataTimeParts(now);
+      const timeDisplay = kolkata.timeWithSeconds;
+      const rawPayload = `MANUAL:${employeeId}`;
+      const outcome = await withEmployeeScanLock(employeeId, async () => {
+        const empSnap = await db.collection("employees").doc(employeeId).get();
+        if (!empSnap.exists) {
+          await writePunchLog({
+            employeeId,
+            timestamp: now.toISOString(),
+            action: "REJECTED_TOKEN",
+            rawPayload,
+            scannerDevice: "MANUAL",
+            qrVerificationMode: "MANUAL_EMPLOYEE_ID",
+            performedByUid: caller.uid,
+            performedByLoginId: caller.loginId,
+            message: `Manual entry rejected: Employee ID ${employeeId} not found in database.`
+          });
+          return {
+            httpStatus: 404,
+            body: {
+              success: false,
+              action: "REJECTED",
+              scannerType: scannerType || "IN",
+              error: `Employee "${employeeId}" Not Found.`,
+              message: `Employee "${employeeId}" Not Found.`,
+              time: timeDisplay
+            }
+          };
+        }
+        const employee = empSnap.data();
+        if (employee.employeeStatus !== "Active") {
+          await writePunchLog({
+            employeeId: employee.employeeId,
+            employeeName: employee.employeeName,
+            timestamp: now.toISOString(),
+            action: "REJECTED_INACTIVE",
+            rawPayload,
+            scannerDevice: "MANUAL",
+            qrVerificationMode: "MANUAL_EMPLOYEE_ID",
+            performedByUid: caller.uid,
+            performedByLoginId: caller.loginId,
+            message: `Manual entry rejected: Employee ${employeeId} is inactive.`
+          });
+          return {
+            httpStatus: 400,
+            body: {
+              success: false,
+              action: "REJECTED",
+              scannerType: scannerType || "IN",
+              employee,
+              error: "Employee Is Inactive. Attendance Cannot Be Recorded.",
+              message: "Employee Is Inactive. Attendance Cannot Be Recorded.",
+              time: timeDisplay
+            }
+          };
+        }
+        const result = await executePunchForVerifiedEmployee({
+          employee,
+          caller,
+          now,
+          kolkata,
+          timeDisplay,
+          scannerType,
+          scannerDevice: "MANUAL",
+          rawPayload,
+          qrVerificationMode: "MANUAL_EMPLOYEE_ID"
+        });
+        if (result.httpStatus === 200 && result.body.success) {
+          await recordEnterpriseAuditEvent(db, {
+            req,
+            action: "MANUAL_ATTENDANCE_PUNCH",
+            category: "ATTENDANCE",
+            actorUid: caller.uid,
+            actorLoginId: caller.loginId,
+            actorRole: caller.role.toUpperCase(),
+            employeeId: employee.employeeId,
+            targetType: "ATTENDANCE",
+            targetId: result.body.attendance?.id || employee.employeeId,
+            newValue: `${result.body.action} via manual ID entry (${employee.employeeId})`,
+            actionSource: "MANUAL_SCANNER_ENTRY",
+            reason: reason || "Authorized operator manual Employee ID punch",
+            captureGeo: false
+          });
+        }
+        return result;
+      });
+      return res.status(outcome.httpStatus).json(outcome.body);
+    } catch (err) {
+      console.error("[API Manual Punch] Error:", err);
+      return res.status(500).json({
+        success: false,
+        action: "REJECTED",
+        error: "Manual attendance punch processing failed.",
+        message: "Manual attendance punch processing failed."
+      });
+    }
+  });
+  async function executePunchForVerifiedEmployee(params) {
+    const {
+      employee,
+      caller,
+      now,
+      kolkata,
+      timeDisplay,
+      scannerDevice,
+      rawPayload,
+      qrVerificationMode
+    } = params;
+    let { scannerType } = params;
+    const [shiftsSnap, settingsSnap] = await Promise.all([
+      db.collection("shifts").get(),
+      db.collection("system_settings").doc("global").get()
+    ]);
+    const shifts = shiftsSnap.empty ? DEFAULT_SHIFTS : shiftsSnap.docs.map((d) => d.data());
+    const settings = settingsSnap.exists ? settingsSnap.data() || DEFAULT_SETTINGS : DEFAULT_SETTINGS;
+    const shiftsMap = new Map(shifts.map((s) => [s.id, s]));
+    const todayKey = kolkata.dateKey;
+    const yesterdayKey = getYesterdayKolkataDateKey(now);
+    const currentMins = kolkata.totalMinutes;
+    const candidateSnap = await db.collection("attendance").where("employeeId", "==", employee.employeeId).where("shiftDate", ">=", yesterdayKey).get();
+    const existingRecords = candidateSnap.docs.map((d) => d.data()).sort((a, b) => new Date(b.punchIn).getTime() - new Date(a.punchIn).getTime());
+    let activeRecord = null;
+    if (currentMins < 540) {
+      const yesterdayNight = existingRecords.find(
+        (r) => r.shiftDate === yesterdayKey && (r.shiftId === "NIGHT" || String(r.shiftNameSnapshot || "").toUpperCase().includes("NIGHT"))
+      );
+      if (yesterdayNight) {
+        activeRecord = yesterdayNight;
+      }
+    }
+    if (!activeRecord) {
+      activeRecord = existingRecords.find((r) => r.shiftDate === todayKey) || null;
+    }
+    if (!scannerType) {
+      const derivedState = activeRecord?.currentState || (activeRecord?.actualPunchOut ? "OUTSIDE" : activeRecord ? "INSIDE" : "OUTSIDE");
+      scannerType = derivedState === "INSIDE" ? "OUT" : "IN";
+    }
+    if (scannerType === "IN") {
+      if (activeRecord) {
+        const docRef3 = db.collection("attendance").doc(activeRecord.id);
+        const eventId3 = `pe_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
+        const logId3 = `log_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
+        const txRes2 = await db.runTransaction(async (tx) => {
+          const snap = await tx.get(docRef3);
+          const currentData = snap.exists ? snap.data() : activeRecord;
+          const currentState = currentData.currentState || (currentData.actualPunchOut || currentData.punchOutType === "ACTUAL" ? "OUTSIDE" : "INSIDE");
+          if (currentState === "INSIDE") {
+            return { kind: "CONSECUTIVE_IN", record: currentData };
+          }
+          const lastPunchTime = Array.isArray(currentData.punches) && currentData.punches.length > 0 ? new Date(currentData.punches[currentData.punches.length - 1].timestamp).getTime() : new Date(currentData.updatedAt || currentData.punchIn).getTime();
+          if (Math.abs(now.getTime() - lastPunchTime) < 3e3) {
+            return { kind: "BOUNCE", record: currentData };
+          }
+          const punchEvent = {
+            id: eventId3,
+            employeeId: employee.employeeId,
+            employeeName: employee.employeeName,
+            eventType: "IN",
+            timestamp: now.toISOString(),
+            displayTime: timeDisplay,
+            shiftDate: currentData.shiftDate,
+            shiftId: currentData.shiftId,
+            shiftName: currentData.shiftNameSnapshot,
+            floor: employee.floor,
+            section: employee.section,
+            department: employee.department,
+            scannerType: "IN",
+            scannerDevice,
+            status: "SUBSEQUENT_IN",
+            recordedByUid: caller.uid,
+            recordedByLoginId: caller.loginId
+          };
+          const existingPunches = Array.isArray(currentData.punches) ? currentData.punches : [];
+          const updatedAttendance = {
+            ...currentData,
+            currentState: "INSIDE",
+            punchOutType: "NONE",
+            punches: [...existingPunches, punchEvent],
+            updatedAt: now.toISOString()
+          };
+          tx.set(docRef3, updatedAttendance);
+          tx.set(db.collection("punch_events").doc(eventId3), punchEvent);
+          tx.set(db.collection("punch_logs").doc(logId3), {
+            id: logId3,
+            employeeId: employee.employeeId,
+            employeeName: employee.employeeName,
+            timestamp: now.toISOString(),
+            action: "PUNCH_IN",
+            rawPayload,
+            scannerDevice,
+            qrVerificationMode,
+            performedByUid: caller.uid,
+            performedByLoginId: caller.loginId,
+            message: `Subsequent Punch In (Event #${updatedAttendance.punches.length}). Status: INSIDE.`
+          });
+          return { kind: "RECORDED", record: updatedAttendance };
+        });
+        if (txRes2.kind === "CONSECUTIVE_IN") {
+          await writePunchLog({
+            employeeId: employee.employeeId,
+            employeeName: employee.employeeName,
+            timestamp: now.toISOString(),
+            action: "REJECTED_DUPLICATE",
+            rawPayload,
+            scannerDevice,
+            performedByUid: caller.uid,
+            performedByLoginId: caller.loginId,
+            message: `Consecutive Punch In rejected. Employee already Punched In at ${formatTimeDisplay(txRes2.record.punchIn)}.`
+          });
+          return {
+            httpStatus: 409,
+            body: {
+              success: false,
+              action: "REJECTED_DUPLICATE",
+              scannerType: "IN",
+              currentState: "INSIDE",
+              employee,
+              attendance: txRes2.record,
+              message: "Consecutive Punch In rejected. Employee is already Punched In (Status: INSIDE).",
+              time: timeDisplay,
+              punchCount: txRes2.record.punches?.length || 1
+            }
+          };
+        }
+        if (txRes2.kind === "BOUNCE") {
+          return {
+            httpStatus: 429,
+            body: {
+              success: false,
+              action: "REJECTED_DUPLICATE",
+              scannerType: "IN",
+              currentState: "OUTSIDE",
+              employee,
+              attendance: txRes2.record,
+              message: "Duplicate scan prevented. Please wait a few seconds before scanning again.",
+              time: timeDisplay
+            }
+          };
+        }
+        const shift3 = shiftsMap.get(txRes2.record.shiftId) || shifts[0];
+        return {
+          httpStatus: 200,
+          body: {
+            success: true,
+            action: "PUNCH_IN",
+            scannerType: "IN",
+            currentState: "INSIDE",
+            employee,
+            attendance: txRes2.record,
+            shift: shift3,
+            message: `Punch In Successfully Recorded (Re-entry #${txRes2.record.punches.length}).`,
+            time: timeDisplay,
+            punchCount: txRes2.record.punches.length
+          }
+        };
+      }
+      const shiftMatch = identifyShiftForPunchIn(shifts, now);
+      if (!shiftMatch) {
+        await writePunchLog({
+          employeeId: employee.employeeId,
+          employeeName: employee.employeeName,
+          timestamp: now.toISOString(),
+          action: "REJECTED_SHIFT",
+          rawPayload,
+          scannerDevice,
+          performedByUid: caller.uid,
+          performedByLoginId: caller.loginId,
+          message: "No shift window matched the punch-in time."
+        });
+        return {
+          httpStatus: 400,
+          body: {
+            success: false,
+            action: "REJECTED",
+            scannerType: "IN",
+            employee,
+            message: "No Valid Shift Found For This Punch-In Time.",
+            time: timeDisplay
+          }
+        };
+      }
+      const { shift: shift2, shiftDate } = shiftMatch;
+      const attendanceId = `att_${employee.employeeId}_${shiftDate}_${shift2.id}`;
+      const shiftStartMins = timeStringToMinutes(shift2.startTime);
+      const grace = shift2.gracePeriodMinutes ?? settings.lateGraceMinutes ?? 15;
+      const isLate = !shift2.isOvernight ? currentMins > shiftStartMins + grace : currentMins >= 1200 ? currentMins > shiftStartMins + grace : true;
+      const initialStatus = isLate ? "LATE" : "PRESENT";
+      const eventId2 = `pe_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
+      const logId2 = `log_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
+      const firstPunchEvent = {
+        id: eventId2,
+        employeeId: employee.employeeId,
+        employeeName: employee.employeeName,
+        eventType: "IN",
+        timestamp: now.toISOString(),
+        displayTime: timeDisplay,
+        shiftDate,
+        shiftId: shift2.id,
+        shiftName: shift2.name,
+        floor: employee.floor,
+        section: employee.section,
+        department: employee.department,
+        scannerType: "IN",
+        scannerDevice,
+        status: isLate ? "FIRST_IN_LATE" : "FIRST_IN",
+        recordedByUid: caller.uid,
+        recordedByLoginId: caller.loginId
+      };
+      const newAttendanceRecord = {
+        id: attendanceId,
+        employeeId: employee.employeeId,
+        employeeNameSnapshot: employee.employeeName,
+        employeeTypeSnapshot: employee.employeeType,
+        floorIdSnapshot: employee.floor,
+        lineIdSnapshot: employee.floor,
+        sectionIdSnapshot: employee.section,
+        departmentIdSnapshot: employee.department,
+        shiftId: shift2.id,
+        shiftNameSnapshot: shift2.name,
+        shiftDate,
+        punchIn: now.toISOString(),
+        firstPunchIn: now.toISOString(),
+        scheduledPunchOut: shift2.endTime,
+        actualPunchOut: null,
+        lastPunchOut: null,
+        effectivePunchOut: null,
+        punchOutType: "NONE",
+        currentState: "INSIDE",
+        punches: [firstPunchEvent],
+        totalDutyMinutes: 0,
+        regularDutyMinutes: 0,
+        overtimeMinutes: 0,
+        attendanceStatus: initialStatus,
+        missedPunchOut: false,
+        autoClosed: false,
+        qrTokenReference: employee.qrCodeToken || "",
+        qrVerificationMode,
+        createdByUid: caller.uid,
+        createdByLoginId: caller.loginId,
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString()
+      };
+      const docRef2 = db.collection("attendance").doc(attendanceId);
+      const txRes = await db.runTransaction(async (tx) => {
+        const existing = await tx.get(docRef2);
+        if (existing.exists) {
+          const data = existing.data();
+          if (data.currentState === "INSIDE" || !data.actualPunchOut && data.punchOutType === "NONE") {
+            return { kind: "CONSECUTIVE_IN", record: data };
+          }
+        }
+        tx.set(docRef2, newAttendanceRecord);
+        tx.set(db.collection("punch_events").doc(eventId2), firstPunchEvent);
+        tx.set(db.collection("punch_logs").doc(logId2), {
+          id: logId2,
+          employeeId: employee.employeeId,
+          employeeName: employee.employeeName,
+          timestamp: now.toISOString(),
+          action: "PUNCH_IN",
+          rawPayload,
+          scannerDevice,
+          qrVerificationMode,
+          performedByUid: caller.uid,
+          performedByLoginId: caller.loginId,
+          message: `First Punch In recorded for ${shift2.name} (${shiftDate}). Status: ${initialStatus}.`
+        });
+        return { kind: "RECORDED", record: newAttendanceRecord };
+      });
+      if (txRes.kind === "CONSECUTIVE_IN") {
+        return {
+          httpStatus: 409,
+          body: {
+            success: false,
+            action: "REJECTED_DUPLICATE",
+            scannerType: "IN",
+            currentState: "INSIDE",
+            employee,
+            attendance: txRes.record,
+            message: "Consecutive Punch In rejected. Employee is already Punched In (Status: INSIDE).",
+            time: timeDisplay
+          }
+        };
+      }
+      return {
+        httpStatus: 200,
+        body: {
+          success: true,
+          action: "PUNCH_IN",
+          scannerType: "IN",
+          currentState: "INSIDE",
+          employee,
+          attendance: newAttendanceRecord,
+          shift: shift2,
+          message: isLate ? `First Punch In Recorded for ${shift2.name} (Marked LATE).` : `First Punch In Recorded for ${shift2.name}.`,
+          time: timeDisplay,
+          punchCount: 1
+        }
+      };
+    }
+    if (!activeRecord) {
+      await writePunchLog({
+        employeeId: employee.employeeId,
+        employeeName: employee.employeeName,
+        timestamp: now.toISOString(),
+        action: "REJECTED_TOKEN",
+        rawPayload,
+        scannerDevice,
+        performedByUid: caller.uid,
+        performedByLoginId: caller.loginId,
+        message: "Punch Out rejected: No valid Punch In found for employee today."
+      });
+      return {
+        httpStatus: 400,
+        body: {
+          success: false,
+          action: "REJECTED",
+          scannerType: "OUT",
+          employee,
+          message: "Punch Out rejected: No valid Punch In found for employee. Please Punch In first.",
+          time: timeDisplay
+        }
+      };
+    }
+    const docRef = db.collection("attendance").doc(activeRecord.id);
+    const eventId = `pe_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
+    const logId = `log_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
+    const txOutRes = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(docRef);
+      const currentData = snap.exists ? snap.data() : activeRecord;
+      const currentState = currentData.currentState || (currentData.actualPunchOut || currentData.punchOutType === "ACTUAL" ? "OUTSIDE" : "INSIDE");
+      if (currentState === "OUTSIDE") {
+        return { kind: "CONSECUTIVE_OUT", record: currentData };
+      }
+      const lastPunchTime = Array.isArray(currentData.punches) && currentData.punches.length > 0 ? new Date(currentData.punches[currentData.punches.length - 1].timestamp).getTime() : new Date(currentData.updatedAt || currentData.punchIn).getTime();
+      if (Math.abs(now.getTime() - lastPunchTime) < 3e3) {
+        return { kind: "BOUNCE", record: currentData };
+      }
+      const firstInIso = currentData.firstPunchIn || currentData.punchIn;
+      const firstInDate = new Date(firstInIso);
+      const totalDutyMinutes = Math.max(
+        0,
+        Math.floor((now.getTime() - firstInDate.getTime()) / (1e3 * 60))
+      );
+      const scheduledStandardDutyMinutes = 510;
+      const regularDutyMinutes = Math.min(totalDutyMinutes, scheduledStandardDutyMinutes);
+      const overtimeMinutes = Math.max(0, totalDutyMinutes - scheduledStandardDutyMinutes);
+      const outEvent = {
+        id: eventId,
+        employeeId: employee.employeeId,
+        employeeName: employee.employeeName,
+        eventType: "OUT",
+        timestamp: now.toISOString(),
+        displayTime: timeDisplay,
+        shiftDate: currentData.shiftDate,
+        shiftId: currentData.shiftId,
+        shiftName: currentData.shiftNameSnapshot,
+        floor: employee.floor,
+        section: employee.section,
+        department: employee.department,
+        scannerType: "OUT",
+        scannerDevice,
+        dutyDurationMinutes: totalDutyMinutes,
+        overtimeMinutes,
+        status: "VALID_OUT",
+        recordedByUid: caller.uid,
+        recordedByLoginId: caller.loginId
+      };
+      const existingPunches = Array.isArray(currentData.punches) ? currentData.punches : [];
+      const updatedAttendance = {
+        ...currentData,
+        actualPunchOut: now.toISOString(),
+        lastPunchOut: now.toISOString(),
+        effectivePunchOut: now.toISOString(),
+        punchOutType: "ACTUAL",
+        currentState: "OUTSIDE",
+        punches: [...existingPunches, outEvent],
+        totalDutyMinutes,
+        regularDutyMinutes,
+        overtimeMinutes,
+        attendanceStatus: "COMPLETED",
+        missedPunchOut: false,
+        autoClosed: false,
+        updatedByUid: caller.uid,
+        updatedByLoginId: caller.loginId,
+        updatedAt: now.toISOString()
+      };
+      tx.set(docRef, updatedAttendance);
+      tx.set(db.collection("punch_events").doc(eventId), outEvent);
+      tx.set(db.collection("punch_logs").doc(logId), {
+        id: logId,
+        employeeId: employee.employeeId,
+        employeeName: employee.employeeName,
+        timestamp: now.toISOString(),
+        action: "PUNCH_OUT",
+        rawPayload,
+        scannerDevice,
+        qrVerificationMode,
+        performedByUid: caller.uid,
+        performedByLoginId: caller.loginId,
+        message: `Punch Out recorded. Duty: ${formatMinutes(regularDutyMinutes)}, OT: ${formatMinutes(overtimeMinutes)}. Total: ${formatMinutes(totalDutyMinutes)}.`
+      });
+      return {
+        kind: "RECORDED",
+        record: updatedAttendance,
+        regularDutyMinutes,
+        overtimeMinutes
+      };
+    });
+    if (txOutRes.kind === "CONSECUTIVE_OUT") {
+      await writePunchLog({
+        employeeId: employee.employeeId,
+        employeeName: employee.employeeName,
+        timestamp: now.toISOString(),
+        action: "REJECTED_DUPLICATE",
+        rawPayload,
+        scannerDevice,
+        performedByUid: caller.uid,
+        performedByLoginId: caller.loginId,
+        message: "Consecutive Punch Out rejected. Employee has already Punched Out."
+      });
+      return {
+        httpStatus: 409,
+        body: {
+          success: false,
+          action: "REJECTED_DUPLICATE",
+          scannerType: "OUT",
+          currentState: "OUTSIDE",
+          employee,
+          attendance: txOutRes.record,
+          message: "Consecutive Punch Out rejected. Employee has already Punched Out (Status: OUTSIDE).",
+          time: timeDisplay,
+          punchCount: txOutRes.record.punches?.length || 1
+        }
+      };
+    }
+    if (txOutRes.kind === "BOUNCE") {
+      return {
+        httpStatus: 429,
+        body: {
+          success: false,
+          action: "REJECTED_DUPLICATE",
+          scannerType: "OUT",
+          currentState: "INSIDE",
+          employee,
+          attendance: txOutRes.record,
+          message: "Duplicate scan prevented. Please wait a few seconds before scanning again.",
+          time: timeDisplay
+        }
+      };
+    }
+    const shift = shiftsMap.get(txOutRes.record.shiftId) || shifts[0];
+    return {
+      httpStatus: 200,
+      body: {
+        success: true,
+        action: "PUNCH_OUT",
+        scannerType: "OUT",
+        currentState: "OUTSIDE",
+        employee,
+        attendance: txOutRes.record,
+        shift,
+        message: "Punch Out Successfully Recorded.",
+        time: timeDisplay,
+        dutyFormatted: formatMinutes(txOutRes.regularDutyMinutes),
+        otFormatted: formatMinutes(txOutRes.overtimeMinutes),
+        punchCount: txOutRes.record.punches.length
+      }
+    };
+  }
   app.post("/api/attendance/auto-close", async (req, res) => {
     try {
       const caller = await requireVerifiedCaller(
@@ -4348,7 +4637,13 @@ function registerAttendanceRoutes(app, deps) {
       const shifts = shiftsSnap.empty ? DEFAULT_SHIFTS : shiftsSnap.docs.map((d) => d.data());
       const shiftsMap = new Map(shifts.map((s) => [s.id, s]));
       const closedRecords = [];
+      const MAX_AUTO_CLOSE_PER_INVOCATION = 25;
+      const startTimeMs = Date.now();
+      const SOFT_TIME_BUDGET_MS = 6500;
       for (const docSnap of openSnap.docs) {
+        if (closedRecords.length >= MAX_AUTO_CLOSE_PER_INVOCATION || Date.now() - startTimeMs >= SOFT_TIME_BUDGET_MS) {
+          break;
+        }
         const record = docSnap.data();
         if (record.actualPunchOut || record.punchOutType !== "NONE") continue;
         const shift = shiftsMap.get(record.shiftId);
@@ -4384,32 +4679,34 @@ function registerAttendanceRoutes(app, deps) {
           });
           if (updatedRecord) {
             closedRecords.push(updatedRecord);
-            await writePunchLog({
-              employeeId: record.employeeId,
-              employeeName: record.employeeNameSnapshot,
-              timestamp: now.toISOString(),
-              action: "AUTO_CLOSE",
-              rawPayload: "SYSTEM_CRON",
-              scannerDevice: "SYSTEM_AUTO",
-              performedByUid: caller.uid,
-              performedByLoginId: caller.loginId,
-              message: `Auto-closed at scheduled shift end (${shift.endTime}). Status: AUTO CLOSED. OT: 00:00.`
-            });
-            await recordEnterpriseAuditEvent(db, {
-              req,
-              action: "AUTOMATIC_PUNCH_OUT",
-              category: "ATTENDANCE",
-              actorUid: caller.uid,
-              actorLoginId: caller.loginId,
-              actorRole: caller.role.toUpperCase(),
-              employeeId: record.employeeId,
-              targetType: "ATTENDANCE",
-              targetId: record.id,
-              newValue: `Auto-closed at ${scheduledEndIso}, Duty: ${formatMinutes(scheduledDuration)}, OT: 00:00`,
-              actionSource: "SYSTEM_SCHEDULER",
-              reason: "Employee missed scanning Punch Out at scheduled shift closing",
-              captureGeo: false
-            });
+            await Promise.all([
+              writePunchLog({
+                employeeId: record.employeeId,
+                employeeName: record.employeeNameSnapshot,
+                timestamp: now.toISOString(),
+                action: "AUTO_CLOSE",
+                rawPayload: "SYSTEM_CRON",
+                scannerDevice: "SYSTEM_AUTO",
+                performedByUid: caller.uid,
+                performedByLoginId: caller.loginId,
+                message: `Auto-closed at scheduled shift end (${shift.endTime}). Status: AUTO CLOSED. OT: 00:00.`
+              }),
+              recordEnterpriseAuditEvent(db, {
+                req,
+                action: "AUTOMATIC_PUNCH_OUT",
+                category: "ATTENDANCE",
+                actorUid: caller.uid,
+                actorLoginId: caller.loginId,
+                actorRole: caller.role.toUpperCase(),
+                employeeId: record.employeeId,
+                targetType: "ATTENDANCE",
+                targetId: record.id,
+                newValue: `Auto-closed at ${scheduledEndIso}, Duty: ${formatMinutes(scheduledDuration)}, OT: 00:00`,
+                actionSource: "SYSTEM_SCHEDULER",
+                reason: "Employee missed scanning Punch Out at scheduled shift closing",
+                captureGeo: false
+              })
+            ]);
           }
         }
       }
@@ -4691,6 +4988,266 @@ function registerAttendanceRoutes(app, deps) {
   });
 }
 
+// src/config/dashboardCardsConfig.ts
+var DASHBOARD_CARDS = [
+  {
+    id: "active_total",
+    permissionKey: "dashboard.card.active_total",
+    metricKey: "activeTotal",
+    label: "Active Total",
+    description: "Total active registered employees matching selected filters"
+  },
+  {
+    id: "total_present",
+    permissionKey: "dashboard.card.total_present",
+    metricKey: "totalPresent",
+    label: "Total Present",
+    description: "Employees with recorded attendance on the selected date"
+  },
+  {
+    id: "currently_inside",
+    permissionKey: "dashboard.card.currently_inside",
+    metricKey: "currentlyInside",
+    label: "Currently Inside",
+    description: "Employees currently inside factory without a punch out"
+  },
+  {
+    id: "currently_outside",
+    permissionKey: "dashboard.card.currently_outside",
+    metricKey: "currentlyOutside",
+    label: "Currently Outside",
+    description: "Employees who have punched out / exited the factory"
+  },
+  {
+    id: "absent",
+    permissionKey: "dashboard.card.absent",
+    metricKey: "absent",
+    label: "Absent",
+    description: "Active scheduled employees with no attendance punches"
+  },
+  {
+    id: "on_leave",
+    permissionKey: "dashboard.card.on_leave",
+    metricKey: "onLeave",
+    label: "On Leave",
+    description: "Employees marked on sanctioned leave in shift roster"
+  },
+  {
+    id: "first_in",
+    permissionKey: "dashboard.card.first_in",
+    metricKey: "firstIn",
+    label: "First In",
+    description: "Count of initial entry punches recorded for the shift"
+  },
+  {
+    id: "final_out",
+    permissionKey: "dashboard.card.final_out",
+    metricKey: "finalOut",
+    label: "Final Out",
+    description: "Count of actual final exit punches scanned"
+  },
+  {
+    id: "duty_hours",
+    permissionKey: "dashboard.card.duty_hours",
+    metricKey: "dutyHoursMins",
+    label: "Duty Hours",
+    description: "Cumulative regular duty hours (also governs Duty column in drilldown)"
+  },
+  {
+    id: "ot_hours",
+    permissionKey: "dashboard.card.ot_hours",
+    metricKey: "otHoursMins",
+    label: "OT Hours",
+    description: "Cumulative overtime hours beyond 08:30 (also governs OT in drilldown)"
+  },
+  {
+    id: "auto_closed",
+    permissionKey: "dashboard.card.auto_closed",
+    metricKey: "autoClosed",
+    label: "Auto Closed",
+    description: "Attendance records automatically closed at shift end"
+  },
+  {
+    id: "missed_punch_out",
+    permissionKey: "dashboard.card.missed_punch_out",
+    metricKey: "missedPunchOut",
+    label: "Missed Punch Out",
+    description: "Employees flagged for missing exit punch with zero OT"
+  }
+];
+var DASHBOARD_SECTIONS = [
+  {
+    id: "shift_banner",
+    permissionKey: "dashboard.section.shift_banner",
+    label: "Automatic Shift Allocation & Auto-Closing Banner",
+    description: "Displays automatic shift timings, auto-closing status badge, and quick scanner shortcut",
+    isBreakdownReport: false
+  },
+  {
+    id: "line_wise",
+    permissionKey: "dashboard.section.line_wise",
+    label: "Line-Wise Manpower Availability",
+    description: "Production line breakdown table showing active, present, absent, and availability %",
+    isBreakdownReport: true
+  },
+  {
+    id: "section_wise",
+    permissionKey: "dashboard.section.section_wise",
+    label: "Section-Wise Manpower Availability",
+    description: "Section breakdown table (MI, SMT, FATP, STORE) with manpower availability",
+    isBreakdownReport: true
+  },
+  {
+    id: "department_wise",
+    permissionKey: "dashboard.section.department_wise",
+    label: "Department-Wise Manpower Availability",
+    description: "Department breakdown table (Production, Quality, PPC, R&D, etc.)",
+    isBreakdownReport: true
+  },
+  {
+    id: "employee_type_wise",
+    permissionKey: "dashboard.section.employee_type_wise",
+    label: "Employee-Type Manpower Availability",
+    description: "Manpower availability grouped by Permanent, Staff, and Offroll categories",
+    isBreakdownReport: true
+  }
+];
+var ALL_DASHBOARD_CARD_IDS = DASHBOARD_CARDS.map((c) => c.id);
+var USER_LEGACY_DASHBOARD_CARD_IDS = [
+  "active_total",
+  "total_present",
+  "absent",
+  "duty_hours",
+  "ot_hours",
+  "missed_punch_out"
+];
+var ALL_DASHBOARD_SECTION_IDS = DASHBOARD_SECTIONS.map((s) => s.id);
+var DASHBOARD_CARD_PERMISSION_KEYS = new Set(
+  DASHBOARD_CARDS.map((c) => c.permissionKey)
+);
+var DASHBOARD_SECTION_PERMISSION_KEYS = new Set(
+  DASHBOARD_SECTIONS.map((s) => s.permissionKey)
+);
+var DASHBOARD_VISIBILITY_KEYS = /* @__PURE__ */ new Set([
+  ...DASHBOARD_CARD_PERMISSION_KEYS,
+  ...DASHBOARD_SECTION_PERMISSION_KEYS
+]);
+function normalizeUserRole(role) {
+  if (!role) return "USER";
+  const clean = String(role).trim().toUpperCase().replace(/[\s-]+/g, "_");
+  if (clean === "SUPER_ADMIN" || clean === "SUPERADMIN") return "SUPER_ADMIN";
+  if (clean === "ADMIN") return "ADMIN";
+  if (clean === "USER") return "USER";
+  return clean || "USER";
+}
+function resolveDashboardVisibility(params) {
+  const {
+    role,
+    modulesAllowed,
+    rolePermissions,
+    roleDefaultPermissions,
+    userPermissionOverride
+  } = params;
+  const normalized = normalizeUserRole(role);
+  if (normalized === "SUPER_ADMIN") {
+    const explicitCardKeys2 = {};
+    ALL_DASHBOARD_CARD_IDS.forEach((id) => {
+      explicitCardKeys2[id] = true;
+    });
+    const explicitSectionKeys2 = {};
+    ALL_DASHBOARD_SECTION_IDS.forEach((id) => {
+      explicitSectionKeys2[id] = true;
+    });
+    return {
+      dashboardViewAllowed: true,
+      permittedCards: [...ALL_DASHBOARD_CARD_IDS],
+      permittedSections: [...ALL_DASHBOARD_SECTION_IDS],
+      explicitCardKeys: explicitCardKeys2,
+      explicitSectionKeys: explicitSectionKeys2
+    };
+  }
+  const hasUserOverride = Boolean(userPermissionOverride) && userPermissionOverride?.isCustomOverride !== false;
+  const userPerms = hasUserOverride ? userPermissionOverride?.permissions || {} : null;
+  const effectiveRolePerms = rolePermissions || roleDefaultPermissions || null;
+  const mods = Array.isArray(modulesAllowed) ? modulesAllowed.map((m) => String(m).trim().toLowerCase()) : [];
+  let dashboardViewAllowed;
+  if (userPerms?.dashboard && typeof userPerms.dashboard.view === "boolean") {
+    dashboardViewAllowed = userPerms.dashboard.view;
+  } else if (effectiveRolePerms?.dashboard && typeof effectiveRolePerms.dashboard.view === "boolean") {
+    dashboardViewAllowed = effectiveRolePerms.dashboard.view;
+  } else if (mods.length > 0) {
+    dashboardViewAllowed = mods.includes("all") || mods.includes("dashboard");
+  } else {
+    dashboardViewAllowed = normalized === "ADMIN" || normalized === "USER";
+  }
+  if (!dashboardViewAllowed) {
+    return {
+      dashboardViewAllowed: false,
+      permittedCards: [],
+      permittedSections: [],
+      explicitCardKeys: {},
+      explicitSectionKeys: {}
+    };
+  }
+  let fallbackCardIds;
+  if (normalized === "ADMIN") {
+    fallbackCardIds = ALL_DASHBOARD_CARD_IDS;
+  } else if (normalized === "USER") {
+    fallbackCardIds = USER_LEGACY_DASHBOARD_CARD_IDS;
+  } else {
+    const hasOperationalAnalytics = mods.includes("all") || mods.includes("reports") || mods.includes("history") || mods.includes("employees") || mods.includes("shifts") || Boolean(
+      effectiveRolePerms?.reports?.view || effectiveRolePerms?.history?.view || effectiveRolePerms?.employees?.view || effectiveRolePerms?.shifts?.view || userPerms?.reports?.view || userPerms?.history?.view || userPerms?.employees?.view || userPerms?.shifts?.view
+    );
+    fallbackCardIds = hasOperationalAnalytics ? ALL_DASHBOARD_CARD_IDS : USER_LEGACY_DASHBOARD_CARD_IDS;
+  }
+  const fallbackCardSet = new Set(fallbackCardIds);
+  const permittedCards = [];
+  const explicitCardKeys = {};
+  for (const card of DASHBOARD_CARDS) {
+    const userEntry = userPerms?.[card.permissionKey];
+    const roleEntry = effectiveRolePerms?.[card.permissionKey];
+    let allowed;
+    if (userEntry && typeof userEntry.view === "boolean") {
+      allowed = userEntry.view;
+      explicitCardKeys[card.id] = true;
+    } else if (roleEntry && typeof roleEntry.view === "boolean") {
+      allowed = roleEntry.view;
+      explicitCardKeys[card.id] = true;
+    } else {
+      allowed = fallbackCardSet.has(card.id);
+    }
+    if (allowed) {
+      permittedCards.push(card.id);
+    }
+  }
+  const permittedSections = [];
+  const explicitSectionKeys = {};
+  for (const section of DASHBOARD_SECTIONS) {
+    const userEntry = userPerms?.[section.permissionKey];
+    const roleEntry = effectiveRolePerms?.[section.permissionKey];
+    let allowed;
+    if (userEntry && typeof userEntry.view === "boolean") {
+      allowed = userEntry.view;
+      explicitSectionKeys[section.id] = true;
+    } else if (roleEntry && typeof roleEntry.view === "boolean") {
+      allowed = roleEntry.view;
+      explicitSectionKeys[section.id] = true;
+    } else {
+      allowed = true;
+    }
+    if (allowed) {
+      permittedSections.push(section.id);
+    }
+  }
+  return {
+    dashboardViewAllowed: true,
+    permittedCards,
+    permittedSections,
+    explicitCardKeys,
+    explicitSectionKeys
+  };
+}
+
 // server.ts
 function hashPassword(password) {
   const salt = crypto4.randomBytes(16).toString("hex");
@@ -4910,6 +5467,8 @@ var DEFAULT_ROLE_PERMISSIONS = {
   super_admin: {
     dashboard: { view: true, add: true, edit: true, delete: true },
     scanner: { view: true, add: true, edit: true, delete: true },
+    "attendance.qr.scan": { view: true, add: true, edit: true, delete: true },
+    "attendance.manual.entry": { view: true, add: true, edit: true, delete: true },
     employees: { view: true, add: true, edit: true, delete: true },
     excel_import: { view: true, add: true, edit: true, delete: true },
     qr_codes: { view: true, add: true, edit: true, delete: true },
@@ -4923,11 +5482,19 @@ var DEFAULT_ROLE_PERMISSIONS = {
     user_rights: { view: true, add: true, edit: true, delete: true },
     audit_logs: { view: true, add: true, edit: true, delete: true },
     security_management: { view: true, add: true, edit: true, delete: true },
-    settings: { view: true, add: true, edit: true, delete: true }
+    settings: { view: true, add: true, edit: true, delete: true },
+    ...Object.fromEntries(
+      Array.from(DASHBOARD_VISIBILITY_KEYS).map((k) => [
+        k,
+        { view: true, add: true, edit: true, delete: true }
+      ])
+    )
   },
   admin: {
     dashboard: { view: true, add: false, edit: false, delete: false },
     scanner: { view: true, add: true, edit: true, delete: false },
+    "attendance.qr.scan": { view: false, add: false, edit: false, delete: false },
+    "attendance.manual.entry": { view: false, add: false, edit: false, delete: false },
     employees: { view: true, add: true, edit: true, delete: false },
     excel_import: { view: true, add: true, edit: true, delete: false },
     qr_codes: { view: true, add: true, edit: true, delete: false },
@@ -4946,6 +5513,8 @@ var DEFAULT_ROLE_PERMISSIONS = {
   user: {
     dashboard: { view: true, add: false, edit: false, delete: false },
     scanner: { view: true, add: true, edit: false, delete: false },
+    "attendance.qr.scan": { view: false, add: false, edit: false, delete: false },
+    "attendance.manual.entry": { view: false, add: false, edit: false, delete: false },
     employees: { view: false, add: false, edit: false, delete: false },
     excel_import: { view: false, add: false, edit: false, delete: false },
     qr_codes: { view: false, add: false, edit: false, delete: false },
@@ -4967,6 +5536,10 @@ var RESTRICTED_SUPER_ADMIN_MODULES = /* @__PURE__ */ new Set([
   "audit_logs",
   "security_management"
 ]);
+var SCANNER_CAPABILITY_KEYS = /* @__PURE__ */ new Set([
+  "attendance.qr.scan",
+  "attendance.manual.entry"
+]);
 function sanitizeRoleModulePermissions(roleId, rawPerms) {
   const normalizedRole = normalizeRoleValue(roleId);
   if (normalizedRole === "super_admin") {
@@ -4974,6 +5547,7 @@ function sanitizeRoleModulePermissions(roleId, rawPerms) {
       Object.entries(DEFAULT_ROLE_PERMISSIONS.super_admin).map(([k, v]) => [k, { ...v }])
     );
   }
+  const hasExplicitQrKey = Boolean(rawPerms) && Object.prototype.hasOwnProperty.call(rawPerms, "attendance.qr.scan");
   const baseKeys = /* @__PURE__ */ new Set([
     ...Object.keys(DEFAULT_ROLE_PERMISSIONS.user),
     ...Object.keys(rawPerms || {})
@@ -4984,12 +5558,44 @@ function sanitizeRoleModulePermissions(roleId, rawPerms) {
       sanitized[modKey] = { view: false, add: false, edit: false, delete: false };
       continue;
     }
+    if (modKey === "attendance.qr.scan" && !hasExplicitQrKey) {
+      continue;
+    }
+    if (DASHBOARD_VISIBILITY_KEYS.has(modKey)) {
+      if (!rawPerms || !Object.prototype.hasOwnProperty.call(rawPerms, modKey)) {
+        continue;
+      }
+      const visEntry = rawPerms[modKey];
+      sanitized[modKey] = {
+        view: Boolean(visEntry?.view),
+        add: false,
+        edit: false,
+        delete: false
+      };
+      continue;
+    }
     const entry = rawPerms?.[modKey];
     const add = Boolean(entry?.add);
     const edit = Boolean(entry?.edit);
     const del = Boolean(entry?.delete);
     const view = Boolean(entry?.view) || add || edit || del;
     sanitized[modKey] = { view, add, edit, delete: del };
+  }
+  if (rawPerms && !Object.prototype.hasOwnProperty.call(rawPerms, "scanner") && (sanitized["attendance.qr.scan"]?.view || sanitized["attendance.manual.entry"]?.view)) {
+    sanitized.scanner = { view: true, add: false, edit: false, delete: false };
+  }
+  const anyDashSubEnabled = Array.from(DASHBOARD_VISIBILITY_KEYS).some(
+    (k) => sanitized[k]?.view === true
+  );
+  if (rawPerms && !Object.prototype.hasOwnProperty.call(rawPerms, "dashboard") && anyDashSubEnabled) {
+    sanitized.dashboard = { view: true, add: false, edit: false, delete: false };
+  }
+  if (rawPerms && Object.prototype.hasOwnProperty.call(rawPerms, "dashboard") && sanitized.dashboard?.view === false) {
+    for (const visKey of DASHBOARD_VISIBILITY_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(sanitized, visKey)) {
+        sanitized[visKey] = { view: false, add: false, edit: false, delete: false };
+      }
+    }
   }
   return sanitized;
 }
@@ -5434,42 +6040,61 @@ function createApp(options = {}) {
   }
   async function getCallerEffectiveDashboardAccess(caller) {
     if (caller.role === "super_admin") {
-      return { allowed: true, readOnly: false };
+      const visibility2 = resolveDashboardVisibility({ role: "super_admin" });
+      return {
+        allowed: true,
+        readOnly: false,
+        permittedCards: visibility2.permittedCards,
+        permittedSections: visibility2.permittedSections
+      };
     }
-    const [userPermSnap, rolePermSnap, userRoleSnap] = await Promise.all([
+    const [userPermSnap, rolePermSnap, roleDefSnap, userRoleSnap] = await Promise.all([
       caller.profileDocId ? adminDb.collection("user_permissions").doc(caller.profileDocId).get() : Promise.resolve(null),
       adminDb.collection("role_permissions").doc(caller.role).get(),
+      adminDb.collection("roles").doc(caller.role).get(),
       caller.profileDocId ? adminDb.collection("user_roles").doc(caller.profileDocId).get() : Promise.resolve(null)
     ]);
     const hasUserOverride = userPermSnap?.exists && userPermSnap.data()?.isCustomOverride !== false;
     const userPerms = hasUserOverride ? userPermSnap?.data()?.permissions || {} : null;
     const rolePerms = rolePermSnap?.exists ? rolePermSnap.data()?.modulePermissions || {} : null;
+    const roleDefaultPerms = roleDefSnap?.exists ? roleDefSnap.data()?.defaultPermissions || {} : null;
     const userData = userRoleSnap?.exists ? userRoleSnap.data() || {} : {};
     const modulesAllowed = Array.isArray(userData.modulesAllowed) ? userData.modulesAllowed.map((m) => String(m).trim().toLowerCase()) : [];
-    let dashboardAllowed;
-    if (userPerms?.dashboard && typeof userPerms.dashboard.view === "boolean") {
-      dashboardAllowed = userPerms.dashboard.view;
-    } else if (rolePerms?.dashboard && typeof rolePerms.dashboard.view === "boolean") {
-      dashboardAllowed = rolePerms.dashboard.view;
-    } else if (modulesAllowed.length > 0) {
-      dashboardAllowed = modulesAllowed.includes("all") || modulesAllowed.includes("dashboard");
-    } else {
-      dashboardAllowed = caller.role === "admin" || caller.role === "user";
-    }
+    const visibility = resolveDashboardVisibility({
+      role: caller.role,
+      modulesAllowed,
+      rolePermissions: rolePerms,
+      roleDefaultPermissions: roleDefaultPerms,
+      userPermissionOverride: hasUserOverride ? { isCustomOverride: true, permissions: userPerms } : null
+    });
     if (caller.role === "user") {
-      return { allowed: dashboardAllowed, readOnly: true };
+      return {
+        allowed: visibility.dashboardViewAllowed,
+        readOnly: true,
+        permittedCards: visibility.permittedCards,
+        permittedSections: visibility.permittedSections
+      };
     }
     if (caller.role === "admin") {
-      return { allowed: dashboardAllowed, readOnly: false };
+      return {
+        allowed: visibility.dashboardViewAllowed,
+        readOnly: false,
+        permittedCards: visibility.permittedCards,
+        permittedSections: visibility.permittedSections
+      };
     }
-    const effectivePerms = userPerms || rolePerms || {};
+    const effectivePerms = userPerms || rolePerms || roleDefaultPerms || {};
     const hasOperationalWrite = Object.entries(effectivePerms).some(([modKey, perms]) => {
-      if (modKey === "dashboard" || RESTRICTED_SUPER_ADMIN_MODULES.has(modKey)) return false;
+      if (modKey === "dashboard" || DASHBOARD_VISIBILITY_KEYS.has(modKey) || RESTRICTED_SUPER_ADMIN_MODULES.has(modKey)) {
+        return false;
+      }
       return Boolean(perms?.add || perms?.edit || perms?.delete);
     });
     return {
-      allowed: dashboardAllowed,
-      readOnly: !hasOperationalWrite
+      allowed: visibility.dashboardViewAllowed,
+      readOnly: !hasOperationalWrite,
+      permittedCards: visibility.permittedCards,
+      permittedSections: visibility.permittedSections
     };
   }
   registerSecurityAuditRoutes(app, adminDb, auth, projectId);
@@ -6096,9 +6721,13 @@ function createApp(options = {}) {
           if (assignedRole === "super_admin") {
             finalModules = ["all"];
           } else if (rolePermData?.modulePermissions) {
-            finalModules = Object.entries(rolePermData.modulePermissions).filter(([modKey, perms]) => Boolean(perms?.view) && !RESTRICTED_SUPER_ADMIN_MODULES.has(modKey)).map(([modKey]) => modKey);
+            finalModules = Object.entries(rolePermData.modulePermissions).filter(
+              ([modKey, perms]) => Boolean(perms?.view) && !RESTRICTED_SUPER_ADMIN_MODULES.has(modKey) && !SCANNER_CAPABILITY_KEYS.has(modKey) && !DASHBOARD_VISIBILITY_KEYS.has(modKey)
+            ).map(([modKey]) => modKey);
           } else if (roleDocData?.defaultPermissions) {
-            finalModules = Object.entries(roleDocData.defaultPermissions).filter(([modKey, perms]) => Boolean(perms?.view) && !RESTRICTED_SUPER_ADMIN_MODULES.has(modKey)).map(([modKey]) => modKey);
+            finalModules = Object.entries(roleDocData.defaultPermissions).filter(
+              ([modKey, perms]) => Boolean(perms?.view) && !RESTRICTED_SUPER_ADMIN_MODULES.has(modKey) && !SCANNER_CAPABILITY_KEYS.has(modKey) && !DASHBOARD_VISIBILITY_KEYS.has(modKey)
+            ).map(([modKey]) => modKey);
           } else if (assignedRole === "admin") {
             finalModules = [
               "dashboard",
@@ -6378,19 +7007,23 @@ function createApp(options = {}) {
       }
       if (permissions) {
         const sanitizedPerms = sanitizeRoleModulePermissions(effectiveRole, permissions);
-        await adminDb.collection("user_permissions").doc(targetId).set(
-          {
-            id: targetId,
-            userId: targetId,
-            loginId: oldData.loginId || "",
-            role: effectiveRole,
-            isCustomOverride: true,
-            permissions: sanitizedPerms,
-            updatedAt: now,
-            updatedBy: cleanCallerId
-          },
-          { merge: true }
-        );
+        const userPermRef = adminDb.collection("user_permissions").doc(targetId);
+        const userPermExisting = await userPermRef.get();
+        const userPermPayload = {
+          id: targetId,
+          userId: targetId,
+          loginId: oldData.loginId || "",
+          role: effectiveRole,
+          isCustomOverride: true,
+          permissions: sanitizedPerms,
+          updatedAt: now,
+          updatedBy: cleanCallerId
+        };
+        if (userPermExisting.exists) {
+          await userPermRef.update(userPermPayload);
+        } else {
+          await userPermRef.set(userPermPayload);
+        }
       }
       await logAuditEvent({
         req,
@@ -6439,28 +7072,37 @@ function createApp(options = {}) {
       const cleanCallerId = caller.loginId;
       const now = (/* @__PURE__ */ new Date()).toISOString();
       const sanitizedModulePermissions = sanitizeRoleModulePermissions(roleId, modulePermissions);
-      await adminDb.collection("role_permissions").doc(roleId).set(
-        {
-          roleId,
-          roleName: resolvedRoleName,
-          modulePermissions: sanitizedModulePermissions,
-          updatedAt: now,
-          updatedBy: cleanCallerId
-        },
-        { merge: true }
-      );
-      await adminDb.collection("roles").doc(roleId).set(
-        {
-          roleId,
-          roleName: resolvedRoleName,
-          defaultPermissions: sanitizedModulePermissions,
-          updatedAt: now
-        },
-        { merge: true }
-      );
+      const rolePermRef = adminDb.collection("role_permissions").doc(roleId);
+      const rolePermExisting = await rolePermRef.get();
+      const rolePermPayload = {
+        roleId,
+        roleName: resolvedRoleName,
+        modulePermissions: sanitizedModulePermissions,
+        updatedAt: now,
+        updatedBy: cleanCallerId
+      };
+      if (rolePermExisting.exists) {
+        await rolePermRef.update(rolePermPayload);
+      } else {
+        await rolePermRef.set(rolePermPayload);
+      }
+      const roleRefForUpdate = adminDb.collection("roles").doc(roleId);
+      const roleUpdatePayload = {
+        roleId,
+        roleName: resolvedRoleName,
+        defaultPermissions: sanitizedModulePermissions,
+        updatedAt: now
+      };
+      if (roleDocSnap.exists) {
+        await roleRefForUpdate.update(roleUpdatePayload);
+      } else {
+        await roleRefForUpdate.set(roleUpdatePayload, { merge: true });
+      }
       const allowedModules = [];
       Object.entries(sanitizedModulePermissions).forEach(([modKey, perms]) => {
-        if (perms?.view) allowedModules.push(modKey);
+        if (perms?.view && !SCANNER_CAPABILITY_KEYS.has(modKey) && !DASHBOARD_VISIBILITY_KEYS.has(modKey)) {
+          allowedModules.push(modKey);
+        }
       });
       const usersSnap = await adminDb.collection("user_roles").where("role", "==", roleId).get();
       await Promise.all(
@@ -6472,19 +7114,21 @@ function createApp(options = {}) {
           const userPermRef = adminDb.collection("user_permissions").doc(uDoc.id);
           const userPermSnap = await userPermRef.get();
           if (!userPermSnap.exists || userPermSnap.data()?.isCustomOverride !== true) {
-            await userPermRef.set(
-              {
-                id: uDoc.id,
-                userId: uDoc.id,
-                loginId: uDoc.data()?.loginId || "",
-                role: roleId,
-                isCustomOverride: false,
-                permissions: sanitizedModulePermissions,
-                updatedAt: now,
-                updatedBy: cleanCallerId
-              },
-              { merge: true }
-            );
+            const inheritedPayload = {
+              id: uDoc.id,
+              userId: uDoc.id,
+              loginId: uDoc.data()?.loginId || "",
+              role: roleId,
+              isCustomOverride: false,
+              permissions: sanitizedModulePermissions,
+              updatedAt: now,
+              updatedBy: cleanCallerId
+            };
+            if (userPermSnap.exists) {
+              await userPermRef.update(inheritedPayload);
+            } else {
+              await userPermRef.set(inheritedPayload);
+            }
           }
         })
       );
@@ -6610,19 +7254,29 @@ function createApp(options = {}) {
         updatedAt: now,
         updatedBy: cleanCallerId
       };
-      await roleRef.set(roleDoc, { merge: true });
-      await adminDb.collection("role_permissions").doc(derivedId).set(
-        {
-          roleId: derivedId,
-          roleName: roleDoc.roleName,
-          modulePermissions: sanitizedDefaultPerms,
-          updatedAt: now,
-          updatedBy: cleanCallerId
-        },
-        { merge: true }
-      );
+      if (existingSnap.exists) {
+        await roleRef.update(roleDoc);
+      } else {
+        await roleRef.set(roleDoc);
+      }
+      const rolePermRef = adminDb.collection("role_permissions").doc(derivedId);
+      const rolePermSnap = await rolePermRef.get();
+      const rolePermDocPayload = {
+        roleId: derivedId,
+        roleName: roleDoc.roleName,
+        modulePermissions: sanitizedDefaultPerms,
+        updatedAt: now,
+        updatedBy: cleanCallerId
+      };
+      if (rolePermSnap.exists) {
+        await rolePermRef.update(rolePermDocPayload);
+      } else {
+        await rolePermRef.set(rolePermDocPayload);
+      }
       if (parsed.data.defaultPermissions) {
-        const allowedModules = Object.entries(sanitizedDefaultPerms).filter(([, perms]) => Boolean(perms?.view)).map(([modKey]) => modKey);
+        const allowedModules = Object.entries(sanitizedDefaultPerms).filter(
+          ([modKey, perms]) => Boolean(perms?.view) && !SCANNER_CAPABILITY_KEYS.has(modKey) && !DASHBOARD_VISIBILITY_KEYS.has(modKey)
+        ).map(([modKey]) => modKey);
         const usersSnap = await adminDb.collection("user_roles").where("role", "==", derivedId).get();
         await Promise.all(
           usersSnap.docs.map(async (uDoc) => {
@@ -6633,19 +7287,21 @@ function createApp(options = {}) {
             const userPermRef = adminDb.collection("user_permissions").doc(uDoc.id);
             const userPermSnap = await userPermRef.get();
             if (!userPermSnap.exists || userPermSnap.data()?.isCustomOverride !== true) {
-              await userPermRef.set(
-                {
-                  id: uDoc.id,
-                  userId: uDoc.id,
-                  loginId: uDoc.data()?.loginId || "",
-                  role: derivedId,
-                  isCustomOverride: false,
-                  permissions: sanitizedDefaultPerms,
-                  updatedAt: now,
-                  updatedBy: cleanCallerId
-                },
-                { merge: true }
-              );
+              const inheritedPayload = {
+                id: uDoc.id,
+                userId: uDoc.id,
+                loginId: uDoc.data()?.loginId || "",
+                role: derivedId,
+                isCustomOverride: false,
+                permissions: sanitizedDefaultPerms,
+                updatedAt: now,
+                updatedBy: cleanCallerId
+              };
+              if (userPermSnap.exists) {
+                await userPermRef.update(inheritedPayload);
+              } else {
+                await userPermRef.set(inheritedPayload);
+              }
             }
           })
         );
@@ -7010,24 +7666,34 @@ function createApp(options = {}) {
         (a) => a.missedPunchOut || a.attendanceStatus === "MISSED PUNCH OUT"
       ).length;
       const onLeave = rosterSnap.size;
+      const allMetrics = {
+        activeTotal,
+        totalPresent,
+        currentlyInside,
+        currentlyOutside,
+        absent,
+        onLeave,
+        firstIn,
+        finalOut,
+        dutyHoursMins,
+        otHoursMins,
+        autoClosed,
+        missedPunchOut
+      };
+      const permittedCardSet = new Set(access.permittedCards);
+      const filteredMetrics = {};
+      for (const card of DASHBOARD_CARDS) {
+        if (permittedCardSet.has(card.id)) {
+          filteredMetrics[card.metricKey] = allMetrics[card.metricKey];
+        }
+      }
       return res.json({
         success: true,
         role: caller.role.toUpperCase(),
         readOnly: access.readOnly,
-        metrics: {
-          activeTotal,
-          totalPresent,
-          currentlyInside,
-          currentlyOutside,
-          absent,
-          onLeave,
-          firstIn,
-          finalOut,
-          dutyHoursMins,
-          otHoursMins,
-          autoClosed,
-          missedPunchOut
-        }
+        permittedCards: access.permittedCards,
+        permittedSections: access.permittedSections,
+        metrics: filteredMetrics
       });
     } catch (err) {
       console.error("[Dashboard Summary API] Error:", err);
@@ -7109,6 +7775,7 @@ export {
   AI_STUDIO_DEV_ORIGIN,
   AI_STUDIO_PREVIEW_ORIGIN,
   RESTRICTED_SUPER_ADMIN_MODULES,
+  SCANNER_CAPABILITY_KEYS,
   VERCEL_PRODUCTION_ORIGIN,
   buildAllowedOriginsSet,
   createApp,

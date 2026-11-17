@@ -175,25 +175,65 @@ export function formatTimeDisplay(isoString: string | null): string {
   });
 }
 
-export function parseQrPayload(raw: string): { employeeId: string; token?: string } {
-  const trimmed = raw.trim();
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (parsed.employeeId || parsed.id) {
-      return {
-        employeeId: String(parsed.employeeId || parsed.id).trim().toUpperCase(),
-        token: parsed.token || parsed.qrToken,
-      };
-    }
-  } catch {
-    if (trimmed.startsWith('QR_')) {
-      const parts = trimmed.split('_');
-      if (parts.length >= 2) {
-        return { employeeId: parts[1].trim().toUpperCase(), token: trimmed };
+export type QrPayloadFormat = 'JSON_TOKEN' | 'TOKEN_STRING' | 'LEGACY_EMPLOYEE_ID' | 'INVALID';
+
+const EMPLOYEE_ID_PATTERN = /^[A-Z0-9][A-Z0-9_-]{1,31}$/;
+
+export function parseQrPayload(raw: string): {
+  employeeId: string;
+  token?: string;
+  format: QrPayloadFormat;
+} {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) {
+    return { employeeId: '', format: 'INVALID' };
+  }
+
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return { employeeId: '', format: 'INVALID' };
       }
+      const rawId = parsed.employeeId ?? parsed.id;
+      if (typeof rawId !== 'string') {
+        return { employeeId: '', format: 'INVALID' };
+      }
+      const cleanId = rawId.trim().toUpperCase();
+      if (!EMPLOYEE_ID_PATTERN.test(cleanId)) {
+        return { employeeId: '', format: 'INVALID' };
+      }
+      const rawToken = parsed.token ?? parsed.qrToken;
+      const cleanToken = typeof rawToken === 'string' && rawToken.trim() ? rawToken.trim() : undefined;
+      return {
+        employeeId: cleanId,
+        token: cleanToken,
+        format: 'JSON_TOKEN',
+      };
+    } catch {
+      return { employeeId: '', format: 'INVALID' };
     }
   }
-  return { employeeId: trimmed.toUpperCase() };
+
+  if (trimmed.startsWith('QR_')) {
+    const parts = trimmed.split('_');
+    const cleanId = (parts[1] || '').trim().toUpperCase();
+    if (!cleanId || !EMPLOYEE_ID_PATTERN.test(cleanId)) {
+      return { employeeId: '', format: 'INVALID' };
+    }
+    const tokenSuffix = parts.slice(2).join('_').trim();
+    return {
+      employeeId: cleanId,
+      token: parts.length >= 3 && tokenSuffix.length > 0 ? trimmed : undefined,
+      format: 'TOKEN_STRING',
+    };
+  }
+
+  const cleanLegacyId = trimmed.toUpperCase();
+  if (!EMPLOYEE_ID_PATTERN.test(cleanLegacyId)) {
+    return { employeeId: '', format: 'INVALID' };
+  }
+  return { employeeId: cleanLegacyId, format: 'LEGACY_EMPLOYEE_ID' };
 }
 
 export function identifyShiftForPunchIn(
@@ -240,6 +280,21 @@ const AttendanceScanSchema = z.object({
   rawPayload: z.string().trim().min(1, 'Scan payload cannot be empty.').max(256),
   scannerType: z.enum(['IN', 'OUT']).optional(),
   scannerDevice: z.enum(['USB_SCANNER', 'WEBCAM', 'MANUAL', 'SYSTEM_AUTO']).optional(),
+  customScanTime: z.string().datetime({ offset: true }).or(z.string().datetime()).optional(),
+});
+
+const ManualPunchSchema = z.object({
+  employeeId: z
+    .string()
+    .trim()
+    .min(2, 'Please enter a valid Employee ID.')
+    .max(32, 'Employee ID cannot exceed 32 characters.')
+    .transform((v) => v.toUpperCase())
+    .refine((v) => EMPLOYEE_ID_PATTERN.test(v), {
+      message: 'Invalid Employee ID format. Use letters, numbers, hyphens, or underscores only.',
+    }),
+  scannerType: z.enum(['IN', 'OUT']).optional(),
+  reason: z.string().trim().max(250).optional(),
   customScanTime: z.string().datetime({ offset: true }).or(z.string().datetime()).optional(),
 });
 
@@ -342,10 +397,94 @@ async function callerHasModuleAction(
   }
 }
 
+function isScannerCapabilityEntryEnabled(entry: any): boolean {
+  if (!entry || typeof entry !== 'object') return false;
+  if (entry.view === false) return false;
+  if (typeof entry.add === 'boolean') {
+    return entry.add === true;
+  }
+  return entry.view === true;
+}
+
 async function callerHasScannerAccess(db: AdminFirestoreLike, caller: VerifiedCaller): Promise<boolean> {
   const canView = await callerHasModuleAction(db, caller, 'scanner', 'view');
   if (!canView) return false;
   return callerHasModuleAction(db, caller, 'scanner', 'add');
+}
+
+async function callerHasQrScanAccess(db: AdminFirestoreLike, caller: VerifiedCaller): Promise<boolean> {
+  if (caller.role === 'super_admin') return true;
+  try {
+    const userPermSnap = await db.collection('user_permissions').doc(caller.profileDocId).get();
+    if (userPermSnap.exists && userPermSnap.data()?.isCustomOverride !== false) {
+      const perms = userPermSnap.data()?.permissions || {};
+      const qrEntry = perms['attendance.qr.scan'];
+      if (qrEntry && typeof qrEntry === 'object' && (typeof qrEntry.view === 'boolean' || typeof qrEntry.add === 'boolean')) {
+        return isScannerCapabilityEntryEnabled(qrEntry);
+      }
+      if (perms.scanner && typeof perms.scanner === 'object') {
+        return isScannerCapabilityEntryEnabled(perms.scanner);
+      }
+    }
+
+    const rolePermSnap = await db.collection('role_permissions').doc(caller.role).get();
+    if (rolePermSnap.exists) {
+      const modPerms = rolePermSnap.data()?.modulePermissions || {};
+      const qrEntry = modPerms['attendance.qr.scan'];
+      if (qrEntry && typeof qrEntry === 'object' && (typeof qrEntry.view === 'boolean' || typeof qrEntry.add === 'boolean')) {
+        return isScannerCapabilityEntryEnabled(qrEntry);
+      }
+      if (modPerms.scanner && typeof modPerms.scanner === 'object') {
+        return isScannerCapabilityEntryEnabled(modPerms.scanner);
+      }
+    }
+
+    // Legacy fallback when attendance.qr.scan has not yet been configured in role_permissions
+    return callerHasScannerAccess(db, caller);
+  } catch (err) {
+    console.warn('[Attendance QR Permission Guard] Lookup failed; failing closed:', (err as any)?.message || err);
+    return false;
+  }
+}
+
+async function callerHasManualEntryAccess(db: AdminFirestoreLike, caller: VerifiedCaller): Promise<boolean> {
+  if (caller.role === 'super_admin') return true;
+  try {
+    const userPermSnap = await db.collection('user_permissions').doc(caller.profileDocId).get();
+    if (userPermSnap.exists && userPermSnap.data()?.isCustomOverride !== false) {
+      const perms = userPermSnap.data()?.permissions || {};
+      const manualEntry = perms['attendance.manual.entry'];
+      if (
+        manualEntry &&
+        typeof manualEntry === 'object' &&
+        (typeof manualEntry.view === 'boolean' || typeof manualEntry.add === 'boolean')
+      ) {
+        return isScannerCapabilityEntryEnabled(manualEntry);
+      }
+      if (perms.scanner?.view === false) {
+        return false;
+      }
+    }
+
+    const rolePermSnap = await db.collection('role_permissions').doc(caller.role).get();
+    if (rolePermSnap.exists) {
+      const modPerms = rolePermSnap.data()?.modulePermissions || {};
+      const manualEntry = modPerms['attendance.manual.entry'];
+      if (
+        manualEntry &&
+        typeof manualEntry === 'object' &&
+        (typeof manualEntry.view === 'boolean' || typeof manualEntry.add === 'boolean')
+      ) {
+        return isScannerCapabilityEntryEnabled(manualEntry);
+      }
+    }
+
+    // Strict deny-by-default: never auto-enabled from scanner/QR permissions or legacy modulesAllowed
+    return false;
+  } catch (err) {
+    console.warn('[Attendance Manual Entry Permission Guard] Lookup failed; failing closed:', (err as any)?.message || err);
+    return false;
+  }
 }
 
 export interface AttendanceRoutesDeps {
@@ -382,7 +521,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
       );
       if (!caller) return;
 
-      const canScan = await callerHasScannerAccess(db, caller);
+      const canScan = await callerHasQrScanAccess(db, caller);
       if (!canScan) {
         await recordEnterpriseAuditEvent(db, {
           req,
@@ -395,12 +534,14 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           targetType: 'ATTENDANCE_SCANNER',
           targetId: '/api/attendance/scan',
           actionSource: 'ATTENDANCE_PERMISSION_GUARD',
-          description: `User "${caller.loginId}" (${caller.role}) blocked from /api/attendance/scan due to missing scanner permission.`,
+          description: `User "${caller.loginId}" (${caller.role}) blocked from /api/attendance/scan due to missing attendance.qr.scan permission.`,
           success: false,
         });
         return res.status(403).json({
           success: false,
-          error: 'Forbidden: Your account does not have Attendance Scanner permission.',
+          action: 'REJECTED',
+          error: 'Forbidden: Your role does not have QR Code Scanning permission (attendance.qr.scan).',
+          message: 'Forbidden: Your role does not have QR Code Scanning permission (attendance.qr.scan).',
         });
       }
 
@@ -437,9 +578,9 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
 
       const kolkata = getKolkataTimeParts(now);
       const timeDisplay = kolkata.timeWithSeconds;
-      const { employeeId, token } = parseQrPayload(rawPayload);
+      const { employeeId, token, format } = parseQrPayload(rawPayload);
 
-      if (!employeeId) {
+      if (format === 'INVALID' || !employeeId) {
         await writePunchLog({
           employeeId: 'UNKNOWN',
           timestamp: now.toISOString(),
@@ -448,14 +589,14 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           scannerDevice,
           performedByUid: caller.uid,
           performedByLoginId: caller.loginId,
-          message: 'Invalid QR Code payload or empty Employee ID.',
+          message: 'Invalid QR Code payload format.',
         });
         return res.status(400).json({
           success: false,
           action: 'REJECTED',
           scannerType: scannerType || 'IN',
-          error: 'Invalid QR Code. Employee Not Found.',
-          message: 'Invalid QR Code. Employee Not Found.',
+          error: 'Invalid QR payload. Please scan a valid Employee QR code or Employee ID.',
+          message: 'Invalid QR payload. Please scan a valid Employee QR code or Employee ID.',
           time: timeDisplay,
         });
       }
@@ -513,6 +654,8 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           };
         }
 
+        // Strict QR security token validation (unchanged for QR scans):
+        // Whenever an employee has qrCodeToken configured, QR scanning requires a matching token.
         if (employee.qrCodeToken && (!token || token !== employee.qrCodeToken)) {
           await writePunchLog({
             employeeId: employee.employeeId,
@@ -521,6 +664,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             action: 'REJECTED_TOKEN',
             rawPayload,
             scannerDevice,
+            qrVerificationMode: 'TOKEN_REJECTED',
             performedByUid: caller.uid,
             performedByLoginId: caller.loginId,
             message: token
@@ -544,6 +688,226 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             },
           };
         }
+
+        const qrVerificationMode = token ? 'TOKEN_VERIFIED' : 'UNTOKENIZED_EMPLOYEE';
+        return executePunchForVerifiedEmployee({
+          employee,
+          caller,
+          now,
+          kolkata,
+          timeDisplay,
+          scannerType,
+          scannerDevice,
+          rawPayload,
+          qrVerificationMode,
+        });
+      });
+
+      return res.status(outcome.httpStatus).json(outcome.body);
+    } catch (err: any) {
+      console.error('[API Attendance Scan] Error:', err);
+      return res.status(500).json({
+        success: false,
+        action: 'REJECTED',
+        error: 'Attendance scan processing failed.',
+        message: 'Attendance scan processing failed.',
+      });
+    }
+  });
+
+  // --------------------------------------------------------------------------
+  // 1b. POST /api/attendance/manual-punch — Authorized Manual Employee ID Entry
+  //     Separate from QR token verification; enforces caller RBAC + employee validation + attendance rules.
+  // --------------------------------------------------------------------------
+  app.post('/api/attendance/manual-punch', async (req: Request, res: Response) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        '*',
+        'Manual Employee ID Punch'
+      );
+      if (!caller) return;
+
+      const canManualPunch = await callerHasManualEntryAccess(db, caller);
+      if (!canManualPunch) {
+        await recordEnterpriseAuditEvent(db, {
+          req,
+          action: 'unauthorized_access_attempt',
+          category: 'SECURITY',
+          severity: 'CRITICAL',
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: caller.role.toUpperCase(),
+          targetType: 'ATTENDANCE_MANUAL_PUNCH',
+          targetId: '/api/attendance/manual-punch',
+          actionSource: 'ATTENDANCE_PERMISSION_GUARD',
+          description: `User "${caller.loginId}" (${caller.role}) blocked from /api/attendance/manual-punch due to missing attendance.manual.entry permission.`,
+          success: false,
+        });
+        return res.status(403).json({
+          success: false,
+          action: 'REJECTED',
+          error: 'Forbidden: Your role does not have Manual Employee ID Entry permission (attendance.manual.entry).',
+          message: 'Forbidden: Your role does not have Manual Employee ID Entry permission (attendance.manual.entry).',
+        });
+      }
+
+      const parsed = ManualPunchSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          action: 'REJECTED',
+          error: parsed.error.issues[0]?.message || 'Invalid Employee ID.',
+          message: parsed.error.issues[0]?.message || 'Invalid Employee ID.',
+        });
+      }
+
+      const { employeeId, scannerType, reason, customScanTime } = parsed.data;
+
+      if (customScanTime) {
+        const canCustomTime =
+          (await callerHasModuleAction(db, caller, 'scanner', 'edit')) ||
+          (await callerHasModuleAction(db, caller, 'history', 'edit'));
+        if (!canCustomTime) {
+          return res.status(403).json({
+            success: false,
+            error: 'Forbidden: Your role is not permitted to submit custom punch timestamps.',
+          });
+        }
+      }
+
+      const now = customScanTime ? new Date(customScanTime) : new Date();
+      if (Number.isNaN(now.getTime())) {
+        return res.status(400).json({ success: false, error: 'Invalid customScanTime timestamp.' });
+      }
+
+      const kolkata = getKolkataTimeParts(now);
+      const timeDisplay = kolkata.timeWithSeconds;
+      const rawPayload = `MANUAL:${employeeId}`;
+
+      const outcome = await withEmployeeScanLock(employeeId, async () => {
+        const empSnap = await db.collection('employees').doc(employeeId).get();
+        if (!empSnap.exists) {
+          await writePunchLog({
+            employeeId,
+            timestamp: now.toISOString(),
+            action: 'REJECTED_TOKEN',
+            rawPayload,
+            scannerDevice: 'MANUAL',
+            qrVerificationMode: 'MANUAL_EMPLOYEE_ID',
+            performedByUid: caller.uid,
+            performedByLoginId: caller.loginId,
+            message: `Manual entry rejected: Employee ID ${employeeId} not found in database.`,
+          });
+          return {
+            httpStatus: 404,
+            body: {
+              success: false,
+              action: 'REJECTED',
+              scannerType: scannerType || 'IN',
+              error: `Employee "${employeeId}" Not Found.`,
+              message: `Employee "${employeeId}" Not Found.`,
+              time: timeDisplay,
+            },
+          };
+        }
+
+        const employee = empSnap.data()!;
+        if (employee.employeeStatus !== 'Active') {
+          await writePunchLog({
+            employeeId: employee.employeeId,
+            employeeName: employee.employeeName,
+            timestamp: now.toISOString(),
+            action: 'REJECTED_INACTIVE',
+            rawPayload,
+            scannerDevice: 'MANUAL',
+            qrVerificationMode: 'MANUAL_EMPLOYEE_ID',
+            performedByUid: caller.uid,
+            performedByLoginId: caller.loginId,
+            message: `Manual entry rejected: Employee ${employeeId} is inactive.`,
+          });
+          return {
+            httpStatus: 400,
+            body: {
+              success: false,
+              action: 'REJECTED',
+              scannerType: scannerType || 'IN',
+              employee,
+              error: 'Employee Is Inactive. Attendance Cannot Be Recorded.',
+              message: 'Employee Is Inactive. Attendance Cannot Be Recorded.',
+              time: timeDisplay,
+            },
+          };
+        }
+
+        const result = await executePunchForVerifiedEmployee({
+          employee,
+          caller,
+          now,
+          kolkata,
+          timeDisplay,
+          scannerType,
+          scannerDevice: 'MANUAL',
+          rawPayload,
+          qrVerificationMode: 'MANUAL_EMPLOYEE_ID',
+        });
+
+        if (result.httpStatus === 200 && result.body.success) {
+          await recordEnterpriseAuditEvent(db, {
+            req,
+            action: 'MANUAL_ATTENDANCE_PUNCH',
+            category: 'ATTENDANCE',
+            actorUid: caller.uid,
+            actorLoginId: caller.loginId,
+            actorRole: caller.role.toUpperCase(),
+            employeeId: employee.employeeId,
+            targetType: 'ATTENDANCE',
+            targetId: result.body.attendance?.id || employee.employeeId,
+            newValue: `${result.body.action} via manual ID entry (${employee.employeeId})`,
+            actionSource: 'MANUAL_SCANNER_ENTRY',
+            reason: reason || 'Authorized operator manual Employee ID punch',
+            captureGeo: false,
+          });
+        }
+
+        return result;
+      });
+
+      return res.status(outcome.httpStatus).json(outcome.body);
+    } catch (err: any) {
+      console.error('[API Manual Punch] Error:', err);
+      return res.status(500).json({
+        success: false,
+        action: 'REJECTED',
+        error: 'Manual attendance punch processing failed.',
+        message: 'Manual attendance punch processing failed.',
+      });
+    }
+  });
+
+  async function executePunchForVerifiedEmployee(params: {
+    employee: Record<string, any>;
+    caller: VerifiedCaller;
+    now: Date;
+    kolkata: ReturnType<typeof getKolkataTimeParts>;
+    timeDisplay: string;
+    scannerType?: 'IN' | 'OUT';
+    scannerDevice: 'USB_SCANNER' | 'WEBCAM' | 'MANUAL' | 'SYSTEM_AUTO';
+    rawPayload: string;
+    qrVerificationMode: string;
+  }): Promise<{ httpStatus: number; body: Record<string, any> }> {
+    const {
+      employee,
+      caller,
+      now,
+      kolkata,
+      timeDisplay,
+      scannerDevice,
+      rawPayload,
+      qrVerificationMode,
+    } = params;
+    let { scannerType } = params;
 
         const [shiftsSnap, settingsSnap] = await Promise.all([
           db.collection('shifts').get(),
@@ -659,6 +1023,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                 action: 'PUNCH_IN',
                 rawPayload,
                 scannerDevice,
+                qrVerificationMode,
                 performedByUid: caller.uid,
                 performedByLoginId: caller.loginId,
                 message: `Subsequent Punch In (Event #${updatedAttendance.punches.length}). Status: INSIDE.`,
@@ -818,6 +1183,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             missedPunchOut: false,
             autoClosed: false,
             qrTokenReference: employee.qrCodeToken || '',
+            qrVerificationMode,
             createdByUid: caller.uid,
             createdByLoginId: caller.loginId,
             createdAt: now.toISOString(),
@@ -844,6 +1210,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
               action: 'PUNCH_IN',
               rawPayload,
               scannerDevice,
+              qrVerificationMode,
               performedByUid: caller.uid,
               performedByLoginId: caller.loginId,
               message: `First Punch In recorded for ${shift.name} (${shiftDate}). Status: ${initialStatus}.`,
@@ -1000,6 +1367,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             action: 'PUNCH_OUT',
             rawPayload,
             scannerDevice,
+            qrVerificationMode,
             performedByUid: caller.uid,
             performedByLoginId: caller.loginId,
             message: `Punch Out recorded. Duty: ${formatMinutes(regularDutyMinutes)}, OT: ${formatMinutes(overtimeMinutes)}. Total: ${formatMinutes(totalDutyMinutes)}.`,
@@ -1075,19 +1443,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             punchCount: txOutRes.record.punches.length,
           },
         };
-      });
-
-      return res.status(outcome.httpStatus).json(outcome.body);
-    } catch (err: any) {
-      console.error('[API Attendance Scan] Error:', err);
-      return res.status(500).json({
-        success: false,
-        action: 'REJECTED',
-        error: 'Attendance scan processing failed.',
-        message: 'Attendance scan processing failed.',
-      });
-    }
-  });
+  }
 
   // --------------------------------------------------------------------------
   // 2. POST /api/attendance/auto-close — Automatic Shift Closing Engine (ADMIN / SUPER_ADMIN)
@@ -1141,8 +1497,17 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
       const shifts = shiftsSnap.empty ? DEFAULT_SHIFTS : shiftsSnap.docs.map((d) => d.data()!);
       const shiftsMap = new Map(shifts.map((s) => [s.id, s]));
       const closedRecords: any[] = [];
+      const MAX_AUTO_CLOSE_PER_INVOCATION = 25;
+      const startTimeMs = Date.now();
+      const SOFT_TIME_BUDGET_MS = 6500;
 
       for (const docSnap of openSnap.docs) {
+        if (
+          closedRecords.length >= MAX_AUTO_CLOSE_PER_INVOCATION ||
+          Date.now() - startTimeMs >= SOFT_TIME_BUDGET_MS
+        ) {
+          break;
+        }
         const record = docSnap.data()!;
         if (record.actualPunchOut || record.punchOutType !== 'NONE') continue;
 
@@ -1183,32 +1548,34 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
 
           if (updatedRecord) {
             closedRecords.push(updatedRecord);
-            await writePunchLog({
-              employeeId: record.employeeId,
-              employeeName: record.employeeNameSnapshot,
-              timestamp: now.toISOString(),
-              action: 'AUTO_CLOSE',
-              rawPayload: 'SYSTEM_CRON',
-              scannerDevice: 'SYSTEM_AUTO',
-              performedByUid: caller.uid,
-              performedByLoginId: caller.loginId,
-              message: `Auto-closed at scheduled shift end (${shift.endTime}). Status: AUTO CLOSED. OT: 00:00.`,
-            });
-            await recordEnterpriseAuditEvent(db, {
-              req,
-              action: 'AUTOMATIC_PUNCH_OUT',
-              category: 'ATTENDANCE',
-              actorUid: caller.uid,
-              actorLoginId: caller.loginId,
-              actorRole: caller.role.toUpperCase(),
-              employeeId: record.employeeId,
-              targetType: 'ATTENDANCE',
-              targetId: record.id,
-              newValue: `Auto-closed at ${scheduledEndIso}, Duty: ${formatMinutes(scheduledDuration)}, OT: 00:00`,
-              actionSource: 'SYSTEM_SCHEDULER',
-              reason: 'Employee missed scanning Punch Out at scheduled shift closing',
-              captureGeo: false,
-            });
+            await Promise.all([
+              writePunchLog({
+                employeeId: record.employeeId,
+                employeeName: record.employeeNameSnapshot,
+                timestamp: now.toISOString(),
+                action: 'AUTO_CLOSE',
+                rawPayload: 'SYSTEM_CRON',
+                scannerDevice: 'SYSTEM_AUTO',
+                performedByUid: caller.uid,
+                performedByLoginId: caller.loginId,
+                message: `Auto-closed at scheduled shift end (${shift.endTime}). Status: AUTO CLOSED. OT: 00:00.`,
+              }),
+              recordEnterpriseAuditEvent(db, {
+                req,
+                action: 'AUTOMATIC_PUNCH_OUT',
+                category: 'ATTENDANCE',
+                actorUid: caller.uid,
+                actorLoginId: caller.loginId,
+                actorRole: caller.role.toUpperCase(),
+                employeeId: record.employeeId,
+                targetType: 'ATTENDANCE',
+                targetId: record.id,
+                newValue: `Auto-closed at ${scheduledEndIso}, Duty: ${formatMinutes(scheduledDuration)}, OT: 00:00`,
+                actionSource: 'SYSTEM_SCHEDULER',
+                reason: 'Employee missed scanning Punch Out at scheduled shift closing',
+                captureGeo: false,
+              }),
+            ]);
           }
         }
       }

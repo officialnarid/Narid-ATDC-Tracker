@@ -19,10 +19,17 @@ import {
   ChevronRight,
   Activity,
   Maximize2,
-  Minimize2
+  Minimize2,
+  Keyboard,
+  Lock
 } from 'lucide-react';
-import { processDualAttendanceScan } from '../services/attendanceService';
-import { ScanResult, ScannerType } from '../types';
+import { processDualAttendanceScan, processManualAttendancePunch } from '../services/attendanceService';
+import {
+  RolePermissionRecord,
+  UserPermissionRecordWithOverride,
+  resolveScannerCapabilities,
+} from '../services/permissionService';
+import { ScanResult, UserRoleRecord } from '../types';
 import { Html5QrcodeScanner } from 'html5-qrcode';
 
 interface ScannerProps {
@@ -30,6 +37,9 @@ interface ScannerProps {
   isFullscreen?: boolean;
   onToggleFullscreen?: () => void;
   onExitFullscreen?: () => void;
+  currentUserRole?: UserRoleRecord | null;
+  rolePermissions?: Record<string, RolePermissionRecord> | null;
+  userPermissionOverride?: UserPermissionRecordWithOverride | null;
 }
 
 export const Scanner: React.FC<ScannerProps> = ({
@@ -37,15 +47,29 @@ export const Scanner: React.FC<ScannerProps> = ({
   isFullscreen = false,
   onToggleFullscreen,
   onExitFullscreen,
+  currentUserRole,
+  rolePermissions,
+  userPermissionOverride,
 }) => {
+  const { canQrScan, canManualEntry } = resolveScannerCapabilities({
+    profile: currentUserRole,
+    rolePermissions,
+    userPermissionOverride,
+  });
   // Mode selection: Dual side-by-side or dedicated single station
   const [activeStationMode, setActiveStationMode] = useState<'DUAL' | 'IN_ONLY' | 'OUT_ONLY'>('DUAL');
 
-  // Input states for IN and OUT
+  // QR Input states for IN and OUT (Strict QR Verification)
   const [inInput, setInInput] = useState('');
   const [outInput, setOutInput] = useState('');
   const [isProcessingIn, setIsProcessingIn] = useState(false);
   const [isProcessingOut, setIsProcessingOut] = useState(false);
+
+  // Separate Manual Employee ID Entry states for IN and OUT
+  const [manualInId, setManualInId] = useState('');
+  const [manualOutId, setManualOutId] = useState('');
+  const [isProcessingManualIn, setIsProcessingManualIn] = useState(false);
+  const [isProcessingManualOut, setIsProcessingManualOut] = useState(false);
 
   // Results for both stations
   const [lastInResult, setLastInResult] = useState<ScanResult | null>(null);
@@ -62,6 +86,8 @@ export const Scanner: React.FC<ScannerProps> = ({
 
   const inInputRef = useRef<HTMLInputElement>(null);
   const outInputRef = useRef<HTMLInputElement>(null);
+  const manualInInputRef = useRef<HTMLInputElement>(null);
+  const manualOutInputRef = useRef<HTMLInputElement>(null);
   const webcamScannerRef = useRef<Html5QrcodeScanner | null>(null);
 
   // Audio synthesizer for industrial audio confirmations
@@ -115,28 +141,60 @@ export const Scanner: React.FC<ScannerProps> = ({
     }
   }, [soundEnabled]);
 
-  // Keep target scanner focused for USB hardware readers
+  // Keep target scanner input focused only for permitted methods without stealing focus from manual fields
   useEffect(() => {
     const keepFocus = () => {
       const activeEl = document.activeElement;
-      if (activeEl?.tagName === 'INPUT' && (activeEl === inInputRef.current || activeEl === outInputRef.current)) {
+      if (
+        activeEl?.tagName === 'INPUT' &&
+        (activeEl === inInputRef.current ||
+          activeEl === outInputRef.current ||
+          activeEl === manualInInputRef.current ||
+          activeEl === manualOutInputRef.current)
+      ) {
         return;
       }
-      if (activeFocus === 'IN') {
-        inInputRef.current?.focus();
-      } else {
-        outInputRef.current?.focus();
+      if (canQrScan) {
+        if (activeFocus === 'IN') {
+          inInputRef.current?.focus();
+        } else {
+          outInputRef.current?.focus();
+        }
+      } else if (canManualEntry) {
+        if (activeFocus === 'IN') {
+          manualInInputRef.current?.focus();
+        } else {
+          manualOutInputRef.current?.focus();
+        }
       }
     };
     keepFocus();
     const interval = setInterval(keepFocus, 1000);
     return () => clearInterval(interval);
-  }, [activeFocus]);
+  }, [activeFocus, canQrScan, canManualEntry]);
+
+  // Close webcam immediately if QR permission is revoked
+  useEffect(() => {
+    if (!canQrScan && webcamStation !== 'NONE') {
+      setWebcamStation('NONE');
+    }
+  }, [canQrScan, webcamStation]);
 
   // Process Punch In Scan
   const handlePunchIn = async (payload: string, source: 'USB_SCANNER' | 'WEBCAM' | 'MANUAL' = 'USB_SCANNER') => {
     const clean = payload.trim();
     if (!clean || isProcessingIn) return;
+    if (!canQrScan) {
+      setLastInResult({
+        success: false,
+        action: 'REJECTED',
+        scannerType: 'IN',
+        message: 'Access denied: Your role lacks QR Code Scanning permission (attendance.qr.scan).',
+        time: new Date().toLocaleTimeString(),
+      });
+      playSound('error');
+      return;
+    }
 
     setIsProcessingIn(true);
     try {
@@ -173,7 +231,9 @@ export const Scanner: React.FC<ScannerProps> = ({
     } finally {
       setIsProcessingIn(false);
       setInInput('');
-      setTimeout(() => inInputRef.current?.focus(), 50);
+      if (canQrScan) {
+        setTimeout(() => inInputRef.current?.focus(), 50);
+      }
     }
   };
 
@@ -181,6 +241,17 @@ export const Scanner: React.FC<ScannerProps> = ({
   const handlePunchOut = async (payload: string, source: 'USB_SCANNER' | 'WEBCAM' | 'MANUAL' = 'USB_SCANNER') => {
     const clean = payload.trim();
     if (!clean || isProcessingOut) return;
+    if (!canQrScan) {
+      setLastOutResult({
+        success: false,
+        action: 'REJECTED',
+        scannerType: 'OUT',
+        message: 'Access denied: Your role lacks QR Code Scanning permission (attendance.qr.scan).',
+        time: new Date().toLocaleTimeString(),
+      });
+      playSound('error');
+      return;
+    }
 
     setIsProcessingOut(true);
     try {
@@ -213,10 +284,116 @@ export const Scanner: React.FC<ScannerProps> = ({
     } finally {
       setIsProcessingOut(false);
       setOutInput('');
-      setTimeout(() => outInputRef.current?.focus(), 50);
+      if (canQrScan) {
+        setTimeout(() => outInputRef.current?.focus(), 50);
+      }
+    }
+  };
+  // Process Authorized Manual Employee ID Punch In
+  const handleManualPunchIn = async (empId: string) => {
+    const clean = empId.trim().toUpperCase();
+    if (!clean || isProcessingManualIn) return;
+    if (!canManualEntry) {
+      setLastInResult({
+        success: false,
+        action: 'REJECTED',
+        scannerType: 'IN',
+        message: 'Access denied: Your role lacks Manual Employee ID Entry permission (attendance.manual.entry).',
+        time: new Date().toLocaleTimeString(),
+      });
+      playSound('error');
+      return;
+    }
+
+    setIsProcessingManualIn(true);
+    try {
+      const result = await processManualAttendancePunch({
+        employeeId: clean,
+        scannerType: 'IN',
+      });
+
+      setLastInResult(result);
+      setRecentEvents(prev => [result, ...prev.slice(0, 9)]);
+
+      if (result.success) {
+        setManualInId('');
+        if (result.attendance?.attendanceStatus === 'LATE') {
+          playSound('warning');
+        } else {
+          playSound('success_in');
+        }
+        onAttendanceUpdated?.();
+      } else {
+        playSound('error');
+      }
+    } catch (err: any) {
+      console.error('Manual Punch In Error:', err);
+      const fallback: ScanResult = {
+        success: false,
+        action: 'REJECTED',
+        scannerType: 'IN',
+        message: err.message || 'System error processing manual Punch In.',
+        time: new Date().toLocaleTimeString(),
+      };
+      setLastInResult(fallback);
+      playSound('error');
+    } finally {
+      setIsProcessingManualIn(false);
+      if (canManualEntry) {
+        setTimeout(() => manualInInputRef.current?.focus(), 50);
+      }
     }
   };
 
+  // Process Authorized Manual Employee ID Punch Out
+  const handleManualPunchOut = async (empId: string) => {
+    const clean = empId.trim().toUpperCase();
+    if (!clean || isProcessingManualOut) return;
+    if (!canManualEntry) {
+      setLastOutResult({
+        success: false,
+        action: 'REJECTED',
+        scannerType: 'OUT',
+        message: 'Access denied: Your role lacks Manual Employee ID Entry permission (attendance.manual.entry).',
+        time: new Date().toLocaleTimeString(),
+      });
+      playSound('error');
+      return;
+    }
+
+    setIsProcessingManualOut(true);
+    try {
+      const result = await processManualAttendancePunch({
+        employeeId: clean,
+        scannerType: 'OUT',
+      });
+
+      setLastOutResult(result);
+      setRecentEvents(prev => [result, ...prev.slice(0, 9)]);
+
+      if (result.success) {
+        setManualOutId('');
+        playSound('success_out');
+        onAttendanceUpdated?.();
+      } else {
+        playSound('error');
+      }
+    } catch (err: any) {
+      console.error('Manual Punch Out Error:', err);
+      const fallback: ScanResult = {
+        success: false,
+        action: 'REJECTED',
+        scannerType: 'OUT',
+        message: err.message || 'System error processing manual Punch Out.',
+        time: new Date().toLocaleTimeString(),
+      };
+      setLastOutResult(fallback);
+      playSound('error');
+    } finally {
+      setIsProcessingManualOut(false);
+      setTimeout(() => manualOutInputRef.current?.focus(), 50);
+    }
+  };
   // Setup Webcam QR Reader if activated
   useEffect(() => {
     if (webcamStation !== 'NONE') {
@@ -382,6 +559,20 @@ export const Scanner: React.FC<ScannerProps> = ({
 
       {/* Main Dual Scanner Workstation Stage */}
       <div className={`flex-1 p-4 sm:p-6 grid grid-cols-1 lg:grid-cols-12 gap-5 sm:gap-6 w-full ${isFullscreen ? 'max-w-none' : 'max-w-7xl mx-auto'}`}>
+        {!canQrScan && !canManualEntry && (
+          <div className="lg:col-span-12 bg-red-950/50 border border-red-700/80 rounded-xl p-5 flex items-start gap-3 text-red-100 shadow-lg">
+            <Lock className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+            <div>
+              <h3 className="text-sm font-bold text-white uppercase tracking-wide">
+                Attendance Entry Methods Restricted
+              </h3>
+              <p className="text-xs text-red-200 mt-1">
+                Your role currently does not have permission for <strong>QR Code Scanning</strong> (<code className="font-mono">attendance.qr.scan</code>) or <strong>Manual Employee ID Entry</strong> (<code className="font-mono">attendance.manual.entry</code>). Contact Super Admin to enable one or both methods in Role Permissions Management.
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* Left/Middle: Scanners Area (8 or 9 cols) */}
         <div className="lg:col-span-8 flex flex-col gap-6">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -419,52 +610,125 @@ export const Scanner: React.FC<ScannerProps> = ({
                     </div>
                   </div>
 
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setWebcamStation(webcamStation === 'IN' ? 'NONE' : 'IN');
-                    }}
-                    className={`px-2 py-1 rounded text-[11px] font-medium flex items-center gap-1 border transition ${
-                      webcamStation === 'IN'
-                        ? 'bg-emerald-600 border-emerald-500 text-white'
-                        : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
-                    }`}
-                  >
-                    <Camera className="w-3 h-3" />
-                    <span>{webcamStation === 'IN' ? 'Cam ON' : 'Cam'}</span>
-                  </button>
+                  {canQrScan ? (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setWebcamStation(webcamStation === 'IN' ? 'NONE' : 'IN');
+                      }}
+                      className={`px-2 py-1 rounded text-[11px] font-medium flex items-center gap-1 border transition ${
+                        webcamStation === 'IN'
+                          ? 'bg-emerald-600 border-emerald-500 text-white'
+                          : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
+                      }`}
+                    >
+                      <Camera className="w-3 h-3" />
+                      <span>{webcamStation === 'IN' ? 'Cam ON' : 'Cam'}</span>
+                    </button>
+                  ) : (
+                    <span className="px-2 py-1 rounded text-[10px] font-mono bg-slate-950 border border-slate-800 text-slate-500 flex items-center gap-1">
+                      <Lock className="w-3 h-3" />
+                      <span>QR Off</span>
+                    </span>
+                  )}
                 </div>
 
-                {/* USB Scanner Keystroke / Manual Input Field */}
+                {/* USB Scanner / Camera QR Code Input Field */}
                 <div className="mt-4">
                   <label className="text-[11px] text-slate-400 uppercase font-semibold mb-1 block">
-                    Scan Employee QR Card or Type ID
+                    Scan Employee QR Card (USB / Camera)
                   </label>
-                  <div className="relative">
-                    <input
-                      ref={inInputRef}
-                      type="text"
-                      value={inInput}
-                      onChange={(e) => setInInput(e.target.value)}
-                      onFocus={() => setActiveFocus('IN')}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          e.preventDefault();
+                  {canQrScan ? (
+                    <div className="relative">
+                      <input
+                        ref={inInputRef}
+                        type="text"
+                        value={inInput}
+                        onChange={(e) => setInInput(e.target.value)}
+                        onFocus={() => setActiveFocus('IN')}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            handlePunchIn(inInput, 'USB_SCANNER');
+                          }
+                        }}
+                        disabled={isProcessingIn}
+                        placeholder="Scan QR Badge (Punch In Ready)..."
+                        className="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-lg px-3.5 py-2.5 pr-24 text-sm text-white font-mono placeholder-slate-500 focus:outline-hidden focus:ring-1 focus:ring-emerald-500 transition"
+                      />
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
                           handlePunchIn(inInput, 'USB_SCANNER');
-                        }
-                      }}
-                      disabled={isProcessingIn}
-                      placeholder="Punch In Ready (e.g. JMD001)..."
-                      className="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-lg px-3.5 py-2.5 text-sm text-white font-mono placeholder-slate-500 focus:outline-hidden focus:ring-1 focus:ring-emerald-500 transition"
-                    />
-                    <button
-                      onClick={() => handlePunchIn(inInput, 'USB_SCANNER')}
-                      disabled={isProcessingIn || !inInput.trim()}
-                      className="absolute right-1.5 top-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-semibold px-3 py-1.5 rounded transition"
-                    >
-                      Punch In
-                    </button>
+                        }}
+                        disabled={isProcessingIn || !inInput.trim()}
+                        className="absolute right-1.5 top-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-semibold px-3 py-1.5 rounded transition"
+                      >
+                        Scan In
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="rounded-lg bg-slate-950/70 border border-slate-800 px-3 py-2.5 text-[11px] text-slate-400 flex items-center gap-2">
+                      <Lock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                      <span>QR Code Scanning disabled for your role (<code className="font-mono text-slate-300">attendance.qr.scan</code>).</span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Separate Authorized Manual Employee ID Entry */}
+                <div
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setActiveFocus('IN');
+                  }}
+                  className="mt-3 p-3 rounded-lg bg-slate-950/70 border border-slate-800/90"
+                >
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="text-[11px] text-emerald-300/90 uppercase font-semibold flex items-center gap-1.5">
+                      <Keyboard className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Manual Employee ID Entry</span>
+                    </label>
+                    <span className={`text-[10px] font-mono ${canManualEntry ? 'text-emerald-400' : 'text-slate-500'}`}>
+                      {canManualEntry ? 'Authorized' : 'Restricted'}
+                    </span>
                   </div>
+                  {canManualEntry ? (
+                    <div className="flex items-center gap-2">
+                      <input
+                        ref={manualInInputRef}
+                        type="text"
+                        value={manualInId}
+                        onChange={(e) => setManualInId(e.target.value.toUpperCase())}
+                        onFocus={() => setActiveFocus('IN')}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            handleManualPunchIn(manualInId);
+                          }
+                        }}
+                        disabled={isProcessingManualIn}
+                        placeholder="Enter Employee ID (e.g. MSI1335)"
+                        className="flex-1 min-w-0 bg-slate-900 border border-slate-700 focus:border-emerald-500 rounded-lg px-3 py-2 text-xs text-white font-mono uppercase placeholder-slate-500 focus:outline-hidden focus:ring-1 focus:ring-emerald-500 transition"
+                      />
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleManualPunchIn(manualInId);
+                        }}
+                        disabled={isProcessingManualIn || !manualInId.trim()}
+                        className="shrink-0 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-40 text-white text-xs font-semibold px-3 py-2 rounded-lg transition cursor-pointer"
+                      >
+                        {isProcessingManualIn ? 'Saving...' : 'Manual In'}
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="text-[11px] text-slate-400 flex items-center gap-2 py-1">
+                      <Lock className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                      <span>Manual ID entry disabled for your role (<code className="font-mono text-slate-300">attendance.manual.entry</code>).</span>
+                    </div>
+                  )}
                 </div>
 
                 {/* Latest Punch In Result Badge */}
@@ -578,52 +842,125 @@ export const Scanner: React.FC<ScannerProps> = ({
                     </div>
                   </div>
 
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setWebcamStation(webcamStation === 'OUT' ? 'NONE' : 'OUT');
-                    }}
-                    className={`px-2 py-1 rounded text-[11px] font-medium flex items-center gap-1 border transition ${
-                      webcamStation === 'OUT'
-                        ? 'bg-indigo-600 border-indigo-500 text-white'
-                        : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
-                    }`}
-                  >
-                    <Camera className="w-3 h-3" />
-                    <span>{webcamStation === 'OUT' ? 'Cam ON' : 'Cam'}</span>
-                  </button>
+                  {canQrScan ? (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setWebcamStation(webcamStation === 'OUT' ? 'NONE' : 'OUT');
+                      }}
+                      className={`px-2 py-1 rounded text-[11px] font-medium flex items-center gap-1 border transition ${
+                        webcamStation === 'OUT'
+                          ? 'bg-indigo-600 border-indigo-500 text-white'
+                          : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
+                      }`}
+                    >
+                      <Camera className="w-3 h-3" />
+                      <span>{webcamStation === 'OUT' ? 'Cam ON' : 'Cam'}</span>
+                    </button>
+                  ) : (
+                    <span className="px-2 py-1 rounded text-[10px] font-mono bg-slate-950 border border-slate-800 text-slate-500 flex items-center gap-1">
+                      <Lock className="w-3 h-3" />
+                      <span>QR Off</span>
+                    </span>
+                  )}
                 </div>
 
-                {/* USB Scanner Keystroke / Manual Input Field */}
+                {/* USB Scanner / Camera QR Code Input Field */}
                 <div className="mt-4">
                   <label className="text-[11px] text-slate-400 uppercase font-semibold mb-1 block">
-                    Scan Employee QR Card or Type ID
+                    Scan Employee QR Card (USB / Camera)
                   </label>
-                  <div className="relative">
-                    <input
-                      ref={outInputRef}
-                      type="text"
-                      value={outInput}
-                      onChange={(e) => setOutInput(e.target.value)}
-                      onFocus={() => setActiveFocus('OUT')}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          e.preventDefault();
+                  {canQrScan ? (
+                    <div className="relative">
+                      <input
+                        ref={outInputRef}
+                        type="text"
+                        value={outInput}
+                        onChange={(e) => setOutInput(e.target.value)}
+                        onFocus={() => setActiveFocus('OUT')}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            handlePunchOut(outInput, 'USB_SCANNER');
+                          }
+                        }}
+                        disabled={isProcessingOut}
+                        placeholder="Scan QR Badge (Punch Out Ready)..."
+                        className="w-full bg-slate-950 border border-slate-700 focus:border-indigo-500 rounded-lg px-3.5 py-2.5 pr-24 text-sm text-white font-mono placeholder-slate-500 focus:outline-hidden focus:ring-1 focus:ring-indigo-500 transition"
+                      />
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
                           handlePunchOut(outInput, 'USB_SCANNER');
-                        }
-                      }}
-                      disabled={isProcessingOut}
-                      placeholder="Punch Out Ready (e.g. JMD001)..."
-                      className="w-full bg-slate-950 border border-slate-700 focus:border-indigo-500 rounded-lg px-3.5 py-2.5 text-sm text-white font-mono placeholder-slate-500 focus:outline-hidden focus:ring-1 focus:ring-indigo-500 transition"
-                    />
-                    <button
-                      onClick={() => handlePunchOut(outInput, 'USB_SCANNER')}
-                      disabled={isProcessingOut || !outInput.trim()}
-                      className="absolute right-1.5 top-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-xs font-semibold px-3 py-1.5 rounded transition"
-                    >
-                      Punch Out
-                    </button>
+                        }}
+                        disabled={isProcessingOut || !outInput.trim()}
+                        className="absolute right-1.5 top-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-xs font-semibold px-3 py-1.5 rounded transition"
+                      >
+                        Scan Out
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="rounded-lg bg-slate-950/70 border border-slate-800 px-3 py-2.5 text-[11px] text-slate-400 flex items-center gap-2">
+                      <Lock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                      <span>QR Code Scanning disabled for your role (<code className="font-mono text-slate-300">attendance.qr.scan</code>).</span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Separate Authorized Manual Employee ID Entry */}
+                <div
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setActiveFocus('OUT');
+                  }}
+                  className="mt-3 p-3 rounded-lg bg-slate-950/70 border border-slate-800/90"
+                >
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="text-[11px] text-indigo-300/90 uppercase font-semibold flex items-center gap-1.5">
+                      <Keyboard className="w-3.5 h-3.5 text-indigo-400" />
+                      <span>Manual Employee ID Entry</span>
+                    </label>
+                    <span className={`text-[10px] font-mono ${canManualEntry ? 'text-indigo-400' : 'text-slate-500'}`}>
+                      {canManualEntry ? 'Authorized' : 'Restricted'}
+                    </span>
                   </div>
+                  {canManualEntry ? (
+                    <div className="flex items-center gap-2">
+                      <input
+                        ref={manualOutInputRef}
+                        type="text"
+                        value={manualOutId}
+                        onChange={(e) => setManualOutId(e.target.value.toUpperCase())}
+                        onFocus={() => setActiveFocus('OUT')}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            handleManualPunchOut(manualOutId);
+                          }
+                        }}
+                        disabled={isProcessingManualOut}
+                        placeholder="Enter Employee ID (e.g. MSI1335)"
+                        className="flex-1 min-w-0 bg-slate-900 border border-slate-700 focus:border-indigo-500 rounded-lg px-3 py-2 text-xs text-white font-mono uppercase placeholder-slate-500 focus:outline-hidden focus:ring-1 focus:ring-indigo-500 transition"
+                      />
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleManualPunchOut(manualOutId);
+                        }}
+                        disabled={isProcessingManualOut || !manualOutId.trim()}
+                        className="shrink-0 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-40 text-white text-xs font-semibold px-3 py-2 rounded-lg transition cursor-pointer"
+                      >
+                        {isProcessingManualOut ? 'Saving...' : 'Manual Out'}
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="text-[11px] text-slate-400 flex items-center gap-2 py-1">
+                      <Lock className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                      <span>Manual ID entry disabled for your role (<code className="font-mono text-slate-300">attendance.manual.entry</code>).</span>
+                    </div>
+                  )}
                 </div>
 
                 {/* Latest Punch Out Result Badge */}

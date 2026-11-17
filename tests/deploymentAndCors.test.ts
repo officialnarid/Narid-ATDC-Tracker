@@ -928,5 +928,110 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
       getFirebaseAdminContext(true);
     }
   });
+
+  it('retries same-origin /api/* in AI Studio Preview when cross-origin Vercel fetch fails at network layer', async () => {
+    const { executeApiFetch } = await import('../src/config/api.ts');
+    const prevWindow = (globalThis as any).window;
+    const prevFetch = globalThis.fetch;
+
+    try {
+      const calls: string[] = [];
+      (globalThis as any).window = {
+        location: {
+          hostname: 'ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app',
+          origin: 'https://ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app',
+        },
+      };
+
+      globalThis.fetch = (async (input: any) => {
+        const target = String(input);
+        calls.push(target);
+        if (target.startsWith('https://narid-atdc-tracker.vercel.app')) {
+          throw new TypeError('Failed to fetch');
+        }
+        return new Response(JSON.stringify({ success: true, closedCount: 0, closedRecords: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }) as typeof fetch;
+
+      const res = await executeApiFetch(
+        'https://narid-atdc-tracker.vercel.app/api/attendance/auto-close',
+        { method: 'POST', body: '{}' },
+        'POST /api/attendance/auto-close'
+      );
+      expect(res.status).toBe(200);
+      expect(calls).toEqual([
+        'https://narid-atdc-tracker.vercel.app/api/attendance/auto-close',
+        '/api/attendance/auto-close',
+      ]);
+
+      // When shared Vercel returns 404 "API endpoint not found." for a newer route in Preview, retry same-origin /api/*
+      const routeFallbackCalls: string[] = [];
+      globalThis.fetch = (async (input: any) => {
+        const target = String(input);
+        routeFallbackCalls.push(target);
+        if (target.startsWith('https://narid-atdc-tracker.vercel.app')) {
+          return new Response(JSON.stringify({ success: false, error: 'API endpoint not found.' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({ success: true, action: 'PUNCH_IN' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }) as typeof fetch;
+
+      const fallbackRes = await executeApiFetch(
+        'https://narid-atdc-tracker.vercel.app/api/attendance/manual-punch',
+        { method: 'POST', body: '{"employeeId":"MSI1335","scannerType":"IN"}' },
+        'POST /api/attendance/manual-punch'
+      );
+      expect(fallbackRes.status).toBe(200);
+      expect(routeFallbackCalls).toEqual([
+        'https://narid-atdc-tracker.vercel.app/api/attendance/manual-punch',
+        '/api/attendance/manual-punch',
+      ]);
+
+      // Genuine resource 404 (e.g., Employee Not Found) must NOT retry same-origin
+      const genuine404Calls: string[] = [];
+      globalThis.fetch = (async (input: any) => {
+        genuine404Calls.push(String(input));
+        return new Response(JSON.stringify({ success: false, error: 'Employee "UNKNOWN" Not Found.' }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }) as typeof fetch;
+
+      const genuine404Res = await executeApiFetch(
+        'https://narid-atdc-tracker.vercel.app/api/attendance/manual-punch',
+        { method: 'POST', body: '{"employeeId":"UNKNOWN","scannerType":"IN"}' },
+        'POST /api/attendance/manual-punch'
+      );
+      expect(genuine404Res.status).toBe(404);
+      expect(genuine404Calls).toEqual([
+        'https://narid-atdc-tracker.vercel.app/api/attendance/manual-punch',
+      ]);
+
+      // When non-preview host fails both, structured error is thrown as before
+      (globalThis as any).window = {
+        location: {
+          hostname: 'narid-atdc-tracker.vercel.app',
+          origin: 'https://narid-atdc-tracker.vercel.app',
+        },
+      };
+      globalThis.fetch = (async () => {
+        throw new TypeError('Failed to fetch');
+      }) as typeof fetch;
+
+      await expect(
+        executeApiFetch('/api/attendance/auto-close', { method: 'POST' }, 'POST /api/attendance/auto-close')
+      ).rejects.toThrow('Unable to reach POST /api/attendance/auto-close');
+    } finally {
+      (globalThis as any).window = prevWindow;
+      globalThis.fetch = prevFetch;
+    }
+  });
 });
 

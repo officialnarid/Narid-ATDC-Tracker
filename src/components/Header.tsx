@@ -24,6 +24,9 @@ export const Header: React.FC<HeaderProps> = ({
   const [currentTime, setCurrentTime] = useState<Date>(new Date());
   const [isRunningAutoClose, setIsRunningAutoClose] = useState(false);
   const [autoCloseMessage, setAutoCloseMessage] = useState<string | null>(null);
+  const isAutoCloseInFlightRef = React.useRef(false);
+  const onRefreshDataRef = React.useRef(onRefreshData);
+  onRefreshDataRef.current = onRefreshData;
 
   const normalizedRole = String(currentUserRole?.role || 'USER').toUpperCase();
   const canRunAutoClose =
@@ -48,23 +51,29 @@ export const Header: React.FC<HeaderProps> = ({
   useEffect(() => {
     if (!canRunAutoClose) return;
     const autoCloseInterval = setInterval(async () => {
+      if (isAutoCloseInFlightRef.current) return;
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      isAutoCloseInFlightRef.current = true;
       try {
-        const res = await runAutoCloseShiftsEngine();
+        const res = await runAutoCloseShiftsEngine({ silent: true });
         if (res.closedCount > 0) {
           setAutoCloseMessage(`Auto-closed ${res.closedCount} missed punch-outs`);
           setTimeout(() => setAutoCloseMessage(null), 8000);
-          onRefreshData?.();
+          onRefreshDataRef.current?.();
         }
       } catch (err) {
-        console.error('Periodic shift auto close error:', err);
+        console.warn('Periodic shift auto close error:', err);
+      } finally {
+        isAutoCloseInFlightRef.current = false;
       }
     }, 60000);
 
     return () => clearInterval(autoCloseInterval);
-  }, [canRunAutoClose, onRefreshData]);
+  }, [canRunAutoClose]);
 
   const handleManualAutoClose = async () => {
-    if (!canRunAutoClose) return;
+    if (!canRunAutoClose || isAutoCloseInFlightRef.current) return;
+    isAutoCloseInFlightRef.current = true;
     setIsRunningAutoClose(true);
     setAutoCloseMessage(null);
     try {
@@ -75,10 +84,11 @@ export const Header: React.FC<HeaderProps> = ({
         setAutoCloseMessage('Shift closing check: No open shifts past scheduled end.');
       }
       setTimeout(() => setAutoCloseMessage(null), 6000);
-      onRefreshData?.();
-    } catch (err) {
+      onRefreshDataRef.current?.();
+    } catch {
       setAutoCloseMessage('Error executing shift auto-close.');
     } finally {
+      isAutoCloseInFlightRef.current = false;
       setIsRunningAutoClose(false);
     }
   };

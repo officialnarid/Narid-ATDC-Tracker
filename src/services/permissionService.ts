@@ -1,5 +1,6 @@
 import { 
   collection, 
+  doc,
   getDocs, 
   onSnapshot 
 } from 'firebase/firestore';
@@ -7,6 +8,23 @@ import { db } from '../firebase';
 import { apiFetchJson } from '../config/api';
 import { UserRoleRecord, UserRoleType } from '../types';
 import { getAuthHeaders } from './auditService';
+import {
+  DASHBOARD_CARDS,
+  DASHBOARD_SECTIONS,
+  DASHBOARD_CARD_PERMISSION_KEYS,
+  DASHBOARD_SECTION_PERMISSION_KEYS,
+  DASHBOARD_VISIBILITY_KEYS,
+  resolveDashboardVisibility,
+} from '../config/dashboardCardsConfig';
+
+export {
+  DASHBOARD_CARDS,
+  DASHBOARD_SECTIONS,
+  DASHBOARD_CARD_PERMISSION_KEYS,
+  DASHBOARD_SECTION_PERMISSION_KEYS,
+  DASHBOARD_VISIBILITY_KEYS,
+  resolveDashboardVisibility,
+};
 
 export const SYSTEM_ROLE_IDS = new Set(['super_admin', 'admin', 'user']);
 export const VALID_ROLE_ID_REGEX = /^[a-z][a-z0-9_]{1,47}$/;
@@ -83,7 +101,38 @@ export interface PermissionModuleItem {
   isParent?: boolean;
   parentKey?: string;
   submodule?: boolean;
+  isCapability?: boolean;
+  isVisibilityOnly?: boolean;
+  visibilityGroup?: 'card' | 'section';
 }
+
+export const SCANNER_CAPABILITY_KEYS = new Set([
+  'attendance.qr.scan',
+  'attendance.manual.entry',
+]);
+
+export const DASHBOARD_VISIBILITY_MODULES: PermissionModuleItem[] = [
+  ...DASHBOARD_CARDS.map((c) => ({
+    key: c.permissionKey,
+    label: `• Card: ${c.label}`,
+    category: 'Dashboard Visibility',
+    description: `${c.description} (${c.permissionKey})`,
+    submodule: true,
+    parentKey: 'dashboard',
+    isVisibilityOnly: true,
+    visibilityGroup: 'card' as const,
+  })),
+  ...DASHBOARD_SECTIONS.map((s) => ({
+    key: s.permissionKey,
+    label: `• Section: ${s.label}`,
+    category: 'Dashboard Visibility',
+    description: `${s.description} (${s.permissionKey})`,
+    submodule: true,
+    parentKey: 'dashboard',
+    isVisibilityOnly: true,
+    visibilityGroup: 'section' as const,
+  })),
+];
 
 export const PERMISSION_MODULES: PermissionModuleItem[] = [
   {
@@ -91,12 +140,33 @@ export const PERMISSION_MODULES: PermissionModuleItem[] = [
     label: '1. Dashboard',
     category: 'Analytics',
     description: 'Real-time manpower metrics, line attendance, gate tracking',
+    isParent: true,
   },
+  ...DASHBOARD_VISIBILITY_MODULES,
   {
     key: 'scanner',
     label: '2. Attendance Scanner',
     category: 'Attendance',
     description: 'Continuous QR / barcode punch in and out scanning interface',
+    isParent: true,
+  },
+  {
+    key: 'attendance.qr.scan',
+    label: '• Allow QR Code Scanning',
+    category: 'Attendance',
+    description: 'Camera QR scanning, USB QR scanner input, and QR Punch In / Punch Out (attendance.qr.scan)',
+    submodule: true,
+    parentKey: 'scanner',
+    isCapability: true,
+  },
+  {
+    key: 'attendance.manual.entry',
+    label: '• Allow Manual Employee ID Entry',
+    category: 'Attendance',
+    description: 'Manually typing Employee ID, Manual Punch In, and Manual Punch Out (attendance.manual.entry)',
+    submodule: true,
+    parentKey: 'scanner',
+    isCapability: true,
   },
   {
     key: 'employees',
@@ -202,6 +272,7 @@ export const DEFAULT_SUPER_ADMIN_PERMISSIONS: Record<string, ModulePermission> =
 export const DEFAULT_ADMIN_PERMISSIONS: Record<string, ModulePermission> = {
   dashboard: { view: true, add: false, edit: false, delete: false },
   scanner: { view: true, add: true, edit: false, delete: false },
+  'attendance.manual.entry': { view: false, add: false, edit: false, delete: false },
   employees: { view: true, add: true, edit: true, delete: false },
   excel_import: { view: true, add: true, edit: true, delete: false },
   qr_codes: { view: true, add: true, edit: true, delete: false },
@@ -226,6 +297,7 @@ export const EMPTY_MODULE_PERMISSIONS: Record<string, ModulePermission> = PERMIS
 export const DEFAULT_USER_PERMISSIONS: Record<string, ModulePermission> = {
   dashboard: { view: true, add: false, edit: false, delete: false },
   scanner: { view: true, add: true, edit: false, delete: false },
+  'attendance.manual.entry': { view: false, add: false, edit: false, delete: false },
   employees: { view: false, add: false, edit: false, delete: false },
   excel_import: { view: false, add: false, edit: false, delete: false },
   qr_codes: { view: false, add: false, edit: false, delete: false },
@@ -564,6 +636,174 @@ export async function saveUserIndividualPermissions(
     },
     'Failed to update user permissions.'
   );
+}
+
+export interface UserPermissionRecordWithOverride extends UserPermissionRecord {
+  isCustomOverride?: boolean;
+}
+
+/**
+ * Subscribe to the signed-in caller's own individual user_permissions/{profileDocId} document
+ * (Permitted by Firestore Rules via isOwnerByUidIndex without requiring list access).
+ */
+export function subscribeToCurrentUserPermission(
+  profileDocId: string | null | undefined,
+  callback: (record: UserPermissionRecordWithOverride | null) => void
+): () => void {
+  const cleanId = String(profileDocId || '').trim();
+  if (!cleanId) {
+    callback(null);
+    return () => {};
+  }
+  const docRef = doc(db, 'user_permissions', cleanId);
+  return onSnapshot(
+    docRef,
+    (snap) => {
+      if (!snap.exists()) {
+        callback(null);
+        return;
+      }
+      callback({
+        ...(snap.data() as UserPermissionRecordWithOverride),
+        id: snap.id,
+      });
+    },
+    (err) => {
+      console.warn('[PermissionService] Current user permission subscription notice:', err);
+      callback(null);
+    }
+  );
+}
+
+export function isScannerCapabilityEntryEnabled(entry: Partial<ModulePermission> | null | undefined): boolean {
+  if (!entry || typeof entry !== 'object') return false;
+  if (entry.view === false) return false;
+  if (typeof entry.add === 'boolean') {
+    return entry.add === true;
+  }
+  return entry.view === true;
+}
+
+export interface ResolvedScannerCapabilities {
+  canViewScanner: boolean;
+  canQrScan: boolean;
+  canManualEntry: boolean;
+  qrConfiguredExplicitly: boolean;
+  manualConfiguredExplicitly: boolean;
+}
+
+/**
+ * Resolves independent attendance.qr.scan and attendance.manual.entry capabilities
+ * mirroring the backend guard precedence:
+ * 1. Super Admin -> all enabled
+ * 2. user_permissions override (when isCustomOverride !== false)
+ * 3. role_permissions[role]
+ * 4. Fallback: QR falls back to legacy scanner access; Manual stays strictly denied by default
+ */
+export function resolveScannerCapabilities(params: {
+  profile?: UserRoleRecord | null;
+  rolePermissions?: Record<string, RolePermissionRecord> | null;
+  userPermissionOverride?: UserPermissionRecordWithOverride | null;
+}): ResolvedScannerCapabilities {
+  const { profile, rolePermissions, userPermissionOverride } = params;
+  if (!profile) {
+    return {
+      canViewScanner: false,
+      canQrScan: false,
+      canManualEntry: false,
+      qrConfiguredExplicitly: false,
+      manualConfiguredExplicitly: false,
+    };
+  }
+
+  const roleKey = normalizeRoleId(profile.role);
+  if (roleKey === 'super_admin') {
+    return {
+      canViewScanner: true,
+      canQrScan: true,
+      canManualEntry: true,
+      qrConfiguredExplicitly: true,
+      manualConfiguredExplicitly: true,
+    };
+  }
+
+  const hasCustomOverride =
+    Boolean(userPermissionOverride) && userPermissionOverride?.isCustomOverride !== false;
+  const userPerms = hasCustomOverride ? userPermissionOverride?.permissions || {} : {};
+  const roleModPerms = rolePermissions?.[roleKey]?.modulePermissions || {};
+
+  // Evaluate attendance.qr.scan
+  let canQrScan: boolean;
+  let qrConfiguredExplicitly = false;
+
+  const userQrEntry = userPerms['attendance.qr.scan'];
+  const roleQrEntry = roleModPerms['attendance.qr.scan'];
+
+  if (
+    userQrEntry &&
+    typeof userQrEntry === 'object' &&
+    (typeof userQrEntry.view === 'boolean' || typeof userQrEntry.add === 'boolean')
+  ) {
+    canQrScan = isScannerCapabilityEntryEnabled(userQrEntry);
+    qrConfiguredExplicitly = true;
+  } else if (hasCustomOverride && userPerms.scanner && typeof userPerms.scanner === 'object') {
+    canQrScan = isScannerCapabilityEntryEnabled(userPerms.scanner);
+  } else if (
+    roleQrEntry &&
+    typeof roleQrEntry === 'object' &&
+    (typeof roleQrEntry.view === 'boolean' || typeof roleQrEntry.add === 'boolean')
+  ) {
+    canQrScan = isScannerCapabilityEntryEnabled(roleQrEntry);
+    qrConfiguredExplicitly = true;
+  } else if (roleModPerms.scanner && typeof roleModPerms.scanner === 'object') {
+    canQrScan = isScannerCapabilityEntryEnabled(roleModPerms.scanner);
+  } else if (Array.isArray(profile.modulesAllowed)) {
+    canQrScan = profile.modulesAllowed.includes('all') || profile.modulesAllowed.includes('scanner');
+  } else {
+    canQrScan = roleKey === 'admin' || roleKey === 'user';
+  }
+
+  // Evaluate attendance.manual.entry (strict deny-by-default)
+  let canManualEntry = false;
+  let manualConfiguredExplicitly = false;
+
+  const userManualEntry = userPerms['attendance.manual.entry'];
+  const roleManualEntry = roleModPerms['attendance.manual.entry'];
+
+  if (
+    userManualEntry &&
+    typeof userManualEntry === 'object' &&
+    (typeof userManualEntry.view === 'boolean' || typeof userManualEntry.add === 'boolean')
+  ) {
+    canManualEntry = isScannerCapabilityEntryEnabled(userManualEntry);
+    manualConfiguredExplicitly = true;
+  } else if (hasCustomOverride && userPerms.scanner?.view === false) {
+    canManualEntry = false;
+  } else if (
+    roleManualEntry &&
+    typeof roleManualEntry === 'object' &&
+    (typeof roleManualEntry.view === 'boolean' || typeof roleManualEntry.add === 'boolean')
+  ) {
+    canManualEntry = isScannerCapabilityEntryEnabled(roleManualEntry);
+    manualConfiguredExplicitly = true;
+  }
+
+  const canViewScanner =
+    canQrScan ||
+    canManualEntry ||
+    Boolean(userPerms.scanner?.view) ||
+    Boolean(roleModPerms.scanner?.view) ||
+    (Array.isArray(profile.modulesAllowed)
+      ? profile.modulesAllowed.includes('all') || profile.modulesAllowed.includes('scanner')
+      : roleKey === 'admin' || roleKey === 'user');
+
+  return {
+    canViewScanner,
+    canQrScan,
+    canManualEntry,
+    qrConfiguredExplicitly,
+    manualConfiguredExplicitly,
+  };
 }
 
 /**

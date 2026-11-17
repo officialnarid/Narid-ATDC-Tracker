@@ -46,7 +46,12 @@ import { AuditLogsManagement } from './components/AuditLogsManagement';
 import { SecurityManagement } from './components/SecurityManagement';
 import { SystemSettingsView } from './components/SystemSettings';
 import { UnauthorizedAccess } from './components/UnauthorizedAccess';
-import { RolePermissionRecord, subscribeToAllRolePermissions } from './services/permissionService';
+import {
+  RolePermissionRecord,
+  UserPermissionRecordWithOverride,
+  subscribeToAllRolePermissions,
+  subscribeToCurrentUserPermission,
+} from './services/permissionService';
 
 const VALID_TABS: NavItem[] = [
   'dashboard',
@@ -105,6 +110,7 @@ export default function App() {
   const [shifts, setShifts] = useState<Shift[]>([]);
   const [isLoadingMasterData, setIsLoadingMasterData] = useState<boolean>(false);
   const [rolePermissions, setRolePermissions] = useState<Record<string, RolePermissionRecord>>({});
+  const [currentUserPermOverride, setCurrentUserPermOverride] = useState<UserPermissionRecordWithOverride | null>(null);
 
   // Real-time synchronization of Role Permissions matrix (only when authenticated)
   useEffect(() => {
@@ -112,6 +118,16 @@ export default function App() {
     const unsub = subscribeToAllRolePermissions(setRolePermissions);
     return () => unsub();
   }, [currentUser]);
+
+  // Real-time synchronization of signed-in user's individual permission overrides
+  useEffect(() => {
+    if (!currentUser || !auth.currentUser || !currentUserRole?.id) {
+      setCurrentUserPermOverride(null);
+      return;
+    }
+    const unsub = subscribeToCurrentUserPermission(currentUserRole.id, setCurrentUserPermOverride);
+    return () => unsub();
+  }, [currentUser, currentUserRole?.id]);
 
   // Synchronize direct URL navigation / browser Back-Forward
   useEffect(() => {
@@ -506,6 +522,7 @@ export default function App() {
                   onRefreshData={() => loadAllMasterData(false)}
                   currentUserRole={currentUserRole}
                   rolePermissions={rolePermissions}
+                  userPermissionOverride={currentUserPermOverride}
                   isFullscreen={isFullscreenDashboard}
                   onToggleFullscreen={() => handleToggleFullscreen('dashboard')}
                   onExitFullscreen={handleExitFullscreen}
@@ -518,6 +535,9 @@ export default function App() {
                   isFullscreen={isFullscreenScanner}
                   onToggleFullscreen={() => handleToggleFullscreen('scanner')}
                   onExitFullscreen={handleExitFullscreen}
+                  currentUserRole={currentUserRole}
+                  rolePermissions={rolePermissions}
+                  userPermissionOverride={currentUserPermOverride}
                 />
               )}
 
