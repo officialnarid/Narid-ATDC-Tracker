@@ -34,6 +34,11 @@ import { collection, doc, getDocs, onSnapshot, query, where } from 'firebase/fir
 import { db, auth } from '../firebase';
 import { formatDateKey, formatMinutes } from '../services/attendanceService';
 import { isModuleAllowedForUser } from '../services/authService';
+import {
+  formatDurationClock,
+  getAttendanceStatusBadgeClasses,
+  resolveAttendanceMetrics,
+} from '../utils/attendanceStatus';
 import { 
   DashboardCardId, 
   DashboardSectionId,
@@ -184,6 +189,15 @@ export const Dashboard: React.FC<DashboardProps> = ({
     if (onRefreshData) onRefreshData();
   };
 
+  // O(1) employee lookup by employeeId
+  const employeeByIdMap = useMemo(() => {
+    const map = new Map<string, Employee>();
+    for (const emp of employees) {
+      map.set(emp.employeeId, emp);
+    }
+    return map;
+  }, [employees]);
+
   // Filtered employees list
   const filteredEmployees = useMemo(() => {
     return employees.filter(emp => {
@@ -217,56 +231,131 @@ export const Dashboard: React.FC<DashboardProps> = ({
     return map;
   }, [rosterRecords]);
 
-  // Calculations
+  // O(N + M) Present records + single-pass KPI & breakdown aggregations
   const presentRecords = useMemo(() => {
     return attendanceRecords.filter(a => {
-      const emp = employees.find(e => e.employeeId === a.employeeId);
-      if (!emp) return false;
+      if (!employeeByIdMap.has(a.employeeId)) return false;
       if (selectedFloor !== 'ALL' && a.floorIdSnapshot !== selectedFloor) return false;
       if (selectedSection !== 'ALL' && a.sectionIdSnapshot !== selectedSection) return false;
       if (selectedDept !== 'ALL' && a.departmentIdSnapshot !== selectedDept) return false;
       if (selectedType !== 'ALL' && a.employeeTypeSnapshot !== selectedType) return false;
       return true;
     });
-  }, [attendanceRecords, employees, selectedFloor, selectedSection, selectedDept, selectedType]);
+  }, [attendanceRecords, employeeByIdMap, selectedFloor, selectedSection, selectedDept, selectedType]);
 
-  // First-In Last-Out Dashboard Metrics
-  const firstInCount = useMemo(() => {
-    return presentRecords.filter(a => !!(a.firstPunchIn || a.punchIn)).length;
-  }, [presentRecords]);
+  const dashboardMetrics = useMemo(() => {
+    let firstInCount = 0;
+    let finalOutCount = 0;
+    let currentlyInsideCount = 0;
+    let currentlyOutsideCount = 0;
+    let autoClosedCount = 0;
+    let missedPunchOutCount = 0;
+    let totalDutyMinutes = 0;
+    let totalOtMinutes = 0;
 
-  const finalOutCount = useMemo(() => {
-    return presentRecords.filter(a => !!(a.lastPunchOut || a.actualPunchOut)).length;
-  }, [presentRecords]);
+    const floorPresentCounts = new Map<string, number>();
+    const sectionPresentCounts = new Map<string, number>();
+    const deptPresentCounts = new Map<string, number>();
+    const typePresentCounts = new Map<string, number>();
 
-  const currentlyInsideCount = useMemo(() => {
-    return presentRecords.filter(a => a.currentState === 'INSIDE' || (!a.actualPunchOut && a.punchOutType === 'NONE')).length;
-  }, [presentRecords]);
+    for (const a of presentRecords) {
+      if (a.firstPunchIn || a.punchIn) firstInCount++;
+      if (a.lastPunchOut || a.actualPunchOut) finalOutCount++;
+      if (a.currentState === 'INSIDE' || (!a.actualPunchOut && a.punchOutType === 'NONE')) {
+        currentlyInsideCount++;
+      }
+      if (a.currentState === 'OUTSIDE' || !!a.actualPunchOut || a.punchOutType === 'ACTUAL') {
+        currentlyOutsideCount++;
+      }
+      if (a.punchOutType === 'AUTO' || a.autoClosed) autoClosedCount++;
+      if (a.missedPunchOut || a.attendanceStatus === 'MISSED PUNCH OUT' || a.punchOutType === 'AUTO') {
+        missedPunchOutCount++;
+      }
+      const resolved = resolveAttendanceMetrics(a);
+      if (!resolved.isOpen) {
+        totalDutyMinutes += resolved.completedDutyMinutes;
+        totalOtMinutes += resolved.overtimeMinutes;
+      }
 
-  const currentlyOutsideCount = useMemo(() => {
-    return presentRecords.filter(a => a.currentState === 'OUTSIDE' || (!!a.actualPunchOut || a.punchOutType === 'ACTUAL')).length;
-  }, [presentRecords]);
+      if (a.floorIdSnapshot) {
+        floorPresentCounts.set(a.floorIdSnapshot, (floorPresentCounts.get(a.floorIdSnapshot) || 0) + 1);
+      }
+      if (a.sectionIdSnapshot) {
+        sectionPresentCounts.set(a.sectionIdSnapshot, (sectionPresentCounts.get(a.sectionIdSnapshot) || 0) + 1);
+      }
+      if (a.departmentIdSnapshot) {
+        deptPresentCounts.set(a.departmentIdSnapshot, (deptPresentCounts.get(a.departmentIdSnapshot) || 0) + 1);
+      }
+      if (a.employeeTypeSnapshot) {
+        typePresentCounts.set(a.employeeTypeSnapshot, (typePresentCounts.get(a.employeeTypeSnapshot) || 0) + 1);
+      }
+    }
 
-  const autoClosedCount = useMemo(() => {
-    return presentRecords.filter(a => a.punchOutType === 'AUTO' || a.autoClosed).length;
-  }, [presentRecords]);
+    const floorActiveCounts = new Map<string, number>();
+    const sectionActiveCounts = new Map<string, number>();
+    const deptActiveCounts = new Map<string, number>();
+    const typeActiveCounts = new Map<string, number>();
 
-  const missedPunchOutCount = useMemo(() => {
-    return presentRecords.filter(a => a.missedPunchOut || a.attendanceStatus === 'MISSED PUNCH OUT' || a.punchOutType === 'AUTO').length;
-  }, [presentRecords]);
+    for (const emp of activeEmployees) {
+      if (emp.floor) floorActiveCounts.set(emp.floor, (floorActiveCounts.get(emp.floor) || 0) + 1);
+      if (emp.section) sectionActiveCounts.set(emp.section, (sectionActiveCounts.get(emp.section) || 0) + 1);
+      if (emp.department) deptActiveCounts.set(emp.department, (deptActiveCounts.get(emp.department) || 0) + 1);
+      if (emp.employeeType) typeActiveCounts.set(emp.employeeType, (typeActiveCounts.get(emp.employeeType) || 0) + 1);
+    }
 
-  const totalDutyMinutes = useMemo(() => {
-    return presentRecords.reduce((acc, curr) => acc + (curr.totalDutyMinutes || curr.regularDutyMinutes || 0), 0);
-  }, [presentRecords]);
+    return {
+      firstInCount,
+      finalOutCount,
+      currentlyInsideCount,
+      currentlyOutsideCount,
+      autoClosedCount,
+      missedPunchOutCount,
+      totalDutyMinutes,
+      totalOtMinutes,
+      floorActiveCounts,
+      floorPresentCounts,
+      sectionActiveCounts,
+      sectionPresentCounts,
+      deptActiveCounts,
+      deptPresentCounts,
+      typeActiveCounts,
+      typePresentCounts,
+    };
+  }, [presentRecords, activeEmployees]);
 
-  const totalOtMinutes = useMemo(() => {
-    return presentRecords.reduce((acc, curr) => acc + (curr.overtimeMinutes || 0), 0);
-  }, [presentRecords]);
+  const {
+    firstInCount,
+    finalOutCount,
+    currentlyInsideCount,
+    currentlyOutsideCount,
+    autoClosedCount,
+    missedPunchOutCount,
+    totalDutyMinutes,
+    totalOtMinutes,
+    floorActiveCounts,
+    floorPresentCounts,
+    sectionActiveCounts,
+    sectionPresentCounts,
+    deptActiveCounts,
+    deptPresentCounts,
+    typeActiveCounts,
+    typePresentCounts,
+  } = dashboardMetrics;
 
-  // Expected manpower calculation from Roster
-  const isRosterConfigured = rosterRecords.length > 0;
-  const scheduledCount = rosterRecords.filter(r => r.rosterStatus === 'SCHEDULED').length;
-  const leaveCount = rosterRecords.filter(r => r.rosterStatus === 'LEAVE').length;
+  // Expected manpower calculation from Roster (single pass)
+  const { isRosterConfigured, scheduledCount, leaveCount } = useMemo(() => {
+    let scheduled = 0;
+    let leave = 0;
+    for (const r of rosterRecords) {
+      if (r.rosterStatus === 'SCHEDULED') scheduled++;
+      else if (r.rosterStatus === 'LEAVE') leave++;
+    }
+    return {
+      isRosterConfigured: rosterRecords.length > 0,
+      scheduledCount: scheduled,
+      leaveCount: leave,
+    };
+  }, [rosterRecords]);
 
   const expectedManpower = isRosterConfigured
     ? Math.max(0, scheduledCount)
@@ -312,7 +401,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         const att = attendanceMap.get(emp.employeeId);
         let status = 'ABSENT';
         if (att) {
-          status = att.attendanceStatus;
+          status = resolveAttendanceMetrics(att).status;
         } else {
           const r = rosterMap.get(emp.employeeId);
           if (r?.rosterStatus === 'LEAVE') status = 'LEAVE';
@@ -449,7 +538,11 @@ export const Dashboard: React.FC<DashboardProps> = ({
         return (
           <div 
             key="duty_hours"
-            onClick={() => handleOpenDrilldown({ type: 'card', cardId: 'duty_hours' }, 'Employees with Completed Duty', (emp, att) => (att?.totalDutyMinutes || att?.regularDutyMinutes || 0) > 0)}
+            onClick={() => handleOpenDrilldown({ type: 'card', cardId: 'duty_hours' }, 'Employees with Completed Duty', (emp, att) => {
+              if (!att) return false;
+              const m = resolveAttendanceMetrics(att);
+              return !m.isOpen && m.completedDutyMinutes > 0;
+            })}
             className="bg-blue-50/50 p-3.5 rounded-xl border border-blue-200 shadow-2xs hover:border-blue-400 cursor-pointer transition"
           >
             <div className="text-[11px] font-semibold text-blue-800 uppercase">Duty Hours</div>
@@ -464,7 +557,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         return (
           <div 
             key="ot_hours"
-            onClick={() => handleOpenDrilldown({ type: 'card', cardId: 'ot_hours' }, 'Employees with Overtime', (emp, att) => (att?.overtimeMinutes || 0) > 0)}
+            onClick={() => handleOpenDrilldown({ type: 'card', cardId: 'ot_hours' }, 'Employees with Overtime', (emp, att) => !!att && resolveAttendanceMetrics(att).overtimeMinutes > 0)}
             className="bg-amber-50/50 p-3.5 rounded-xl border border-amber-200 shadow-2xs hover:border-amber-400 cursor-pointer transition"
           >
             <div className="text-[11px] font-semibold text-amber-800 uppercase">OT Hours</div>
@@ -762,10 +855,10 @@ export const Dashboard: React.FC<DashboardProps> = ({
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {floors.map(floor => {
-                  const floorEmps = activeEmployees.filter(e => e.floor === floor.name);
-                  const floorPresent = presentRecords.filter(a => a.floorIdSnapshot === floor.name).length;
-                  const floorAbsent = Math.max(0, floorEmps.length - floorPresent);
-                  const percent = floorEmps.length > 0 ? Math.round((floorPresent / floorEmps.length) * 100) : 0;
+                  const floorActive = floorActiveCounts.get(floor.name) || 0;
+                  const floorPresent = floorPresentCounts.get(floor.name) || 0;
+                  const floorAbsent = Math.max(0, floorActive - floorPresent);
+                  const percent = floorActive > 0 ? Math.round((floorPresent / floorActive) * 100) : 0;
 
                   return (
                     <tr
@@ -774,7 +867,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                       className="hover:bg-blue-50/50 cursor-pointer transition font-medium"
                     >
                       <td className="py-2.5 px-3 font-semibold text-slate-800">{floor.name}</td>
-                      <td className="py-2.5 px-3 text-center text-slate-600">{floorEmps.length}</td>
+                      <td className="py-2.5 px-3 text-center text-slate-600">{floorActive}</td>
                       <td className="py-2.5 px-3 text-center font-bold text-emerald-600">{floorPresent}</td>
                       <td className="py-2.5 px-3 text-center font-bold text-red-600">{floorAbsent}</td>
                       <td className="py-2.5 px-3 text-right">
@@ -820,10 +913,10 @@ export const Dashboard: React.FC<DashboardProps> = ({
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {sections.map(sec => {
-                  const secEmps = activeEmployees.filter(e => e.section === sec.name);
-                  const secPresent = presentRecords.filter(a => a.sectionIdSnapshot === sec.name).length;
-                  const secAbsent = Math.max(0, secEmps.length - secPresent);
-                  const percent = secEmps.length > 0 ? Math.round((secPresent / secEmps.length) * 100) : 0;
+                  const secActive = sectionActiveCounts.get(sec.name) || 0;
+                  const secPresent = sectionPresentCounts.get(sec.name) || 0;
+                  const secAbsent = Math.max(0, secActive - secPresent);
+                  const percent = secActive > 0 ? Math.round((secPresent / secActive) * 100) : 0;
 
                   return (
                     <tr
@@ -832,7 +925,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                       className="hover:bg-indigo-50/50 cursor-pointer transition font-medium"
                     >
                       <td className="py-2.5 px-3 font-semibold text-slate-800">{sec.name}</td>
-                      <td className="py-2.5 px-3 text-center text-slate-600">{secEmps.length}</td>
+                      <td className="py-2.5 px-3 text-center text-slate-600">{secActive}</td>
                       <td className="py-2.5 px-3 text-center font-bold text-emerald-600">{secPresent}</td>
                       <td className="py-2.5 px-3 text-center font-bold text-red-600">{secAbsent}</td>
                       <td className="py-2.5 px-3 text-right">
@@ -878,10 +971,10 @@ export const Dashboard: React.FC<DashboardProps> = ({
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {departments.map(dept => {
-                  const deptEmps = activeEmployees.filter(e => e.department === dept.name);
-                  const deptPresent = presentRecords.filter(a => a.departmentIdSnapshot === dept.name).length;
-                  const deptAbsent = Math.max(0, deptEmps.length - deptPresent);
-                  const percent = deptEmps.length > 0 ? Math.round((deptPresent / deptEmps.length) * 100) : 0;
+                  const deptActive = deptActiveCounts.get(dept.name) || 0;
+                  const deptPresent = deptPresentCounts.get(dept.name) || 0;
+                  const deptAbsent = Math.max(0, deptActive - deptPresent);
+                  const percent = deptActive > 0 ? Math.round((deptPresent / deptActive) * 100) : 0;
 
                   return (
                     <tr
@@ -890,7 +983,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                       className="hover:bg-cyan-50/50 cursor-pointer transition font-medium"
                     >
                       <td className="py-2.5 px-3 font-semibold text-slate-800">{dept.name}</td>
-                      <td className="py-2.5 px-3 text-center text-slate-600">{deptEmps.length}</td>
+                      <td className="py-2.5 px-3 text-center text-slate-600">{deptActive}</td>
                       <td className="py-2.5 px-3 text-center font-bold text-emerald-600">{deptPresent}</td>
                       <td className="py-2.5 px-3 text-center font-bold text-red-600">{deptAbsent}</td>
                       <td className="py-2.5 px-3 text-right">
@@ -936,10 +1029,10 @@ export const Dashboard: React.FC<DashboardProps> = ({
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {(['Permanent', 'Staff', 'Offroll'] as const).map(type => {
-                  const typeEmps = activeEmployees.filter(e => e.employeeType === type);
-                  const typePresent = presentRecords.filter(a => a.employeeTypeSnapshot === type).length;
-                  const typeAbsent = Math.max(0, typeEmps.length - typePresent);
-                  const percent = typeEmps.length > 0 ? Math.round((typePresent / typeEmps.length) * 100) : 0;
+                  const typeActive = typeActiveCounts.get(type) || 0;
+                  const typePresent = typePresentCounts.get(type) || 0;
+                  const typeAbsent = Math.max(0, typeActive - typePresent);
+                  const percent = typeActive > 0 ? Math.round((typePresent / typeActive) * 100) : 0;
 
                   return (
                     <tr
@@ -948,7 +1041,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                       className="hover:bg-purple-50/50 cursor-pointer transition font-medium"
                     >
                       <td className="py-2.5 px-3 font-semibold text-slate-800">{type}</td>
-                      <td className="py-2.5 px-3 text-center text-slate-600">{typeEmps.length}</td>
+                      <td className="py-2.5 px-3 text-center text-slate-600">{typeActive}</td>
                       <td className="py-2.5 px-3 text-center font-bold text-emerald-600">{typePresent}</td>
                       <td className="py-2.5 px-3 text-center font-bold text-red-600">{typeAbsent}</td>
                       <td className="py-2.5 px-3 text-right">
@@ -1011,6 +1104,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {drilldownEmployees.map(({ employee, attendance, status }) => {
+                    const resolved = attendance ? resolveAttendanceMetrics(attendance) : null;
                     return (
                       <tr key={employee.employeeId} className="hover:bg-slate-50">
                         <td className="py-2 px-3 font-mono font-bold text-slate-800">{employee.employeeId}</td>
@@ -1019,30 +1113,31 @@ export const Dashboard: React.FC<DashboardProps> = ({
                         <td className="py-2 px-3 text-slate-600">{employee.department}</td>
                         <td className="py-2 px-3 text-slate-600">{employee.employeeType}</td>
                         <td className="py-2 px-3">
-                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                            status === 'PRESENT' || status === 'COMPLETED' ? 'bg-emerald-100 text-emerald-800' :
-                            status === 'LATE' ? 'bg-amber-100 text-amber-800' :
-                            status === 'MISSED PUNCH OUT' ? 'bg-orange-100 text-orange-800' :
-                            'bg-red-100 text-red-800'
-                          }`}>
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${getAttendanceStatusBadgeClasses(status)}`}>
                             {status}
                           </span>
                         </td>
                         <td className="py-2 px-3 text-right font-mono text-[11px]">
-                          {attendance ? (
-                            <span>
-                              {canShowDutyHours && (
-                                <span>{formatMinutes(attendance.regularDutyMinutes).replace(' Hours', 'h')}</span>
-                              )}
-                              {canShowOtHours && attendance.overtimeMinutes > 0 && (
-                                <span className={`text-amber-600 ${canShowDutyHours ? 'ml-1' : ''}`}>
-                                  +{formatMinutes(attendance.overtimeMinutes).replace(' Hours', 'h')} OT
-                                </span>
-                              )}
-                              {!canShowDutyHours && (!canShowOtHours || attendance.overtimeMinutes <= 0) && (
-                                <span className="text-slate-400">Recorded</span>
-                              )}
-                            </span>
+                          {attendance && resolved ? (
+                            resolved.isOpen ? (
+                              <span className="text-sky-700">
+                                {canShowDutyHours ? `In Progress (${formatDurationClock(resolved.accumulatedDutyMinutes)})` : 'INSIDE'}
+                              </span>
+                            ) : (
+                              <span>
+                                {canShowDutyHours && (
+                                  <span>{formatDurationClock(resolved.completedDutyMinutes)}h</span>
+                                )}
+                                {canShowOtHours && resolved.overtimeMinutes > 0 && (
+                                  <span className={`text-indigo-700 font-bold ${canShowDutyHours ? 'ml-1.5' : ''}`}>
+                                    ({resolved.otLabel})
+                                  </span>
+                                )}
+                                {!canShowDutyHours && (!canShowOtHours || resolved.overtimeMinutes <= 0) && (
+                                  <span className="text-slate-400">Recorded</span>
+                                )}
+                              </span>
+                            )
                           ) : (
                             <span className="text-slate-400">--</span>
                           )}

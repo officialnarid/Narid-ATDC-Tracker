@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   QrCode, 
   Printer, 
@@ -15,7 +15,6 @@ import {
 } from 'lucide-react';
 import { Employee, Floor, Department } from '../types';
 import { regenerateQrToken } from '../services/employeeService';
-import QRCode from 'qrcode';
 
 interface QrManagementProps {
   employees: Employee[];
@@ -36,41 +35,96 @@ export const QrManagement: React.FC<QrManagementProps> = ({
   const [qrImages, setQrImages] = useState<Record<string, string>>({});
   const [selectedForPrint, setSelectedForPrint] = useState<Set<string>>(new Set());
   const [isPrintModalOpen, setIsPrintModalOpen] = useState(false);
+  const qrCacheRef = useRef<Map<string, string>>(new Map());
 
-  // Active employees only
-  const activeEmployees = employees.filter(e => e.employeeStatus === 'Active');
+  // Active employees only (memoized)
+  const activeEmployees = useMemo(
+    () => employees.filter(e => e.employeeStatus === 'Active'),
+    [employees]
+  );
 
-  // Generate QR data URLs
+  // Generate QR data URLs in parallel batches with cache keyed by employeeId + qrCodeToken
   useEffect(() => {
+    let cancelled = false;
     const generateQrs = async () => {
+      const targetList = activeEmployees.slice(0, 100);
+      if (targetList.length === 0) {
+        setQrImages({});
+        return;
+      }
+
+      const QRCodeMod = await import('qrcode');
+      const QRCode = QRCodeMod.default || QRCodeMod;
+      if (cancelled) return;
+
       const map: Record<string, string> = {};
-      for (const emp of activeEmployees.slice(0, 100)) { // Render top 100 on demand
-        try {
-          const payload = JSON.stringify({
-            employeeId: emp.employeeId,
-            token: emp.qrCodeToken,
-          });
-          map[emp.employeeId] = await QRCode.toDataURL(payload, { width: 180, margin: 2 });
-        } catch (e) {
-          console.error(e);
+      const pending: Employee[] = [];
+
+      for (const emp of targetList) {
+        const cacheKey = `${emp.employeeId}:${emp.qrCodeToken}`;
+        const cached = qrCacheRef.current.get(cacheKey);
+        if (cached) {
+          map[emp.employeeId] = cached;
+        } else {
+          pending.push(emp);
         }
       }
-      setQrImages(map);
+
+      if (pending.length === 0) {
+        setQrImages(map);
+        return;
+      }
+
+      const BATCH_SIZE = 20;
+      for (let i = 0; i < pending.length; i += BATCH_SIZE) {
+        if (cancelled) return;
+        const batch = pending.slice(i, i + BATCH_SIZE);
+        const results = await Promise.all(
+          batch.map(async (emp) => {
+            try {
+              const payload = JSON.stringify({
+                employeeId: emp.employeeId,
+                token: emp.qrCodeToken,
+              });
+              const dataUrl = await QRCode.toDataURL(payload, { width: 180, margin: 2 });
+              return { emp, dataUrl };
+            } catch (e) {
+              console.error(e);
+              return { emp, dataUrl: '' };
+            }
+          })
+        );
+        for (const { emp, dataUrl } of results) {
+          if (dataUrl) {
+            qrCacheRef.current.set(`${emp.employeeId}:${emp.qrCodeToken}`, dataUrl);
+            map[emp.employeeId] = dataUrl;
+          }
+        }
+      }
+
+      if (!cancelled) {
+        setQrImages({ ...map });
+      }
     };
     generateQrs();
-  }, [employees]);
+    return () => {
+      cancelled = true;
+    };
+  }, [activeEmployees]);
 
-  const filtered = activeEmployees.filter(emp => {
-    if (searchTerm.trim() !== '') {
-      const s = searchTerm.toLowerCase();
-      if (!emp.employeeId.toLowerCase().includes(s) && !emp.employeeName.toLowerCase().includes(s)) {
-        return false;
+  const filtered = useMemo(() => {
+    const s = searchTerm.trim().toLowerCase();
+    return activeEmployees.filter(emp => {
+      if (s !== '') {
+        if (!emp.employeeId.toLowerCase().includes(s) && !emp.employeeName.toLowerCase().includes(s)) {
+          return false;
+        }
       }
-    }
-    if (filterFloor !== 'ALL' && emp.floor !== filterFloor) return false;
-    if (filterDept !== 'ALL' && emp.department !== filterDept) return false;
-    return true;
-  });
+      if (filterFloor !== 'ALL' && emp.floor !== filterFloor) return false;
+      if (filterDept !== 'ALL' && emp.department !== filterDept) return false;
+      return true;
+    });
+  }, [activeEmployees, searchTerm, filterFloor, filterDept]);
 
   const toggleSelect = (empId: string) => {
     const next = new Set(selectedForPrint);

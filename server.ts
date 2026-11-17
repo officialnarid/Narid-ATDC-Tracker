@@ -38,6 +38,12 @@ import {
 } from './serverLoginSecurity.ts';
 import { registerAttendanceRoutes } from './serverAttendance.ts';
 import {
+  getCachedRoleDefDoc,
+  getCachedRolePermissionsDoc,
+  invalidateRoleCaches,
+} from './serverPerfCache.ts';
+import { resolveAttendanceMetrics } from './src/utils/attendanceStatus.ts';
+import {
   DASHBOARD_CARDS,
   DASHBOARD_VISIBILITY_KEYS,
   resolveDashboardVisibility,
@@ -1046,20 +1052,25 @@ export function createApp(options: ServerAppOptions = {}) {
       caller.profileDocId
         ? adminDb.collection('user_permissions').doc(caller.profileDocId).get()
         : Promise.resolve(null),
-      adminDb.collection('role_permissions').doc(caller.role).get(),
-      adminDb.collection('roles').doc(caller.role).get(),
-      caller.profileDocId
+      getCachedRolePermissionsDoc(adminDb, caller.role),
+      getCachedRoleDefDoc(adminDb, caller.role),
+      caller.modulesAllowed === undefined && caller.profileDocId
         ? adminDb.collection('user_roles').doc(caller.profileDocId).get()
         : Promise.resolve(null),
     ]);
 
     const hasUserOverride = userPermSnap?.exists && userPermSnap.data()?.isCustomOverride !== false;
     const userPerms = hasUserOverride ? userPermSnap?.data()?.permissions || {} : null;
-    const rolePerms = rolePermSnap?.exists ? rolePermSnap.data()?.modulePermissions || {} : null;
-    const roleDefaultPerms = roleDefSnap?.exists ? roleDefSnap.data()?.defaultPermissions || {} : null;
-    const userData = userRoleSnap?.exists ? userRoleSnap.data() || {} : {};
-    const modulesAllowed = Array.isArray(userData.modulesAllowed)
-      ? userData.modulesAllowed.map((m: any) => String(m).trim().toLowerCase())
+    const rolePerms = rolePermSnap?.exists ? rolePermSnap.data?.modulePermissions || {} : null;
+    const roleDefaultPerms = roleDefSnap?.exists ? roleDefSnap.data?.defaultPermissions || {} : null;
+    const rawModules =
+      caller.modulesAllowed !== undefined
+        ? caller.modulesAllowed
+        : userRoleSnap?.exists && Array.isArray(userRoleSnap.data()?.modulesAllowed)
+        ? userRoleSnap.data()!.modulesAllowed
+        : [];
+    const modulesAllowed = Array.isArray(rawModules)
+      ? rawModules.map((m: any) => String(m).trim().toLowerCase())
       : [];
 
     const visibility = resolveDashboardVisibility({
@@ -1160,7 +1171,17 @@ export function createApp(options: ServerAppOptions = {}) {
       }
 
       const targetDocId = userId || caller.profileDocId;
-      let userDoc = await adminDb.collection('user_roles').doc(targetDocId).get();
+      const speculativeSecId =
+        !loginId || loginId.trim().toLowerCase() === caller.loginId
+          ? `sec_${caller.loginId}`
+          : null;
+
+      let [userDoc, secSnap] = await Promise.all([
+        adminDb.collection('user_roles').doc(targetDocId).get(),
+        speculativeSecId
+          ? adminDb.collection('account_security').doc(speculativeSecId).get()
+          : Promise.resolve(null),
+      ]);
 
       if (!userDoc.exists && loginId) {
         const cleanId = loginId.trim().toLowerCase();
@@ -1193,7 +1214,9 @@ export function createApp(options: ServerAppOptions = {}) {
       const resolvedLoginId = String(userData.loginId || userDoc.id.replace(/^role_/, ''))
         .trim()
         .toLowerCase();
-      const secSnap = await adminDb.collection('account_security').doc(`sec_${resolvedLoginId}`).get();
+      if (!secSnap || speculativeSecId !== `sec_${resolvedLoginId}`) {
+        secSnap = await adminDb.collection('account_security').doc(`sec_${resolvedLoginId}`).get();
+      }
       const secData = secSnap.exists ? secSnap.data() || {} : null;
       const isLocked =
         secData?.lockStatus === 'LOCKED' ||
@@ -2271,6 +2294,8 @@ export function createApp(options: ServerAppOptions = {}) {
         details: `Updated permissions and role for user "${oldData.loginId}"`,
       });
 
+      invalidateRoleCaches(adminDb, effectiveRole);
+
       return res.json({ success: true, message: `Permissions for "${oldData.loginId}" updated successfully.` });
     } catch (err: any) {
       console.error('[Set User Permissions] Error:', err);
@@ -2391,6 +2416,8 @@ export function createApp(options: ServerAppOptions = {}) {
         newValue: { roleId, allowedModules },
         details: `Updated default role permissions for role "${roleId.toUpperCase()}"`,
       });
+
+      invalidateRoleCaches(adminDb, roleId);
 
       return res.json({
         success: true,
@@ -2610,6 +2637,8 @@ export function createApp(options: ServerAppOptions = {}) {
         details: `${existingSnap.exists ? 'Updated' : 'Created'} role "${roleDoc.roleName}" (${derivedId}).`,
       });
 
+      invalidateRoleCaches(adminDb, derivedId);
+
       return res.json({
         success: true,
         created: !existingSnap.exists,
@@ -2678,6 +2707,8 @@ export function createApp(options: ServerAppOptions = {}) {
         },
         details: `Deleted custom role "${prevRoleData.roleName || roleId}" (${roleId}).`,
       });
+
+      invalidateRoleCaches(adminDb, roleId);
 
       return res.json({
         success: true,
@@ -2999,11 +3030,16 @@ export function createApp(options: ServerAppOptions = {}) {
       ).length;
       const firstIn = attendance.filter((a) => !!(a.firstPunchIn || a.punchIn)).length;
       const finalOut = attendance.filter((a) => !!(a.lastPunchOut || a.actualPunchOut)).length;
-      const dutyHoursMins = attendance.reduce(
-        (acc, curr) => acc + Number(curr.totalDutyMinutes || curr.regularDutyMinutes || 0),
-        0
-      );
-      const otHoursMins = attendance.reduce((acc, curr) => acc + Number(curr.overtimeMinutes || 0), 0);
+      const nowMs = Date.now();
+      let dutyHoursMins = 0;
+      let otHoursMins = 0;
+      for (const curr of attendance) {
+        const m = resolveAttendanceMetrics(curr, nowMs);
+        if (!m.isOpen) {
+          dutyHoursMins += m.completedDutyMinutes;
+          otHoursMins += m.overtimeMinutes;
+        }
+      }
       const autoClosed = attendance.filter((a) => a.punchOutType === 'AUTO' || a.autoClosed).length;
       const missedPunchOut = attendance.filter(
         (a) => a.missedPunchOut || a.attendanceStatus === 'MISSED PUNCH OUT'

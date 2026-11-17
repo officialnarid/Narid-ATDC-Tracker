@@ -3,9 +3,41 @@ import crypto from 'crypto';
 import { z } from 'zod';
 import {
   type AdminFirestoreLike,
+  type AdminQuerySnapLike,
   type VerifiedCaller,
   recordEnterpriseAuditEvent,
 } from './serverSecurityAudit.ts';
+import {
+  getCachedRolePermissionsDoc,
+  getCachedShifts,
+  getCachedSystemSettings,
+  runWithOptionalClientRequestDedup,
+  roundMs,
+  emitNonSensitivePerfLog,
+  type AttendancePerfMetrics,
+} from './serverPerfCache.ts';
+import {
+  classifyCompletedDutyStatus,
+  STANDARD_DUTY_MINUTES,
+} from './src/utils/attendanceStatus.ts';
+
+const KOLKATA_PARTS_FORMATTER = new Intl.DateTimeFormat('en-IN', {
+  timeZone: 'Asia/Kolkata',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+});
+
+const KOLKATA_TIME_DISPLAY_FORMATTER = new Intl.DateTimeFormat('en-IN', {
+  timeZone: 'Asia/Kolkata',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: true,
+});
 
 // ============================================================================
 // Constants & Default Shift / Setting Definitions (100% Preserved from App)
@@ -96,18 +128,7 @@ export function getKolkataTimeParts(date: Date = new Date()): {
   timeDisplay: string;
   timeWithSeconds: string;
 } {
-  const formatter = new Intl.DateTimeFormat('en-IN', {
-    timeZone: 'Asia/Kolkata',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  });
-
-  const parts = formatter.formatToParts(date);
+  const parts = KOLKATA_PARTS_FORMATTER.formatToParts(date);
   const map: Record<string, string> = {};
   for (const p of parts) {
     map[p.type] = p.value;
@@ -167,12 +188,7 @@ export function getShiftScheduledEndIso(shiftDate: string, shift: any): string {
 export function formatTimeDisplay(isoString: string | null): string {
   if (!isoString) return '--:--';
   const d = new Date(isoString);
-  return d.toLocaleTimeString('en-IN', {
-    timeZone: 'Asia/Kolkata',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: true,
-  });
+  return KOLKATA_TIME_DISPLAY_FORMATTER.format(d);
 }
 
 export type QrPayloadFormat = 'JSON_TOKEN' | 'TOKEN_STRING' | 'LEGACY_EMPLOYEE_ID' | 'INVALID';
@@ -281,6 +297,7 @@ const AttendanceScanSchema = z.object({
   scannerType: z.enum(['IN', 'OUT']).optional(),
   scannerDevice: z.enum(['USB_SCANNER', 'WEBCAM', 'MANUAL', 'SYSTEM_AUTO']).optional(),
   customScanTime: z.string().datetime({ offset: true }).or(z.string().datetime()).optional(),
+  clientRequestId: z.string().trim().min(4).max(64).optional(),
 });
 
 const ManualPunchSchema = z.object({
@@ -296,6 +313,7 @@ const ManualPunchSchema = z.object({
   scannerType: z.enum(['IN', 'OUT']).optional(),
   reason: z.string().trim().max(250).optional(),
   customScanTime: z.string().datetime({ offset: true }).or(z.string().datetime()).optional(),
+  clientRequestId: z.string().trim().min(4).max(64).optional(),
 });
 
 const AttendanceCorrectSchema = z.object({
@@ -303,12 +321,15 @@ const AttendanceCorrectSchema = z.object({
   actualPunchOut: z.string().optional(),
   punchOutType: z.enum(['ACTUAL', 'AUTO']),
   attendanceStatus: z.enum([
+    'IN PROGRESS',
+    'SHORT LEAVE',
+    'HALF DAY',
+    'COMPLETED',
+    'COMPLETED + OT',
     'PRESENT',
     'LATE',
-    'COMPLETED',
     'AUTO CLOSED',
     'MISSED PUNCH OUT',
-    'HALF DAY',
     'ABSENT',
     'ON LEAVE',
   ]),
@@ -346,6 +367,47 @@ const ADMIN_FALLBACK_ACTIONS: Record<string, { view?: boolean; add?: boolean; ed
   reports: { view: true },
 };
 
+function evalModuleActionFromSnapshots(
+  caller: VerifiedCaller,
+  userPermData: Record<string, any> | undefined,
+  rolePermData: Record<string, any> | undefined,
+  fallbackModules: string[] | undefined,
+  moduleKey: string,
+  action: 'view' | 'add' | 'edit' | 'delete'
+): boolean {
+  if (caller.role === 'super_admin') return true;
+  if (moduleKey === 'user_rights' || moduleKey === 'audit_logs' || moduleKey === 'security_management') {
+    return false;
+  }
+
+  if (userPermData && userPermData.isCustomOverride !== false) {
+    const mod = userPermData.permissions?.[moduleKey];
+    if (mod && typeof mod[action] === 'boolean') {
+      return mod[action] === true && (action === 'view' || mod.view !== false);
+    }
+  }
+
+  if (rolePermData) {
+    const mod = rolePermData.modulePermissions?.[moduleKey];
+    if (mod && typeof mod[action] === 'boolean') {
+      return mod[action] === true && (action === 'view' || mod.view !== false);
+    }
+  }
+
+  if (caller.role === 'admin') {
+    return Boolean(ADMIN_FALLBACK_ACTIONS[moduleKey]?.[action]);
+  }
+
+  if (Array.isArray(fallbackModules)) {
+    if (fallbackModules.includes('all') || fallbackModules.includes(moduleKey)) {
+      if (action === 'view') return true;
+      if (moduleKey === 'scanner' && action === 'add') return true;
+    }
+  }
+
+  return false;
+}
+
 async function callerHasModuleAction(
   db: AdminFirestoreLike,
   caller: VerifiedCaller,
@@ -358,39 +420,29 @@ async function callerHasModuleAction(
   }
 
   try {
-    const userPermSnap = await db.collection('user_permissions').doc(caller.profileDocId).get();
-    if (userPermSnap.exists && userPermSnap.data()?.isCustomOverride !== false) {
-      const mod = userPermSnap.data()?.permissions?.[moduleKey];
-      if (mod && typeof mod[action] === 'boolean') {
-        return mod[action] === true && (action === 'view' || mod.view !== false);
+    const [userPermSnap, rolePermSnap] = await Promise.all([
+      db.collection('user_permissions').doc(caller.profileDocId).get(),
+      getCachedRolePermissionsDoc(db, caller.role),
+    ]);
+    const userPermData = userPermSnap.exists ? userPermSnap.data() : undefined;
+    const rolePermData = rolePermSnap.exists ? rolePermSnap.data : undefined;
+
+    let fallbackModules = caller.modulesAllowed;
+    if (fallbackModules === undefined && caller.role !== 'admin') {
+      const userSnap = await db.collection('user_roles').doc(caller.profileDocId).get();
+      if (userSnap.exists && Array.isArray(userSnap.data()?.modulesAllowed)) {
+        fallbackModules = userSnap.data()!.modulesAllowed;
       }
     }
 
-    const rolePermSnap = await db.collection('role_permissions').doc(caller.role).get();
-    if (rolePermSnap.exists) {
-      const mod = rolePermSnap.data()?.modulePermissions?.[moduleKey];
-      if (mod && typeof mod[action] === 'boolean') {
-        return mod[action] === true && (action === 'view' || mod.view !== false);
-      }
-    }
-
-    // Legacy / unseeded built-in defaults & modulesAllowed compatibility
-    if (caller.role === 'admin') {
-      return Boolean(ADMIN_FALLBACK_ACTIONS[moduleKey]?.[action]);
-    }
-
-    const userSnap = await db.collection('user_roles').doc(caller.profileDocId).get();
-    if (userSnap.exists) {
-      const mods: any[] = Array.isArray(userSnap.data()?.modulesAllowed)
-        ? userSnap.data()!.modulesAllowed
-        : [];
-      if (mods.includes('all') || mods.includes(moduleKey)) {
-        if (action === 'view') return true;
-        if (moduleKey === 'scanner' && action === 'add') return true;
-      }
-    }
-
-    return false;
+    return evalModuleActionFromSnapshots(
+      caller,
+      userPermData,
+      rolePermData,
+      fallbackModules,
+      moduleKey,
+      action
+    );
   } catch (err) {
     console.warn(`[Attendance Permission Guard] Lookup failed (${moduleKey}.${action}); failing closed:`, (err as any)?.message || err);
     return false;
@@ -406,84 +458,115 @@ function isScannerCapabilityEntryEnabled(entry: any): boolean {
   return entry.view === true;
 }
 
-async function callerHasScannerAccess(db: AdminFirestoreLike, caller: VerifiedCaller): Promise<boolean> {
-  const canView = await callerHasModuleAction(db, caller, 'scanner', 'view');
-  if (!canView) return false;
-  return callerHasModuleAction(db, caller, 'scanner', 'add');
-}
+async function resolveCallerAttendancePermissions(
+  db: AdminFirestoreLike,
+  caller: VerifiedCaller
+): Promise<{
+  canQrScan: boolean;
+  canManualEntry: boolean;
+  canCustomTime: boolean;
+  cacheHitRolePerms: boolean;
+}> {
+  if (caller.role === 'super_admin') {
+    return {
+      canQrScan: true,
+      canManualEntry: true,
+      canCustomTime: true,
+      cacheHitRolePerms: true,
+    };
+  }
 
-async function callerHasQrScanAccess(db: AdminFirestoreLike, caller: VerifiedCaller): Promise<boolean> {
-  if (caller.role === 'super_admin') return true;
   try {
-    const userPermSnap = await db.collection('user_permissions').doc(caller.profileDocId).get();
-    if (userPermSnap.exists && userPermSnap.data()?.isCustomOverride !== false) {
-      const perms = userPermSnap.data()?.permissions || {};
+    const [userPermSnap, rolePermSnap] = await Promise.all([
+      db.collection('user_permissions').doc(caller.profileDocId).get(),
+      getCachedRolePermissionsDoc(db, caller.role),
+    ]);
+
+    const userPermData = userPermSnap.exists ? userPermSnap.data() : undefined;
+    const rolePermData = rolePermSnap.exists ? rolePermSnap.data : undefined;
+
+    let fallbackModules = caller.modulesAllowed;
+    if (fallbackModules === undefined && caller.role !== 'admin') {
+      const userSnap = await db.collection('user_roles').doc(caller.profileDocId).get();
+      if (userSnap.exists && Array.isArray(userSnap.data()?.modulesAllowed)) {
+        fallbackModules = userSnap.data()!.modulesAllowed;
+      }
+    }
+
+    // Resolve QR Scan access with exact legacy fallback rules
+    let canQrScan: boolean | null = null;
+    if (userPermData && userPermData.isCustomOverride !== false) {
+      const perms = userPermData.permissions || {};
       const qrEntry = perms['attendance.qr.scan'];
       if (qrEntry && typeof qrEntry === 'object' && (typeof qrEntry.view === 'boolean' || typeof qrEntry.add === 'boolean')) {
-        return isScannerCapabilityEntryEnabled(qrEntry);
-      }
-      if (perms.scanner && typeof perms.scanner === 'object') {
-        return isScannerCapabilityEntryEnabled(perms.scanner);
+        canQrScan = isScannerCapabilityEntryEnabled(qrEntry);
+      } else if (perms.scanner && typeof perms.scanner === 'object') {
+        canQrScan = isScannerCapabilityEntryEnabled(perms.scanner);
       }
     }
-
-    const rolePermSnap = await db.collection('role_permissions').doc(caller.role).get();
-    if (rolePermSnap.exists) {
-      const modPerms = rolePermSnap.data()?.modulePermissions || {};
+    if (canQrScan === null && rolePermData) {
+      const modPerms = rolePermData.modulePermissions || {};
       const qrEntry = modPerms['attendance.qr.scan'];
       if (qrEntry && typeof qrEntry === 'object' && (typeof qrEntry.view === 'boolean' || typeof qrEntry.add === 'boolean')) {
-        return isScannerCapabilityEntryEnabled(qrEntry);
-      }
-      if (modPerms.scanner && typeof modPerms.scanner === 'object') {
-        return isScannerCapabilityEntryEnabled(modPerms.scanner);
+        canQrScan = isScannerCapabilityEntryEnabled(qrEntry);
+      } else if (modPerms.scanner && typeof modPerms.scanner === 'object') {
+        canQrScan = isScannerCapabilityEntryEnabled(modPerms.scanner);
       }
     }
+    if (canQrScan === null) {
+      canQrScan =
+        evalModuleActionFromSnapshots(caller, userPermData, rolePermData, fallbackModules, 'scanner', 'view') &&
+        evalModuleActionFromSnapshots(caller, userPermData, rolePermData, fallbackModules, 'scanner', 'add');
+    }
 
-    // Legacy fallback when attendance.qr.scan has not yet been configured in role_permissions
-    return callerHasScannerAccess(db, caller);
-  } catch (err) {
-    console.warn('[Attendance QR Permission Guard] Lookup failed; failing closed:', (err as any)?.message || err);
-    return false;
-  }
-}
-
-async function callerHasManualEntryAccess(db: AdminFirestoreLike, caller: VerifiedCaller): Promise<boolean> {
-  if (caller.role === 'super_admin') return true;
-  try {
-    const userPermSnap = await db.collection('user_permissions').doc(caller.profileDocId).get();
-    if (userPermSnap.exists && userPermSnap.data()?.isCustomOverride !== false) {
-      const perms = userPermSnap.data()?.permissions || {};
+    // Resolve Manual Employee ID Entry access (strictly deny-by-default)
+    let canManualEntry: boolean | null = null;
+    if (userPermData && userPermData.isCustomOverride !== false) {
+      const perms = userPermData.permissions || {};
       const manualEntry = perms['attendance.manual.entry'];
       if (
         manualEntry &&
         typeof manualEntry === 'object' &&
         (typeof manualEntry.view === 'boolean' || typeof manualEntry.add === 'boolean')
       ) {
-        return isScannerCapabilityEntryEnabled(manualEntry);
-      }
-      if (perms.scanner?.view === false) {
-        return false;
+        canManualEntry = isScannerCapabilityEntryEnabled(manualEntry);
+      } else if (perms.scanner?.view === false) {
+        canManualEntry = false;
       }
     }
-
-    const rolePermSnap = await db.collection('role_permissions').doc(caller.role).get();
-    if (rolePermSnap.exists) {
-      const modPerms = rolePermSnap.data()?.modulePermissions || {};
+    if (canManualEntry === null && rolePermData) {
+      const modPerms = rolePermData.modulePermissions || {};
       const manualEntry = modPerms['attendance.manual.entry'];
       if (
         manualEntry &&
         typeof manualEntry === 'object' &&
         (typeof manualEntry.view === 'boolean' || typeof manualEntry.add === 'boolean')
       ) {
-        return isScannerCapabilityEntryEnabled(manualEntry);
+        canManualEntry = isScannerCapabilityEntryEnabled(manualEntry);
       }
     }
+    if (canManualEntry === null) {
+      canManualEntry = false;
+    }
 
-    // Strict deny-by-default: never auto-enabled from scanner/QR permissions or legacy modulesAllowed
-    return false;
+    const canCustomTime =
+      evalModuleActionFromSnapshots(caller, userPermData, rolePermData, fallbackModules, 'scanner', 'edit') ||
+      evalModuleActionFromSnapshots(caller, userPermData, rolePermData, fallbackModules, 'history', 'edit');
+
+    return {
+      canQrScan,
+      canManualEntry,
+      canCustomTime,
+      cacheHitRolePerms: rolePermSnap.cacheHit,
+    };
   } catch (err) {
-    console.warn('[Attendance Manual Entry Permission Guard] Lookup failed; failing closed:', (err as any)?.message || err);
-    return false;
+    console.warn('[Attendance Permission Context] Lookup failed; failing closed:', (err as any)?.message || err);
+    return {
+      canQrScan: false,
+      canManualEntry: false,
+      canCustomTime: false,
+      cacheHitRolePerms: false,
+    };
   }
 }
 
@@ -512,6 +595,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
   // 1. POST /api/attendance/scan — Authenticated Atomic First-In / Last-Out Engine
   // --------------------------------------------------------------------------
   app.post('/api/attendance/scan', async (req: Request, res: Response) => {
+    const reqStartMs = performance.now();
     try {
       const caller = await requireVerifiedCaller(
         req,
@@ -520,9 +604,13 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         'Attendance Scan Processing'
       );
       if (!caller) return;
+      const authDoneMs = performance.now();
 
-      const canScan = await callerHasQrScanAccess(db, caller);
-      if (!canScan) {
+      const parsed = AttendanceScanSchema.safeParse(req.body);
+      const perms = await resolveCallerAttendancePermissions(db, caller);
+      const permDoneMs = performance.now();
+
+      if (!perms.canQrScan) {
         await recordEnterpriseAuditEvent(db, {
           req,
           action: 'unauthorized_access_attempt',
@@ -545,7 +633,6 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         });
       }
 
-      const parsed = AttendanceScanSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({
           success: false,
@@ -555,20 +642,15 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         });
       }
 
-      const { rawPayload, scannerDevice = 'USB_SCANNER', customScanTime } = parsed.data;
-      let { scannerType } = parsed.data;
+      const { rawPayload, scannerDevice = 'USB_SCANNER', customScanTime, clientRequestId } = parsed.data;
+      const { scannerType } = parsed.data;
 
       // Only roles permitted scanner.edit or history.edit can submit customScanTime (prevents operator timestamp spoofing)
-      if (customScanTime) {
-        const canCustomTime =
-          (await callerHasModuleAction(db, caller, 'scanner', 'edit')) ||
-          (await callerHasModuleAction(db, caller, 'history', 'edit'));
-        if (!canCustomTime) {
-          return res.status(403).json({
-            success: false,
-            error: 'Forbidden: Your role is not permitted to submit custom scan timestamps.',
-          });
-        }
+      if (customScanTime && !perms.canCustomTime) {
+        return res.status(403).json({
+          success: false,
+          error: 'Forbidden: Your role is not permitted to submit custom scan timestamps.',
+        });
       }
 
       const now = customScanTime ? new Date(customScanTime) : new Date();
@@ -601,107 +683,147 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         });
       }
 
-      const outcome = await withEmployeeScanLock(employeeId, async () => {
-        const empSnap = await db.collection('employees').doc(employeeId).get();
-        if (!empSnap.exists) {
-          await writePunchLog({
-            employeeId,
-            timestamp: now.toISOString(),
-            action: 'REJECTED_TOKEN',
-            rawPayload,
-            scannerDevice,
-            performedByUid: caller.uid,
-            performedByLoginId: caller.loginId,
-            message: `Employee ID ${employeeId} not found in database.`,
-          });
-          return {
-            httpStatus: 404,
-            body: {
-              success: false,
-              action: 'REJECTED',
-              scannerType: scannerType || 'IN',
-              error: `Invalid QR Code. Employee "${employeeId}" Not Found.`,
-              message: `Invalid QR Code. Employee "${employeeId}" Not Found.`,
-              time: timeDisplay,
-            },
-          };
-        }
+      const dedupKey = clientRequestId ? `scan:${caller.uid}:${employeeId}:${clientRequestId}` : null;
+      const outcome = await runWithOptionalClientRequestDedup(db, dedupKey, () =>
+        withEmployeeScanLock(employeeId, async () => {
+          const lookupStartMs = performance.now();
+          const yesterdayKey = getYesterdayKolkataDateKey(now);
 
-        const employee = empSnap.data()!;
-        if (employee.employeeStatus !== 'Active') {
-          await writePunchLog({
-            employeeId: employee.employeeId,
-            employeeName: employee.employeeName,
-            timestamp: now.toISOString(),
-            action: 'REJECTED_INACTIVE',
-            rawPayload,
-            scannerDevice,
-            performedByUid: caller.uid,
-            performedByLoginId: caller.loginId,
-            message: `Employee ${employeeId} is inactive.`,
-          });
-          return {
-            httpStatus: 400,
-            body: {
-              success: false,
-              action: 'REJECTED',
-              scannerType: scannerType || 'IN',
-              employee,
-              error: 'Employee Is Inactive. Attendance Cannot Be Recorded.',
-              message: 'Employee Is Inactive. Attendance Cannot Be Recorded.',
-              time: timeDisplay,
-            },
-          };
-        }
+          // Single parallel batch: authoritative employee doc + attendance window + cached shifts & settings
+          const [empSnap, candidateSnap, shiftsRes, settingsRes] = await Promise.all([
+            db.collection('employees').doc(employeeId).get(),
+            db
+              .collection('attendance')
+              .where('employeeId', '==', employeeId)
+              .where('shiftDate', '>=', yesterdayKey)
+              .get(),
+            getCachedShifts(db, DEFAULT_SHIFTS),
+            getCachedSystemSettings(db, DEFAULT_SETTINGS),
+          ]);
+          const lookupDoneMs = performance.now();
 
-        // Strict QR security token validation (unchanged for QR scans):
-        // Whenever an employee has qrCodeToken configured, QR scanning requires a matching token.
-        if (employee.qrCodeToken && (!token || token !== employee.qrCodeToken)) {
-          await writePunchLog({
-            employeeId: employee.employeeId,
-            employeeName: employee.employeeName,
-            timestamp: now.toISOString(),
-            action: 'REJECTED_TOKEN',
-            rawPayload,
-            scannerDevice,
-            qrVerificationMode: 'TOKEN_REJECTED',
-            performedByUid: caller.uid,
-            performedByLoginId: caller.loginId,
-            message: token
-              ? `Token mismatch: provided ${token}, expected configured qrCodeToken`
-              : 'Missing required QR security token for employee with configured qrCodeToken',
-          });
-          return {
-            httpStatus: 403,
-            body: {
-              success: false,
-              action: 'REJECTED',
-              scannerType: scannerType || 'IN',
-              employee,
-              error: token
-                ? 'QR Token Expired or Revoked. Please re-issue QR code.'
-                : 'Invalid QR Payload: Security token is required for this employee.',
+          if (!empSnap.exists) {
+            await writePunchLog({
+              employeeId,
+              timestamp: now.toISOString(),
+              action: 'REJECTED_TOKEN',
+              rawPayload,
+              scannerDevice,
+              performedByUid: caller.uid,
+              performedByLoginId: caller.loginId,
+              message: `Employee ID ${employeeId} not found in database.`,
+            });
+            return {
+              httpStatus: 404,
+              body: {
+                success: false,
+                action: 'REJECTED',
+                scannerType: scannerType || 'IN',
+                error: `Invalid QR Code. Employee "${employeeId}" Not Found.`,
+                message: `Invalid QR Code. Employee "${employeeId}" Not Found.`,
+                time: timeDisplay,
+              },
+            };
+          }
+
+          const employee = empSnap.data()!;
+          if (employee.employeeStatus !== 'Active') {
+            await writePunchLog({
+              employeeId: employee.employeeId,
+              employeeName: employee.employeeName,
+              timestamp: now.toISOString(),
+              action: 'REJECTED_INACTIVE',
+              rawPayload,
+              scannerDevice,
+              performedByUid: caller.uid,
+              performedByLoginId: caller.loginId,
+              message: `Employee ${employeeId} is inactive.`,
+            });
+            return {
+              httpStatus: 400,
+              body: {
+                success: false,
+                action: 'REJECTED',
+                scannerType: scannerType || 'IN',
+                employee,
+                error: 'Employee Is Inactive. Attendance Cannot Be Recorded.',
+                message: 'Employee Is Inactive. Attendance Cannot Be Recorded.',
+                time: timeDisplay,
+              },
+            };
+          }
+
+          // Strict QR security token validation (unchanged for QR scans):
+          if (employee.qrCodeToken && (!token || token !== employee.qrCodeToken)) {
+            await writePunchLog({
+              employeeId: employee.employeeId,
+              employeeName: employee.employeeName,
+              timestamp: now.toISOString(),
+              action: 'REJECTED_TOKEN',
+              rawPayload,
+              scannerDevice,
+              qrVerificationMode: 'TOKEN_REJECTED',
+              performedByUid: caller.uid,
+              performedByLoginId: caller.loginId,
               message: token
-                ? 'QR Token Expired or Revoked. Please re-issue QR code.'
-                : 'Invalid QR Payload: Security token is required for this employee.',
-              time: timeDisplay,
-            },
-          };
-        }
+                ? `Token mismatch: provided ${token}, expected configured qrCodeToken`
+                : 'Missing required QR security token for employee with configured qrCodeToken',
+            });
+            return {
+              httpStatus: 403,
+              body: {
+                success: false,
+                action: 'REJECTED',
+                scannerType: scannerType || 'IN',
+                employee,
+                error: token
+                  ? 'QR Token Expired or Revoked. Please re-issue QR code.'
+                  : 'Invalid QR Payload: Security token is required for this employee.',
+                message: token
+                  ? 'QR Token Expired or Revoked. Please re-issue QR code.'
+                  : 'Invalid QR Payload: Security token is required for this employee.',
+                time: timeDisplay,
+              },
+            };
+          }
 
-        const qrVerificationMode = token ? 'TOKEN_VERIFIED' : 'UNTOKENIZED_EMPLOYEE';
-        return executePunchForVerifiedEmployee({
-          employee,
-          caller,
-          now,
-          kolkata,
-          timeDisplay,
-          scannerType,
-          scannerDevice,
-          rawPayload,
-          qrVerificationMode,
-        });
-      });
+          const qrVerificationMode = token ? 'TOKEN_VERIFIED' : 'UNTOKENIZED_EMPLOYEE';
+          const txStartMs = performance.now();
+          const punchRes = await executePunchForVerifiedEmployee({
+            employee,
+            caller,
+            now,
+            kolkata,
+            timeDisplay,
+            scannerType,
+            scannerDevice,
+            rawPayload,
+            qrVerificationMode,
+            shifts: shiftsRes.shifts,
+            settings: settingsRes.data,
+            candidateSnap,
+          });
+          const txDoneMs = performance.now();
+
+          const perf: AttendancePerfMetrics = {
+            authMs: roundMs(authDoneMs - reqStartMs),
+            permissionMs: roundMs(permDoneMs - authDoneMs),
+            lookupAndQueryMs: roundMs(lookupDoneMs - lookupStartMs),
+            txMs: roundMs(txDoneMs - txStartMs),
+            totalServerMs: roundMs(txDoneMs - reqStartMs),
+            cacheHitRolePerms: perms.cacheHitRolePerms,
+            cacheHitConfig: shiftsRes.cacheHit && settingsRes.cacheHit,
+          };
+          emitNonSensitivePerfLog('attendance.scan', {
+            status: punchRes.httpStatus,
+            ...perf,
+          });
+          return {
+            httpStatus: punchRes.httpStatus,
+            body: { ...punchRes.body, perf },
+          };
+        })
+      );
 
       return res.status(outcome.httpStatus).json(outcome.body);
     } catch (err: any) {
@@ -720,6 +842,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
   //     Separate from QR token verification; enforces caller RBAC + employee validation + attendance rules.
   // --------------------------------------------------------------------------
   app.post('/api/attendance/manual-punch', async (req: Request, res: Response) => {
+    const reqStartMs = performance.now();
     try {
       const caller = await requireVerifiedCaller(
         req,
@@ -728,9 +851,13 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         'Manual Employee ID Punch'
       );
       if (!caller) return;
+      const authDoneMs = performance.now();
 
-      const canManualPunch = await callerHasManualEntryAccess(db, caller);
-      if (!canManualPunch) {
+      const parsed = ManualPunchSchema.safeParse(req.body);
+      const perms = await resolveCallerAttendancePermissions(db, caller);
+      const permDoneMs = performance.now();
+
+      if (!perms.canManualEntry) {
         await recordEnterpriseAuditEvent(db, {
           req,
           action: 'unauthorized_access_attempt',
@@ -753,7 +880,6 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         });
       }
 
-      const parsed = ManualPunchSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({
           success: false,
@@ -763,18 +889,13 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         });
       }
 
-      const { employeeId, scannerType, reason, customScanTime } = parsed.data;
+      const { employeeId, scannerType, reason, customScanTime, clientRequestId } = parsed.data;
 
-      if (customScanTime) {
-        const canCustomTime =
-          (await callerHasModuleAction(db, caller, 'scanner', 'edit')) ||
-          (await callerHasModuleAction(db, caller, 'history', 'edit'));
-        if (!canCustomTime) {
-          return res.status(403).json({
-            success: false,
-            error: 'Forbidden: Your role is not permitted to submit custom punch timestamps.',
-          });
-        }
+      if (customScanTime && !perms.canCustomTime) {
+        return res.status(403).json({
+          success: false,
+          error: 'Forbidden: Your role is not permitted to submit custom punch timestamps.',
+        });
       }
 
       const now = customScanTime ? new Date(customScanTime) : new Date();
@@ -786,93 +907,135 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
       const timeDisplay = kolkata.timeWithSeconds;
       const rawPayload = `MANUAL:${employeeId}`;
 
-      const outcome = await withEmployeeScanLock(employeeId, async () => {
-        const empSnap = await db.collection('employees').doc(employeeId).get();
-        if (!empSnap.exists) {
-          await writePunchLog({
-            employeeId,
-            timestamp: now.toISOString(),
-            action: 'REJECTED_TOKEN',
-            rawPayload,
+      const dedupKey = clientRequestId ? `manual:${caller.uid}:${employeeId}:${clientRequestId}` : null;
+      const outcome = await runWithOptionalClientRequestDedup(db, dedupKey, () =>
+        withEmployeeScanLock(employeeId, async () => {
+          const lookupStartMs = performance.now();
+          const yesterdayKey = getYesterdayKolkataDateKey(now);
+
+          const [empSnap, candidateSnap, shiftsRes, settingsRes] = await Promise.all([
+            db.collection('employees').doc(employeeId).get(),
+            db
+              .collection('attendance')
+              .where('employeeId', '==', employeeId)
+              .where('shiftDate', '>=', yesterdayKey)
+              .get(),
+            getCachedShifts(db, DEFAULT_SHIFTS),
+            getCachedSystemSettings(db, DEFAULT_SETTINGS),
+          ]);
+          const lookupDoneMs = performance.now();
+
+          if (!empSnap.exists) {
+            await writePunchLog({
+              employeeId,
+              timestamp: now.toISOString(),
+              action: 'REJECTED_TOKEN',
+              rawPayload,
+              scannerDevice: 'MANUAL',
+              qrVerificationMode: 'MANUAL_EMPLOYEE_ID',
+              performedByUid: caller.uid,
+              performedByLoginId: caller.loginId,
+              message: `Manual entry rejected: Employee ID ${employeeId} not found in database.`,
+            });
+            return {
+              httpStatus: 404,
+              body: {
+                success: false,
+                action: 'REJECTED',
+                scannerType: scannerType || 'IN',
+                error: `Employee "${employeeId}" Not Found.`,
+                message: `Employee "${employeeId}" Not Found.`,
+                time: timeDisplay,
+              },
+            };
+          }
+
+          const employee = empSnap.data()!;
+          if (employee.employeeStatus !== 'Active') {
+            await writePunchLog({
+              employeeId: employee.employeeId,
+              employeeName: employee.employeeName,
+              timestamp: now.toISOString(),
+              action: 'REJECTED_INACTIVE',
+              rawPayload,
+              scannerDevice: 'MANUAL',
+              qrVerificationMode: 'MANUAL_EMPLOYEE_ID',
+              performedByUid: caller.uid,
+              performedByLoginId: caller.loginId,
+              message: `Manual entry rejected: Employee ${employeeId} is inactive.`,
+            });
+            return {
+              httpStatus: 400,
+              body: {
+                success: false,
+                action: 'REJECTED',
+                scannerType: scannerType || 'IN',
+                employee,
+                error: 'Employee Is Inactive. Attendance Cannot Be Recorded.',
+                message: 'Employee Is Inactive. Attendance Cannot Be Recorded.',
+                time: timeDisplay,
+              },
+            };
+          }
+
+          const txStartMs = performance.now();
+          const result = await executePunchForVerifiedEmployee({
+            employee,
+            caller,
+            now,
+            kolkata,
+            timeDisplay,
+            scannerType,
             scannerDevice: 'MANUAL',
-            qrVerificationMode: 'MANUAL_EMPLOYEE_ID',
-            performedByUid: caller.uid,
-            performedByLoginId: caller.loginId,
-            message: `Manual entry rejected: Employee ID ${employeeId} not found in database.`,
-          });
-          return {
-            httpStatus: 404,
-            body: {
-              success: false,
-              action: 'REJECTED',
-              scannerType: scannerType || 'IN',
-              error: `Employee "${employeeId}" Not Found.`,
-              message: `Employee "${employeeId}" Not Found.`,
-              time: timeDisplay,
-            },
-          };
-        }
-
-        const employee = empSnap.data()!;
-        if (employee.employeeStatus !== 'Active') {
-          await writePunchLog({
-            employeeId: employee.employeeId,
-            employeeName: employee.employeeName,
-            timestamp: now.toISOString(),
-            action: 'REJECTED_INACTIVE',
             rawPayload,
-            scannerDevice: 'MANUAL',
             qrVerificationMode: 'MANUAL_EMPLOYEE_ID',
-            performedByUid: caller.uid,
-            performedByLoginId: caller.loginId,
-            message: `Manual entry rejected: Employee ${employeeId} is inactive.`,
+            shifts: shiftsRes.shifts,
+            settings: settingsRes.data,
+            candidateSnap,
           });
-          return {
-            httpStatus: 400,
-            body: {
-              success: false,
-              action: 'REJECTED',
-              scannerType: scannerType || 'IN',
-              employee,
-              error: 'Employee Is Inactive. Attendance Cannot Be Recorded.',
-              message: 'Employee Is Inactive. Attendance Cannot Be Recorded.',
-              time: timeDisplay,
-            },
+          const txDoneMs = performance.now();
+
+          let auditDoneMs = txDoneMs;
+          if (result.httpStatus === 200 && result.body.success) {
+            await recordEnterpriseAuditEvent(db, {
+              req,
+              action: 'MANUAL_ATTENDANCE_PUNCH',
+              category: 'ATTENDANCE',
+              actorUid: caller.uid,
+              actorLoginId: caller.loginId,
+              actorRole: caller.role.toUpperCase(),
+              employeeId: employee.employeeId,
+              targetType: 'ATTENDANCE',
+              targetId: result.body.attendance?.id || employee.employeeId,
+              newValue: `${result.body.action} via manual ID entry (${employee.employeeId})`,
+              actionSource: 'MANUAL_SCANNER_ENTRY',
+              reason: reason || 'Authorized operator manual Employee ID punch',
+              captureGeo: false,
+            });
+            auditDoneMs = performance.now();
+          }
+
+          const perf: AttendancePerfMetrics = {
+            authMs: roundMs(authDoneMs - reqStartMs),
+            permissionMs: roundMs(permDoneMs - authDoneMs),
+            lookupAndQueryMs: roundMs(lookupDoneMs - lookupStartMs),
+            txMs: roundMs(txDoneMs - txStartMs),
+            auditMs: roundMs(auditDoneMs - txDoneMs),
+            totalServerMs: roundMs(auditDoneMs - reqStartMs),
+            cacheHitRolePerms: perms.cacheHitRolePerms,
+            cacheHitConfig: shiftsRes.cacheHit && settingsRes.cacheHit,
           };
-        }
-
-        const result = await executePunchForVerifiedEmployee({
-          employee,
-          caller,
-          now,
-          kolkata,
-          timeDisplay,
-          scannerType,
-          scannerDevice: 'MANUAL',
-          rawPayload,
-          qrVerificationMode: 'MANUAL_EMPLOYEE_ID',
-        });
-
-        if (result.httpStatus === 200 && result.body.success) {
-          await recordEnterpriseAuditEvent(db, {
-            req,
-            action: 'MANUAL_ATTENDANCE_PUNCH',
-            category: 'ATTENDANCE',
-            actorUid: caller.uid,
-            actorLoginId: caller.loginId,
-            actorRole: caller.role.toUpperCase(),
-            employeeId: employee.employeeId,
-            targetType: 'ATTENDANCE',
-            targetId: result.body.attendance?.id || employee.employeeId,
-            newValue: `${result.body.action} via manual ID entry (${employee.employeeId})`,
-            actionSource: 'MANUAL_SCANNER_ENTRY',
-            reason: reason || 'Authorized operator manual Employee ID punch',
-            captureGeo: false,
+          emitNonSensitivePerfLog('attendance.manual_punch', {
+            status: result.httpStatus,
+            ...perf,
           });
-        }
 
-        return result;
-      });
+          return {
+            httpStatus: result.httpStatus,
+            body: { ...result.body, perf },
+          };
+        })
+      );
 
       return res.status(outcome.httpStatus).json(outcome.body);
     } catch (err: any) {
@@ -896,6 +1059,9 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
     scannerDevice: 'USB_SCANNER' | 'WEBCAM' | 'MANUAL' | 'SYSTEM_AUTO';
     rawPayload: string;
     qrVerificationMode: string;
+    shifts: any[];
+    settings: Record<string, any>;
+    candidateSnap: AdminQuerySnapLike;
   }): Promise<{ httpStatus: number; body: Record<string, any> }> {
     const {
       employee,
@@ -906,27 +1072,17 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
       scannerDevice,
       rawPayload,
       qrVerificationMode,
+      shifts,
+      settings,
+      candidateSnap,
     } = params;
     let { scannerType } = params;
 
-        const [shiftsSnap, settingsSnap] = await Promise.all([
-          db.collection('shifts').get(),
-          db.collection('system_settings').doc('global').get(),
-        ]);
-
-        const shifts = shiftsSnap.empty ? DEFAULT_SHIFTS : shiftsSnap.docs.map((d) => d.data()!);
-        const settings = settingsSnap.exists ? (settingsSnap.data() || DEFAULT_SETTINGS) : DEFAULT_SETTINGS;
         const shiftsMap = new Map(shifts.map((s) => [s.id, s]));
 
         const todayKey = kolkata.dateKey;
         const yesterdayKey = getYesterdayKolkataDateKey(now);
         const currentMins = kolkata.totalMinutes;
-
-        const candidateSnap = await db
-          .collection('attendance')
-          .where('employeeId', '==', employee.employeeId)
-          .where('shiftDate', '>=', yesterdayKey)
-          .get();
 
         const existingRecords = candidateSnap.docs
           .map((d) => d.data()!)
@@ -1009,6 +1165,10 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                 ...currentData,
                 currentState: 'INSIDE',
                 punchOutType: 'NONE',
+                attendanceStatus: 'IN PROGRESS',
+                totalDutyMinutes: 0,
+                regularDutyMinutes: 0,
+                overtimeMinutes: 0,
                 punches: [...existingPunches, punchEvent],
                 updatedAt: now.toISOString(),
               };
@@ -1026,7 +1186,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                 qrVerificationMode,
                 performedByUid: caller.uid,
                 performedByLoginId: caller.loginId,
-                message: `Subsequent Punch In (Event #${updatedAttendance.punches.length}). Status: INSIDE.`,
+                message: `Subsequent Punch In (Event #${updatedAttendance.punches.length}). State: INSIDE, Status: IN PROGRESS.`,
               });
 
               return { kind: 'RECORDED' as const, record: updatedAttendance };
@@ -1131,7 +1291,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             ? currentMins > shiftStartMins + grace
             : true;
 
-          const initialStatus = isLate ? 'LATE' : 'PRESENT';
+          const arrivalStatus = isLate ? 'LATE' : 'PRESENT';
           const eventId = `pe_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
           const logId = `log_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
 
@@ -1179,7 +1339,9 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             totalDutyMinutes: 0,
             regularDutyMinutes: 0,
             overtimeMinutes: 0,
-            attendanceStatus: initialStatus,
+            attendanceStatus: 'IN PROGRESS',
+            isLate,
+            arrivalStatus,
             missedPunchOut: false,
             autoClosed: false,
             qrTokenReference: employee.qrCodeToken || '',
@@ -1213,7 +1375,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
               qrVerificationMode,
               performedByUid: caller.uid,
               performedByLoginId: caller.loginId,
-              message: `First Punch In recorded for ${shift.name} (${shiftDate}). Status: ${initialStatus}.`,
+              message: `First Punch In recorded for ${shift.name} (${shiftDate}). Arrival: ${arrivalStatus}. Status: IN PROGRESS.`,
             });
             return { kind: 'RECORDED' as const, record: newAttendanceRecord };
           });
@@ -1311,9 +1473,13 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             0,
             Math.floor((now.getTime() - firstInDate.getTime()) / (1000 * 60))
           );
-          const scheduledStandardDutyMinutes = 510;
+          const scheduledStandardDutyMinutes = STANDARD_DUTY_MINUTES;
           const regularDutyMinutes = Math.min(totalDutyMinutes, scheduledStandardDutyMinutes);
           const overtimeMinutes = Math.max(0, totalDutyMinutes - scheduledStandardDutyMinutes);
+          const computedStatus = classifyCompletedDutyStatus(
+            totalDutyMinutes,
+            scheduledStandardDutyMinutes
+          );
 
           const outEvent = {
             id: eventId,
@@ -1349,7 +1515,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             totalDutyMinutes,
             regularDutyMinutes,
             overtimeMinutes,
-            attendanceStatus: 'COMPLETED',
+            attendanceStatus: computedStatus,
             missedPunchOut: false,
             autoClosed: false,
             updatedByUid: caller.uid,
@@ -1370,7 +1536,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             qrVerificationMode,
             performedByUid: caller.uid,
             performedByLoginId: caller.loginId,
-            message: `Punch Out recorded. Duty: ${formatMinutes(regularDutyMinutes)}, OT: ${formatMinutes(overtimeMinutes)}. Total: ${formatMinutes(totalDutyMinutes)}.`,
+            message: `Punch Out recorded (${computedStatus}). Duty: ${formatMinutes(regularDutyMinutes)}, OT: ${formatMinutes(overtimeMinutes)}. Total: ${formatMinutes(totalDutyMinutes)}.`,
           });
 
           return {
@@ -1483,18 +1649,18 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
       }
 
       const now = new Date();
-      const [settingsSnap, shiftsSnap, openSnap] = await Promise.all([
-        db.collection('system_settings').doc('global').get(),
-        db.collection('shifts').get(),
+      const [settingsRes, shiftsRes, openSnap] = await Promise.all([
+        getCachedSystemSettings(db, DEFAULT_SETTINGS),
+        getCachedShifts(db, DEFAULT_SHIFTS),
         db.collection('attendance').where('punchOutType', '==', 'NONE').get(),
       ]);
 
-      const settings = settingsSnap.exists ? (settingsSnap.data() || DEFAULT_SETTINGS) : DEFAULT_SETTINGS;
+      const settings = settingsRes.data || DEFAULT_SETTINGS;
       if (!settings.autoPunchOutEnabled) {
         return res.json({ success: true, closedCount: 0, closedRecords: [] });
       }
 
-      const shifts = shiftsSnap.empty ? DEFAULT_SHIFTS : shiftsSnap.docs.map((d) => d.data()!);
+      const shifts = shiftsRes.shifts;
       const shiftsMap = new Map(shifts.map((s) => [s.id, s]));
       const closedRecords: any[] = [];
       const MAX_AUTO_CLOSE_PER_INVOCATION = 25;
@@ -1654,11 +1820,23 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             throw new Error('INVALID_PUNCH_OUT');
           }
           totalDutyMinutes = Math.max(0, Math.floor((outTime - inTime) / (60 * 1000)));
-          regularDutyMinutes = Math.min(totalDutyMinutes, 510);
-          overtimeMinutes = punchOutType === 'AUTO' ? 0 : Math.max(0, totalDutyMinutes - 510);
+          regularDutyMinutes = Math.min(totalDutyMinutes, STANDARD_DUTY_MINUTES);
+          overtimeMinutes = punchOutType === 'AUTO' ? 0 : Math.max(0, totalDutyMinutes - STANDARD_DUTY_MINUTES);
         } else if (punchOutType === 'AUTO') {
           overtimeMinutes = 0;
         }
+
+        const autoClassifySet = new Set([
+          'COMPLETED',
+          'COMPLETED + OT',
+          'HALF DAY',
+          'SHORT LEAVE',
+          'PRESENT',
+        ]);
+        const finalAttendanceStatus =
+          punchOutType === 'ACTUAL' && actualPunchOut && autoClassifySet.has(attendanceStatus)
+            ? classifyCompletedDutyStatus(totalDutyMinutes, STANDARD_DUTY_MINUTES)
+            : attendanceStatus;
 
         const updatedFields = {
           actualPunchOut: actualPunchOut || current.actualPunchOut || null,
@@ -1666,7 +1844,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           effectivePunchOut: actualPunchOut || current.effectivePunchOut || null,
           punchOutType,
           currentState: actualPunchOut ? 'OUTSIDE' : current.currentState || 'OUTSIDE',
-          attendanceStatus,
+          attendanceStatus: finalAttendanceStatus,
           totalDutyMinutes,
           regularDutyMinutes,
           overtimeMinutes,
@@ -1700,7 +1878,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         targetType: 'ATTENDANCE',
         targetId: attendanceId,
         oldValue: `Status: ${txResult.current.attendanceStatus}, Out: ${txResult.current.actualPunchOut || 'None'}`,
-        newValue: `Status: ${attendanceStatus}, Out: ${actualPunchOut || 'None'}`,
+        newValue: `Status: ${txResult.updated.attendanceStatus}, Out: ${actualPunchOut || 'None'}`,
         actionSource: 'ADMIN_CORRECTION',
         reason: reason.trim(),
         description: `Attendance record ${attendanceId} corrected by "${caller.loginId}".`,

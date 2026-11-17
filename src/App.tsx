@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef, Suspense } from 'react';
 import { onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
-import { auth, testConnection } from './firebase';
+import { auth } from './firebase';
 import { 
   initializeMasterData, 
   getFloors, 
@@ -25,33 +25,37 @@ import {
 import { getAuthHeaders } from './services/auditService';
 import { Employee, Floor, Section, Department, Shift, UserRoleRecord } from './types';
 
-// Components
+// Core Entry Components (loaded eagerly for instant initial render)
 import { Sidebar, NavItem } from './components/Sidebar';
 import { Header } from './components/Header';
 import { Login } from './components/Login';
 import { PasswordChangeModal } from './components/PasswordChangeModal';
 import { Dashboard } from './components/Dashboard';
 import { Scanner } from './components/Scanner';
-import { EmployeeMaster } from './components/EmployeeMaster';
-import { ExcelImport } from './components/ExcelImport';
-import { QrManagement } from './components/QrManagement';
-import { FloorManagement } from './components/FloorManagement';
-import { SectionManagement } from './components/SectionManagement';
-import { DepartmentManagement } from './components/DepartmentManagement';
-import { ShiftManagement } from './components/ShiftManagement';
-import { AttendanceHistory } from './components/AttendanceHistory';
-import { Reports } from './components/Reports';
-import { UserRights } from './components/UserRights';
-import { AuditLogsManagement } from './components/AuditLogsManagement';
-import { SecurityManagement } from './components/SecurityManagement';
-import { SystemSettingsView } from './components/SystemSettings';
-import { UnauthorizedAccess } from './components/UnauthorizedAccess';
 import {
   RolePermissionRecord,
   UserPermissionRecordWithOverride,
   subscribeToAllRolePermissions,
   subscribeToCurrentUserPermission,
 } from './services/permissionService';
+
+import { lazyWithRetry, ModuleErrorBoundary } from './components/LazyModuleBoundary';
+
+// Secondary Modules (code-split via resilient lazyWithRetry for smaller initial JS bundle & automatic recovery)
+const EmployeeMaster = lazyWithRetry(() => import('./components/EmployeeMaster'), m => m.EmployeeMaster, 'employees');
+const ExcelImport = lazyWithRetry(() => import('./components/ExcelImport'), m => m.ExcelImport, 'excel_import');
+const QrManagement = lazyWithRetry(() => import('./components/QrManagement'), m => m.QrManagement, 'qr_codes');
+const FloorManagement = lazyWithRetry(() => import('./components/FloorManagement'), m => m.FloorManagement, 'floors');
+const SectionManagement = lazyWithRetry(() => import('./components/SectionManagement'), m => m.SectionManagement, 'sections');
+const DepartmentManagement = lazyWithRetry(() => import('./components/DepartmentManagement'), m => m.DepartmentManagement, 'departments');
+const ShiftManagement = lazyWithRetry(() => import('./components/ShiftManagement'), m => m.ShiftManagement, 'shifts');
+const AttendanceHistory = lazyWithRetry(() => import('./components/AttendanceHistory'), m => m.AttendanceHistory, 'history');
+const Reports = lazyWithRetry(() => import('./components/Reports'), m => m.Reports, 'reports');
+const UserRights = lazyWithRetry(() => import('./components/UserRights'), m => m.UserRights, 'user_rights');
+const AuditLogsManagement = lazyWithRetry(() => import('./components/AuditLogsManagement'), m => m.AuditLogsManagement, 'audit_logs');
+const SecurityManagement = lazyWithRetry(() => import('./components/SecurityManagement'), m => m.SecurityManagement, 'security_management');
+const SystemSettingsView = lazyWithRetry(() => import('./components/SystemSettings'), m => m.SystemSettingsView, 'settings');
+const UnauthorizedAccess = lazyWithRetry(() => import('./components/UnauthorizedAccess'), m => m.UnauthorizedAccess, 'unauthorized');
 
 const VALID_TABS: NavItem[] = [
   'dashboard',
@@ -147,12 +151,13 @@ export default function App() {
     };
   }, []);
 
+  const employeeRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   // Load all master collections (only when authenticated in Firebase Auth)
   const loadAllMasterData = useCallback(async (allowSeed: boolean = false) => {
     if (!auth.currentUser) return;
     setIsLoadingMasterData(true);
     try {
-      await testConnection();
       if (allowSeed) {
         await initializeMasterData();
       }
@@ -175,6 +180,31 @@ export default function App() {
     } finally {
       setIsLoadingMasterData(false);
     }
+  }, []);
+
+  // Silent debounced post-scan background refresh (avoids full master-data refetch & loading flicker during rapid punches)
+  const refreshEmployeesBackground = useCallback(() => {
+    if (!auth.currentUser) return;
+    if (employeeRefreshTimerRef.current) {
+      clearTimeout(employeeRefreshTimerRef.current);
+    }
+    employeeRefreshTimerRef.current = setTimeout(() => {
+      employeeRefreshTimerRef.current = null;
+      if (!auth.currentUser) return;
+      getEmployees()
+        .then((empsData) => {
+          setEmployees(empsData);
+        })
+        .catch(() => {});
+    }, 800);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (employeeRefreshTimerRef.current) {
+        clearTimeout(employeeRefreshTimerRef.current);
+      }
+    };
   }, []);
 
   // Initialize and observe Authentication Session
@@ -409,6 +439,11 @@ export default function App() {
     return () => clearInterval(timer);
   }, [currentUserRole, handleLogout]);
 
+  const activeEmployeeCount = useMemo(
+    () => employees.filter(e => e.employeeStatus === 'Active').length,
+    [employees]
+  );
+
   // 1. Initial Authentication Check Loader (Instant, clean, no 5s splash screen)
   if (isAuthChecking) {
     return (
@@ -453,7 +488,6 @@ export default function App() {
   }
 
   // 3. Authenticated State -> Display authorized application
-  const activeEmployeeCount = employees.filter(e => e.employeeStatus === 'Active').length;
   const isFullscreenDashboard = fullscreenTab === 'dashboard' && currentTab === 'dashboard';
   const isFullscreenScanner = fullscreenTab === 'scanner' && currentTab === 'scanner';
   const isFullscreenAny = isFullscreenDashboard || isFullscreenScanner;
@@ -509,7 +543,15 @@ export default function App() {
               onGoHome={() => handleSelectTab(getDefaultTabForRole(currentUserRole.role, currentUserRole))} 
             />
           ) : (
-            <>
+            <ModuleErrorBoundary resetKey={currentTab}>
+              <Suspense
+                fallback={
+                  <div className="h-full flex flex-col items-center justify-center text-slate-500 gap-2 py-12">
+                    <div className="w-6 h-6 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
+                    <span className="text-xs font-mono tracking-wide">LOADING MODULE...</span>
+                  </div>
+                }
+              >
               {currentTab === 'dashboard' && (
                 <Dashboard
                   employees={employees}
@@ -531,7 +573,7 @@ export default function App() {
 
               {currentTab === 'scanner' && isModuleAllowedForUser(currentUserRole, 'scanner') && (
                 <Scanner
-                  onAttendanceUpdated={() => loadAllMasterData(false)}
+                  onAttendanceUpdated={refreshEmployeesBackground}
                   isFullscreen={isFullscreenScanner}
                   onToggleFullscreen={() => handleToggleFullscreen('scanner')}
                   onExitFullscreen={handleExitFullscreen}
@@ -661,7 +703,8 @@ export default function App() {
                   onOpenAuditConsole={() => handleSelectTab('audit_logs')}
                 />
               )}
-            </>
+            </Suspense>
+            </ModuleErrorBoundary>
           )}
         </main>
       </div>

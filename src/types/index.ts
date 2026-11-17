@@ -42,13 +42,18 @@ export interface PunchEvent {
 }
 
 export type AttendanceStatus = 
+  | 'IN PROGRESS'
+  | 'SHORT LEAVE'
+  | 'HALF DAY'
+  | 'COMPLETED'
+  | 'COMPLETED + OT'
   | 'PRESENT'
   | 'LATE'
   | 'MISSED PUNCH OUT'
   | 'AUTO CLOSED'
-  | 'COMPLETED'
   | 'ABSENT'
   | 'LEAVE'
+  | 'ON LEAVE'
   | 'WEEKLY_OFF'
   | 'HOLIDAY';
 
@@ -77,6 +82,8 @@ export interface AttendanceRecord {
   regularDutyMinutes: number; // Scheduled duty in minutes (max 510 by default)
   overtimeMinutes: number; // OT duration in minutes
   attendanceStatus: AttendanceStatus;
+  isLate?: boolean;
+  arrivalStatus?: 'PRESENT' | 'LATE';
   missedPunchOut?: boolean;
   autoClosed?: boolean;
   qrTokenReference: string;
@@ -414,4 +421,10 @@ export interface ScanResult {
   dutyFormatted?: string;
   otFormatted?: string;
   punchCount?: number;
+  perf?: {
+    totalServerMs?: number;
+    networkApiMs?: number;
+    uiDisplayMs?: number;
+    totalEndToEndMs?: number;
+  };
 }

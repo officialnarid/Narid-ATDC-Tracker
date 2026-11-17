@@ -32,7 +32,6 @@ import {
   regenerateQrToken,
   deleteEmployee 
 } from '../services/employeeService';
-import QRCode from 'qrcode';
 import { UserRoleRecord } from '../types';
 import { RolePermissionRecord, hasModulePermission } from '../services/permissionService';
 
@@ -86,10 +85,12 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
   const [viewEmployee, setViewEmployee] = useState<Employee | null>(null);
   const [badgeQrUrl, setBadgeQrUrl] = useState<string | null>(null);
 
-  // Generate QR image when viewing badge
+  // Generate QR image on demand when viewing badge
   const handleOpenBadge = async (emp: Employee) => {
     setViewEmployee(emp);
     try {
+      const QRCodeMod = await import('qrcode');
+      const QRCode = QRCodeMod.default || QRCodeMod;
       const qrPayload = JSON.stringify({
         employeeId: emp.employeeId,
         token: emp.qrCodeToken,
@@ -188,11 +189,16 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
     }
   };
 
+  const activeCount = useMemo(
+    () => employees.filter(e => e.employeeStatus === 'Active').length,
+    [employees]
+  );
+
   // Filtered employees list
   const filteredList = useMemo(() => {
+    const s = searchTerm.trim().toLowerCase();
     return employees.filter(emp => {
-      if (searchTerm.trim() !== '') {
-        const s = searchTerm.toLowerCase();
+      if (s !== '') {
         if (
           !emp.employeeId.toLowerCase().includes(s) &&
           !emp.employeeName.toLowerCase().includes(s) &&
@@ -220,7 +226,7 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
             <span>EMPLOYEE MASTER</span>
           </h2>
           <p className="text-xs text-slate-500">
-            Total {employees.length} records • {employees.filter(e => e.employeeStatus === 'Active').length} Active
+            Total {employees.length} records • {activeCount} Active
           </p>
         </div>
 

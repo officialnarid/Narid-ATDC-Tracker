@@ -1,9 +1,8 @@
-import * as XLSX from 'xlsx';
 import { Employee, AttendanceRecord, EmployeeType, EmployeeStatus } from '../types';
 import { formatMinutes, formatTimeDisplay } from './attendanceService';
 import { getEmployees, generateQrToken } from './employeeService';
 import { recordAuditLog } from './masterService';
-import { doc, setDoc } from 'firebase/firestore';
+import { doc, writeBatch } from 'firebase/firestore';
 import { db } from '../firebase';
 
 export interface ExcelImportRow {
@@ -39,7 +38,8 @@ export interface ImportValidationResult {
 }
 
 // 1. Download Standard Employee Template
-export function downloadEmployeeTemplate(): void {
+export async function downloadEmployeeTemplate(): Promise<void> {
+  const XLSX = await import('xlsx');
   const templateHeaders = [
     'Employee ID',
     'Employee Name',
@@ -86,7 +86,7 @@ export async function parseAndValidateEmployeeExcel(
   validSections: string[],
   validDepartments: string[]
 ): Promise<ImportValidationResult> {
-  const buffer = await file.arrayBuffer();
+  const [XLSX, buffer] = await Promise.all([import('xlsx'), file.arrayBuffer()]);
   const wb = XLSX.read(buffer, { type: 'array' });
   const sheetName = wb.SheetNames[0];
   const sheet = wb.Sheets[sheetName];
@@ -268,18 +268,23 @@ export async function parseAndValidateEmployeeExcel(
   };
 }
 
-// 3. Commit Validated Rows to Firestore
+// 3. Commit Validated Rows to Firestore using batched writes
 export async function commitImportedEmployees(
   items: ImportValidationResult['validRows'],
   fileName: string
 ): Promise<{ savedCount: number }> {
-  let savedCount = 0;
-  for (const item of items) {
-    if (item.actionType === 'UNCHANGED') continue;
-    await setDoc(doc(db, 'employees', item.data.employeeId), item.data);
-    savedCount++;
+  const toSave = items.filter((item) => item.actionType !== 'UNCHANGED');
+  const BATCH_CHUNK_SIZE = 400;
+  for (let i = 0; i < toSave.length; i += BATCH_CHUNK_SIZE) {
+    const chunk = toSave.slice(i, i + BATCH_CHUNK_SIZE);
+    const batch = writeBatch(db);
+    for (const item of chunk) {
+      batch.set(doc(db, 'employees', item.data.employeeId), item.data);
+    }
+    await batch.commit();
   }
 
+  const savedCount = toSave.length;
   await recordAuditLog({
     action: 'EXCEL_EMPLOYEE_IMPORT',
     newValue: `Committed ${savedCount} employees from ${fileName}`,
@@ -291,11 +296,12 @@ export async function commitImportedEmployees(
 }
 
 // 4. Export Generic Table Data to Excel (.xlsx) & CSV
-export function exportTableToExcel(
+export async function exportTableToExcel(
   data: Record<string, any>[],
   columns: { header: string; key: string }[],
   fileName: string
-): void {
+): Promise<void> {
+  const XLSX = await import('xlsx');
   const wsData = [
     columns.map(c => c.header),
     ...data.map(row => columns.map(c => row[c.key] ?? '')),
@@ -308,18 +314,24 @@ export function exportTableToExcel(
   XLSX.writeFile(wb, `${fileName}.xlsx`);
 }
 
+function escapeCsvCell(value: unknown): string {
+  const s = String(value ?? '');
+  if (s.includes('"') || s.includes(',') || s.includes('\n') || s.includes('\r')) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
 export function exportTableToCsv(
   data: Record<string, any>[],
   columns: { header: string; key: string }[],
   fileName: string
 ): void {
-  const wsData = [
-    columns.map(c => c.header),
-    ...data.map(row => columns.map(c => row[c.key] ?? '')),
-  ];
-
-  const ws = XLSX.utils.aoa_to_sheet(wsData);
-  const csv = XLSX.utils.sheet_to_csv(ws);
+  const lines: string[] = [columns.map((c) => escapeCsvCell(c.header)).join(',')];
+  for (const row of data) {
+    lines.push(columns.map((c) => escapeCsvCell(row[c.key])).join(','));
+  }
+  const csv = lines.join('\r\n');
 
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
@@ -329,4 +341,5 @@ export function exportTableToCsv(
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
+  URL.revokeObjectURL(url);
 }

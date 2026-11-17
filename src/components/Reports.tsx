@@ -18,6 +18,7 @@ import { db } from '../firebase';
 import { formatDateKey, formatMinutes, formatTimeDisplay } from '../services/attendanceService';
 import { exportTableToExcel, exportTableToCsv } from '../services/exportService';
 import { sendServerAuditEvent } from '../services/auditService';
+import { formatDurationClock, resolveAttendanceMetrics } from '../utils/attendanceStatus';
 
 interface ReportsProps {
   employees: Employee[];
@@ -132,22 +133,27 @@ export const Reports: React.FC<ReportsProps> = ({
           { header: 'OT Hours', key: 'ot' },
           { header: 'Status', key: 'status' },
         ];
-        rows = attendanceRecords.map(a => ({
-          employeeId: a.employeeId,
-          name: a.employeeNameSnapshot,
-          floor: a.floorIdSnapshot,
-          section: a.sectionIdSnapshot,
-          dept: a.departmentIdSnapshot,
-          shift: a.shiftNameSnapshot,
-          state: a.currentState || (a.actualPunchOut ? 'OUTSIDE' : 'INSIDE'),
-          inTime: formatTimeDisplay(a.firstPunchIn || a.punchIn),
-          outTime: formatTimeDisplay(a.lastPunchOut || a.actualPunchOut || a.effectivePunchOut),
-          punches: a.punches?.length || (a.actualPunchOut ? 2 : 1),
-          outType: a.punchOutType,
-          duty: formatMinutes(a.regularDutyMinutes),
-          ot: formatMinutes(a.overtimeMinutes),
-          status: a.attendanceStatus,
-        }));
+        rows = attendanceRecords.map(a => {
+          const m = resolveAttendanceMetrics(a);
+          return {
+            employeeId: a.employeeId,
+            name: a.employeeNameSnapshot,
+            floor: a.floorIdSnapshot,
+            section: a.sectionIdSnapshot,
+            dept: a.departmentIdSnapshot,
+            shift: a.shiftNameSnapshot,
+            state: m.state,
+            inTime: formatTimeDisplay(a.firstPunchIn || a.punchIn),
+            outTime: m.isOpen ? 'In Progress' : formatTimeDisplay(a.lastPunchOut || a.actualPunchOut || a.effectivePunchOut),
+            punches: a.punches?.length || (a.actualPunchOut ? 2 : 1),
+            outType: a.punchOutType,
+            duty: m.isOpen
+              ? `00:00 Hours (Elapsed: ${formatDurationClock(m.accumulatedDutyMinutes)})`
+              : `${formatDurationClock(m.completedDutyMinutes)} Hours`,
+            ot: m.overtimeMinutes > 0 ? m.otLabel : '00:00',
+            status: m.status,
+          };
+        });
         break;
 
       case 'floor_wise':
@@ -229,7 +235,7 @@ export const Reports: React.FC<ReportsProps> = ({
           { header: 'Status', key: 'status' },
         ];
         rows = attendanceRecords
-          .filter(a => a.attendanceStatus === 'LATE')
+          .filter(a => resolveAttendanceMetrics(a).isLate)
           .map(a => ({
             employeeId: a.employeeId,
             name: a.employeeNameSnapshot,
@@ -279,16 +285,19 @@ export const Reports: React.FC<ReportsProps> = ({
           { header: 'OT Duration', key: 'ot' },
         ];
         rows = attendanceRecords
-          .filter(a => (a.overtimeMinutes || 0) > 0)
-          .map(a => ({
-            employeeId: a.employeeId,
-            name: a.employeeNameSnapshot,
-            floorDept: `${a.floorIdSnapshot} • ${a.departmentIdSnapshot}`,
-            inTime: formatTimeDisplay(a.punchIn),
-            outTime: formatTimeDisplay(a.actualPunchOut),
-            duty: formatMinutes(a.regularDutyMinutes),
-            ot: formatMinutes(a.overtimeMinutes),
-          }));
+          .filter(a => resolveAttendanceMetrics(a).overtimeMinutes > 0)
+          .map(a => {
+            const m = resolveAttendanceMetrics(a);
+            return {
+              employeeId: a.employeeId,
+              name: a.employeeNameSnapshot,
+              floorDept: `${a.floorIdSnapshot} • ${a.departmentIdSnapshot}`,
+              inTime: formatTimeDisplay(a.firstPunchIn || a.punchIn),
+              outTime: formatTimeDisplay(a.lastPunchOut || a.actualPunchOut),
+              duty: formatMinutes(m.regularDutyMinutes),
+              ot: m.otLabel,
+            };
+          });
         break;
 
       case 'absent_manpower':
@@ -324,13 +333,16 @@ export const Reports: React.FC<ReportsProps> = ({
           { header: 'Duty', key: 'duty' },
           { header: 'OT', key: 'ot' },
         ];
-        rows = attendanceRecords.map(a => ({
-          employeeId: a.employeeId,
-          name: a.employeeNameSnapshot,
-          date: a.shiftDate,
-          duty: formatMinutes(a.regularDutyMinutes),
-          ot: formatMinutes(a.overtimeMinutes),
-        }));
+        rows = attendanceRecords.map(a => {
+          const m = resolveAttendanceMetrics(a);
+          return {
+            employeeId: a.employeeId,
+            name: a.employeeNameSnapshot,
+            date: a.shiftDate,
+            duty: m.isOpen ? '00:00 Hours' : `${formatDurationClock(m.completedDutyMinutes)} Hours`,
+            ot: m.overtimeMinutes > 0 ? m.otLabel : '00:00',
+          };
+        });
     }
 
     return { tableColumns: cols, tableData: rows, fileName: name };

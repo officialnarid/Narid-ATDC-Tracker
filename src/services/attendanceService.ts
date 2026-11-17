@@ -41,6 +41,30 @@ export function timeStringToMinutes(timeStr: string): number {
   return hh * 60 + (mm || 0);
 }
 
+const KOLKATA_PARTS_FORMATTER = new Intl.DateTimeFormat('en-IN', {
+  timeZone: 'Asia/Kolkata',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+});
+
+const KOLKATA_TIME_DISPLAY_FORMATTER = new Intl.DateTimeFormat('en-IN', {
+  timeZone: 'Asia/Kolkata',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: true,
+});
+
+function nowMs(): number {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now();
+}
+
 /**
  * Extract comprehensive date and time components strictly in Asia/Kolkata timezone
  */
@@ -56,18 +80,7 @@ export function getKolkataTimeParts(date: Date = new Date()): {
   timeDisplay: string; // "hh:mm A"
   timeWithSeconds: string; // "hh:mm:ss A"
 } {
-  const formatter = new Intl.DateTimeFormat('en-IN', {
-    timeZone: 'Asia/Kolkata',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  });
-
-  const parts = formatter.formatToParts(date);
+  const parts = KOLKATA_PARTS_FORMATTER.formatToParts(date);
   const map: Record<string, string> = {};
   for (const p of parts) {
     map[p.type] = p.value;
@@ -135,13 +148,7 @@ export function getShiftScheduledEndIso(shiftDate: string, shift: Shift): string
 // Format ISO string to time string "hh:mm A" in Asia/Kolkata
 export function formatTimeDisplay(isoString: string | null): string {
   if (!isoString) return '--:--';
-  const d = new Date(isoString);
-  return d.toLocaleTimeString('en-IN', {
-    timeZone: 'Asia/Kolkata',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: true,
-  });
+  return KOLKATA_TIME_DISPLAY_FORMATTER.format(new Date(isoString));
 }
 
 export type QrPayloadFormat = 'JSON_TOKEN' | 'TOKEN_STRING' | 'LEGACY_EMPLOYEE_ID' | 'INVALID';
@@ -271,6 +278,7 @@ export interface DualScanParams {
   scannerType: 'IN' | 'OUT';
   scannerDevice?: 'USB_SCANNER' | 'WEBCAM' | 'MANUAL' | 'SYSTEM_AUTO';
   customScanTime?: Date;
+  clientRequestId?: string;
 }
 
 /**
@@ -283,7 +291,9 @@ export async function processDualAttendanceScan({
   scannerType,
   scannerDevice = 'USB_SCANNER',
   customScanTime,
+  clientRequestId,
 }: DualScanParams): Promise<ScanResult> {
+  const apiStart = nowMs();
   const now = customScanTime || new Date();
   const timeDisplay = getKolkataTimeParts(now).timeWithSeconds;
 
@@ -298,6 +308,7 @@ export async function processDualAttendanceScan({
         rawPayload,
         scannerType,
         scannerDevice,
+        ...(clientRequestId ? { clientRequestId } : {}),
         ...(customScanTime ? { customScanTime: customScanTime.toISOString() } : {}),
       }),
     },
@@ -305,6 +316,7 @@ export async function processDualAttendanceScan({
   );
 
   const parsed = await safeParseJsonResponse<any>(res, 'POST /api/attendance/scan');
+  const networkApiMs = Number((nowMs() - apiStart).toFixed(2));
   const data = parsed.data || {};
   return {
     success: Boolean(parsed.ok && data?.success),
@@ -319,6 +331,10 @@ export async function processDualAttendanceScan({
     dutyFormatted: data?.dutyFormatted,
     otFormatted: data?.otFormatted,
     punchCount: data?.punchCount,
+    perf: {
+      totalServerMs: typeof data?.perf?.totalServerMs === 'number' ? data.perf.totalServerMs : undefined,
+      networkApiMs,
+    },
   };
 }
 
@@ -327,6 +343,7 @@ export interface ManualPunchParams {
   scannerType: 'IN' | 'OUT';
   reason?: string;
   customScanTime?: Date;
+  clientRequestId?: string;
 }
 
 /**
@@ -338,7 +355,9 @@ export async function processManualAttendancePunch({
   scannerType,
   reason,
   customScanTime,
+  clientRequestId,
 }: ManualPunchParams): Promise<ScanResult> {
+  const apiStart = nowMs();
   const now = customScanTime || new Date();
   const timeDisplay = getKolkataTimeParts(now).timeWithSeconds;
 
@@ -352,6 +371,7 @@ export async function processManualAttendancePunch({
       body: JSON.stringify({
         employeeId: employeeId.trim().toUpperCase(),
         scannerType,
+        ...(clientRequestId ? { clientRequestId } : {}),
         ...(reason ? { reason: reason.trim() } : {}),
         ...(customScanTime ? { customScanTime: customScanTime.toISOString() } : {}),
       }),
@@ -360,6 +380,7 @@ export async function processManualAttendancePunch({
   );
 
   const parsed = await safeParseJsonResponse<any>(res, 'POST /api/attendance/manual-punch');
+  const networkApiMs = Number((nowMs() - apiStart).toFixed(2));
   const data = parsed.data || {};
   return {
     success: Boolean(parsed.ok && data?.success),
@@ -374,6 +395,10 @@ export async function processManualAttendancePunch({
     dutyFormatted: data?.dutyFormatted,
     otFormatted: data?.otFormatted,
     punchCount: data?.punchCount,
+    perf: {
+      totalServerMs: typeof data?.perf?.totalServerMs === 'number' ? data.perf.totalServerMs : undefined,
+      networkApiMs,
+    },
   };
 }
 

@@ -30,7 +30,18 @@ import {
   resolveScannerCapabilities,
 } from '../services/permissionService';
 import { ScanResult, UserRoleRecord } from '../types';
-import { Html5QrcodeScanner } from 'html5-qrcode';
+import {
+  formatDurationClock,
+  isAttendanceLate,
+  resolveAttendanceMetrics,
+} from '../utils/attendanceStatus';
+
+function createClientRequestId(prefix: string): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `${prefix}_${crypto.randomUUID()}`;
+  }
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
 
 interface ScannerProps {
   onAttendanceUpdated?: () => void;
@@ -88,15 +99,28 @@ export const Scanner: React.FC<ScannerProps> = ({
   const outInputRef = useRef<HTMLInputElement>(null);
   const manualInInputRef = useRef<HTMLInputElement>(null);
   const manualOutInputRef = useRef<HTMLInputElement>(null);
-  const webcamScannerRef = useRef<Html5QrcodeScanner | null>(null);
+  const webcamScannerRef = useRef<any>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
 
-  // Audio synthesizer for industrial audio confirmations
+  // Synchronous ref locks prevent rapid duplicate Enter/click double-submissions in the same frame
+  const inFlightInRef = useRef(false);
+  const inFlightOutRef = useRef(false);
+  const inFlightManualInRef = useRef(false);
+  const inFlightManualOutRef = useRef(false);
+
+  // Audio synthesizer reusing a single AudioContext instance for zero overhead
   const playSound = useCallback((type: 'success_in' | 'success_out' | 'error' | 'warning') => {
     if (!soundEnabled) return;
     try {
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       if (!AudioCtx) return;
-      const ctx = new AudioCtx();
+      if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
+        audioCtxRef.current = new AudioCtx();
+      }
+      const ctx = audioCtxRef.current;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
 
@@ -104,18 +128,16 @@ export const Scanner: React.FC<ScannerProps> = ({
       gain.connect(ctx.destination);
 
       if (type === 'success_in') {
-        // High bright double beep for entry
-        osc.frequency.setValueAtTime(880, ctx.currentTime); // A5
-        osc.frequency.setValueAtTime(1174.66, ctx.currentTime + 0.1); // D6
+        osc.frequency.setValueAtTime(880, ctx.currentTime);
+        osc.frequency.setValueAtTime(1174.66, ctx.currentTime + 0.1);
         gain.gain.setValueAtTime(0.3, ctx.currentTime);
         gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.25);
         osc.start();
         osc.stop(ctx.currentTime + 0.25);
       } else if (type === 'success_out') {
-        // Melodic triple chime for exit
-        osc.frequency.setValueAtTime(587.33, ctx.currentTime); // D5
-        osc.frequency.setValueAtTime(739.99, ctx.currentTime + 0.08); // F#5
-        osc.frequency.setValueAtTime(880, ctx.currentTime + 0.16); // A5
+        osc.frequency.setValueAtTime(587.33, ctx.currentTime);
+        osc.frequency.setValueAtTime(739.99, ctx.currentTime + 0.08);
+        osc.frequency.setValueAtTime(880, ctx.currentTime + 0.16);
         gain.gain.setValueAtTime(0.3, ctx.currentTime);
         gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3);
         osc.start();
@@ -127,7 +149,6 @@ export const Scanner: React.FC<ScannerProps> = ({
         osc.start();
         osc.stop(ctx.currentTime + 0.3);
       } else {
-        // Error low double buzz
         osc.type = 'sawtooth';
         osc.frequency.setValueAtTime(220, ctx.currentTime);
         osc.frequency.setValueAtTime(160, ctx.currentTime + 0.15);
@@ -141,37 +162,47 @@ export const Scanner: React.FC<ScannerProps> = ({
     }
   }, [soundEnabled]);
 
-  // Keep target scanner input focused only for permitted methods without stealing focus from manual fields
   useEffect(() => {
-    const keepFocus = () => {
-      const activeEl = document.activeElement;
-      if (
-        activeEl?.tagName === 'INPUT' &&
-        (activeEl === inInputRef.current ||
-          activeEl === outInputRef.current ||
-          activeEl === manualInInputRef.current ||
-          activeEl === manualOutInputRef.current)
-      ) {
-        return;
-      }
-      if (canQrScan) {
-        if (activeFocus === 'IN') {
-          inInputRef.current?.focus();
-        } else {
-          outInputRef.current?.focus();
-        }
-      } else if (canManualEntry) {
-        if (activeFocus === 'IN') {
-          manualInInputRef.current?.focus();
-        } else {
-          manualOutInputRef.current?.focus();
-        }
+    return () => {
+      if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
+        audioCtxRef.current.close().catch(() => {});
       }
     };
-    keepFocus();
-    const interval = setInterval(keepFocus, 1000);
-    return () => clearInterval(interval);
-  }, [activeFocus, canQrScan, canManualEntry]);
+  }, []);
+
+  // Focus active scanner input on mount/mode switch without polling intervals
+  const restoreTargetFocus = useCallback((target: 'IN' | 'OUT', mode: 'QR' | 'MANUAL') => {
+    const focusFn = () => {
+      if (mode === 'QR' && canQrScan) {
+        (target === 'IN' ? inInputRef : outInputRef).current?.focus();
+      } else if (mode === 'MANUAL' && canManualEntry) {
+        (target === 'IN' ? manualInInputRef : manualOutInputRef).current?.focus();
+      }
+    };
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(focusFn);
+    } else {
+      focusFn();
+    }
+  }, [canQrScan, canManualEntry]);
+
+  useEffect(() => {
+    const activeEl = document.activeElement;
+    if (
+      activeEl?.tagName === 'INPUT' &&
+      (activeEl === inInputRef.current ||
+        activeEl === outInputRef.current ||
+        activeEl === manualInInputRef.current ||
+        activeEl === manualOutInputRef.current)
+    ) {
+      return;
+    }
+    if (canQrScan) {
+      restoreTargetFocus(activeFocus, 'QR');
+    } else if (canManualEntry) {
+      restoreTargetFocus(activeFocus, 'MANUAL');
+    }
+  }, [activeFocus, canQrScan, canManualEntry, restoreTargetFocus]);
 
   // Close webcam immediately if QR permission is revoked
   useEffect(() => {
@@ -181,9 +212,9 @@ export const Scanner: React.FC<ScannerProps> = ({
   }, [canQrScan, webcamStation]);
 
   // Process Punch In Scan
-  const handlePunchIn = async (payload: string, source: 'USB_SCANNER' | 'WEBCAM' | 'MANUAL' = 'USB_SCANNER') => {
+  const handlePunchIn = useCallback(async (payload: string, source: 'USB_SCANNER' | 'WEBCAM' | 'MANUAL' = 'USB_SCANNER') => {
     const clean = payload.trim();
-    if (!clean || isProcessingIn) return;
+    if (!clean || inFlightInRef.current) return;
     if (!canQrScan) {
       setLastInResult({
         success: false,
@@ -196,19 +227,34 @@ export const Scanner: React.FC<ScannerProps> = ({
       return;
     }
 
+    inFlightInRef.current = true;
+    const e2eStart = performance.now();
     setIsProcessingIn(true);
     try {
       const result = await processDualAttendanceScan({
         rawPayload: clean,
         scannerType: 'IN',
         scannerDevice: source,
+        clientRequestId: createClientRequestId('qrin'),
       });
 
-      setLastInResult(result);
-      setRecentEvents(prev => [result, ...prev.slice(0, 9)]);
+      const uiDisplayStart = performance.now();
+      const networkApiMs = result.perf?.networkApiMs ?? (uiDisplayStart - e2eStart);
+      const enriched: ScanResult = {
+        ...result,
+        perf: {
+          ...result.perf,
+          networkApiMs: Number(networkApiMs.toFixed(2)),
+          uiDisplayMs: Number((performance.now() - uiDisplayStart).toFixed(2)),
+          totalEndToEndMs: Number((performance.now() - e2eStart).toFixed(2)),
+        },
+      };
 
-      if (result.success) {
-        if (result.attendance?.attendanceStatus === 'LATE') {
+      setLastInResult(enriched);
+      setRecentEvents(prev => [enriched, ...prev.slice(0, 9)]);
+
+      if (enriched.success) {
+        if (isAttendanceLate(enriched.attendance)) {
           playSound('warning');
         } else {
           playSound('success_in');
@@ -229,18 +275,17 @@ export const Scanner: React.FC<ScannerProps> = ({
       setLastInResult(fallback);
       playSound('error');
     } finally {
+      inFlightInRef.current = false;
       setIsProcessingIn(false);
       setInInput('');
-      if (canQrScan) {
-        setTimeout(() => inInputRef.current?.focus(), 50);
-      }
+      restoreTargetFocus('IN', 'QR');
     }
-  };
+  }, [canQrScan, onAttendanceUpdated, playSound, restoreTargetFocus]);
 
   // Process Punch Out Scan
-  const handlePunchOut = async (payload: string, source: 'USB_SCANNER' | 'WEBCAM' | 'MANUAL' = 'USB_SCANNER') => {
+  const handlePunchOut = useCallback(async (payload: string, source: 'USB_SCANNER' | 'WEBCAM' | 'MANUAL' = 'USB_SCANNER') => {
     const clean = payload.trim();
-    if (!clean || isProcessingOut) return;
+    if (!clean || inFlightOutRef.current) return;
     if (!canQrScan) {
       setLastOutResult({
         success: false,
@@ -253,18 +298,33 @@ export const Scanner: React.FC<ScannerProps> = ({
       return;
     }
 
+    inFlightOutRef.current = true;
+    const e2eStart = performance.now();
     setIsProcessingOut(true);
     try {
       const result = await processDualAttendanceScan({
         rawPayload: clean,
         scannerType: 'OUT',
         scannerDevice: source,
+        clientRequestId: createClientRequestId('qrout'),
       });
 
-      setLastOutResult(result);
-      setRecentEvents(prev => [result, ...prev.slice(0, 9)]);
+      const uiDisplayStart = performance.now();
+      const networkApiMs = result.perf?.networkApiMs ?? (uiDisplayStart - e2eStart);
+      const enriched: ScanResult = {
+        ...result,
+        perf: {
+          ...result.perf,
+          networkApiMs: Number(networkApiMs.toFixed(2)),
+          uiDisplayMs: Number((performance.now() - uiDisplayStart).toFixed(2)),
+          totalEndToEndMs: Number((performance.now() - e2eStart).toFixed(2)),
+        },
+      };
 
-      if (result.success) {
+      setLastOutResult(enriched);
+      setRecentEvents(prev => [enriched, ...prev.slice(0, 9)]);
+
+      if (enriched.success) {
         playSound('success_out');
         onAttendanceUpdated?.();
       } else {
@@ -282,17 +342,17 @@ export const Scanner: React.FC<ScannerProps> = ({
       setLastOutResult(fallback);
       playSound('error');
     } finally {
+      inFlightOutRef.current = false;
       setIsProcessingOut(false);
       setOutInput('');
-      if (canQrScan) {
-        setTimeout(() => outInputRef.current?.focus(), 50);
-      }
+      restoreTargetFocus('OUT', 'QR');
     }
-  };
+  }, [canQrScan, onAttendanceUpdated, playSound, restoreTargetFocus]);
+
   // Process Authorized Manual Employee ID Punch In
-  const handleManualPunchIn = async (empId: string) => {
+  const handleManualPunchIn = useCallback(async (empId: string) => {
     const clean = empId.trim().toUpperCase();
-    if (!clean || isProcessingManualIn) return;
+    if (!clean || inFlightManualInRef.current) return;
     if (!canManualEntry) {
       setLastInResult({
         success: false,
@@ -305,19 +365,34 @@ export const Scanner: React.FC<ScannerProps> = ({
       return;
     }
 
+    inFlightManualInRef.current = true;
+    const e2eStart = performance.now();
     setIsProcessingManualIn(true);
     try {
       const result = await processManualAttendancePunch({
         employeeId: clean,
         scannerType: 'IN',
+        clientRequestId: createClientRequestId('manin'),
       });
 
-      setLastInResult(result);
-      setRecentEvents(prev => [result, ...prev.slice(0, 9)]);
+      const uiDisplayStart = performance.now();
+      const networkApiMs = result.perf?.networkApiMs ?? (uiDisplayStart - e2eStart);
+      const enriched: ScanResult = {
+        ...result,
+        perf: {
+          ...result.perf,
+          networkApiMs: Number(networkApiMs.toFixed(2)),
+          uiDisplayMs: Number((performance.now() - uiDisplayStart).toFixed(2)),
+          totalEndToEndMs: Number((performance.now() - e2eStart).toFixed(2)),
+        },
+      };
 
-      if (result.success) {
+      setLastInResult(enriched);
+      setRecentEvents(prev => [enriched, ...prev.slice(0, 9)]);
+
+      if (enriched.success) {
         setManualInId('');
-        if (result.attendance?.attendanceStatus === 'LATE') {
+        if (isAttendanceLate(enriched.attendance)) {
           playSound('warning');
         } else {
           playSound('success_in');
@@ -338,17 +413,16 @@ export const Scanner: React.FC<ScannerProps> = ({
       setLastInResult(fallback);
       playSound('error');
     } finally {
+      inFlightManualInRef.current = false;
       setIsProcessingManualIn(false);
-      if (canManualEntry) {
-        setTimeout(() => manualInInputRef.current?.focus(), 50);
-      }
+      restoreTargetFocus('IN', 'MANUAL');
     }
-  };
+  }, [canManualEntry, onAttendanceUpdated, playSound, restoreTargetFocus]);
 
   // Process Authorized Manual Employee ID Punch Out
-  const handleManualPunchOut = async (empId: string) => {
+  const handleManualPunchOut = useCallback(async (empId: string) => {
     const clean = empId.trim().toUpperCase();
-    if (!clean || isProcessingManualOut) return;
+    if (!clean || inFlightManualOutRef.current) return;
     if (!canManualEntry) {
       setLastOutResult({
         success: false,
@@ -361,17 +435,32 @@ export const Scanner: React.FC<ScannerProps> = ({
       return;
     }
 
+    inFlightManualOutRef.current = true;
+    const e2eStart = performance.now();
     setIsProcessingManualOut(true);
     try {
       const result = await processManualAttendancePunch({
         employeeId: clean,
         scannerType: 'OUT',
+        clientRequestId: createClientRequestId('manout'),
       });
 
-      setLastOutResult(result);
-      setRecentEvents(prev => [result, ...prev.slice(0, 9)]);
+      const uiDisplayStart = performance.now();
+      const networkApiMs = result.perf?.networkApiMs ?? (uiDisplayStart - e2eStart);
+      const enriched: ScanResult = {
+        ...result,
+        perf: {
+          ...result.perf,
+          networkApiMs: Number(networkApiMs.toFixed(2)),
+          uiDisplayMs: Number((performance.now() - uiDisplayStart).toFixed(2)),
+          totalEndToEndMs: Number((performance.now() - e2eStart).toFixed(2)),
+        },
+      };
 
-      if (result.success) {
+      setLastOutResult(enriched);
+      setRecentEvents(prev => [enriched, ...prev.slice(0, 9)]);
+
+      if (enriched.success) {
         setManualOutId('');
         playSound('success_out');
         onAttendanceUpdated?.();
@@ -390,43 +479,60 @@ export const Scanner: React.FC<ScannerProps> = ({
       setLastOutResult(fallback);
       playSound('error');
     } finally {
+      inFlightManualOutRef.current = false;
       setIsProcessingManualOut(false);
-      setTimeout(() => manualOutInputRef.current?.focus(), 50);
+      restoreTargetFocus('OUT', 'MANUAL');
     }
-  };
-  // Setup Webcam QR Reader if activated
-  useEffect(() => {
-    if (webcamStation !== 'NONE') {
-      const scanner = new Html5QrcodeScanner(
-        'dual-qr-reader-container',
-        { fps: 10, qrbox: { width: 250, height: 250 } },
-        false
-      );
+  }, [canManualEntry, onAttendanceUpdated, playSound, restoreTargetFocus]);
 
-      scanner.render(
-        (decodedText) => {
-          if (webcamStation === 'IN') {
-            handlePunchIn(decodedText, 'WEBCAM');
-          } else if (webcamStation === 'OUT') {
-            handlePunchOut(decodedText, 'WEBCAM');
-          }
-        },
-        () => {}
-      );
-      webcamScannerRef.current = scanner;
-    } else {
+  // Dynamically load Webcam QR Reader only when webcam camera is opened
+  useEffect(() => {
+    let cancelled = false;
+
+    const cleanupScanner = () => {
       if (webcamScannerRef.current) {
         webcamScannerRef.current.clear().catch(console.error);
         webcamScannerRef.current = null;
       }
+    };
+
+    if (webcamStation === 'NONE') {
+      cleanupScanner();
+      return cleanupScanner;
     }
 
+    import('html5-qrcode')
+      .then(({ Html5QrcodeScanner }) => {
+        if (cancelled) return;
+        const containerEl = document.getElementById('dual-qr-reader-container');
+        if (!containerEl) return;
+        const scanner = new Html5QrcodeScanner(
+          'dual-qr-reader-container',
+          { fps: 15, qrbox: { width: 250, height: 250 } },
+          false
+        );
+
+        scanner.render(
+          (decodedText: string) => {
+            if (webcamStation === 'IN') {
+              handlePunchIn(decodedText, 'WEBCAM');
+            } else if (webcamStation === 'OUT') {
+              handlePunchOut(decodedText, 'WEBCAM');
+            }
+          },
+          () => {}
+        );
+        webcamScannerRef.current = scanner;
+      })
+      .catch((err) => {
+        console.error('Failed to load webcam QR scanner:', err);
+      });
+
     return () => {
-      if (webcamScannerRef.current) {
-        webcamScannerRef.current.clear().catch(console.error);
-      }
+      cancelled = true;
+      cleanupScanner();
     };
-  }, [webcamStation]);
+  }, [webcamStation, handlePunchIn, handlePunchOut]);
 
   return (
     <div className="flex flex-col h-full bg-slate-950 text-white overflow-y-auto">
@@ -665,7 +771,7 @@ export const Scanner: React.FC<ScannerProps> = ({
                         disabled={isProcessingIn || !inInput.trim()}
                         className="absolute right-1.5 top-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-semibold px-3 py-1.5 rounded transition"
                       >
-                        Scan In
+                        {isProcessingIn ? 'Scanning...' : 'Scan In'}
                       </button>
                     </div>
                   ) : (
@@ -737,7 +843,7 @@ export const Scanner: React.FC<ScannerProps> = ({
                     <div 
                       className={`p-4 rounded-lg border flex flex-col gap-3 transition-all ${
                         lastInResult.success
-                          ? lastInResult.attendance?.attendanceStatus === 'LATE'
+                          ? isAttendanceLate(lastInResult.attendance)
                             ? 'bg-amber-950/30 border-amber-600/70 text-amber-200'
                             : 'bg-emerald-950/30 border-emerald-600/70 text-emerald-200'
                           : 'bg-red-950/40 border-red-700 text-red-200'
@@ -787,7 +893,8 @@ export const Scanner: React.FC<ScannerProps> = ({
                           <div>
                             <span className="text-slate-400 block text-[10px]">SHIFT / STATUS</span>
                             <span className="font-semibold text-emerald-400 block">
-                              {lastInResult.shift?.name || 'DAY SHIFT'} • INSIDE
+                              {lastInResult.shift?.name || 'DAY SHIFT'} • INSIDE / IN PROGRESS
+                              {isAttendanceLate(lastInResult.attendance) ? ' (LATE)' : ''}
                             </span>
                           </div>
                         </div>
@@ -897,7 +1004,7 @@ export const Scanner: React.FC<ScannerProps> = ({
                         disabled={isProcessingOut || !outInput.trim()}
                         className="absolute right-1.5 top-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-xs font-semibold px-3 py-1.5 rounded transition"
                       >
-                        Scan Out
+                        {isProcessingOut ? 'Scanning...' : 'Scan Out'}
                       </button>
                     </div>
                   ) : (
@@ -994,36 +1101,43 @@ export const Scanner: React.FC<ScannerProps> = ({
                         </span>
                       </div>
 
-                      {lastOutResult.employee && (
-                        <div className="grid grid-cols-2 gap-2 pt-2 border-t border-white/10 text-xs">
-                          <div>
-                            <span className="text-slate-400 block text-[10px]">EMPLOYEE</span>
-                            <span className="font-bold text-white truncate block">
-                              {lastOutResult.employee.employeeName} ({lastOutResult.employee.employeeId})
-                            </span>
+                      {lastOutResult.employee && (() => {
+                        const resolvedOut = resolveAttendanceMetrics(lastOutResult.attendance);
+                        return (
+                          <div className="grid grid-cols-2 gap-2 pt-2 border-t border-white/10 text-xs">
+                            <div>
+                              <span className="text-slate-400 block text-[10px]">EMPLOYEE</span>
+                              <span className="font-bold text-white truncate block">
+                                {lastOutResult.employee.employeeName} ({lastOutResult.employee.employeeId})
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-slate-400 block text-[10px]">DUTY RECORDED</span>
+                              <span className="font-bold text-emerald-400 block">
+                                {lastOutResult.attendance
+                                  ? `${formatDurationClock(resolvedOut.completedDutyMinutes)} Hours`
+                                  : lastOutResult.dutyFormatted || '08:30 Hours'}
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-slate-400 block text-[10px]">OVERTIME (OT)</span>
+                              <span className="font-bold text-amber-400 block">
+                                {resolvedOut.overtimeMinutes > 0
+                                  ? resolvedOut.otLabel
+                                  : lastOutResult.otFormatted && lastOutResult.otFormatted !== '00:00 Hours'
+                                    ? lastOutResult.otFormatted
+                                    : '00:00 Hours'}
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-slate-400 block text-[10px]">STATE &amp; STATUS</span>
+                              <span className="font-semibold text-slate-200 block">
+                                OUTSIDE • {resolvedOut.status} (Punch #{lastOutResult.punchCount || 2})
+                              </span>
+                            </div>
                           </div>
-                          <div>
-                            <span className="text-slate-400 block text-[10px]">DUTY RECORDED</span>
-                            <span className="font-bold text-emerald-400 block">
-                              {lastOutResult.dutyFormatted || '08:30 Hours'}
-                            </span>
-                          </div>
-                          <div>
-                            <span className="text-slate-400 block text-[10px]">OVERTIME (OT)</span>
-                            <span className="font-bold text-amber-400 block">
-                              {lastOutResult.otFormatted && lastOutResult.otFormatted !== '00:00 Hours' 
-                                ? lastOutResult.otFormatted 
-                                : '00:00 Hours'}
-                            </span>
-                          </div>
-                          <div>
-                            <span className="text-slate-400 block text-[10px]">CURRENT STATE</span>
-                            <span className="font-semibold text-slate-300 block">
-                              OUTSIDE (Punch #{lastOutResult.punchCount || 2})
-                            </span>
-                          </div>
-                        </div>
-                      )}
+                        );
+                      })()}
                     </div>
                   ) : (
                     <div className="border border-dashed border-slate-800 rounded-lg p-6 text-center text-xs text-slate-500">

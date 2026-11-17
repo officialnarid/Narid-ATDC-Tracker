@@ -1,5 +1,8 @@
 import express, { type Request, type Response } from 'express';
 import crypto from 'crypto';
+import { getCachedRoleDefDoc, getCachedSystemSettings } from './serverPerfCache.ts';
+
+const KOLKATA_CA_DATE_FORMATTER = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' });
 
 // ============================================================================
 // Admin SDK Structural Interfaces (Compatible with firebase-admin & test doubles)
@@ -90,6 +93,7 @@ export interface VerifiedCaller {
   role: string;
   profileDocId: string;
   authTime?: number;
+  modulesAllowed?: string[];
 }
 
 export interface GeoLocationInfo {
@@ -333,8 +337,8 @@ export async function verifyCallerIdentity(
 
   const normalizedRole = normalizeRoleValue(matchedDoc.data.role);
   if (!SYSTEM_ROLE_IDS.has(normalizedRole)) {
-    const roleDefSnap = await db.collection('roles').doc(normalizedRole).get();
-    if (roleDefSnap.exists && roleDefSnap.data()?.isActive === false) {
+    const roleDefSnap = await getCachedRoleDefDoc(db, normalizedRole);
+    if (roleDefSnap.exists && roleDefSnap.data?.isActive === false) {
       const err: any = new Error('Assigned role is currently inactive. Access denied.');
       err.statusCode = 403;
       throw err;
@@ -374,6 +378,9 @@ export async function verifyCallerIdentity(
     role: normalizedRole,
     profileDocId: matchedDoc.id,
     authTime,
+    modulesAllowed: Array.isArray(matchedDoc.data.modulesAllowed)
+      ? matchedDoc.data.modulesAllowed
+      : undefined,
   };
 }
 
@@ -934,8 +941,8 @@ export function registerSecurityAuditRoutes(
 
       let captureGeo = true;
       try {
-        const settingsSnap = await db.collection('system_settings').doc('global').get();
-        if (settingsSnap.exists && settingsSnap.data()?.captureGeoLocation === false) {
+        const settingsSnap = await getCachedSystemSettings(db, {});
+        if (settingsSnap.exists && settingsSnap.data?.captureGeoLocation === false) {
           captureGeo = false;
         }
       } catch {}
@@ -1003,8 +1010,8 @@ export function registerSecurityAuditRoutes(
         pageSize = '25',
       } = req.query as Record<string, string>;
 
-      const settingsSnap = await db.collection('system_settings').doc('global').get();
-      const settingsData = settingsSnap.exists ? (settingsSnap.data() || {}) : {};
+      const settingsSnap = await getCachedSystemSettings(db, {});
+      const settingsData = settingsSnap.exists ? (settingsSnap.data || {}) : {};
       const retentionDays = Number(settingsData.auditRetentionDays || 90);
       const retentionCutoffMs = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
 
@@ -1028,14 +1035,14 @@ export function registerSecurityAuditRoutes(
       const allArchived = Array.from(archivedMap.values());
       const activeOnly = activeLogs.filter(l => !l.archived);
 
-      const kolkataToday = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
+      const kolkataToday = KOLKATA_CA_DATE_FORMATTER.format(new Date());
 
       const allCombined = [...activeOnly, ...allArchived];
       const kpis = {
         totalLogs: allCombined.length,
         todayActivities: activeLogs.filter(l => {
           try {
-            const dStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date(l.timestamp));
+            const dStr = KOLKATA_CA_DATE_FORMATTER.format(new Date(l.timestamp));
             return dStr === kolkataToday;
           } catch {
             return false;
