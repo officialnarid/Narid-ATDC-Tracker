@@ -48,8 +48,8 @@ export const DEFAULT_SHIFTS: Shift[] = [
     startTime: '09:00',
     endTime: '17:30',
     scheduledDurationMinutes: 510, // 8 Hours 30 Minutes
-    punchInWindowStart: '09:00',
-    punchInWindowEnd: '20:00',
+    punchInWindowStart: '06:00',
+    punchInWindowEnd: '18:00',
     isOvernight: false,
     gracePeriodMinutes: 15,
     status: 'Active',
@@ -60,8 +60,8 @@ export const DEFAULT_SHIFTS: Shift[] = [
     startTime: '20:00',
     endTime: '04:30',
     scheduledDurationMinutes: 510, // 8 Hours 30 Minutes
-    punchInWindowStart: '20:00',
-    punchInWindowEnd: '09:00',
+    punchInWindowStart: '18:00',
+    punchInWindowEnd: '06:00',
     isOvernight: true,
     gracePeriodMinutes: 15,
     status: 'Active',
@@ -153,7 +153,12 @@ export async function initializeMasterData(): Promise<void> {
           await setDoc(doc(db, 'shifts', shift.id), shift);
         } else {
           const data = existing.data() as Shift;
-          if (data.punchInWindowStart === '07:30' || data.punchInWindowStart === '18:30') {
+          if (
+            data.punchInWindowStart === '07:30' ||
+            data.punchInWindowStart === '18:30' ||
+            (shift.id === 'DAY' && data.punchInWindowStart === '09:00' && data.punchInWindowEnd === '20:00') ||
+            (shift.id === 'NIGHT' && data.punchInWindowStart === '20:00' && data.punchInWindowEnd === '09:00')
+          ) {
             await setDoc(doc(db, 'shifts', shift.id), shift);
           }
         }

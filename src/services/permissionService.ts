@@ -259,6 +259,12 @@ export const PERMISSION_MODULES: PermissionModuleItem[] = [
     category: 'Administration',
     description: 'Camera parameters, company branding, security retention policies',
   },
+  {
+    key: 'system_performance',
+    label: '14. System Performance & Monitoring',
+    category: 'Administration',
+    description: 'Live APM, API/Database monitoring, QR telemetry, alerts, error & activity center (Super Admin only)',
+  },
 ];
 
 // Default permissions for Super Admin (Always complete and unrestricted)
@@ -286,6 +292,7 @@ export const DEFAULT_ADMIN_PERMISSIONS: Record<string, ModulePermission> = {
   user_rights: { view: false, add: false, edit: false, delete: false },
   audit_logs: { view: false, add: false, edit: false, delete: false },
   security_management: { view: false, add: false, edit: false, delete: false },
+  system_performance: { view: false, add: false, edit: false, delete: false },
   settings: { view: false, add: false, edit: false, delete: false },
 };
 
@@ -311,6 +318,7 @@ export const DEFAULT_USER_PERMISSIONS: Record<string, ModulePermission> = {
   user_rights: { view: false, add: false, edit: false, delete: false },
   audit_logs: { view: false, add: false, edit: false, delete: false },
   security_management: { view: false, add: false, edit: false, delete: false },
+  system_performance: { view: false, add: false, edit: false, delete: false },
   settings: { view: false, add: false, edit: false, delete: false },
 };
 
@@ -508,7 +516,12 @@ export function hasModulePermission(
   }
 
   // Restricted administrative modules are never allowed for non-Super Admin roles
-  if (moduleKey === 'user_rights' || moduleKey === 'audit_logs' || moduleKey === 'security_management') {
+  if (
+    moduleKey === 'user_rights' ||
+    moduleKey === 'audit_logs' ||
+    moduleKey === 'security_management' ||
+    moduleKey === 'system_performance'
+  ) {
     return false;
   }
 

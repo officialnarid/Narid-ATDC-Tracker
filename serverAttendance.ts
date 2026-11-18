@@ -18,8 +18,18 @@ import {
 } from './serverPerfCache.ts';
 import {
   classifyCompletedDutyStatus,
+  EARLY_PUNCH_POLICY_ID,
+  evaluateEarlyPunchOnPunchIn,
+  evaluateOptionAPunchOut,
+  resolveShiftScheduleBounds,
   STANDARD_DUTY_MINUTES,
 } from './src/utils/attendanceStatus.ts';
+import {
+  recordQrPunchTelemetry,
+  recordDbOpMetric,
+  recordActivityTelemetry,
+  recordErrorTelemetry,
+} from './serverMonitoring.ts';
 
 const KOLKATA_PARTS_FORMATTER = new Intl.DateTimeFormat('en-IN', {
   timeZone: 'Asia/Kolkata',
@@ -49,8 +59,8 @@ const DEFAULT_SHIFTS = [
     startTime: '09:00',
     endTime: '17:30',
     scheduledDurationMinutes: 510,
-    punchInWindowStart: '09:00',
-    punchInWindowEnd: '20:00',
+    punchInWindowStart: '06:00',
+    punchInWindowEnd: '18:00',
     isOvernight: false,
     gracePeriodMinutes: 15,
     status: 'Active',
@@ -61,8 +71,8 @@ const DEFAULT_SHIFTS = [
     startTime: '20:00',
     endTime: '04:30',
     scheduledDurationMinutes: 510,
-    punchInWindowStart: '20:00',
-    punchInWindowEnd: '09:00',
+    punchInWindowStart: '18:00',
+    punchInWindowEnd: '06:00',
     isOvernight: true,
     gracePeriodMinutes: 15,
     status: 'Active',
@@ -252,6 +262,22 @@ export function parseQrPayload(raw: string): {
   return { employeeId: cleanLegacyId, format: 'LEGACY_EMPLOYEE_ID' };
 }
 
+function resolveEffectivePunchInWindow(shift: any): { winStartStr: string; winEndStr: string } {
+  const rawStart = String(shift?.punchInWindowStart || '').trim();
+  const rawEnd = String(shift?.punchInWindowEnd || '').trim();
+  const shiftIdUpper = String(shift?.id || '').toUpperCase();
+
+  // Upgrade legacy default DAY/NIGHT windows dynamically in memory so existing Firestore shift docs
+  // accurately classify early punches (Day >= 06:00 AM, Night >= 06:00 PM / 18:00) without DB rewrites.
+  if (!shift?.isOvernight && (shiftIdUpper === 'DAY' || shift?.startTime === '09:00') && rawStart === '09:00' && rawEnd === '20:00') {
+    return { winStartStr: '06:00', winEndStr: '18:00' };
+  }
+  if ((shift?.isOvernight || shiftIdUpper === 'NIGHT') && shift?.startTime === '20:00' && rawStart === '20:00' && rawEnd === '09:00') {
+    return { winStartStr: '18:00', winEndStr: '06:00' };
+  }
+  return { winStartStr: rawStart, winEndStr: rawEnd };
+}
+
 export function identifyShiftForPunchIn(
   shifts: any[],
   now: Date = new Date()
@@ -261,8 +287,9 @@ export function identifyShiftForPunchIn(
   const activeShifts = shifts.filter((s) => s.status === 'Active');
 
   for (const shift of activeShifts) {
-    const winStart = timeStringToMinutes(shift.punchInWindowStart);
-    const winEnd = timeStringToMinutes(shift.punchInWindowEnd);
+    const { winStartStr, winEndStr } = resolveEffectivePunchInWindow(shift);
+    const winStart = timeStringToMinutes(winStartStr);
+    const winEnd = timeStringToMinutes(winEndStr);
 
     if (winStart < winEnd) {
       if (currentMins >= winStart && currentMins < winEnd) {
@@ -280,9 +307,9 @@ export function identifyShiftForPunchIn(
   const dayShift = activeShifts.find((s) => !s.isOvernight) || activeShifts[0];
   const nightShift = activeShifts.find((s) => s.isOvernight) || activeShifts[activeShifts.length - 1];
 
-  if (currentMins >= 540 && currentMins < 1200) {
+  if (currentMins >= 360 && currentMins < 1080) {
     return dayShift ? { shift: dayShift, shiftDate: kolkata.dateKey } : null;
-  } else if (currentMins >= 1200) {
+  } else if (currentMins >= 1080) {
     return nightShift ? { shift: nightShift, shiftDate: kolkata.dateKey } : null;
   } else {
     return nightShift ? { shift: nightShift, shiftDate: getYesterdayKolkataDateKey(now) } : null;
@@ -841,9 +868,90 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         })
       );
 
+      const scanTotalMs = roundMs(performance.now() - reqStartMs);
+      const outcomePerf = (outcome.body as any)?.perf;
+      const outcomeAction = String((outcome.body as any)?.action || 'REJECTED');
+      const resolvedDir: 'IN' | 'OUT' =
+        (outcome.body as any)?.scannerType === 'OUT' || scannerType === 'OUT' ? 'OUT' : 'IN';
+      const isSuccess = outcome.httpStatus >= 200 && outcome.httpStatus < 300 && Boolean((outcome.body as any)?.success);
+      const isDuplicate = outcomeAction === 'REJECTED_DUPLICATE';
+
+      recordQrPunchTelemetry(db, {
+        mode: resolvedDir === 'OUT' ? 'QR_OUT' : 'QR_IN',
+        action: outcomeAction,
+        success: isSuccess,
+        isDuplicateRejection: isDuplicate,
+        timedOut: outcome.httpStatus === 408 || outcome.httpStatus === 504,
+        qrParseMs,
+        authMs: outcomePerf?.authMs ?? roundMs(authDoneMs - reqStartMs),
+        permissionMs: outcomePerf?.permissionMs ?? roundMs(permDoneMs - authDoneMs),
+        lookupAndQueryMs: outcomePerf?.lookupAndQueryMs,
+        tokenValidationMs: outcomePerf?.tokenValidationMs,
+        txMs: outcomePerf?.txMs,
+        firestoreOpMs: outcomePerf?.firestoreOpMs,
+        totalServerMs: outcomePerf?.totalServerMs ?? scanTotalMs,
+        reasonCode: isSuccess ? undefined : outcomeAction,
+        correlationId: (req as any).correlationId,
+      });
+
+      if (typeof outcomePerf?.lookupAndQueryMs === 'number') {
+        recordDbOpMetric(db, {
+          operation: 'QUERY',
+          collection: 'employees+attendance',
+          durationMs: outcomePerf.lookupAndQueryMs,
+          success: true,
+          correlationId: (req as any).correlationId,
+        });
+      }
+      if (typeof outcomePerf?.txMs === 'number') {
+        recordDbOpMetric(db, {
+          operation: 'TRANSACTION',
+          collection: 'attendance',
+          durationMs: outcomePerf.txMs,
+          success: outcome.httpStatus < 500,
+          correlationId: (req as any).correlationId,
+        });
+      }
+
+      recordActivityTelemetry(db, {
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        action: isSuccess
+          ? resolvedDir === 'OUT'
+            ? 'QR_PUNCH_OUT'
+            : 'QR_PUNCH_IN'
+          : `QR_SCAN_${outcomeAction}`,
+        module: 'Attendance Scanner',
+        result: isSuccess ? 'Success' : 'Failed',
+        correlationId: (req as any).correlationId,
+        detail: `${resolvedDir} scan via ${scannerDevice} (${outcome.httpStatus})`,
+      });
+
       return res.status(outcome.httpStatus).json(outcome.body);
     } catch (err: any) {
       console.error('[API Attendance Scan] Error:', err);
+      const errMsg = String(err?.message || 'Attendance scan processing failed.');
+      recordDbOpMetric(db, {
+        operation: 'TRANSACTION',
+        collection: 'attendance',
+        durationMs: roundMs(performance.now() - reqStartMs),
+        success: false,
+        isPermissionDenied: errMsg.toLowerCase().includes('permission'),
+        isNetworkError: errMsg.toLowerCase().includes('timeout') || errMsg.toLowerCase().includes('unavailable'),
+        errorMessage: errMsg,
+        correlationId: (req as any).correlationId,
+      });
+      recordQrPunchTelemetry(db, {
+        mode: 'QR_IN',
+        action: 'SYSTEM_ERROR',
+        success: false,
+        isDuplicateRejection: false,
+        timedOut: errMsg.toLowerCase().includes('timeout'),
+        totalServerMs: roundMs(performance.now() - reqStartMs),
+        reasonCode: 'SYSTEM_ERROR',
+        correlationId: (req as any).correlationId,
+      });
       return res.status(500).json({
         success: false,
         action: 'REJECTED',
@@ -1059,9 +1167,61 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         })
       );
 
+      const manualTotalMs = roundMs(performance.now() - reqStartMs);
+      const outcomePerf = (outcome.body as any)?.perf;
+      const outcomeAction = String((outcome.body as any)?.action || 'REJECTED');
+      const isSuccess = outcome.httpStatus >= 200 && outcome.httpStatus < 300 && Boolean((outcome.body as any)?.success);
+      const isDuplicate = outcomeAction === 'REJECTED_DUPLICATE';
+
+      recordQrPunchTelemetry(db, {
+        mode: scannerType === 'OUT' ? 'MANUAL_OUT' : 'MANUAL_IN',
+        action: outcomeAction,
+        success: isSuccess,
+        isDuplicateRejection: isDuplicate,
+        timedOut: outcome.httpStatus === 408 || outcome.httpStatus === 504,
+        authMs: outcomePerf?.authMs ?? roundMs(authDoneMs - reqStartMs),
+        permissionMs: outcomePerf?.permissionMs ?? roundMs(permDoneMs - authDoneMs),
+        lookupAndQueryMs: outcomePerf?.lookupAndQueryMs,
+        txMs: outcomePerf?.txMs,
+        firestoreOpMs: outcomePerf?.firestoreOpMs,
+        totalServerMs: outcomePerf?.totalServerMs ?? manualTotalMs,
+        reasonCode: isSuccess ? undefined : outcomeAction,
+        correlationId: (req as any).correlationId,
+      });
+
+      if (typeof outcomePerf?.txMs === 'number') {
+        recordDbOpMetric(db, {
+          operation: 'TRANSACTION',
+          collection: 'attendance',
+          durationMs: outcomePerf.txMs,
+          success: outcome.httpStatus < 500,
+          correlationId: (req as any).correlationId,
+        });
+      }
+
+      recordActivityTelemetry(db, {
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        action: isSuccess ? `MANUAL_PUNCH_${scannerType}` : `MANUAL_PUNCH_${outcomeAction}`,
+        module: 'Attendance Scanner',
+        result: isSuccess ? 'Success' : 'Failed',
+        correlationId: (req as any).correlationId,
+        detail: `Manual ${scannerType} entry (${outcome.httpStatus})`,
+      });
+
       return res.status(outcome.httpStatus).json(outcome.body);
     } catch (err: any) {
       console.error('[API Manual Punch] Error:', err);
+      recordErrorTelemetry(db, {
+        source: 'BACKEND',
+        module: 'Attendance Scanner',
+        category: 'MANUAL_PUNCH_ERROR',
+        severity: 'CRITICAL',
+        message: err?.message || 'Manual attendance punch processing failed.',
+        statusCode: 500,
+        correlationId: (req as any).correlationId,
+      });
       return res.status(500).json({
         success: false,
         action: 'REJECTED',
@@ -1118,11 +1278,36 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
               (r.shiftId === 'NIGHT' || String(r.shiftNameSnapshot || '').toUpperCase().includes('NIGHT'))
           );
           if (yesterdayNight) {
-            activeRecord = yesterdayNight;
+            const isYesterdayNightOpen =
+              yesterdayNight.currentState === 'INSIDE' ||
+              (!yesterdayNight.actualPunchOut && yesterdayNight.punchOutType === 'NONE');
+            // Always attach to yesterday's Night shift if still INSIDE (e.g. OT checkout after 06:00 AM)
+            // OR if currently before 06:00 AM (cross-midnight Night shift window).
+            if (isYesterdayNightOpen || currentMins < 360) {
+              activeRecord = yesterdayNight;
+            }
           }
         }
         if (!activeRecord) {
-          activeRecord = existingRecords.find((r) => r.shiftDate === todayKey) || null;
+          const todayOpenRecord = existingRecords.find(
+            (r) =>
+              r.shiftDate === todayKey &&
+              (r.currentState === 'INSIDE' || (!r.actualPunchOut && r.punchOutType === 'NONE'))
+          );
+          if (todayOpenRecord) {
+            activeRecord = todayOpenRecord;
+          } else if (scannerType === 'OUT') {
+            activeRecord = existingRecords.find((r) => r.shiftDate === todayKey) || null;
+          } else {
+            const expectedShiftMatch = identifyShiftForPunchIn(shifts, now);
+            const expectedShiftId = expectedShiftMatch?.shift?.id;
+            activeRecord =
+              existingRecords.find(
+                (r) =>
+                  r.shiftDate === todayKey &&
+                  (!expectedShiftId || r.shiftId === expectedShiftId)
+              ) || null;
+          }
         }
 
         // Auto-detect scannerType if omitted
@@ -1191,6 +1376,10 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                 totalDutyMinutes: 0,
                 regularDutyMinutes: 0,
                 overtimeMinutes: 0,
+                earlyOtMinutes: 0,
+                postShiftOtMinutes: 0,
+                totalOtMinutes: 0,
+                earlyOtFinalized: false,
                 punches: [...existingPunches, punchEvent],
                 updatedAt: now.toISOString(),
               };
@@ -1305,13 +1494,13 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
 
           const { shift, shiftDate } = shiftMatch;
           const attendanceId = `att_${employee.employeeId}_${shiftDate}_${shift.id}`;
-          const shiftStartMins = timeStringToMinutes(shift.startTime);
+          const scheduleBounds = resolveShiftScheduleBounds(shiftDate, shift);
           const grace = shift.gracePeriodMinutes ?? settings.lateGraceMinutes ?? 15;
-          const isLate = !shift.isOvernight
-            ? currentMins > shiftStartMins + grace
-            : currentMins >= 1200
-            ? currentMins > shiftStartMins + grace
-            : true;
+          const isLate = now.getTime() > scheduleBounds.scheduledStartMs + grace * 60000;
+          const earlyEval = evaluateEarlyPunchOnPunchIn({
+            firstInIso: now.toISOString(),
+            scheduledStartIso: scheduleBounds.scheduledStartIso,
+          });
 
           const arrivalStatus = isLate ? 'LATE' : 'PRESENT';
           const eventId = `pe_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
@@ -1351,7 +1540,10 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             shiftDate,
             punchIn: now.toISOString(),
             firstPunchIn: now.toISOString(),
-            scheduledPunchOut: shift.endTime,
+            scheduledPunchIn: scheduleBounds.startTime,
+            scheduledPunchInIso: scheduleBounds.scheduledStartIso,
+            scheduledPunchOut: scheduleBounds.endTime,
+            scheduledPunchOutIso: scheduleBounds.scheduledEndIso,
             actualPunchOut: null,
             lastPunchOut: null,
             effectivePunchOut: null,
@@ -1361,6 +1553,13 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             totalDutyMinutes: 0,
             regularDutyMinutes: 0,
             overtimeMinutes: 0,
+            earlyArrivalMinutes: earlyEval.earlyArrivalMinutes,
+            provisionalEarlyOtMinutes: earlyEval.provisionalEarlyOtMinutes,
+            earlyOtMinutes: 0,
+            postShiftOtMinutes: 0,
+            totalOtMinutes: 0,
+            earlyOtFinalized: false,
+            earlyPunchPolicy: earlyEval.earlyPunchPolicy,
             attendanceStatus: 'IN PROGRESS',
             isLate,
             arrivalStatus,
@@ -1397,7 +1596,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
               qrVerificationMode,
               performedByUid: caller.uid,
               performedByLoginId: caller.loginId,
-              message: `First Punch In recorded for ${shift.name} (${shiftDate}). Arrival: ${arrivalStatus}. Status: IN PROGRESS.`,
+              message: `First Punch In recorded for ${shift.name} (${shiftDate}). Arrival: ${arrivalStatus}${earlyEval.earlyArrivalMinutes > 0 ? `, Early: ${earlyEval.earlyArrivalMinutes}m (Provisional Early OT: ${earlyEval.provisionalEarlyOtMinutes}m)` : ''}. Status: IN PROGRESS.`,
             });
             return { kind: 'RECORDED' as const, record: newAttendanceRecord };
           });
@@ -1430,6 +1629,10 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
               shift,
               message: isLate
                 ? `First Punch In Recorded for ${shift.name} (Marked LATE).`
+                : earlyEval.provisionalEarlyOtMinutes > 0
+                ? `First Punch In Recorded for ${shift.name} (Early ${formatMinutes(earlyEval.earlyArrivalMinutes)} • Provisional Early OT).`
+                : earlyEval.earlyArrivalMinutes > 0
+                ? `First Punch In Recorded for ${shift.name} (Early ${formatMinutes(earlyEval.earlyArrivalMinutes)} • <60m: 0 Early OT).`
                 : `First Punch In Recorded for ${shift.name}.`,
               time: timeDisplay,
               punchCount: 1,
@@ -1490,18 +1693,29 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           }
 
           const firstInIso = currentData.firstPunchIn || currentData.punchIn;
-          const firstInDate = new Date(firstInIso);
-          const totalDutyMinutes = Math.max(
-            0,
-            Math.floor((now.getTime() - firstInDate.getTime()) / (1000 * 60))
-          );
-          const scheduledStandardDutyMinutes = STANDARD_DUTY_MINUTES;
-          const regularDutyMinutes = Math.min(totalDutyMinutes, scheduledStandardDutyMinutes);
-          const overtimeMinutes = Math.max(0, totalDutyMinutes - scheduledStandardDutyMinutes);
-          const computedStatus = classifyCompletedDutyStatus(
-            totalDutyMinutes,
-            scheduledStandardDutyMinutes
-          );
+          const recordShift = shiftsMap.get(currentData.shiftId) || shifts[0];
+          const bounds = resolveShiftScheduleBounds(currentData.shiftDate || todayKey, {
+            ...recordShift,
+            shiftId: currentData.shiftId,
+            shiftNameSnapshot: currentData.shiftNameSnapshot,
+            scheduledPunchIn: currentData.scheduledPunchIn || recordShift?.startTime,
+            scheduledPunchOut: currentData.scheduledPunchOut || recordShift?.endTime,
+          });
+          const scheduledStartIso = currentData.scheduledPunchInIso || bounds.scheduledStartIso;
+          const scheduledEndIso = currentData.scheduledPunchOutIso || bounds.scheduledEndIso;
+
+          const otEval = evaluateOptionAPunchOut({
+            firstInIso,
+            lastOutIso: now.toISOString(),
+            scheduledStartIso,
+            scheduledEndIso,
+            standardDutyMinutes: STANDARD_DUTY_MINUTES,
+          });
+
+          const totalDutyMinutes = otEval.totalDutyMinutes;
+          const regularDutyMinutes = otEval.regularDutyMinutes;
+          const overtimeMinutes = otEval.overtimeMinutes;
+          const computedStatus = otEval.attendanceStatus;
 
           const outEvent = {
             id: eventId,
@@ -1520,6 +1734,8 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             scannerDevice,
             dutyDurationMinutes: totalDutyMinutes,
             overtimeMinutes,
+            earlyOtMinutes: otEval.earlyOtMinutes,
+            postShiftOtMinutes: otEval.postShiftOtMinutes,
             status: 'VALID_OUT',
             recordedByUid: caller.uid,
             recordedByLoginId: caller.loginId,
@@ -1528,15 +1744,27 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           const existingPunches = Array.isArray(currentData.punches) ? currentData.punches : [];
           const updatedAttendance: Record<string, any> = {
             ...currentData,
+            scheduledPunchIn: currentData.scheduledPunchIn || bounds.startTime,
+            scheduledPunchInIso: scheduledStartIso,
+            scheduledPunchOut: currentData.scheduledPunchOut || bounds.endTime,
+            scheduledPunchOutIso: scheduledEndIso,
             actualPunchOut: now.toISOString(),
             lastPunchOut: now.toISOString(),
             effectivePunchOut: now.toISOString(),
             punchOutType: 'ACTUAL',
             currentState: 'OUTSIDE',
             punches: [...existingPunches, outEvent],
+            actualPresenceMinutes: otEval.actualPresenceMinutes,
             totalDutyMinutes,
             regularDutyMinutes,
             overtimeMinutes,
+            earlyArrivalMinutes: otEval.earlyArrivalMinutes,
+            provisionalEarlyOtMinutes: otEval.provisionalEarlyOtMinutes,
+            earlyOtMinutes: otEval.earlyOtMinutes,
+            postShiftOtMinutes: otEval.postShiftOtMinutes,
+            totalOtMinutes: otEval.totalOtMinutes,
+            earlyOtFinalized: true,
+            earlyPunchPolicy: EARLY_PUNCH_POLICY_ID,
             attendanceStatus: computedStatus,
             missedPunchOut: false,
             autoClosed: false,
@@ -1558,7 +1786,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             qrVerificationMode,
             performedByUid: caller.uid,
             performedByLoginId: caller.loginId,
-            message: `Punch Out recorded (${computedStatus}). Duty: ${formatMinutes(regularDutyMinutes)}, OT: ${formatMinutes(overtimeMinutes)}. Total: ${formatMinutes(totalDutyMinutes)}.`,
+            message: `Punch Out recorded (${computedStatus}). Duty: ${formatMinutes(regularDutyMinutes)}, Early OT: ${formatMinutes(otEval.earlyOtMinutes)}, Post OT: ${formatMinutes(otEval.postShiftOtMinutes)}, Total OT: ${formatMinutes(overtimeMinutes)}. Total: ${formatMinutes(totalDutyMinutes)}.`,
           });
 
           return {
@@ -1728,6 +1956,10 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
               totalDutyMinutes: scheduledDuration,
               regularDutyMinutes: scheduledDuration,
               overtimeMinutes: 0, // Zero OT on auto-closed shifts
+              earlyOtMinutes: 0,
+              postShiftOtMinutes: 0,
+              totalOtMinutes: 0,
+              earlyOtFinalized: false,
               updatedAt: now.toISOString(),
             };
             tx.set(docRef, next);
@@ -1834,18 +2066,54 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         let regularDutyMinutes = Number(current.regularDutyMinutes || 0);
         let overtimeMinutes = Number(current.overtimeMinutes || 0);
         let totalDutyMinutes = Number(current.totalDutyMinutes || 0);
+        let earlyArrivalMinutes = Number(current.earlyArrivalMinutes || 0);
+        let provisionalEarlyOtMinutes = Number(current.provisionalEarlyOtMinutes || 0);
+        let earlyOtMinutes = Number(current.earlyOtMinutes || 0);
+        let postShiftOtMinutes = Number(current.postShiftOtMinutes || 0);
+        let earlyOtFinalized = Boolean(current.earlyOtFinalized);
+        let actualPresenceMinutes = Number(current.actualPresenceMinutes || totalDutyMinutes || 0);
+
+        const bounds = resolveShiftScheduleBounds(current.shiftDate || '', current);
+        const scheduledStartIso = current.scheduledPunchInIso || bounds.scheduledStartIso;
 
         if (actualPunchOut) {
-          const inTime = new Date(current.firstPunchIn || current.punchIn).getTime();
+          const firstInIso = current.firstPunchIn || current.punchIn;
+          const inTime = new Date(firstInIso).getTime();
           const outTime = new Date(actualPunchOut).getTime();
           if (Number.isNaN(outTime)) {
             throw new Error('INVALID_PUNCH_OUT');
           }
-          totalDutyMinutes = Math.max(0, Math.floor((outTime - inTime) / (60 * 1000)));
-          regularDutyMinutes = Math.min(totalDutyMinutes, STANDARD_DUTY_MINUTES);
-          overtimeMinutes = punchOutType === 'AUTO' ? 0 : Math.max(0, totalDutyMinutes - STANDARD_DUTY_MINUTES);
+          if (punchOutType === 'AUTO') {
+            totalDutyMinutes = Math.max(0, Math.floor((outTime - inTime) / (60 * 1000)));
+            actualPresenceMinutes = totalDutyMinutes;
+            regularDutyMinutes = Math.min(totalDutyMinutes, STANDARD_DUTY_MINUTES);
+            overtimeMinutes = 0;
+            earlyOtMinutes = 0;
+            postShiftOtMinutes = 0;
+            earlyOtFinalized = false;
+          } else {
+            const otEval = evaluateOptionAPunchOut({
+              firstInIso,
+              lastOutIso: actualPunchOut,
+              scheduledStartIso,
+              scheduledEndIso: current.scheduledPunchOutIso || bounds.scheduledEndIso,
+              standardDutyMinutes: STANDARD_DUTY_MINUTES,
+            });
+            actualPresenceMinutes = otEval.actualPresenceMinutes;
+            totalDutyMinutes = otEval.totalDutyMinutes;
+            regularDutyMinutes = otEval.regularDutyMinutes;
+            overtimeMinutes = otEval.overtimeMinutes;
+            earlyArrivalMinutes = otEval.earlyArrivalMinutes;
+            provisionalEarlyOtMinutes = otEval.provisionalEarlyOtMinutes;
+            earlyOtMinutes = otEval.earlyOtMinutes;
+            postShiftOtMinutes = otEval.postShiftOtMinutes;
+            earlyOtFinalized = true;
+          }
         } else if (punchOutType === 'AUTO') {
           overtimeMinutes = 0;
+          earlyOtMinutes = 0;
+          postShiftOtMinutes = 0;
+          earlyOtFinalized = false;
         }
 
         const autoClassifySet = new Set([
@@ -1867,9 +2135,21 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           punchOutType,
           currentState: actualPunchOut ? 'OUTSIDE' : current.currentState || 'OUTSIDE',
           attendanceStatus: finalAttendanceStatus,
+          scheduledPunchIn: current.scheduledPunchIn || bounds.startTime,
+          scheduledPunchInIso: scheduledStartIso,
+          scheduledPunchOut: current.scheduledPunchOut || bounds.endTime,
+          scheduledPunchOutIso: current.scheduledPunchOutIso || bounds.scheduledEndIso,
+          actualPresenceMinutes,
           totalDutyMinutes,
           regularDutyMinutes,
           overtimeMinutes,
+          earlyArrivalMinutes,
+          provisionalEarlyOtMinutes,
+          earlyOtMinutes,
+          postShiftOtMinutes,
+          totalOtMinutes: overtimeMinutes,
+          earlyOtFinalized,
+          earlyPunchPolicy: EARLY_PUNCH_POLICY_ID,
           correctionReason: reason.trim(),
           correctedBy: caller.loginId,
           correctedByUid: caller.uid,
@@ -1906,12 +2186,39 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         description: `Attendance record ${attendanceId} corrected by "${caller.loginId}".`,
       });
 
+      recordDbOpMetric(db, {
+        operation: 'TRANSACTION',
+        collection: 'attendance',
+        durationMs: 0,
+        success: true,
+        correlationId: (req as any).correlationId,
+      });
+      recordActivityTelemetry(db, {
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        action: 'ATTENDANCE_CORRECTION',
+        module: 'Attendance History',
+        result: 'Success',
+        correlationId: (req as any).correlationId,
+        detail: `Corrected attendance ${attendanceId} -> ${txResult.updated.attendanceStatus}`,
+      });
+
       return res.json({ success: true, record: txResult.updated });
     } catch (err: any) {
       if (err?.message === 'INVALID_PUNCH_OUT') {
         return res.status(400).json({ success: false, error: 'Invalid actualPunchOut timestamp.' });
       }
       console.error('[API Attendance Correct] Error:', err);
+      recordErrorTelemetry(db, {
+        source: 'BACKEND',
+        module: 'Attendance History',
+        category: 'CORRECTION_ERROR',
+        severity: 'CRITICAL',
+        message: err?.message || 'Failed to correct attendance record.',
+        statusCode: 500,
+        correlationId: (req as any).correlationId,
+      });
       return res.status(500).json({ success: false, error: 'Failed to correct attendance record.' });
     }
   });

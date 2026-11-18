@@ -15,7 +15,8 @@ export function UnauthorizedAccess({ currentTab, currentUserRole, onGoHome }: Un
   const isSuperAdminRestrictedTab =
     currentTab === 'user_rights' ||
     currentTab === 'audit_logs' ||
-    currentTab === 'security_management';
+    currentTab === 'security_management' ||
+    currentTab === 'system_performance';
 
   return (
     <div className="h-full w-full flex items-center justify-center p-6 bg-slate-900 text-white">

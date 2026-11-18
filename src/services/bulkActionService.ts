@@ -6,6 +6,7 @@ import {
   renderEmployeeIdentityCardBlob,
 } from '../utils/qrIdentityCard';
 import { createZipBlob, ZipEntryInput } from '../utils/zipBuilder';
+import { reportUiActivity } from '../utils/perfMonitor';
 
 export interface BulkExportColumn {
   header: string;
@@ -90,6 +91,7 @@ export async function exportChunkedToExcel(
         `Bulk exported ${rows.length} selected ${options.auditTargetType} records to Excel (.xlsx).`,
     });
   }
+  reportUiActivity('EXCEL_EXPORTED', options.auditSource || 'Reports & Export', `Exported ${rows.length} row(s) to Excel`);
 
   return { fileName: `${fileName}.xlsx`, rowCount: rows.length };
 }
@@ -144,6 +146,7 @@ export async function exportChunkedToCsv(
         `Bulk exported ${rows.length} selected ${options.auditTargetType} records to CSV.`,
     });
   }
+  reportUiActivity('CSV_EXPORTED', options.auditSource || 'Reports & Export', `Exported ${rows.length} row(s) to CSV`);
 
   return { fileName, rowCount: rows.length };
 }
@@ -267,6 +270,7 @@ export async function downloadQrIdentityCardsZip(
     actionSource: options.auditSource || 'QR_MANAGEMENT',
     description: `Downloaded ${exportedIds.length} Employee QR Identity Cards in ZIP archive "${fileName}".`,
   });
+  reportUiActivity('QR_ZIP_DOWNLOADED', 'QR Code Management', `Bundled ${exportedIds.length} QR Identity Card(s)`);
 
   return {
     result: {

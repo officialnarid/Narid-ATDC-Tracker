@@ -529,8 +529,13 @@ export function isModuleAllowedForUser(profile: UserRoleRecord | null | undefine
     return true; // Super Admin always has full access
   }
 
-  // Security Lockout Control, Audit Logs & User Rights are strictly SUPER_ADMIN only
-  if (tab === 'security_management' || tab === 'audit_logs' || tab === 'user_rights') {
+  // Security Lockout Control, Audit Logs, User Rights & System Performance are strictly SUPER_ADMIN only
+  if (
+    tab === 'security_management' ||
+    tab === 'audit_logs' ||
+    tab === 'user_rights' ||
+    tab === 'system_performance'
+  ) {
     return false;
   }
 
@@ -558,7 +563,12 @@ export function isModuleAllowedForRole(role: UserRoleType, tab: NavItem): boolea
   if (normalized === 'SUPER_ADMIN' || normalized === 'SUPERADMIN') {
     return true; // Full access
   }
-  if (tab === 'security_management' || tab === 'audit_logs' || tab === 'user_rights') {
+  if (
+    tab === 'security_management' ||
+    tab === 'audit_logs' ||
+    tab === 'user_rights' ||
+    tab === 'system_performance'
+  ) {
     return false;
   }
   if (normalized === 'ADMIN') {

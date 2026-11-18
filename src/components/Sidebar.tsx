@@ -18,7 +18,8 @@ import {
   Building,
   X,
   FileSearch,
-  ShieldAlert
+  ShieldAlert,
+  Activity
 } from 'lucide-react';
 import { UserRoleRecord } from '../types';
 import { isModuleAllowedForUser } from '../services/authService';
@@ -38,6 +39,7 @@ export type NavItem =
   | 'user_rights'
   | 'audit_logs'
   | 'security_management'
+  | 'system_performance'
   | 'settings';
 
 interface SidebarProps {
@@ -121,6 +123,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: 'user_rights', label: 'User Rights & Auth', icon: ShieldCheck },
     { id: 'audit_logs', label: 'Audit Logs & Security', icon: FileSearch },
     { id: 'security_management', label: 'Security & Lockouts', icon: ShieldAlert },
+    { id: 'system_performance', label: 'System Performance', icon: Activity },
     { id: 'settings', label: 'System Settings', icon: Settings },
   ];
 
@@ -130,7 +133,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   const allowedTopItems = topNavItems.filter(item => isModuleAllowedForUser(currentUserRole, item.id));
   const allowedBottomItems = bottomNavItems.filter(item =>
-    item.id === 'audit_logs' || item.id === 'security_management' || item.id === 'user_rights'
+    item.id === 'audit_logs' ||
+    item.id === 'security_management' ||
+    item.id === 'user_rights' ||
+    item.id === 'system_performance'
       ? isSuperAdmin && isModuleAllowedForUser(currentUserRole, item.id)
       : isModuleAllowedForUser(currentUserRole, item.id)
   );

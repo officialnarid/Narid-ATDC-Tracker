@@ -8,6 +8,12 @@ import {
   recordEnterpriseAuditEvent,
 } from './serverSecurityAudit.ts';
 import { getCachedRolePermissionsDoc } from './serverPerfCache.ts';
+import {
+  recordDbOpMetric,
+  recordImportExportTelemetry,
+  recordActivityTelemetry,
+  recordErrorTelemetry,
+} from './serverMonitoring.ts';
 
 export const MASTER_BULK_BATCH_SIZE = 400; // Strictly below Firestore's 500 writes/batch limit
 
@@ -98,6 +104,7 @@ export function registerMasterRoutes(app: express.Express, deps: MasterRoutesDep
   // Shifts, Production Lines (floors), Sections, and Departments.
   // ============================================================================
   app.post('/api/masters/bulk-status', async (req: Request, res: Response) => {
+    const masterStartMs = performance.now();
     try {
       const caller = await requireVerifiedCaller(
         req,
@@ -254,6 +261,37 @@ export function registerMasterRoutes(app: express.Express, deps: MasterRoutesDep
         success: true,
       });
 
+      const masterElapsedMs = Math.round((performance.now() - masterStartMs) * 100) / 100;
+      const modName = resource === 'shifts' ? 'Shift Management' : 'Organization Management';
+      recordDbOpMetric(db, {
+        operation: 'BATCH',
+        collection: resource,
+        durationMs: masterElapsedMs,
+        success: true,
+        recordCount: Math.max(1, ops.length),
+        correlationId: (req as any).correlationId,
+      });
+      recordImportExportTelemetry(db, {
+        type: 'BULK_ACTION',
+        module: modName,
+        rowCount: uniqueIds.length,
+        durationMs: masterElapsedMs,
+        success: true,
+        actorLoginId: caller.loginId,
+        correlationId: (req as any).correlationId,
+        detail: `${resource} -> ${status}: ${committedIds.length} committed, ${skippedItems.length} skipped`,
+      });
+      recordActivityTelemetry(db, {
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        action: `MASTER_BULK_${status.toUpperCase()}`,
+        module: modName,
+        result: 'Success',
+        correlationId: (req as any).correlationId,
+        detail: `${resource}: ${committedIds.length} updated`,
+      });
+
       return res.json({
         success: true,
         resource,
@@ -268,6 +306,15 @@ export function registerMasterRoutes(app: express.Express, deps: MasterRoutesDep
       });
     } catch (err: any) {
       console.error('[Master Bulk Status API] Error:', err);
+      recordErrorTelemetry(db, {
+        source: 'BULK',
+        module: 'Organization Management',
+        category: 'MASTER_BULK_ERROR',
+        severity: 'CRITICAL',
+        message: err?.message || 'Master bulk status update failed.',
+        statusCode: 500,
+        correlationId: (req as any).correlationId,
+      });
       return res.status(500).json({
         success: false,
         error: err?.message || 'Master bulk status update failed.',

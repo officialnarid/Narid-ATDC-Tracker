@@ -222,8 +222,21 @@ export function identifyShiftForPunchIn(
   const activeShifts = shifts.filter((s) => s.status === 'Active');
 
   for (const shift of activeShifts) {
-    const winStart = timeStringToMinutes(shift.punchInWindowStart);
-    const winEnd = timeStringToMinutes(shift.punchInWindowEnd);
+    const rawStart = String(shift.punchInWindowStart || '').trim();
+    const rawEnd = String(shift.punchInWindowEnd || '').trim();
+    const idUpper = String(shift.id || '').toUpperCase();
+    let winStartStr = rawStart;
+    let winEndStr = rawEnd;
+    if (!shift.isOvernight && (idUpper === 'DAY' || shift.startTime === '09:00') && rawStart === '09:00' && rawEnd === '20:00') {
+      winStartStr = '06:00';
+      winEndStr = '18:00';
+    } else if ((shift.isOvernight || idUpper === 'NIGHT') && shift.startTime === '20:00' && rawStart === '20:00' && rawEnd === '09:00') {
+      winStartStr = '18:00';
+      winEndStr = '06:00';
+    }
+
+    const winStart = timeStringToMinutes(winStartStr);
+    const winEnd = timeStringToMinutes(winEndStr);
 
     if (winStart < winEnd) {
       if (currentMins >= winStart && currentMins < winEnd) {
@@ -241,9 +254,9 @@ export function identifyShiftForPunchIn(
   const dayShift = activeShifts.find((s) => !s.isOvernight) || activeShifts[0];
   const nightShift = activeShifts.find((s) => s.isOvernight) || activeShifts[activeShifts.length - 1];
 
-  if (currentMins >= 540 && currentMins < 1200) {
+  if (currentMins >= 360 && currentMins < 1080) {
     return dayShift ? { shift: dayShift, shiftDate: kolkata.dateKey } : null;
-  } else if (currentMins >= 1200) {
+  } else if (currentMins >= 1080) {
     return nightShift ? { shift: nightShift, shiftDate: kolkata.dateKey } : null;
   } else {
     return nightShift ? { shift: nightShift, shiftDate: getYesterdayKolkataDateKey(now) } : null;

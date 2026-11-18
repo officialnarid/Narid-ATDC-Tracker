@@ -391,6 +391,45 @@ export const RolePermissionsSkeleton: React.FC = () => (
   </div>
 );
 
+export const SystemPerformanceSkeleton: React.FC = () => (
+  <div
+    role="status"
+    aria-label="Loading system performance monitoring center"
+    className="p-6 bg-slate-50 min-h-full flex flex-col gap-6"
+  >
+    <div className="bg-white p-4 rounded-xl border border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+      <div className="space-y-2">
+        <SkeletonBlock className="h-6 w-72" />
+        <SkeletonBlock className="h-3.5 w-96" />
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <SkeletonBlock className="h-8 w-44" />
+        <SkeletonBlock className="h-8 w-28" />
+        <SkeletonBlock className="h-8 w-24" />
+      </div>
+    </div>
+    <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-3">
+      {Array.from({ length: 6 }).map((_, idx) => (
+        <div key={idx} className="bg-white p-4 rounded-xl border border-slate-200 space-y-2">
+          <SkeletonBlock className="h-3 w-24" />
+          <SkeletonBlock className="h-7 w-16" />
+          <SkeletonBlock className="h-2.5 w-20" />
+        </div>
+      ))}
+    </div>
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div className="bg-white p-4 rounded-xl border border-slate-200 space-y-3">
+        <SkeletonBlock className="h-4 w-48" />
+        <SkeletonBlock className="h-44 w-full" />
+      </div>
+      <div className="bg-white p-4 rounded-xl border border-slate-200 space-y-3">
+        <SkeletonBlock className="h-4 w-48" />
+        <SkeletonBlock className="h-44 w-full" />
+      </div>
+    </div>
+  </div>
+);
+
 export const GenericModuleSkeleton: React.FC = () => (
   <div role="status" aria-label="Loading module" className="p-6 bg-slate-50 min-h-full flex flex-col gap-6">
     <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-2xs flex items-center justify-between gap-4">
@@ -435,6 +474,8 @@ export const ModuleSkeleton: React.FC<{ tab: NavItem }> = ({ tab }) => {
       return <ReportsSkeleton />;
     case 'user_rights':
       return <UserRightsSkeleton />;
+    case 'system_performance':
+      return <SystemPerformanceSkeleton />;
     default:
       return <GenericModuleSkeleton />;
   }

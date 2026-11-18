@@ -360,7 +360,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
   const getDefaultModulesForRole = (roleIdInput: string): string[] => {
     const cleanRole = normalizeRoleId(roleIdInput);
     if (cleanRole === 'super_admin') return ['all'];
-    const restricted = new Set(['user_rights', 'audit_logs', 'security_management']);
+    const restricted = new Set(['user_rights', 'audit_logs', 'security_management', 'system_performance']);
     const livePerms =
       rolePermissionsMap[cleanRole]?.modulePermissions ||
       rolesList.find((r) => r.roleId === cleanRole)?.defaultPermissions;
@@ -998,7 +998,12 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
   };
 
   const handleToggleRoleFormModule = (moduleKey: string, action: ModuleAction) => {
-    if (moduleKey === 'user_rights' || moduleKey === 'audit_logs' || moduleKey === 'security_management') {
+    if (
+      moduleKey === 'user_rights' ||
+      moduleKey === 'audit_logs' ||
+      moduleKey === 'security_management' ||
+      moduleKey === 'system_performance'
+    ) {
       return;
     }
     setRoleFormPermissions((prev) => {
@@ -3025,7 +3030,10 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                     <tbody className="divide-y divide-slate-100">
                       {PERMISSION_MODULES.map((m) => {
                         const isRestricted =
-                          m.key === 'user_rights' || m.key === 'audit_logs' || m.key === 'security_management';
+                          m.key === 'user_rights' ||
+                          m.key === 'audit_logs' ||
+                          m.key === 'security_management' ||
+                          m.key === 'system_performance';
                         const isCapability = Boolean(m.isCapability);
                         const isVisibilityOnly = Boolean(m.isVisibilityOnly);
                         const rawPerms = roleFormPermissions[m.key];

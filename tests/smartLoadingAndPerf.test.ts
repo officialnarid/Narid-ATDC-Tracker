@@ -80,6 +80,7 @@ describe('Phase 1 — Smart Skeleton Loading Components (Zero Fake Data)', () =>
       'departments',
       'audit_logs',
       'security_management',
+      'system_performance',
       'settings',
     ];
 

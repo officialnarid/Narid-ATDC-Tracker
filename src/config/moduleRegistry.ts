@@ -1,4 +1,5 @@
 import type { NavItem } from '../components/Sidebar';
+import { recordPerfMetric, startPerfTimer, TAB_TO_MODULE_NAME } from '../utils/perfMonitor';
 
 type DynamicModuleLoader = () => Promise<unknown>;
 
@@ -17,6 +18,7 @@ export const MODULE_LOADERS: Partial<Record<NavItem, DynamicModuleLoader>> = {
   user_rights: () => import('../components/UserRights'),
   audit_logs: () => import('../components/AuditLogsManagement'),
   security_management: () => import('../components/SecurityManagement'),
+  system_performance: () => import('../components/SystemPerformance'),
   settings: () => import('../components/SystemSettings'),
 };
 
@@ -26,11 +28,17 @@ export function prefetchTabModule(tab: NavItem): Promise<unknown> | null {
   const existing = prefetchedModules.get(tab);
   if (existing) return existing;
 
-  const promise = loader().catch(() => {
-    // Remove failed entry so subsequent hover or click can retry cleanly
-    prefetchedModules.delete(tab);
-    return undefined;
-  });
+  const stopTimer = startPerfTimer();
+  const promise = loader()
+    .then((mod) => {
+      recordPerfMetric('route_prefetch_ms', stopTimer(), TAB_TO_MODULE_NAME[tab] || tab);
+      return mod;
+    })
+    .catch(() => {
+      // Remove failed entry so subsequent hover or click can retry cleanly
+      prefetchedModules.delete(tab);
+      return undefined;
+    });
   prefetchedModules.set(tab, promise);
   return promise;
 }

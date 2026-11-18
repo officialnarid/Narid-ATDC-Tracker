@@ -9,6 +9,12 @@ import {
   recordEnterpriseAuditEvent,
 } from './serverSecurityAudit.ts';
 import { getCachedRolePermissionsDoc } from './serverPerfCache.ts';
+import {
+  recordDbOpMetric,
+  recordImportExportTelemetry,
+  recordActivityTelemetry,
+  recordErrorTelemetry,
+} from './serverMonitoring.ts';
 
 export const EMPLOYEE_ID_PATTERN = /^[A-Za-z0-9_.\-]+$/;
 export const EMPLOYEE_BULK_BATCH_SIZE = 400; // Strictly below Firestore's 500 writes/batch limit
@@ -223,6 +229,7 @@ export function registerEmployeeRoutes(app: express.Express, deps: EmployeeRoute
   // Authenticated, RBAC-enforced, atomic chunked Admin SDK employee import
   // ==========================================================================
   app.post('/api/employees/bulk-import', async (req: Request, res: Response) => {
+    const routeStartMs = performance.now();
     try {
       const caller = await requireVerifiedCaller(
         req,
@@ -479,6 +486,39 @@ export function registerEmployeeRoutes(app: express.Express, deps: EmployeeRoute
             success: false,
           }).catch(() => {});
 
+          const batchElapsedMs = Math.round((performance.now() - routeStartMs) * 100) / 100;
+          recordDbOpMetric(db, {
+            operation: 'BATCH',
+            collection: 'employees',
+            durationMs: batchElapsedMs,
+            success: false,
+            isPermissionDenied: isFirestorePermissionDeniedError(batchErr),
+            isNetworkError: classified.category === 'NETWORK_OR_TIMEOUT',
+            recordCount: chunk.length,
+            errorMessage: classified.message,
+            correlationId: (req as any).correlationId,
+          });
+          recordImportExportTelemetry(db, {
+            type: 'EXCEL_IMPORT',
+            module: 'Excel Import / Update',
+            rowCount: rows.length,
+            durationMs: batchElapsedMs,
+            success: false,
+            actorLoginId: caller.loginId,
+            correlationId: (req as any).correlationId,
+            detail: classified.message,
+          });
+          recordActivityTelemetry(db, {
+            actorUid: caller.uid,
+            actorLoginId: caller.loginId,
+            actorRole: caller.role.toUpperCase(),
+            action: 'EXCEL_IMPORT_FAILED',
+            module: 'Excel Import / Update',
+            result: 'Failed',
+            correlationId: (req as any).correlationId,
+            detail: `${fileName}: ${committedIds.length} committed, ${failedRows.length} failed`,
+          });
+
           return res.status(classified.status).json({
             success: false,
             code: classified.code,
@@ -515,6 +555,36 @@ export function registerEmployeeRoutes(app: express.Express, deps: EmployeeRoute
         success: true,
       });
 
+      const totalImportMs = Math.round((performance.now() - routeStartMs) * 100) / 100;
+      recordDbOpMetric(db, {
+        operation: 'BATCH',
+        collection: 'employees',
+        durationMs: totalImportMs,
+        success: true,
+        recordCount: Math.max(1, operations.length),
+        correlationId: (req as any).correlationId,
+      });
+      recordImportExportTelemetry(db, {
+        type: 'EXCEL_IMPORT',
+        module: 'Excel Import / Update',
+        rowCount: rows.length,
+        durationMs: totalImportMs,
+        success: true,
+        actorLoginId: caller.loginId,
+        correlationId: (req as any).correlationId,
+        detail: `${fileName}: ${insertedIds.length} inserted, ${updatedIds.length} updated, ${skippedIds.length} skipped`,
+      });
+      recordActivityTelemetry(db, {
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        action: 'EXCEL_IMPORT_COMMITTED',
+        module: 'Excel Import / Update',
+        result: 'Success',
+        correlationId: (req as any).correlationId,
+        detail: `${fileName} (${committedIds.length} committed)`,
+      });
+
       return res.json({
         success: true,
         savedCount: committedIds.length,
@@ -532,6 +602,15 @@ export function registerEmployeeRoutes(app: express.Express, deps: EmployeeRoute
     } catch (err: any) {
       console.error('[Employee Bulk Import API] Error:', err);
       const classified = classifyBatchWriteError(err);
+      recordErrorTelemetry(db, {
+        source: 'IMPORT_EXPORT',
+        module: 'Excel Import / Update',
+        category: classified.code,
+        severity: 'CRITICAL',
+        message: classified.message,
+        statusCode: classified.status,
+        correlationId: (req as any).correlationId,
+      });
       return res.status(classified.status).json({
         success: false,
         code: classified.code,
@@ -547,6 +626,7 @@ export function registerEmployeeRoutes(app: express.Express, deps: EmployeeRoute
   // with historical attendance integrity protection before deletion.
   // ==========================================================================
   app.post('/api/employees/bulk-action', async (req: Request, res: Response) => {
+    const bulkStartMs = performance.now();
     try {
       const caller = await requireVerifiedCaller(
         req,
@@ -776,6 +856,36 @@ export function registerEmployeeRoutes(app: express.Express, deps: EmployeeRoute
         success: true,
       });
 
+      const totalBulkMs = Math.round((performance.now() - bulkStartMs) * 100) / 100;
+      recordDbOpMetric(db, {
+        operation: 'BATCH',
+        collection: 'employees',
+        durationMs: totalBulkMs,
+        success: true,
+        recordCount: Math.max(1, ops.length),
+        correlationId: (req as any).correlationId,
+      });
+      recordImportExportTelemetry(db, {
+        type: 'BULK_ACTION',
+        module: 'Employee Master',
+        rowCount: uniqueIds.length,
+        durationMs: totalBulkMs,
+        success: true,
+        actorLoginId: caller.loginId,
+        correlationId: (req as any).correlationId,
+        detail: `Bulk ${action}: ${committedIds.length} saved, ${skippedItems.length} skipped`,
+      });
+      recordActivityTelemetry(db, {
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        action: `EMPLOYEE_BULK_${action}`,
+        module: 'Employee Master',
+        result: 'Success',
+        correlationId: (req as any).correlationId,
+        detail: `${committedIds.length} updated (${skippedItems.length} skipped)`,
+      });
+
       return res.json({
         success: true,
         action,
@@ -790,6 +900,15 @@ export function registerEmployeeRoutes(app: express.Express, deps: EmployeeRoute
     } catch (err: any) {
       console.error('[Employee Bulk Action API] Error:', err);
       const classified = classifyBatchWriteError(err);
+      recordErrorTelemetry(db, {
+        source: 'BULK',
+        module: 'Employee Master',
+        category: classified.code,
+        severity: 'CRITICAL',
+        message: classified.message,
+        statusCode: classified.status,
+        correlationId: (req as any).correlationId,
+      });
       return res.status(classified.status).json({
         success: false,
         code: classified.code,

@@ -186,9 +186,35 @@ export class ApiRequestError<T = any> extends Error {
   }
 }
 
+import { queueClientTelemetry } from '../utils/perfMonitor';
+
 export interface ExecuteApiFetchOptions {
   timeoutMs?: number;
   noRetryOnNetworkError?: boolean;
+}
+
+function createClientCorrelationId(): string {
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `cli_${Date.now().toString(36)}_${rand}`;
+}
+
+function extractEndpointPath(rawUrl: string): string {
+  try {
+    if (/^https?:\/\//i.test(rawUrl)) {
+      return new URL(rawUrl).pathname;
+    }
+  } catch {
+    // Fallback below
+  }
+  return String(rawUrl || '/').split('?')[0] || '/';
+}
+
+function withCorrelationHeader(init: RequestInit | undefined, correlationId: string): RequestInit {
+  const headers = new Headers(init?.headers || {});
+  if (!headers.has('X-Correlation-ID')) {
+    headers.set('X-Correlation-ID', correlationId);
+  }
+  return { ...(init || {}), headers };
 }
 
 export async function executeApiFetch(
@@ -205,6 +231,16 @@ export async function executeApiFetch(
     ? url.slice(SHARED_VERCEL_BACKEND_URL.length) || '/api/health'
     : '';
 
+  const endpointPath = extractEndpointPath(url);
+  const skipClientTelemetry = endpointPath.startsWith('/api/monitoring/ingest');
+  const existingHeaders = new Headers(init?.headers || {});
+  const correlationId = existingHeaders.get('X-Correlation-ID') || createClientCorrelationId();
+  const method = (init?.method || 'GET').toUpperCase();
+  const fetchStartMs =
+    typeof performance !== 'undefined' && typeof performance.now === 'function'
+      ? performance.now()
+      : Date.now();
+
   const timeoutMs = options?.timeoutMs && options.timeoutMs > 0 ? options.timeoutMs : 0;
   const controller =
     timeoutMs > 0 && !init?.signal && typeof AbortController !== 'undefined'
@@ -213,27 +249,66 @@ export async function executeApiFetch(
   const timeoutId = controller
     ? setTimeout(() => controller.abort(), timeoutMs)
     : null;
-  const effectiveInit: RequestInit | undefined = controller
-    ? { ...(init || {}), signal: controller.signal }
-    : init;
+  const baseInit = withCorrelationHeader(init, correlationId);
+  const effectiveInit: RequestInit = controller
+    ? { ...baseInit, signal: controller.signal }
+    : baseInit;
+
+  const getElapsedMs = () =>
+    Math.max(
+      0,
+      Math.round(
+        ((typeof performance !== 'undefined' && typeof performance.now === 'function'
+          ? performance.now()
+          : Date.now()) -
+          fetchStartMs) *
+          100
+      ) / 100
+    );
 
   try {
-    const res = await fetch(url, effectiveInit);
+    let res = await fetch(url, effectiveInit);
     if (isPreviewToVercel && res.status === 404 && sameOriginPath) {
       try {
         const clonedBody = await res.clone().json();
         if (clonedBody && clonedBody.error === 'API endpoint not found.') {
-          return await fetch(sameOriginPath, effectiveInit);
+          res = await fetch(sameOriginPath, effectiveInit);
         }
       } catch {
         // Non-JSON 404: return original response cleanly
       }
+    }
+    if (!skipClientTelemetry && res.status >= 500) {
+      queueClientTelemetry({
+        kind: 'API_CLIENT',
+        module: 'Backend APIs',
+        endpoint: endpointPath,
+        method,
+        status: res.status,
+        durationMs: getElapsedMs(),
+        timedOut: false,
+        correlationId,
+        message: `${method} ${endpointPath} returned HTTP ${res.status}`,
+      });
     }
     return res;
   } catch (err: any) {
     const isAborted = err?.name === 'AbortError' || controller?.signal?.aborted;
     // NEVER blindly retry aborted/timed-out attendance requests — server may have already started/committed.
     if (isAborted) {
+      if (!skipClientTelemetry) {
+        queueClientTelemetry({
+          kind: 'API_CLIENT',
+          module: 'Backend APIs',
+          endpoint: endpointPath,
+          method,
+          status: 408,
+          durationMs: getElapsedMs(),
+          timedOut: true,
+          correlationId,
+          message: `Client request timeout (${timeoutMs}ms) on ${method} ${endpointPath}`,
+        });
+      }
       const label = endpointLabel || url;
       throw new Error(
         `Request timed out for ${label}. Do not assume failure — verify Dual Gate Activity or Attendance History before retrying.`
@@ -246,10 +321,24 @@ export async function executeApiFetch(
     // transparently retry against same-origin /api/* once unless disabled.
     if (isPreviewToVercel && sameOriginPath && !options?.noRetryOnNetworkError) {
       try {
-        return await fetch(sameOriginPath, init);
+        return await fetch(sameOriginPath, baseInit);
       } catch {
         // Fall through to structured connectivity error below
       }
+    }
+
+    if (!skipClientTelemetry) {
+      queueClientTelemetry({
+        kind: 'API_CLIENT',
+        module: 'Backend APIs',
+        endpoint: endpointPath,
+        method,
+        status: 0,
+        durationMs: getElapsedMs(),
+        timedOut: false,
+        correlationId,
+        message: err?.message || `Network failure reaching ${method} ${endpointPath}`,
+      });
     }
 
     const label = endpointLabel || url;

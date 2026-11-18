@@ -22,6 +22,10 @@ import {
   type GeoLocationInfo,
   type UserAgentMeta,
 } from './serverSecurityAudit.ts';
+import {
+  recordActivityTelemetry,
+  recordErrorTelemetry,
+} from './serverMonitoring.ts';
 
 export const MAX_CONSECUTIVE_FAILED_ATTEMPTS = 3;
 export const LOCKED_ACCOUNT_MESSAGE =
@@ -1129,6 +1133,17 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
             });
           }
 
+          recordActivityTelemetry(db, {
+            actorUid: firebaseUid,
+            actorLoginId: cleanId,
+            actorRole: roleUpper,
+            action: 'LOGIN_BLOCKED_LOCKED',
+            module: 'Authentication',
+            result: 'Failed',
+            correlationId: (req as any).correlationId,
+            detail: 'Attempted login on locked account',
+          });
+
           return {
             status: 423,
             body: {
@@ -1198,6 +1213,26 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
               success: false,
             }),
           ]);
+
+          recordActivityTelemetry(db, {
+            actorUid: firebaseUid,
+            actorLoginId: cleanId,
+            actorRole: roleUpper,
+            action: 'ACCOUNT_LOCKED',
+            module: 'Authentication',
+            result: 'Failed',
+            correlationId: (req as any).correlationId,
+            detail: `Auto-locked on attempt #${txOutcome.attemptNumber}`,
+          });
+          recordErrorTelemetry(db, {
+            source: 'AUTH',
+            module: 'Authentication',
+            category: 'AUTH',
+            severity: 'CRITICAL',
+            message: `Account locked after ${txOutcome.attemptNumber} failed attempts`,
+            statusCode: 423,
+            correlationId: (req as any).correlationId,
+          });
 
           return {
             status: 423,
@@ -1272,6 +1307,17 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
               success: false,
             }),
           ]);
+
+          recordActivityTelemetry(db, {
+            actorUid: firebaseUid,
+            actorLoginId: cleanId,
+            actorRole: roleUpper,
+            action: 'LOGIN_FAILED',
+            module: 'Authentication',
+            result: 'Failed',
+            correlationId: (req as any).correlationId,
+            detail: `Invalid password attempt ${txOutcome.attemptNumber}/${MAX_CONSECUTIVE_FAILED_ATTEMPTS}`,
+          });
 
           return {
             status: 401,
@@ -1369,6 +1415,17 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
             success: true,
           }),
         ]);
+
+        recordActivityTelemetry(db, {
+          actorUid: firebaseUid,
+          actorLoginId: cleanId,
+          actorRole: roleUpper,
+          action: 'LOGIN_SUCCESS',
+          module: 'Authentication',
+          result: 'Success',
+          correlationId: (req as any).correlationId,
+          detail: `Authenticated session ${sessionId}`,
+        });
 
         const { passwordHash: _ph, ...sanitizedProfile } = userData;
         return {

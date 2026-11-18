@@ -42,7 +42,15 @@ import {
 import { lazyWithRetry, ModuleErrorBoundary } from './components/LazyModuleBoundary';
 import { ModuleSkeleton } from './components/Skeletons';
 import { MODULE_LOADERS, prefetchTabModule, scheduleIdleModulePrefetch } from './config/moduleRegistry';
-import { recordPerfMetric, startPerfTimer } from './utils/perfMonitor';
+import {
+  installGlobalErrorMonitoring,
+  recordPerfMetric,
+  reportUiActivity,
+  startPerfTimer,
+  TAB_TO_MODULE_NAME,
+} from './utils/perfMonitor';
+import { startClientTelemetryFlushLoop } from './services/monitoringService';
+import { startBackgroundNetworkMonitoring } from './services/networkMonitorService';
 
 // Secondary Modules (code-split via resilient lazyWithRetry + moduleRegistry prefetching)
 const EmployeeMaster = lazyWithRetry(() => import('./components/EmployeeMaster'), m => m.EmployeeMaster, 'employees');
@@ -57,6 +65,7 @@ const Reports = lazyWithRetry(() => import('./components/Reports'), m => m.Repor
 const UserRights = lazyWithRetry(() => import('./components/UserRights'), m => m.UserRights, 'user_rights');
 const AuditLogsManagement = lazyWithRetry(() => import('./components/AuditLogsManagement'), m => m.AuditLogsManagement, 'audit_logs');
 const SecurityManagement = lazyWithRetry(() => import('./components/SecurityManagement'), m => m.SecurityManagement, 'security_management');
+const SystemPerformance = lazyWithRetry(() => import('./components/SystemPerformance'), m => m.SystemPerformance, 'system_performance');
 const SystemSettingsView = lazyWithRetry(() => import('./components/SystemSettings'), m => m.SystemSettingsView, 'settings');
 const UnauthorizedAccess = lazyWithRetry(() => import('./components/UnauthorizedAccess'), m => m.UnauthorizedAccess, 'unauthorized');
 
@@ -75,6 +84,7 @@ const VALID_TABS: NavItem[] = [
   'user_rights',
   'audit_logs',
   'security_management',
+  'system_performance',
   'settings',
 ];
 
@@ -121,6 +131,8 @@ export default function App() {
   const [currentUserPermOverride, setCurrentUserPermOverride] = useState<UserPermissionRecordWithOverride | null>(null);
   const navTimerRef = useRef<(() => number) | null>(null);
   const appBootTimerRef = useRef<(() => number) | null>(startPerfTimer());
+  const currentTabRef = useRef<NavItem>(currentTab);
+  currentTabRef.current = currentTab;
 
   // Real-time synchronization of Role Permissions matrix (only when authenticated)
   useEffect(() => {
@@ -205,18 +217,37 @@ export default function App() {
     }
   }, [isAuthChecking]);
 
-  // Record navigation time across module switches
+  // Global frontend error monitoring + periodic telemetry ingestion flush (authenticated only)
+  useEffect(() => {
+    if (!currentUser || !currentUserRole) return;
+    const stopErrors = installGlobalErrorMonitoring(
+      () => TAB_TO_MODULE_NAME[currentTabRef.current] || currentTabRef.current
+    );
+    const stopFlush = startClientTelemetryFlushLoop(15_000);
+    const stopNetworkProbes = startBackgroundNetworkMonitoring(30_000);
+    return () => {
+      stopErrors();
+      stopFlush();
+      stopNetworkProbes();
+    };
+  }, [currentUser, currentUserRole]);
+
+  // Record navigation time across module switches + report module view activity
   useEffect(() => {
     if (navTimerRef.current) {
       const elapsed = navTimerRef.current();
       navTimerRef.current = null;
+      const modName = TAB_TO_MODULE_NAME[currentTab] || currentTab;
       if (typeof requestAnimationFrame === 'function') {
-        requestAnimationFrame(() => recordPerfMetric('navigation_ms', elapsed));
+        requestAnimationFrame(() => recordPerfMetric('navigation_ms', elapsed, modName));
       } else {
-        recordPerfMetric('navigation_ms', elapsed);
+        recordPerfMetric('navigation_ms', elapsed, modName);
       }
     }
-  }, [currentTab]);
+    if (currentUser && currentUserRole) {
+      reportUiActivity('MODULE_OPENED', TAB_TO_MODULE_NAME[currentTab] || currentTab);
+    }
+  }, [currentTab, currentUser, currentUserRole]);
 
   // Initialize and observe Authentication Session
   useEffect(() => {
@@ -710,6 +741,18 @@ export default function App() {
               {currentTab === 'security_management' && isModuleAllowedForUser(currentUserRole, 'security_management') && (
                 currentUserRole.role?.toUpperCase() === 'SUPER_ADMIN' ? (
                   <SecurityManagement currentUserRole={currentUserRole} />
+                ) : (
+                  <UnauthorizedAccess
+                    currentTab={currentTab}
+                    currentUserRole={currentUserRole}
+                    onGoHome={() => setCurrentTab(getDefaultTabForRole(currentUserRole.role, currentUserRole))}
+                  />
+                )
+              )}
+
+              {currentTab === 'system_performance' && isModuleAllowedForUser(currentUserRole, 'system_performance') && (
+                currentUserRole.role?.toUpperCase() === 'SUPER_ADMIN' ? (
+                  <SystemPerformance />
                 ) : (
                   <UnauthorizedAccess
                     currentTab={currentTab}

@@ -45,6 +45,13 @@ import {
   invalidateRoleCaches,
   invalidateUidRolePointer,
 } from './serverPerfCache.ts';
+import {
+  createMonitoringRequestMiddleware,
+  registerMonitoringRoutes,
+  noteServerHealthCheck,
+  recordActivityTelemetry,
+  recordErrorTelemetry,
+} from './serverMonitoring.ts';
 import { resolveAttendanceMetrics } from './src/utils/attendanceStatus.ts';
 import {
   DASHBOARD_CARDS,
@@ -345,6 +352,7 @@ const DEFAULT_ROLE_PERMISSIONS: Record<
     user_rights: { view: true, add: true, edit: true, delete: true },
     audit_logs: { view: true, add: true, edit: true, delete: true },
     security_management: { view: true, add: true, edit: true, delete: true },
+    system_performance: { view: true, add: true, edit: true, delete: true },
     settings: { view: true, add: true, edit: true, delete: true },
     ...Object.fromEntries(
       Array.from(DASHBOARD_VISIBILITY_KEYS).map((k) => [
@@ -371,6 +379,7 @@ const DEFAULT_ROLE_PERMISSIONS: Record<
     user_rights: { view: false, add: false, edit: false, delete: false },
     audit_logs: { view: false, add: false, edit: false, delete: false },
     security_management: { view: false, add: false, edit: false, delete: false },
+    system_performance: { view: false, add: false, edit: false, delete: false },
     settings: { view: false, add: false, edit: false, delete: false },
   },
   user: {
@@ -391,6 +400,7 @@ const DEFAULT_ROLE_PERMISSIONS: Record<
     user_rights: { view: false, add: false, edit: false, delete: false },
     audit_logs: { view: false, add: false, edit: false, delete: false },
     security_management: { view: false, add: false, edit: false, delete: false },
+    system_performance: { view: false, add: false, edit: false, delete: false },
     settings: { view: false, add: false, edit: false, delete: false },
   },
 };
@@ -399,6 +409,7 @@ export const RESTRICTED_SUPER_ADMIN_MODULES = new Set([
   'user_rights',
   'audit_logs',
   'security_management',
+  'system_performance',
 ]);
 
 export const SCANNER_CAPABILITY_KEYS = new Set([
@@ -821,14 +832,31 @@ export function createApp(options: ServerAppOptions = {}) {
         origin: permitted ? normalizeAllowedOrigin(rawOrigin) || false : false,
         credentials: permitted,
         methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-        allowedHeaders: ['Content-Type', 'Authorization'],
+        allowedHeaders: ['Content-Type', 'Authorization', 'X-Correlation-ID'],
+        exposedHeaders: ['X-Correlation-ID', 'X-Server-Process-Ms', 'X-Payload-Bytes', 'Server-Timing'],
         optionsSuccessStatus: 204,
       });
     })
   );
 
+  app.use(createMonitoringRequestMiddleware(() => db));
+
+  app.use(
+    '/api/network/speedtest/upload',
+    express.raw({
+      type: ['application/octet-stream', 'application/binary'],
+      limit: '600kb',
+    })
+  );
+
   const jsonBodyParser = express.json({ limit: '2mb' });
   app.use((req: Request, res: Response, next: NextFunction) => {
+    // Preserve raw binary upload payload without running express.json() on it
+    if (req.path === '/api/network/speedtest/upload' && Buffer.isBuffer((req as any).body)) {
+      (req as any)._body = true;
+      return next();
+    }
+
     // Preserve platform-parsed body if a serverless runtime (e.g. @vercel/node) already populated req.body
     const bodyDesc = Object.getOwnPropertyDescriptor(req, 'body');
     const hasOwnBodyProp = Boolean(
@@ -896,8 +924,12 @@ export function createApp(options: ServerAppOptions = {}) {
   // Health Check (Before DB dependency check so Cloud Run readiness probes always inspect status)
   app.get('/api/health', (_req: Request, res: Response) => {
     const effectiveWarning = runtimeFirestoreAccessError || adminCtx?.error;
+    const isOk = Boolean(db && !runtimeFirestoreAccessError);
+    if (db) {
+      noteServerHealthCheck(db, isOk ? 'ok' : 'degraded');
+    }
     res.json({
-      status: db && !runtimeFirestoreAccessError ? 'ok' : 'degraded',
+      status: isOk ? 'ok' : 'degraded',
       timestamp: new Date().toISOString(),
       projectId,
       databaseId,
@@ -969,6 +1001,31 @@ export function createApp(options: ServerAppOptions = {}) {
       success: params.success,
       sessionId: params.sessionId,
     });
+    const actModule =
+      params.action.includes('role') || params.action.includes('permission') || params.action.includes('account')
+        ? 'User Rights & Permissions'
+        : 'Audit Logs & Security';
+    recordActivityTelemetry(adminDb, {
+      actorUid: params.performedByUid || 'system',
+      actorLoginId: params.performedByLoginId || params.loginId || 'system',
+      actorRole: params.performedByRole || 'SYSTEM',
+      action: params.action.toUpperCase(),
+      module: actModule,
+      result: params.success === false ? 'Failed' : 'Success',
+      correlationId: (params.req as any)?.correlationId,
+      detail: params.details,
+    });
+    if (params.action.includes('unauthorized')) {
+      recordErrorTelemetry(adminDb, {
+        source: 'AUTH',
+        module: 'Audit Logs & Security',
+        category: 'PERMISSION',
+        severity: 'CRITICAL',
+        message: params.details || `Unauthorized attempt (${params.action})`,
+        statusCode: 403,
+        correlationId: (params.req as any)?.correlationId,
+      });
+    }
   }
 
   // Reusable Cryptographic Token + Strictly UID-Based RBAC Verification Helper
@@ -1151,6 +1208,14 @@ export function createApp(options: ServerAppOptions = {}) {
   registerMasterRoutes(app, {
     db: adminDb,
     requireVerifiedCaller,
+  });
+
+  registerMonitoringRoutes(app, {
+    db: adminDb,
+    requireVerifiedCaller,
+    projectId,
+    databaseId,
+    credentialMode,
   });
 
   // ============================================================================

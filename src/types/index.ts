@@ -71,7 +71,10 @@ export interface AttendanceRecord {
   shiftDate: string; // YYYY-MM-DD
   punchIn: string; // ISO string (earliest punch in)
   firstPunchIn?: string; // alias to earliest punch in
-  scheduledPunchOut: string; // e.g. 17:30 or 04:30
+  scheduledPunchIn?: string; // e.g. '09:00' or '20:00'
+  scheduledPunchInIso?: string;
+  scheduledPunchOut: string; // e.g. '17:30' or '04:30'
+  scheduledPunchOutIso?: string;
   actualPunchOut: string | null; // ISO string if scanned (latest punch out)
   lastPunchOut?: string | null; // alias to latest punch out
   effectivePunchOut: string | null; // ISO string used for calculation
@@ -79,8 +82,16 @@ export interface AttendanceRecord {
   currentState?: CurrentAttendanceState;
   punches?: PunchEvent[];
   totalDutyMinutes?: number;
+  actualPresenceMinutes?: number;
   regularDutyMinutes: number; // Scheduled duty in minutes (max 510 by default)
-  overtimeMinutes: number; // OT duration in minutes
+  overtimeMinutes: number; // Total finalized OT duration in minutes (earlyOtMinutes + postShiftOtMinutes)
+  earlyArrivalMinutes?: number;
+  provisionalEarlyOtMinutes?: number;
+  earlyOtMinutes?: number;
+  postShiftOtMinutes?: number;
+  totalOtMinutes?: number;
+  earlyOtFinalized?: boolean;
+  earlyPunchPolicy?: 'OPTION_A_60M';
   attendanceStatus: AttendanceStatus;
   isLate?: boolean;
   arrivalStatus?: 'PRESENT' | 'LATE';
