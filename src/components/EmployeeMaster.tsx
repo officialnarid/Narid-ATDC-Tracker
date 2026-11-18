@@ -16,7 +16,10 @@ import {
   Building,
   Layers,
   Network,
-  Download
+  Download,
+  Archive,
+  FileSpreadsheet,
+  Printer
 } from 'lucide-react';
 import { 
   Employee, 
@@ -35,6 +38,23 @@ import {
 import { UserRoleRecord } from '../types';
 import { RolePermissionRecord, hasModulePermission } from '../services/permissionService';
 import { EmployeeMasterSkeleton, TableSkeletonRows } from './Skeletons';
+import { useBulkSelection } from '../hooks/useBulkSelection';
+import {
+  BulkActionBar,
+  BulkActionItem,
+  BulkExecutionSummary,
+  BulkProgressState,
+  SelectAllCheckbox,
+} from './BulkActionBar';
+import { BulkConfirmModal, CrossPageSelectConfirmModal } from './BulkConfirmModal';
+import {
+  downloadQrIdentityCardsZip,
+  executeEmployeeBulkAction,
+  exportChunkedToCsv,
+  exportChunkedToExcel,
+} from '../services/bulkActionService';
+import { EmployeeIdentityPrintCard } from './QrManagement';
+import { generatePureEmployeeQrDataUrl } from '../utils/qrIdentityCard';
 
 interface EmployeeMasterProps {
   employees: Employee[];
@@ -230,6 +250,327 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
     return filteredList.slice(start, start + pageSize);
   }, [filteredList, safePage, pageSize]);
 
+  // Global Bulk Selection & Batch Action state
+  const bulk = useBulkSelection<Employee>({
+    items: filteredList,
+    paginatedItems: paginatedList,
+    getId: (emp) => emp.employeeId,
+  });
+
+  const [bulkProgress, setBulkProgress] = useState<BulkProgressState | null>(null);
+  const [bulkSummary, setBulkSummary] = useState<BulkExecutionSummary | null>(null);
+  const [bulkPendingAction, setBulkPendingAction] = useState<'ACTIVATE' | 'DEACTIVATE' | 'DELETE' | null>(null);
+  const [isBulkExecuting, setIsBulkExecuting] = useState(false);
+  const [retryFailedState, setRetryFailedState] = useState<{
+    kind: 'zip' | 'ACTIVATE' | 'DEACTIVATE' | 'DELETE';
+    ids: string[];
+  } | null>(null);
+
+  const [isBulkPrintOpen, setIsBulkPrintOpen] = useState(false);
+  const [bulkPrintQrMap, setBulkPrintQrMap] = useState<Record<string, string>>({});
+  const [isGeneratingPrintQrs, setIsGeneratingPrintQrs] = useState(false);
+
+  const selectedEmployees = useMemo(() => bulk.selectedItems, [bulk.selectedItems]);
+
+  const EMPLOYEE_EXPORT_COLUMNS = [
+    { header: 'Employee ID', key: 'employeeId' },
+    { header: 'Employee Name', key: 'employeeName' },
+    { header: 'Type', key: 'employeeType' },
+    { header: 'Line', key: 'floor' },
+    { header: 'Section', key: 'section' },
+    { header: 'Department', key: 'department' },
+    { header: 'Designation', key: 'designation' },
+    { header: 'Status', key: 'employeeStatus' },
+  ];
+
+  const handleBulkExport = async (format: 'xlsx' | 'csv') => {
+    const target = selectedEmployees;
+    if (target.length === 0 || isBulkExecuting) return;
+    setIsBulkExecuting(true);
+    setBulkSummary(null);
+    setRetryFailedState(null);
+    setBulkProgress({
+      label: format === 'xlsx' ? 'Exporting selected employees to Excel...' : 'Exporting selected employees to CSV...',
+      completed: 0,
+      total: target.length,
+    });
+    try {
+      const exportRows = target.map((e) => ({
+        employeeId: e.employeeId,
+        employeeName: e.employeeName,
+        employeeType: e.employeeType,
+        floor: e.floor,
+        section: e.section,
+        department: e.department,
+        designation: e.designation,
+        employeeStatus: e.employeeStatus,
+      }));
+      const fn = format === 'xlsx' ? exportChunkedToExcel : exportChunkedToCsv;
+      const out = await fn(exportRows, EMPLOYEE_EXPORT_COLUMNS, 'Employees_Selected', {
+        onProgress: (completed, total) =>
+          setBulkProgress({
+            label: format === 'xlsx' ? 'Exporting selected employees to Excel...' : 'Exporting selected employees to CSV...',
+            completed,
+            total,
+          }),
+        auditTargetType: 'EMPLOYEES',
+        auditSource: 'EMPLOYEE_MASTER',
+        auditDescription: `Bulk exported ${exportRows.length} selected employees to ${format.toUpperCase()}.`,
+      });
+      setBulkSummary({
+        type: 'success',
+        title: `Exported ${out.rowCount} Employees`,
+        message: `Downloaded "${out.fileName}". Selection cleared.`,
+        savedCount: out.rowCount,
+      });
+      bulk.clearSelection();
+    } catch (err: any) {
+      setBulkSummary({
+        type: 'error',
+        title: 'Bulk Export Failed',
+        message: err?.message || 'Unable to export selected employees.',
+      });
+    } finally {
+      setBulkProgress(null);
+      setIsBulkExecuting(false);
+    }
+  };
+
+  const handleBulkDownloadZip = async (overrideIds?: string[]) => {
+    const targets = overrideIds
+      ? employees.filter((e) => overrideIds.includes(e.employeeId))
+      : selectedEmployees;
+    if (targets.length === 0 || isBulkExecuting) return;
+
+    setIsBulkExecuting(true);
+    setBulkSummary(null);
+    setRetryFailedState(null);
+    setBulkProgress({
+      label: 'Generating Employee QR Identity Card ZIP...',
+      completed: 0,
+      total: targets.length,
+    });
+
+    try {
+      const { result } = await downloadQrIdentityCardsZip(targets, {
+        auditSource: 'EMPLOYEE_MASTER',
+        onProgress: ({ completed, total, currentEmployeeId }) => {
+          setBulkProgress({
+            label: 'Generating Employee QR Identity Card ZIP...',
+            completed,
+            total,
+            detail: currentEmployeeId ? `Rendering card: ${currentEmployeeId}` : undefined,
+          });
+        },
+      });
+
+      const failedIds = result.failedItems.map((f) => f.employeeId);
+      if (failedIds.length > 0) {
+        setRetryFailedState({ kind: 'zip', ids: failedIds });
+        bulk.setSelectedIdList(failedIds);
+        setBulkSummary({
+          type: result.exportedCount > 0 ? 'partial' : 'error',
+          title:
+            result.exportedCount > 0
+              ? 'QR Card ZIP Generated with Partial Failures'
+              : 'QR Card ZIP Generation Failed',
+          message:
+            result.fileName
+              ? `Downloaded "${result.fileName}". ${failedIds.length} card(s) failed.`
+              : 'Failed to generate QR identity cards for selected employees.',
+          savedCount: result.exportedCount,
+          skippedCount: result.skippedIds.length,
+          failedCount: failedIds.length,
+          canRetryFailed: true,
+        });
+      } else {
+        setBulkSummary({
+          type: result.skippedIds.length > 0 ? 'partial' : 'success',
+          title: `QR Card ZIP Ready (${result.exportedCount} Cards)`,
+          message: result.fileName
+            ? `Downloaded "${result.fileName}" preserving existing employee QR tokens.`
+            : 'No eligible QR tokens found in selection.',
+          savedCount: result.exportedCount,
+          skippedCount: result.skippedIds.length,
+        });
+        bulk.clearSelection();
+      }
+    } catch (err: any) {
+      setBulkSummary({
+        type: 'error',
+        title: 'Bulk QR ZIP Failed',
+        message: err?.message || 'Unable to package Employee QR Identity Cards.',
+      });
+    } finally {
+      setBulkProgress(null);
+      setIsBulkExecuting(false);
+    }
+  };
+
+  const handleOpenBulkPrintModal = async () => {
+    const targets = selectedEmployees;
+    if (targets.length === 0 || isBulkExecuting) return;
+    setIsBulkPrintOpen(true);
+    setIsGeneratingPrintQrs(true);
+    const nextMap: Record<string, string> = {};
+    try {
+      const CHUNK = 8;
+      for (let i = 0; i < targets.length; i += CHUNK) {
+        const chunk = targets.slice(i, i + CHUNK);
+        await Promise.all(
+          chunk.map(async (emp) => {
+            if (!emp.qrCodeToken) return;
+            try {
+              nextMap[emp.employeeId] = await generatePureEmployeeQrDataUrl(emp, 240);
+            } catch {
+              // ignore individual QR render error
+            }
+          })
+        );
+      }
+      setBulkPrintQrMap(nextMap);
+    } finally {
+      setIsGeneratingPrintQrs(false);
+    }
+  };
+
+  const handleExecuteBulkMutation = async (
+    actionOverride?: 'ACTIVATE' | 'DEACTIVATE' | 'DELETE',
+    overrideIds?: string[]
+  ) => {
+    const action = actionOverride || bulkPendingAction;
+    if (!action) return;
+    const ids = overrideIds || bulk.selectedIdArray;
+    if (ids.length === 0) return;
+
+    setIsBulkExecuting(true);
+    setBulkSummary(null);
+    setRetryFailedState(null);
+    setBulkProgress({
+      label:
+        action === 'DELETE'
+          ? 'Deleting eligible employees...'
+          : action === 'ACTIVATE'
+            ? 'Activating selected employees...'
+            : 'Deactivating selected employees...',
+      completed: 0,
+      total: ids.length,
+      detail: `Submitting ${ids.length} employees in verified batch chunks...`,
+    });
+
+    try {
+      const res = await executeEmployeeBulkAction({
+        action,
+        employeeIds: ids,
+        confirmPhrase: action === 'DELETE' ? 'DELETE' : undefined,
+      });
+
+      setBulkProgress({
+        label: 'Completed',
+        completed: ids.length,
+        total: ids.length,
+      });
+
+      const failedIds = (res.failedItems || []).map((f) => f.id);
+      const skippedSummary =
+        res.skippedItems && res.skippedItems.length > 0
+          ? ` ${res.skippedItems[0].reason || 'Some employees were skipped to preserve attendance integrity.'}`
+          : '';
+
+      if (failedIds.length > 0) {
+        setRetryFailedState({ kind: action, ids: failedIds });
+        bulk.setSelectedIdList(failedIds);
+        setBulkSummary({
+          type: res.savedCount > 0 ? 'partial' : 'error',
+          title: `Bulk ${action} Partially Completed`,
+          message: `${res.savedCount} updated, ${res.failedCount} failed.${skippedSummary}`,
+          savedCount: res.savedCount,
+          skippedCount: res.skippedCount,
+          failedCount: res.failedCount,
+          canRetryFailed: true,
+        });
+      } else {
+        setBulkSummary({
+          type: res.skippedCount > 0 ? 'partial' : 'success',
+          title: `Bulk ${action === 'ACTIVATE' ? 'Activation' : action === 'DEACTIVATE' ? 'Deactivation' : 'Deletion'} Complete`,
+          message:
+            action === 'DELETE'
+              ? `Deleted ${res.savedCount} employee(s).${skippedSummary}`
+              : `Updated ${res.savedCount} employee record(s).${skippedSummary}`,
+          savedCount: res.savedCount,
+          skippedCount: res.skippedCount,
+        });
+        bulk.clearSelection();
+      }
+      setBulkPendingAction(null);
+      onRefresh();
+    } catch (err: any) {
+      setBulkSummary({
+        type: 'error',
+        title: `Bulk ${action} Blocked`,
+        message: err?.message || 'Permission or validation error while processing bulk action.',
+      });
+    } finally {
+      setBulkProgress(null);
+      setIsBulkExecuting(false);
+    }
+  };
+
+  const bulkActionItems: BulkActionItem[] = [
+    {
+      id: 'export_excel',
+      label: 'Export Excel',
+      icon: <FileSpreadsheet className="w-3.5 h-3.5" />,
+      tone: 'emerald',
+      onClick: () => handleBulkExport('xlsx'),
+    },
+    {
+      id: 'export_csv',
+      label: 'Export CSV',
+      icon: <Download className="w-3.5 h-3.5" />,
+      tone: 'default',
+      onClick: () => handleBulkExport('csv'),
+    },
+    {
+      id: 'qr_zip',
+      label: 'Download QR ZIP',
+      icon: <Archive className="w-3.5 h-3.5" />,
+      tone: 'primary',
+      onClick: () => handleBulkDownloadZip(),
+    },
+    {
+      id: 'print_qr',
+      label: 'Print QR ID Cards',
+      icon: <Printer className="w-3.5 h-3.5" />,
+      tone: 'default',
+      onClick: handleOpenBulkPrintModal,
+    },
+    {
+      id: 'bulk_activate',
+      label: 'Activate',
+      icon: <CheckCircle className="w-3.5 h-3.5" />,
+      tone: 'emerald',
+      hidden: !canEdit,
+      onClick: () => setBulkPendingAction('ACTIVATE'),
+    },
+    {
+      id: 'bulk_deactivate',
+      label: 'Deactivate',
+      icon: <XCircle className="w-3.5 h-3.5" />,
+      tone: 'amber',
+      hidden: !canEdit,
+      onClick: () => setBulkPendingAction('DEACTIVATE'),
+    },
+    {
+      id: 'bulk_delete',
+      label: 'Delete Selected',
+      icon: <Trash2 className="w-3.5 h-3.5" />,
+      tone: 'danger',
+      hidden: !canDelete,
+      onClick: () => setBulkPendingAction('DELETE'),
+    },
+  ];
+
   if (isLoading && employees.length === 0 && !loadError) {
     return <EmployeeMasterSkeleton />;
   }
@@ -369,12 +710,48 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
         )}
       </div>
 
+      {/* Global Bulk Action Toolbar */}
+      <BulkActionBar
+        selectedCount={bulk.selectedCount}
+        totalFilteredCount={bulk.totalFilteredCount}
+        currentPageCount={bulk.currentPageCount}
+        isAllFilteredSelected={bulk.isAllFilteredSelected}
+        isPageAllSelected={bulk.isPageAllSelected}
+        recordLabel="employees"
+        actions={bulkActionItems}
+        onSelectAllFiltered={bulk.requestSelectAllFiltered}
+        onClearSelection={bulk.clearSelection}
+        progress={bulkProgress}
+        summary={bulkSummary}
+        onDismissSummary={() => setBulkSummary(null)}
+        onRetryFailed={
+          retryFailedState
+            ? () => {
+                if (retryFailedState.kind === 'zip') {
+                  handleBulkDownloadZip(retryFailedState.ids);
+                } else {
+                  handleExecuteBulkMutation(retryFailedState.kind, retryFailedState.ids);
+                }
+              }
+            : undefined
+        }
+      />
+
       {/* Employees Table */}
       <div className="bg-white rounded-xl border border-slate-200 shadow-2xs overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs">
             <thead className="bg-slate-50 text-slate-600 uppercase font-semibold border-b border-slate-200">
               <tr>
+                <th className="py-3 px-3 w-10 text-center">
+                  <SelectAllCheckbox
+                    checked={bulk.isPageAllSelected}
+                    indeterminate={bulk.isPageIndeterminate}
+                    disabled={paginatedList.length === 0 || isBulkExecuting}
+                    onChange={bulk.togglePageSelection}
+                    ariaLabel="Select all employees on current page"
+                  />
+                </th>
                 <th className="py-3 px-3.5">Employee ID</th>
                 <th className="py-3 px-3.5">Employee Name</th>
                 <th className="py-3 px-3.5">Type</th>
@@ -388,16 +765,31 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
             </thead>
             <tbody className="divide-y divide-slate-100">
               {isLoading && filteredList.length === 0 ? (
-                <TableSkeletonRows rows={6} cols={9} />
+                <TableSkeletonRows rows={6} cols={10} />
               ) : filteredList.length === 0 ? (
                 <tr>
-                  <td colSpan={9} className="py-8 text-center text-slate-400">
+                  <td colSpan={10} className="py-8 text-center text-slate-400">
                     No employees matching the criteria found.
                   </td>
                 </tr>
               ) : (
-                paginatedList.map((emp) => (
-                  <tr key={emp.employeeId} className="hover:bg-slate-50/70 transition">
+                paginatedList.map((emp) => {
+                  const isChecked = bulk.isSelected(emp.employeeId);
+                  return (
+                  <tr
+                    key={emp.employeeId}
+                    className={`transition ${isChecked ? 'bg-blue-50/60 hover:bg-blue-50/90' : 'hover:bg-slate-50/70'}`}
+                  >
+                    <td className="py-3 px-3 text-center">
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        disabled={isBulkExecuting}
+                        onChange={() => bulk.toggleOne(emp.employeeId)}
+                        aria-label={`Select employee ${emp.employeeId}`}
+                        className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
+                      />
+                    </td>
                     <td className="py-3 px-3.5 font-mono font-bold text-slate-900">{emp.employeeId}</td>
                     <td className="py-3 px-3.5 font-semibold text-slate-800">{emp.employeeName}</td>
                     <td className="py-3 px-3.5">
@@ -466,7 +858,8 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
                       </div>
                     </td>
                   </tr>
-                ))
+                  );
+                })
               )}
             </tbody>
           </table>
@@ -823,6 +1216,138 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
           </div>
         </div>
       )}
+
+      {/* BULK PRINT QR IDENTITY CARDS MODAL */}
+      {isBulkPrintOpen && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 qr-print-overlay">
+          <style>{`
+            @media print {
+              body * {
+                visibility: hidden !important;
+              }
+              #print-sheet-area,
+              #print-sheet-area * {
+                visibility: visible !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+              }
+              #print-sheet-area {
+                position: fixed !important;
+                inset: 0 !important;
+                width: 100% !important;
+                height: auto !important;
+                overflow: visible !important;
+                background: #ffffff !important;
+                padding: 8mm !important;
+              }
+              .qr-identity-print-card {
+                break-inside: avoid !important;
+                page-break-inside: avoid !important;
+              }
+            }
+          `}</style>
+          <div className="bg-white rounded-xl max-w-5xl w-full max-h-[90vh] flex flex-col shadow-2xl border border-slate-200 overflow-hidden">
+            <div className="p-4 border-b border-slate-200 flex items-center justify-between bg-slate-900 text-white">
+              <div>
+                <h3 className="text-base font-bold">Bulk Print Employee QR ID Cards</h3>
+                <p className="text-xs text-slate-400">
+                  {isGeneratingPrintQrs
+                    ? `Preparing QR badges for ${selectedEmployees.length} selected employees...`
+                    : `Ready to print ${selectedEmployees.length} employee identity ${selectedEmployees.length === 1 ? 'card' : 'cards'} preserving existing tokens`}
+                </p>
+              </div>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  disabled={isGeneratingPrintQrs}
+                  onClick={() => window.print()}
+                  className="bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs px-4 py-2 rounded flex items-center gap-1.5 shadow disabled:opacity-50 cursor-pointer"
+                >
+                  <Printer className="w-4 h-4" />
+                  <span>Send to Printer (A4 Sheet)</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsBulkPrintOpen(false)}
+                  className="p-1 rounded hover:bg-slate-800 text-slate-400 hover:text-white cursor-pointer"
+                  aria-label="Close Bulk Print Preview"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-6 flex-1 overflow-y-auto bg-slate-100" id="print-sheet-area">
+              <div
+                className={`grid gap-4 bg-white p-6 rounded shadow-sm border border-slate-200 ${
+                  selectedEmployees.length === 1
+                    ? 'grid-cols-1 max-w-xs mx-auto'
+                    : 'grid-cols-2 md:grid-cols-3'
+                }`}
+              >
+                {selectedEmployees.map((emp) => (
+                  <EmployeeIdentityPrintCard
+                    key={emp.employeeId}
+                    employee={emp}
+                    qrUrl={bulkPrintQrMap[emp.employeeId]}
+                  />
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* BULK STATUS / DELETE CONFIRMATION MODAL */}
+      <BulkConfirmModal
+        isOpen={Boolean(bulkPendingAction)}
+        title={
+          bulkPendingAction === 'DELETE'
+            ? 'Bulk Delete Selected Employees?'
+            : bulkPendingAction === 'ACTIVATE'
+              ? 'Bulk Activate Selected Employees?'
+              : 'Bulk Deactivate Selected Employees?'
+        }
+        description={
+          bulkPendingAction === 'DELETE'
+            ? `You are about to permanently remove ${bulk.selectedCount} selected employee profile(s). Employees with historical attendance records will be automatically protected and skipped to preserve attendance integrity.`
+            : bulkPendingAction === 'ACTIVATE'
+              ? `Set status to Active for ${bulk.selectedCount} selected employee(s). Existing QR tokens and employee IDs remain intact.`
+              : `Set status to Inactive for ${bulk.selectedCount} selected employee(s). Gate QR scanning is paused while Inactive, and all tokens & historical attendance remain preserved.`
+        }
+        selectedCount={bulk.selectedCount}
+        confirmLabel={
+          bulkPendingAction === 'DELETE'
+            ? `Delete ${bulk.selectedCount} Eligible`
+            : bulkPendingAction === 'ACTIVATE'
+              ? `Activate ${bulk.selectedCount} Employees`
+              : `Deactivate ${bulk.selectedCount} Employees`
+        }
+        tone={bulkPendingAction === 'DELETE' ? 'danger' : bulkPendingAction === 'DEACTIVATE' ? 'amber' : 'primary'}
+        warningDetails={
+          bulkPendingAction === 'DELETE'
+            ? [
+                'Employees with existing attendance records are automatically skipped and preserved.',
+                'All batch deletions are permanently recorded in Enterprise Audit Logs.',
+              ]
+            : ['Existing Employee IDs, QR tokens, and attendance history remain completely unchanged.']
+        }
+        requireConfirmPhrase={bulkPendingAction === 'DELETE' ? 'DELETE' : undefined}
+        isBusy={isBulkExecuting}
+        onConfirm={() => handleExecuteBulkMutation()}
+        onCancel={() => {
+          if (!isBulkExecuting) setBulkPendingAction(null);
+        }}
+      />
+
+      <CrossPageSelectConfirmModal
+        isOpen={bulk.isCrossPageConfirmOpen}
+        totalFilteredCount={bulk.totalFilteredCount}
+        currentPageCount={bulk.currentPageCount}
+        recordLabel="employees"
+        onConfirm={bulk.confirmSelectAllFiltered}
+        onCancel={bulk.cancelSelectAllFiltered}
+      />
     </div>
   );
 };

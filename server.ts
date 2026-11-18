@@ -38,6 +38,7 @@ import {
 } from './serverLoginSecurity.ts';
 import { registerAttendanceRoutes } from './serverAttendance.ts';
 import { registerEmployeeRoutes } from './serverEmployees.ts';
+import { registerMasterRoutes } from './serverMasters.ts';
 import {
   getCachedRoleDefDoc,
   getCachedRolePermissionsDoc,
@@ -1143,6 +1144,11 @@ export function createApp(options: ServerAppOptions = {}) {
   });
 
   registerEmployeeRoutes(app, {
+    db: adminDb,
+    requireVerifiedCaller,
+  });
+
+  registerMasterRoutes(app, {
     db: adminDb,
     requireVerifiedCaller,
   });
@@ -2312,6 +2318,169 @@ export function createApp(options: ServerAppOptions = {}) {
     } catch (err: any) {
       console.error('[Set User Permissions] Error:', err);
       return res.status(500).json({ success: false, error: err?.message || 'Failed to update user permissions.' });
+    }
+  });
+
+  // ============================================================================
+  // 6.1 Bulk User Status Toggle (Super Admin Only — Safe Account Activation/Deactivation)
+  // ============================================================================
+  const BulkUserStatusInputSchema = z.object({
+    userIds: z.array(z.string().trim().min(1)).min(1, 'Select at least one user account.').max(200),
+    status: z.enum(['Active', 'Inactive']),
+    confirmed: z.literal(true, {
+      message: 'Explicit confirmation is required for bulk user status updates.',
+    }),
+  });
+
+  app.post('/api/admin/users/bulk-status', async (req: Request, res: Response) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, ['super_admin'], 'Bulk User Status Update');
+      if (!caller) return;
+
+      const parsed = BulkUserStatusInputSchema.safeParse(req.body || {});
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || 'Invalid bulk user status payload.',
+        });
+      }
+
+      const { status } = parsed.data;
+      const uniqueIds = Array.from(new Set(parsed.data.userIds.map((id) => id.trim()).filter(Boolean)));
+      const now = new Date().toISOString();
+
+      const allUsersSnap = await adminDb.collection('user_roles').get();
+      const userDocById = new Map<string, Record<string, any>>();
+      let activeSuperAdminCount = 0;
+
+      for (const docSnap of allUsersSnap.docs) {
+        const data = docSnap.data() || {};
+        userDocById.set(docSnap.id, data);
+        if (String(data.role || '').toLowerCase() === 'super_admin' && data.status !== 'Inactive') {
+          activeSuperAdminCount++;
+        }
+      }
+
+      const committedIds: string[] = [];
+      const skippedItems: Array<{ id: string; reason: string }> = [];
+      const failedItems: Array<{ id: string; error: string }> = [];
+
+      for (const targetId of uniqueIds) {
+        const targetData = userDocById.get(targetId);
+        if (!targetData) {
+          skippedItems.push({ id: targetId, reason: 'User account not found.' });
+          continue;
+        }
+
+        const targetLogin = String(targetData.loginId || '').trim().toLowerCase();
+        const targetUid = String(targetData.authUid || targetData.uid || '');
+        const isSuper = String(targetData.role || '').toLowerCase() === 'super_admin';
+
+        if (status === 'Inactive') {
+          if (targetLogin === caller.loginId || targetId === caller.profileDocId) {
+            skippedItems.push({
+              id: targetId,
+              reason: 'Protected: Cannot deactivate your own active account.',
+            });
+            continue;
+          }
+          if (
+            targetLogin === 'superadmin' ||
+            targetId === 'role_superadmin' ||
+            CANONICAL_PROTECTED_UIDS.has(targetUid)
+          ) {
+            skippedItems.push({
+              id: targetId,
+              reason: 'Protected: Root canonical Super Admin account cannot be deactivated.',
+            });
+            continue;
+          }
+          if (isSuper && activeSuperAdminCount <= 1) {
+            skippedItems.push({
+              id: targetId,
+              reason: 'Protected: Cannot deactivate the last remaining active Super Admin.',
+            });
+            continue;
+          }
+        }
+
+        if (targetData.status === status) {
+          skippedItems.push({ id: targetId, reason: `Account is already ${status}.` });
+          continue;
+        }
+
+        try {
+          await adminDb.collection('user_roles').doc(targetId).update({
+            status,
+            updatedAt: now,
+          });
+
+          if (targetUid && !targetUid.startsWith('role_')) {
+            await syncUserUidIndex(adminDb, {
+              uid: targetUid,
+              roleDocId: targetId,
+              role: normalizeRoleValue(targetData.role || 'user'),
+              status,
+              lockStatus: targetData.isLocked || targetData.lockStatus === 'LOCKED' ? 'LOCKED' : 'ACTIVE',
+              loginId: targetLogin,
+            });
+            invalidateUidRolePointer(adminDb, targetUid);
+            if (auth) {
+              await auth.updateUser(targetUid, { disabled: status === 'Inactive' }).catch(() => {});
+              if (status === 'Inactive') {
+                await auth.revokeRefreshTokens(targetUid).catch(() => {});
+              }
+            }
+          }
+
+          if (status === 'Inactive' && isSuper) {
+            activeSuperAdminCount--;
+          } else if (status === 'Active' && isSuper && targetData.status === 'Inactive') {
+            activeSuperAdminCount++;
+          }
+
+          committedIds.push(targetId);
+        } catch (err: any) {
+          failedItems.push({ id: targetId, error: err?.message || 'Failed to update account status.' });
+        }
+      }
+
+      await logAuditEvent({
+        req,
+        action: 'bulk_user_status_updated',
+        targetUid: committedIds.slice(0, 10).join(',') || 'user_roles',
+        loginId: caller.loginId,
+        performedByUid: caller.uid,
+        performedByLoginId: caller.loginId,
+        performedByRole: 'SUPER_ADMIN',
+        actionSource: 'USER_RIGHTS_BULK_STATUS',
+        newValue: {
+          status,
+          savedCount: committedIds.length,
+          skippedCount: skippedItems.length,
+          failedCount: failedItems.length,
+          committedIds,
+        },
+        details: `Super Admin bulk set ${committedIds.length} user account(s) to ${status} (skipped ${skippedItems.length}).`,
+      });
+
+      const partialCommit = committedIds.length > 0 && failedItems.length > 0;
+      const statusCode = failedItems.length > 0 && committedIds.length === 0 ? 500 : 200;
+
+      return res.status(statusCode).json({
+        success: failedItems.length === 0,
+        status,
+        savedCount: committedIds.length,
+        skippedCount: skippedItems.length,
+        failedCount: failedItems.length,
+        partialCommit,
+        committedIds,
+        skippedItems,
+        failedItems,
+      });
+    } catch (err: any) {
+      console.error('[Bulk User Status API] Error:', err);
+      return res.status(500).json({ success: false, error: err?.message || 'Bulk user status update failed.' });
     }
   });
 

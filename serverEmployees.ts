@@ -51,9 +51,9 @@ function generateServerQrToken(employeeId: string): string {
   return `QR_${employeeId}_${ts}_${rand}`;
 }
 
-const ADMIN_EXCEL_DEFAULTS: Record<string, { view: boolean; add: boolean; edit: boolean }> = {
-  excel_import: { view: true, add: true, edit: true },
-  employees: { view: true, add: true, edit: true },
+const ADMIN_EXCEL_DEFAULTS: Record<string, { view: boolean; add: boolean; edit: boolean; delete: boolean }> = {
+  excel_import: { view: true, add: true, edit: true, delete: false },
+  employees: { view: true, add: true, edit: true, delete: false },
 };
 
 function evalModuleAction(
@@ -61,7 +61,7 @@ function evalModuleAction(
   userPermData: Record<string, any> | undefined,
   rolePermData: Record<string, any> | undefined,
   moduleKey: 'excel_import' | 'employees',
-  action: 'view' | 'add' | 'edit'
+  action: 'view' | 'add' | 'edit' | 'delete'
 ): boolean {
   if (caller.role === 'super_admin') return true;
 
@@ -84,6 +84,45 @@ function evalModuleAction(
   }
 
   return false;
+}
+
+const BulkEmployeeActionSchema = z.object({
+  action: z.enum(['ACTIVATE', 'DEACTIVATE', 'DELETE']),
+  employeeIds: z
+    .array(z.string().trim().min(1).max(128))
+    .min(1, 'At least one Employee ID is required.')
+    .max(1000, 'Bulk action supports up to 1,000 employees per request.'),
+  confirmed: z.literal(true, {
+    message: 'Explicit confirmation is required before executing bulk employee actions.',
+  }),
+  confirmPhrase: z.string().trim().optional(),
+  reason: z.string().trim().max(300).optional(),
+});
+
+async function resolveCallerEmployeeActionPermissions(
+  db: AdminFirestoreLike,
+  caller: VerifiedCaller
+): Promise<{ canView: boolean; canEdit: boolean; canDelete: boolean }> {
+  if (caller.role === 'super_admin') {
+    return { canView: true, canEdit: true, canDelete: true };
+  }
+  try {
+    const [userPermSnap, rolePermSnap] = await Promise.all([
+      caller.prefetchedUserPermSnap
+        ? Promise.resolve(caller.prefetchedUserPermSnap)
+        : db.collection('user_permissions').doc(caller.profileDocId).get(),
+      getCachedRolePermissionsDoc(db, caller.role),
+    ]);
+    const userPermData = userPermSnap.exists ? userPermSnap.data() : undefined;
+    const rolePermData = rolePermSnap.exists ? rolePermSnap.data : undefined;
+    const canView = evalModuleAction(caller, userPermData, rolePermData, 'employees', 'view');
+    const canEdit = canView && evalModuleAction(caller, userPermData, rolePermData, 'employees', 'edit');
+    const canDelete = canView && evalModuleAction(caller, userPermData, rolePermData, 'employees', 'delete');
+    return { canView, canEdit, canDelete };
+  } catch (err: any) {
+    console.warn('[Employee Bulk Action Permission Guard] Lookup failed; failing closed:', err?.message || err);
+    return { canView: false, canEdit: false, canDelete: false };
+  }
 }
 
 async function resolveCallerEmployeeImportPermissions(
@@ -497,6 +536,263 @@ export function registerEmployeeRoutes(app: express.Express, deps: EmployeeRoute
         success: false,
         code: classified.code,
         category: classified.category,
+        error: classified.message,
+      });
+    }
+  });
+
+  // ==========================================================================
+  // POST /api/employees/bulk-action
+  // Authenticated, RBAC-enforced chunked Admin SDK bulk ACTIVATE / DEACTIVATE / DELETE
+  // with historical attendance integrity protection before deletion.
+  // ==========================================================================
+  app.post('/api/employees/bulk-action', async (req: Request, res: Response) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        '*',
+        'Employee Master Bulk Action',
+        { prefetchUserPermission: true }
+      );
+      if (!caller) return;
+
+      const parsed = BulkEmployeeActionSchema.safeParse(req.body || {});
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          code: 'VALIDATION_ERROR',
+          error: parsed.error.issues[0]?.message || 'Invalid employee bulk action payload.',
+        });
+      }
+
+      const { action, confirmPhrase, reason } = parsed.data;
+      const uniqueIds = Array.from(
+        new Set(parsed.data.employeeIds.map((id) => id.trim().toUpperCase()).filter(Boolean))
+      );
+      if (uniqueIds.length === 0) {
+        return res.status(400).json({
+          success: false,
+          code: 'VALIDATION_ERROR',
+          error: 'At least one valid Employee ID is required.',
+        });
+      }
+
+      const perms = await resolveCallerEmployeeActionPermissions(db, caller);
+      const isAuthorized =
+        action === 'DELETE' ? perms.canDelete : perms.canEdit;
+
+      if (!isAuthorized) {
+        await recordEnterpriseAuditEvent(db, {
+          req,
+          action: 'unauthorized_access_attempt',
+          category: 'SECURITY',
+          severity: 'CRITICAL',
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: caller.role.toUpperCase(),
+          targetType: 'EMPLOYEE',
+          targetId: '/api/employees/bulk-action',
+          actionSource: 'EMPLOYEE_BULK_RBAC_GUARD',
+          description: `User "${caller.loginId}" (${caller.role}) blocked from Employee bulk ${action} due to missing employees.${action === 'DELETE' ? 'delete' : 'edit'} permission.`,
+          success: false,
+        });
+        return res.status(403).json({
+          success: false,
+          code: 'EMPLOYEE_BULK_FORBIDDEN',
+          error: `Forbidden: Role "${caller.role.toUpperCase()}" is not authorized to perform bulk ${action} on employees.`,
+        });
+      }
+
+      if (action === 'DELETE' && String(confirmPhrase || '').trim().toUpperCase() !== 'DELETE') {
+        return res.status(400).json({
+          success: false,
+          code: 'CONFIRMATION_PHRASE_REQUIRED',
+          error: 'Permanent bulk deletion requires confirmPhrase="DELETE".',
+        });
+      }
+
+      // Fetch current employees map
+      const existingSnap = await db.collection('employees').get();
+      const empByUpperId = new Map<string, { docId: string; ref: AdminDocRefLike; data: Record<string, any> }>();
+      for (const d of existingSnap.docs) {
+        const data = d.data() || {};
+        const key = String(data.employeeId || d.id).trim().toUpperCase();
+        const entry = { docId: d.id, ref: db.collection('employees').doc(d.id), data };
+        if (key) empByUpperId.set(key, entry);
+        const docUpper = String(d.id).trim().toUpperCase();
+        if (docUpper && !empByUpperId.has(docUpper)) {
+          empByUpperId.set(docUpper, entry);
+        }
+      }
+
+      // For permanent deletion: protect employees with historical attendance/punch records
+      const protectedHistoryIds = new Set<string>();
+      if (action === 'DELETE') {
+        const presentIds = uniqueIds.filter((id) => empByUpperId.has(id));
+        const QUERY_IN_LIMIT = 30;
+        for (let i = 0; i < presentIds.length; i += QUERY_IN_LIMIT) {
+          const chunk = presentIds.slice(i, i + QUERY_IN_LIMIT);
+          if (chunk.length === 0) continue;
+          const attSnap = await db
+            .collection('attendance')
+            .where('employeeId', 'in', chunk)
+            .get();
+          for (const attDoc of attSnap.docs) {
+            const empIdVal = String(attDoc.data()?.employeeId || '').trim().toUpperCase();
+            if (empIdVal) protectedHistoryIds.add(empIdVal);
+          }
+        }
+      }
+
+      const now = new Date().toISOString();
+      const targetStatus = action === 'ACTIVATE' ? 'Active' : 'Inactive';
+
+      const ops: Array<{ employeeId: string; ref: AdminDocRefLike }> = [];
+      const skippedItems: Array<{ id: string; reason: string }> = [];
+
+      for (const empId of uniqueIds) {
+        const found = empByUpperId.get(empId);
+        if (!found) {
+          skippedItems.push({ id: empId, reason: 'Employee record not found.' });
+          continue;
+        }
+        if (action === 'DELETE') {
+          if (protectedHistoryIds.has(empId)) {
+            skippedItems.push({
+              id: empId,
+              reason:
+                'Protected: Employee has linked historical attendance/punch records. Deactivate/archive instead.',
+            });
+            continue;
+          }
+          ops.push({ employeeId: empId, ref: found.ref });
+        } else {
+          if (found.data.employeeStatus === targetStatus) {
+            skippedItems.push({
+              id: empId,
+              reason: `Employee is already ${targetStatus}.`,
+            });
+            continue;
+          }
+          ops.push({ employeeId: empId, ref: found.ref });
+        }
+      }
+
+      const committedIds: string[] = [];
+      const failedItems: Array<{ id: string; error: string }> = [];
+
+      for (let i = 0; i < ops.length; i += EMPLOYEE_BULK_BATCH_SIZE) {
+        const chunk = ops.slice(i, i + EMPLOYEE_BULK_BATCH_SIZE);
+        try {
+          if (typeof db.batch === 'function') {
+            const batch = db.batch();
+            for (const op of chunk) {
+              if (action === 'DELETE') {
+                batch.delete(op.ref);
+              } else {
+                batch.update(op.ref, {
+                  employeeStatus: targetStatus,
+                  updatedAt: now,
+                });
+              }
+            }
+            await batch.commit();
+          } else {
+            await Promise.all(
+              chunk.map((op) =>
+                action === 'DELETE'
+                  ? op.ref.delete()
+                  : op.ref.update({ employeeStatus: targetStatus, updatedAt: now })
+              )
+            );
+          }
+
+          for (const op of chunk) {
+            committedIds.push(op.employeeId);
+          }
+        } catch (batchErr: any) {
+          const classified = classifyBatchWriteError(batchErr);
+          for (const rem of ops.slice(i)) {
+            failedItems.push({ id: rem.employeeId, error: classified.message });
+          }
+
+          await recordEnterpriseAuditEvent(db, {
+            req,
+            action: `EMPLOYEE_BULK_${action}_PARTIAL`,
+            category: 'EMPLOYEE',
+            severity: 'WARNING',
+            actorUid: caller.uid,
+            actorLoginId: caller.loginId,
+            actorRole: caller.role.toUpperCase(),
+            targetType: 'EMPLOYEE',
+            targetId: uniqueIds.slice(0, 10).join(','),
+            newValue: {
+              action,
+              savedCount: committedIds.length,
+              skippedCount: skippedItems.length,
+              failedCount: failedItems.length,
+            },
+            actionSource: 'EMPLOYEE_MASTER_BULK',
+            reason: classified.message,
+            success: false,
+          }).catch(() => {});
+
+          return res.status(classified.status).json({
+            success: false,
+            code: classified.code,
+            action,
+            savedCount: committedIds.length,
+            skippedCount: skippedItems.length,
+            failedCount: failedItems.length,
+            partialCommit: committedIds.length > 0,
+            committedIds,
+            skippedItems,
+            failedItems,
+            error: classified.message,
+          });
+        }
+      }
+
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: `EMPLOYEE_BULK_${action}`,
+        category: 'EMPLOYEE',
+        severity: action === 'DELETE' ? 'WARNING' : 'INFO',
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        targetType: 'EMPLOYEE',
+        targetId: committedIds.slice(0, 10).join(',') || 'EMPLOYEE_BATCH',
+        newValue: {
+          action,
+          savedCount: committedIds.length,
+          skippedCount: skippedItems.length,
+          sampleIds: committedIds.slice(0, 20),
+        },
+        actionSource: 'EMPLOYEE_MASTER_BULK',
+        reason: reason || `Bulk ${action.toLowerCase()} executed from Employee Master`,
+        description: `Bulk ${action} processed ${committedIds.length} employees (${skippedItems.length} skipped/protected).`,
+        success: true,
+      });
+
+      return res.json({
+        success: true,
+        action,
+        savedCount: committedIds.length,
+        skippedCount: skippedItems.length,
+        failedCount: 0,
+        partialCommit: false,
+        committedIds,
+        skippedItems,
+        failedItems: [],
+      });
+    } catch (err: any) {
+      console.error('[Employee Bulk Action API] Error:', err);
+      const classified = classifyBatchWriteError(err);
+      return res.status(classified.status).json({
+        success: false,
+        code: classified.code,
         error: classified.message,
       });
     }

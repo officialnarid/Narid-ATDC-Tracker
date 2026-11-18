@@ -39,6 +39,14 @@ import {
   toggleAuditImportant,
 } from '../services/auditService';
 import { exportTableToCsv, exportTableToExcel } from '../services/exportService';
+import { useBulkSelection } from '../hooks/useBulkSelection';
+import {
+  BulkActionBar,
+  BulkExecutionSummary,
+  BulkProgressState,
+  SelectAllCheckbox,
+} from './BulkActionBar';
+import { exportChunkedToCsv, exportChunkedToExcel } from '../services/bulkActionService';
 
 interface AuditLogsManagementProps {
   currentUserRole: UserRoleRecord;
@@ -144,6 +152,123 @@ export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ curren
   const [confirmLogIdInput, setConfirmLogIdInput] = useState<string>('');
   const [superAdminConfirmed, setSuperAdminConfirmed] = useState<boolean>(false);
   const [isDeletingLog, setIsDeletingLog] = useState<boolean>(false);
+
+  const logsBulk = useBulkSelection<AuditLog>({
+    items: logs,
+    paginatedItems: logs,
+    getId: (l) => l.id,
+    resetKey: subTab,
+  });
+
+  const loginHistoryBulk = useBulkSelection<LoginHistoryEntry>({
+    items: loginHistory,
+    paginatedItems: loginHistory,
+    getId: (item) => item.id,
+    resetKey: subTab,
+  });
+
+  const [bulkProgress, setBulkProgress] = useState<BulkProgressState | null>(null);
+  const [bulkSummary, setBulkSummary] = useState<BulkExecutionSummary | null>(null);
+
+  const handleBulkExportLogs = async (format: 'xlsx' | 'csv') => {
+    const target = logsBulk.selectedItems;
+    if (target.length === 0 || bulkProgress) return;
+    setBulkSummary(null);
+    setBulkProgress({ label: `Exporting ${target.length} audit logs...`, completed: 0, total: target.length });
+    try {
+      const columns = [
+        { header: 'Log ID', key: 'id' },
+        { header: 'Timestamp', key: 'timestamp' },
+        { header: 'Action', key: 'action' },
+        { header: 'Category', key: 'category' },
+        { header: 'Severity', key: 'severity' },
+        { header: 'Actor Login ID', key: 'actorLoginId' },
+        { header: 'Actor Role', key: 'actorRole' },
+        { header: 'IP Address', key: 'ipAddress' },
+        { header: 'Location', key: 'location' },
+        { header: 'Browser / OS', key: 'device' },
+        { header: 'Target', key: 'target' },
+        { header: 'Success', key: 'success' },
+        { header: 'Important', key: 'important' },
+        { header: 'Description', key: 'description' },
+      ];
+      const rows = target.map((l) => ({
+        id: l.id,
+        timestamp: l.timestamp,
+        action: l.action,
+        category: l.category || 'SYSTEM',
+        severity: l.severity || 'INFO',
+        actorLoginId: l.actorLoginId || l.loginId || 'system',
+        actorRole: l.actorRole || 'SYSTEM',
+        ipAddress: l.ipAddress || 'unknown',
+        location:
+          l.geoLocation?.status === 'resolved'
+            ? [l.geoLocation.city, l.geoLocation.region, l.geoLocation.country].filter(Boolean).join(', ')
+            : 'unavailable',
+        device: l.userAgentMeta
+          ? `${l.userAgentMeta.browser} / ${l.userAgentMeta.os} (${l.userAgentMeta.deviceType})`
+          : 'Unknown',
+        target: [l.targetType, l.targetId || l.employeeId].filter(Boolean).join(': ') || '--',
+        success: l.success === false ? 'FAILURE' : 'SUCCESS',
+        important: l.isImportant ? 'YES' : 'NO',
+        description: l.description || l.reason || l.newValue || '--',
+      }));
+      const fn = format === 'xlsx' ? exportChunkedToExcel : exportChunkedToCsv;
+      const out = await fn(rows, columns, 'Audit_Logs_Selected', {
+        auditTargetType: 'AUDIT_LOGS',
+        auditSource: 'AUDIT_LOGS_CONSOLE',
+      });
+      setBulkSummary({ type: 'success', title: `Exported ${out.rowCount} Audit Logs`, message: `Downloaded "${out.fileName}".`, savedCount: out.rowCount });
+      logsBulk.clearSelection();
+    } catch (err: any) {
+      setBulkSummary({ type: 'error', title: 'Audit Export Failed', message: err?.message || 'Unable to export selected logs.' });
+    } finally {
+      setBulkProgress(null);
+    }
+  };
+
+  const handleBulkExportLoginHistory = async (format: 'xlsx' | 'csv') => {
+    const target = loginHistoryBulk.selectedItems;
+    if (target.length === 0 || bulkProgress) return;
+    setBulkSummary(null);
+    setBulkProgress({ label: `Exporting ${target.length} login history entries...`, completed: 0, total: target.length });
+    try {
+      const columns = [
+        { header: 'Timestamp', key: 'timestamp' },
+        { header: 'Event Type', key: 'eventType' },
+        { header: 'Login ID', key: 'loginId' },
+        { header: 'Role', key: 'role' },
+        { header: 'IP Address', key: 'ipAddress' },
+        { header: 'Geo Location', key: 'location' },
+        { header: 'Device', key: 'device' },
+        { header: 'Session / Reason', key: 'detail' },
+      ];
+      const rows = target.map((item) => ({
+        timestamp: item.timestamp,
+        eventType: item.eventType,
+        loginId: item.loginId,
+        role: item.role,
+        ipAddress: item.ipAddress,
+        location:
+          item.geoLocation?.status === 'resolved'
+            ? [item.geoLocation.city, item.geoLocation.region, item.geoLocation.country].filter(Boolean).join(', ')
+            : 'unavailable',
+        device: `${item.browser} / ${item.os} (${item.deviceType})`,
+        detail: item.failureReason || item.sessionId || '--',
+      }));
+      const fn = format === 'xlsx' ? exportChunkedToExcel : exportChunkedToCsv;
+      const out = await fn(rows, columns, 'Login_History_Selected', {
+        auditTargetType: 'LOGIN_HISTORY',
+        auditSource: 'AUDIT_LOGS_CONSOLE',
+      });
+      setBulkSummary({ type: 'success', title: `Exported ${out.rowCount} Login Events`, message: `Downloaded "${out.fileName}".`, savedCount: out.rowCount });
+      loginHistoryBulk.clearSelection();
+    } catch (err: any) {
+      setBulkSummary({ type: 'error', title: 'Login History Export Failed', message: err?.message || 'Unable to export selected events.' });
+    } finally {
+      setBulkProgress(null);
+    }
+  };
 
   const showBanner = (type: 'success' | 'error', text: string) => {
     setBanner({ type, text });
@@ -727,12 +852,50 @@ export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ curren
             </div>
           </div>
 
+          <BulkActionBar
+            selectedCount={logsBulk.selectedCount}
+            totalFilteredCount={logsBulk.totalFilteredCount}
+            currentPageCount={logsBulk.currentPageCount}
+            isAllFilteredSelected={logsBulk.isAllFilteredSelected}
+            isPageAllSelected={logsBulk.isPageAllSelected}
+            recordLabel="audit logs"
+            onClearSelection={logsBulk.clearSelection}
+            progress={bulkProgress}
+            summary={bulkSummary}
+            onDismissSummary={() => setBulkSummary(null)}
+            actions={[
+              {
+                id: 'export_logs_xlsx',
+                label: 'Export Selected Excel',
+                icon: <FileSpreadsheet className="w-3.5 h-3.5" />,
+                tone: 'emerald',
+                onClick: () => handleBulkExportLogs('xlsx'),
+              },
+              {
+                id: 'export_logs_csv',
+                label: 'Export Selected CSV',
+                icon: <Download className="w-3.5 h-3.5" />,
+                tone: 'default',
+                onClick: () => handleBulkExportLogs('csv'),
+              },
+            ]}
+          />
+
           {/* Audit Logs Table */}
           <div className="bg-white rounded-xl border border-slate-200 shadow-2xs overflow-hidden">
             <div className="overflow-x-auto">
               <table className="w-full text-left text-xs">
                 <thead className="bg-slate-50 text-slate-600 uppercase font-bold text-[10px] tracking-wider border-b border-slate-200">
                   <tr>
+                    <th className="py-3 px-3 w-10 text-center">
+                      <SelectAllCheckbox
+                        checked={logsBulk.isPageAllSelected}
+                        indeterminate={logsBulk.isPageIndeterminate}
+                        disabled={logs.length === 0 || Boolean(bulkProgress)}
+                        onChange={logsBulk.togglePageSelection}
+                        ariaLabel="Select all audit logs on current page"
+                      />
+                    </th>
                     <th className="py-3 px-3.5">Timestamp (IST)</th>
                     <th className="py-3 px-3.5">Event & Category</th>
                     <th className="py-3 px-3.5">Actor</th>
@@ -745,14 +908,14 @@ export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ curren
                 <tbody className="divide-y divide-slate-100">
                   {isLoadingLogs ? (
                     <tr>
-                      <td colSpan={7} className="py-12 text-center text-slate-400">
+                      <td colSpan={8} className="py-12 text-center text-slate-400">
                         <div className="w-6 h-6 border-2 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto mb-2" />
                         Loading audit records...
                       </td>
                     </tr>
                   ) : logs.length === 0 ? (
                     <tr>
-                      <td colSpan={7} className="py-12 text-center text-slate-400">
+                      <td colSpan={8} className="py-12 text-center text-slate-400">
                         No matching audit logs found for the current filters.
                       </td>
                     </tr>
@@ -765,14 +928,31 @@ export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ curren
                           ? [log.geoLocation.city, log.geoLocation.country].filter(Boolean).join(', ')
                           : 'Geo unavailable';
                       const isBusy = actionBusyId === log.id;
+                      const isChecked = logsBulk.isSelected(log.id);
 
                       return (
                         <tr
                           key={log.id}
-                          className={`hover:bg-slate-50/90 transition ${
-                            isCritical ? 'bg-red-50/20' : log.isImportant ? 'bg-amber-50/20' : ''
+                          className={`transition ${
+                            isChecked
+                              ? 'bg-blue-50/60 hover:bg-blue-50/90'
+                              : isCritical
+                                ? 'bg-red-50/20 hover:bg-slate-50/90'
+                                : log.isImportant
+                                  ? 'bg-amber-50/20 hover:bg-slate-50/90'
+                                  : 'hover:bg-slate-50/90'
                           }`}
                         >
+                          <td className="py-2.5 px-3 text-center">
+                            <input
+                              type="checkbox"
+                              checked={isChecked}
+                              disabled={Boolean(bulkProgress)}
+                              onChange={() => logsBulk.toggleOne(log.id)}
+                              aria-label={`Select audit log ${log.id}`}
+                              className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
+                            />
+                          </td>
                           <td className="py-2.5 px-3.5 font-mono text-[11px] text-slate-600 whitespace-nowrap tabular-nums">
                             <div>{formatDateTime(log.timestamp)}</div>
                             <div className="text-[10px] text-slate-400 truncate max-w-[160px]" title={log.id}>
@@ -1019,11 +1199,49 @@ export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ curren
             </select>
           </div>
 
+          <BulkActionBar
+            selectedCount={loginHistoryBulk.selectedCount}
+            totalFilteredCount={loginHistoryBulk.totalFilteredCount}
+            currentPageCount={loginHistoryBulk.currentPageCount}
+            isAllFilteredSelected={loginHistoryBulk.isAllFilteredSelected}
+            isPageAllSelected={loginHistoryBulk.isPageAllSelected}
+            recordLabel="login events"
+            onClearSelection={loginHistoryBulk.clearSelection}
+            progress={bulkProgress}
+            summary={bulkSummary}
+            onDismissSummary={() => setBulkSummary(null)}
+            actions={[
+              {
+                id: 'export_login_xlsx',
+                label: 'Export Selected Excel',
+                icon: <FileSpreadsheet className="w-3.5 h-3.5" />,
+                tone: 'emerald',
+                onClick: () => handleBulkExportLoginHistory('xlsx'),
+              },
+              {
+                id: 'export_login_csv',
+                label: 'Export Selected CSV',
+                icon: <Download className="w-3.5 h-3.5" />,
+                tone: 'default',
+                onClick: () => handleBulkExportLoginHistory('csv'),
+              },
+            ]}
+          />
+
           <div className="bg-white rounded-xl border border-slate-200 shadow-2xs overflow-hidden">
             <div className="overflow-x-auto">
               <table className="w-full text-left text-xs">
                 <thead className="bg-slate-50 text-slate-600 uppercase font-bold text-[10px] tracking-wider border-b border-slate-200">
                   <tr>
+                    <th className="py-3 px-3 w-10 text-center">
+                      <SelectAllCheckbox
+                        checked={loginHistoryBulk.isPageAllSelected}
+                        indeterminate={loginHistoryBulk.isPageIndeterminate}
+                        disabled={loginHistory.length === 0 || Boolean(bulkProgress)}
+                        onChange={loginHistoryBulk.togglePageSelection}
+                        ariaLabel="Select all login history events"
+                      />
+                    </th>
                     <th className="py-3 px-3.5">Timestamp (IST)</th>
                     <th className="py-3 px-3.5">Event Type</th>
                     <th className="py-3 px-3.5">Login ID & Role</th>
@@ -1036,19 +1254,31 @@ export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ curren
                 <tbody className="divide-y divide-slate-100">
                   {isLoadingLoginHistory ? (
                     <tr>
-                      <td colSpan={7} className="py-10 text-center text-slate-400">
+                      <td colSpan={8} className="py-10 text-center text-slate-400">
                         Loading login history telemetry...
                       </td>
                     </tr>
                   ) : loginHistory.length === 0 ? (
                     <tr>
-                      <td colSpan={7} className="py-10 text-center text-slate-400">
+                      <td colSpan={8} className="py-10 text-center text-slate-400">
                         No login history events recorded yet.
                       </td>
                     </tr>
                   ) : (
-                    loginHistory.map(item => (
-                      <tr key={item.id} className={`hover:bg-slate-50 ${!item.success ? 'bg-red-50/20' : ''}`}>
+                    loginHistory.map(item => {
+                      const isChecked = loginHistoryBulk.isSelected(item.id);
+                      return (
+                      <tr key={item.id} className={isChecked ? 'bg-blue-50/60 hover:bg-blue-50/90' : `hover:bg-slate-50 ${!item.success ? 'bg-red-50/20' : ''}`}>
+                        <td className="py-2.5 px-3 text-center">
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            disabled={Boolean(bulkProgress)}
+                            onChange={() => loginHistoryBulk.toggleOne(item.id)}
+                            aria-label={`Select login event ${item.id}`}
+                            className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
+                          />
+                        </td>
                         <td className="py-2.5 px-3.5 font-mono text-[11px] text-slate-600 whitespace-nowrap tabular-nums">
                           {formatDateTime(item.timestamp)}
                         </td>
@@ -1091,7 +1321,8 @@ export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ curren
                           )}
                         </td>
                       </tr>
-                    ))
+                      );
+                    })
                   )}
                 </tbody>
               </table>

@@ -8,7 +8,8 @@ import {
   ChevronLeft,
   ChevronRight
 } from 'lucide-react';
-import { AttendanceRecord, Employee, Floor, Section, Department, Shift } from '../types';
+import { AttendanceRecord, Employee, Floor, Section, Department, Shift, UserRoleRecord } from '../types';
+import { RolePermissionRecord } from '../services/permissionService';
 import { collection, getDocs, query, where } from 'firebase/firestore';
 import { db } from '../firebase';
 import { formatDateKey, formatMinutes, formatTimeDisplay } from '../services/attendanceService';
@@ -17,6 +18,15 @@ import { sendServerAuditEvent } from '../services/auditService';
 import { formatDurationClock, resolveAttendanceMetrics } from '../utils/attendanceStatus';
 import { TableSkeletonRows } from './Skeletons';
 import { recordPerfMetric, subscribeAttendanceCommitted } from '../utils/perfMonitor';
+import { useBulkSelection } from '../hooks/useBulkSelection';
+import {
+  BulkActionBar,
+  BulkExecutionSummary,
+  BulkProgressState,
+  SelectAllCheckbox,
+} from './BulkActionBar';
+import { CrossPageSelectConfirmModal } from './BulkConfirmModal';
+import { exportChunkedToCsv, exportChunkedToExcel } from '../services/bulkActionService';
 
 interface ReportsProps {
   employees: Employee[];
@@ -24,6 +34,8 @@ interface ReportsProps {
   sections: Section[];
   departments: Department[];
   shifts: Shift[];
+  currentUserRole?: UserRoleRecord | null;
+  rolePermissions?: Record<string, RolePermissionRecord>;
 }
 
 export type ReportType =
@@ -392,7 +404,12 @@ export const Reports: React.FC<ReportsProps> = ({
         });
     }
 
-    return { tableColumns: cols, tableData: rows, fileName: name };
+    const keyedRows = rows.map((row, idx) => ({
+      ...row,
+      _rowKey: `${activeReport}:${row.employeeId || row.floor || row.section || row.department || row.type || 'row'}:${row.date || idx}:${idx}`,
+    }));
+
+    return { tableColumns: cols, tableData: keyedRows, fileName: name };
   }, [activeReport, attendanceRecords, activeEmps, floors, sections, departments, selectedDate]);
 
   const totalPages = Math.max(1, Math.ceil(tableData.length / pageSize));
@@ -401,6 +418,57 @@ export const Reports: React.FC<ReportsProps> = ({
     const start = (safePage - 1) * pageSize;
     return tableData.slice(start, start + pageSize);
   }, [tableData, safePage, pageSize]);
+
+  const bulk = useBulkSelection<Record<string, any>>({
+    items: tableData,
+    paginatedItems: paginatedRows,
+    getId: (row) => String(row._rowKey),
+    resetKey: activeReport,
+  });
+
+  const [bulkProgress, setBulkProgress] = useState<BulkProgressState | null>(null);
+  const [bulkSummary, setBulkSummary] = useState<BulkExecutionSummary | null>(null);
+
+  const handleBulkExportSelected = async (format: 'xlsx' | 'csv') => {
+    const rows = bulk.selectedItems;
+    if (rows.length === 0 || bulkProgress) return;
+    setBulkSummary(null);
+    setBulkProgress({
+      label: format === 'xlsx' ? 'Exporting selected report rows to Excel...' : 'Exporting selected report rows to CSV...',
+      completed: 0,
+      total: rows.length,
+    });
+    try {
+      const fn = format === 'xlsx' ? exportChunkedToExcel : exportChunkedToCsv;
+      const period = activeReport === 'monthly_attendance' || activeReport === 'employee_wise' ? selectedMonth : selectedDate;
+      const out = await fn(rows, tableColumns, `${fileName}_selected`, {
+        onProgress: (completed, total) =>
+          setBulkProgress({
+            label: format === 'xlsx' ? 'Exporting selected report rows to Excel...' : 'Exporting selected report rows to CSV...',
+            completed,
+            total,
+          }),
+        auditTargetType: 'REPORT',
+        auditSource: 'REPORTS_MODULE',
+        auditDescription: `Bulk exported ${rows.length} selected rows from "${activeReport}" (${period}) as ${format.toUpperCase()}.`,
+      });
+      setBulkSummary({
+        type: 'success',
+        title: `Exported ${out.rowCount} Selected Rows`,
+        message: `Downloaded "${out.fileName}". Selection cleared.`,
+        savedCount: out.rowCount,
+      });
+      bulk.clearSelection();
+    } catch (err: any) {
+      setBulkSummary({
+        type: 'error',
+        title: 'Selected Report Export Failed',
+        message: err?.message || 'Unable to export selected rows.',
+      });
+    } finally {
+      setBulkProgress(null);
+    }
+  };
 
   const handleExportXlsx = () => {
     exportTableToExcel(tableData, tableColumns, fileName);
@@ -580,12 +648,51 @@ export const Reports: React.FC<ReportsProps> = ({
             </div>
           </div>
 
+          <BulkActionBar
+            selectedCount={bulk.selectedCount}
+            totalFilteredCount={bulk.totalFilteredCount}
+            currentPageCount={bulk.currentPageCount}
+            isAllFilteredSelected={bulk.isAllFilteredSelected}
+            isPageAllSelected={bulk.isPageAllSelected}
+            recordLabel="report rows"
+            onSelectAllFiltered={bulk.requestSelectAllFiltered}
+            onClearSelection={bulk.clearSelection}
+            progress={bulkProgress}
+            summary={bulkSummary}
+            onDismissSummary={() => setBulkSummary(null)}
+            actions={[
+              {
+                id: 'export_selected_xlsx',
+                label: 'Export Selected Excel (.xlsx)',
+                icon: <FileSpreadsheet className="w-3.5 h-3.5" />,
+                tone: 'emerald',
+                onClick: () => handleBulkExportSelected('xlsx'),
+              },
+              {
+                id: 'export_selected_csv',
+                label: 'Export Selected CSV',
+                icon: <Download className="w-3.5 h-3.5" />,
+                tone: 'default',
+                onClick: () => handleBulkExportSelected('csv'),
+              },
+            ]}
+          />
+
           {/* Table Preview */}
           <div className="bg-white rounded-xl border border-slate-200 shadow-2xs overflow-hidden">
             <div className="overflow-x-auto max-h-[500px]">
               <table className="w-full text-left text-xs">
                 <thead className="bg-slate-50 text-slate-600 uppercase font-semibold border-b border-slate-200 sticky top-0">
                   <tr>
+                    <th className="py-2.5 px-3 w-10 text-center">
+                      <SelectAllCheckbox
+                        checked={bulk.isPageAllSelected}
+                        indeterminate={bulk.isPageIndeterminate}
+                        disabled={paginatedRows.length === 0 || Boolean(bulkProgress)}
+                        onChange={bulk.togglePageSelection}
+                        ariaLabel="Select all report rows on current page"
+                      />
+                    </th>
                     {tableColumns.map((col, idx) => (
                       <th key={idx} className="py-2.5 px-3">
                         {col.header}
@@ -597,25 +704,39 @@ export const Reports: React.FC<ReportsProps> = ({
                   {showInitialTableSkeleton ? (
                     <TableSkeletonRows
                       rows={8}
-                      cols={Math.max(1, tableColumns.length)}
+                      cols={Math.max(2, tableColumns.length + 1)}
                       rowHeightClass="py-2 px-3"
                     />
                   ) : tableData.length === 0 ? (
                     <tr>
-                      <td colSpan={tableColumns.length} className="py-8 text-center text-slate-400">
+                      <td colSpan={tableColumns.length + 1} className="py-8 text-center text-slate-400">
                         No records found for this report and date.
                       </td>
                     </tr>
                   ) : (
-                    paginatedRows.map((row, rowIdx) => (
-                      <tr key={rowIdx} className="hover:bg-slate-50">
+                    paginatedRows.map((row) => {
+                      const rowId = String(row._rowKey);
+                      const isChecked = bulk.isSelected(rowId);
+                      return (
+                      <tr key={rowId} className={isChecked ? 'bg-blue-50/60 hover:bg-blue-50/90' : 'hover:bg-slate-50'}>
+                        <td className="py-2 px-3 text-center">
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            disabled={Boolean(bulkProgress)}
+                            onChange={() => bulk.toggleOne(rowId)}
+                            aria-label={`Select report row ${rowId}`}
+                            className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
+                          />
+                        </td>
                         {tableColumns.map((col, colIdx) => (
                           <td key={colIdx} className="py-2 px-3 text-slate-700">
-                            {row[col.key]}
+                            {(row as Record<string, any>)[col.key]}
                           </td>
                         ))}
                       </tr>
-                    ))
+                      );
+                    })
                   )}
                 </tbody>
               </table>
@@ -673,6 +794,15 @@ export const Reports: React.FC<ReportsProps> = ({
           </div>
         </div>
       </div>
+
+      <CrossPageSelectConfirmModal
+        isOpen={bulk.isCrossPageConfirmOpen}
+        totalFilteredCount={bulk.totalFilteredCount}
+        currentPageCount={bulk.currentPageCount}
+        recordLabel="report rows"
+        onConfirm={bulk.confirmSelectAllFiltered}
+        onCancel={bulk.cancelSelectAllFiltered}
+      />
     </div>
   );
 };

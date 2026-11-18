@@ -31,13 +31,30 @@ import {
   Monitor,
   PlusCircle,
   Edit3,
-  Power
+  Power,
+  FileSpreadsheet,
+  Download,
+  CheckCircle,
+  XCircle
 } from 'lucide-react';
 import { RolePermissionsManagement } from './RolePermissionsManagement';
 import { TableSkeletonRows } from './Skeletons';
 import { onSnapshot, collection } from 'firebase/firestore';
 import { db } from '../firebase';
 import { LoginHistoryEntry, UserRoleRecord, UserRoleType } from '../types';
+import { useBulkSelection } from '../hooks/useBulkSelection';
+import {
+  BulkActionBar,
+  BulkExecutionSummary,
+  BulkProgressState,
+  SelectAllCheckbox,
+} from './BulkActionBar';
+import { BulkConfirmModal } from './BulkConfirmModal';
+import {
+  executeUsersBulkStatus,
+  exportChunkedToCsv,
+  exportChunkedToExcel,
+} from '../services/bulkActionService';
 import { 
   getAllUserRoles, 
   createUserAccount, 
@@ -240,6 +257,105 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
   const [isDeletingRole, setIsDeletingRole] = useState(false);
 
   const isSuperAdmin = currentUserRole?.role?.toUpperCase() === 'SUPER_ADMIN' || currentUserRole?.loginId === 'superadmin';
+
+  const isProtectedUserAccount = (u: UserRoleRecord): boolean => {
+    const login = (u.loginId || '').trim().toLowerCase();
+    const selfLogin = (currentUserRole?.loginId || '').trim().toLowerCase();
+    return login === 'superadmin' || u.id === 'role_superadmin' || (selfLogin !== '' && login === selfLogin);
+  };
+
+  const selectableUsers = React.useMemo(
+    () => (isSuperAdmin ? users.filter((u) => !isProtectedUserAccount(u)) : []),
+    [users, isSuperAdmin, currentUserRole?.loginId]
+  );
+
+  const usersBulk = useBulkSelection<UserRoleRecord>({
+    items: selectableUsers,
+    paginatedItems: selectableUsers,
+    getId: (u) => u.id,
+  });
+
+  const [usersBulkProgress, setUsersBulkProgress] = useState<BulkProgressState | null>(null);
+  const [usersBulkSummary, setUsersBulkSummary] = useState<BulkExecutionSummary | null>(null);
+  const [pendingUserBulkStatus, setPendingUserBulkStatus] = useState<'Active' | 'Inactive' | null>(null);
+  const [isUsersBulkBusy, setIsUsersBulkBusy] = useState(false);
+
+  const handleUsersBulkExport = async (format: 'xlsx' | 'csv') => {
+    const selected = usersBulk.selectedItems;
+    if (selected.length === 0 || isUsersBulkBusy) return;
+    setIsUsersBulkBusy(true);
+    setUsersBulkSummary(null);
+    setUsersBulkProgress({ label: `Exporting ${selected.length} user accounts...`, completed: 0, total: selected.length });
+    try {
+      const cols = [
+        { header: 'Login ID', key: 'loginId' },
+        { header: 'Name', key: 'name' },
+        { header: 'Email', key: 'email' },
+        { header: 'Role', key: 'role' },
+        { header: 'Status', key: 'status' },
+      ];
+      const rows = selected.map((u) => ({
+        loginId: u.loginId,
+        name: u.name,
+        email: u.email,
+        role: u.role,
+        status: u.status || 'Active',
+      }));
+      const fn = format === 'xlsx' ? exportChunkedToExcel : exportChunkedToCsv;
+      const out = await fn(rows, cols, 'Users_Directory_Selected', {
+        auditTargetType: 'USER_ACCOUNTS',
+        auditSource: 'USER_RIGHTS',
+      });
+      setUsersBulkSummary({ type: 'success', title: `Exported ${out.rowCount} User Accounts`, message: `Downloaded "${out.fileName}".`, savedCount: out.rowCount });
+      usersBulk.clearSelection();
+    } catch (err: any) {
+      setUsersBulkSummary({ type: 'error', title: 'User Export Failed', message: err?.message || 'Unable to export users.' });
+    } finally {
+      setUsersBulkProgress(null);
+      setIsUsersBulkBusy(false);
+    }
+  };
+
+  const handleExecuteUsersBulkStatus = async () => {
+    if (!pendingUserBulkStatus || usersBulk.selectedIdArray.length === 0) return;
+    setIsUsersBulkBusy(true);
+    setUsersBulkSummary(null);
+    setUsersBulkProgress({
+      label: `${pendingUserBulkStatus === 'Active' ? 'Activating' : 'Deactivating'} selected user accounts...`,
+      completed: 0,
+      total: usersBulk.selectedCount,
+    });
+    try {
+      const res = await executeUsersBulkStatus({
+        userIds: usersBulk.selectedIdArray,
+        status: pendingUserBulkStatus,
+      });
+      const skippedText =
+        res.skippedItems && res.skippedItems.length > 0
+          ? ` (${res.skippedCount} protected account(s) skipped)`
+          : '';
+      setUsersBulkSummary({
+        type: res.failedCount > 0 || res.skippedCount > 0 ? 'partial' : 'success',
+        title: `Updated ${res.savedCount} User Account(s)`,
+        message: `Account status synchronized with Firebase Auth & Firestore${skippedText}.`,
+        savedCount: res.savedCount,
+        skippedCount: res.skippedCount,
+        failedCount: res.failedCount,
+      });
+      setPendingUserBulkStatus(null);
+      usersBulk.clearSelection();
+      loadUsersManual();
+    } catch (err: any) {
+      setUsersBulkSummary({
+        type: 'error',
+        title: 'User Bulk Status Update Blocked',
+        message: err?.message || 'Permission or validation error.',
+      });
+    } finally {
+      setUsersBulkProgress(null);
+      setIsUsersBulkBusy(false);
+    }
+  };
 
   const getDefaultModulesForRole = (roleIdInput: string): string[] => {
     const cleanRole = normalizeRoleId(roleIdInput);
@@ -1227,10 +1343,44 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
             )}
           </div>
 
+          {isSuperAdmin && (
+            <div className="px-4 pt-3">
+              <BulkActionBar
+                selectedCount={usersBulk.selectedCount}
+                totalFilteredCount={usersBulk.totalFilteredCount}
+                currentPageCount={usersBulk.currentPageCount}
+                isAllFilteredSelected={usersBulk.isAllFilteredSelected}
+                isPageAllSelected={usersBulk.isPageAllSelected}
+                recordLabel="manageable user accounts"
+                onClearSelection={usersBulk.clearSelection}
+                progress={usersBulkProgress}
+                summary={usersBulkSummary}
+                onDismissSummary={() => setUsersBulkSummary(null)}
+                actions={[
+                  { id: 'users_xlsx', label: 'Export Excel', icon: <FileSpreadsheet className="w-3.5 h-3.5" />, tone: 'emerald', onClick: () => handleUsersBulkExport('xlsx') },
+                  { id: 'users_csv', label: 'Export CSV', icon: <Download className="w-3.5 h-3.5" />, tone: 'default', onClick: () => handleUsersBulkExport('csv') },
+                  { id: 'users_activate', label: 'Activate Accounts', icon: <CheckCircle className="w-3.5 h-3.5" />, tone: 'primary', onClick: () => setPendingUserBulkStatus('Active') },
+                  { id: 'users_deactivate', label: 'Deactivate Accounts', icon: <XCircle className="w-3.5 h-3.5" />, tone: 'amber', onClick: () => setPendingUserBulkStatus('Inactive') },
+                ]}
+              />
+            </div>
+          )}
+
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead className="bg-slate-50 text-slate-600 uppercase font-semibold border-b border-slate-200">
                 <tr>
+                  {isSuperAdmin && (
+                    <th className="py-3 px-3 w-10 text-center">
+                      <SelectAllCheckbox
+                        checked={usersBulk.isPageAllSelected}
+                        indeterminate={usersBulk.isPageIndeterminate}
+                        disabled={selectableUsers.length === 0 || isUsersBulkBusy}
+                        onChange={usersBulk.togglePageSelection}
+                        ariaLabel="Select all manageable user accounts"
+                      />
+                    </th>
+                  )}
                   <th className="py-3 px-4">Login ID / Username</th>
                   <th className="py-3 px-4">Name / Designation</th>
                   <th className="py-3 px-4">Email</th>
@@ -1242,10 +1392,10 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {isLoadingUsers && users.length === 0 && !usersLoadError ? (
-                  <TableSkeletonRows rows={6} cols={7} rowHeightClass="py-3 px-4" />
+                  <TableSkeletonRows rows={6} cols={isSuperAdmin ? 8 : 7} rowHeightClass="py-3 px-4" />
                 ) : usersLoadError && users.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="py-8 px-4 text-center">
+                    <td colSpan={isSuperAdmin ? 8 : 7} className="py-8 px-4 text-center">
                       <div className="inline-flex flex-col items-center gap-2 text-red-700">
                         <span className="font-semibold text-xs">{usersLoadError}</span>
                         <button
@@ -1261,7 +1411,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                   </tr>
                 ) : users.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="py-8 text-center text-slate-400">
+                    <td colSpan={isSuperAdmin ? 8 : 7} className="py-8 text-center text-slate-400">
                       No user accounts found. Click "+ Create New Login ID" to provision an account.
                     </td>
                   </tr>
@@ -1274,9 +1424,24 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                     const roleDisplayName =
                       rolesList.find((r) => r.roleId === normalizedRole)?.roleName ||
                       (isSuper ? 'SUPER ADMIN' : isAdmin ? 'ADMIN' : isStdUser ? 'USER' : normalizedRole.replace(/_/g, ' ').toUpperCase());
+                    const isProtected = isProtectedUserAccount(u);
+                    const isChecked = usersBulk.isSelected(u.id);
 
                     return (
-                      <tr key={u.id} className="hover:bg-slate-50 transition">
+                      <tr key={u.id} className={`transition ${isChecked ? 'bg-blue-50/60 hover:bg-blue-50/90' : 'hover:bg-slate-50'}`}>
+                        {isSuperAdmin && (
+                          <td className="py-3 px-3 text-center">
+                            <input
+                              type="checkbox"
+                              checked={isChecked}
+                              disabled={isProtected || isUsersBulkBusy}
+                              onChange={() => usersBulk.toggleOne(u.id)}
+                              title={isProtected ? 'Protected Super Admin / Self account' : `Select user ${u.loginId}`}
+                              aria-label={`Select user ${u.loginId}`}
+                              className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed"
+                            />
+                          </td>
+                        )}
                         <td className="py-3 px-4 font-mono font-bold text-blue-700">
                           {safeStr(u.loginId)}
                         </td>
@@ -3710,6 +3875,24 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
           </div>
         </div>
       )}
+
+      <BulkConfirmModal
+        isOpen={Boolean(pendingUserBulkStatus)}
+        title={pendingUserBulkStatus === 'Active' ? 'Activate Selected User Accounts?' : 'Deactivate Selected User Accounts?'}
+        description={`Set account status to ${pendingUserBulkStatus} for ${usersBulk.selectedCount} selected user account(s). Firebase Authentication disabled flags & active sessions will be synchronized automatically. Root Super Admin and your active account are protected.`}
+        selectedCount={usersBulk.selectedCount}
+        confirmLabel={`${pendingUserBulkStatus === 'Active' ? 'Activate' : 'Deactivate'} ${usersBulk.selectedCount} Account(s)`}
+        tone={pendingUserBulkStatus === 'Inactive' ? 'amber' : 'primary'}
+        warningDetails={[
+          'Role assignments and granular permission matrices remain completely unchanged.',
+          pendingUserBulkStatus === 'Inactive'
+            ? 'Deactivated accounts have refresh tokens immediately revoked and cannot sign in.'
+            : 'Activated accounts will be enabled for login.',
+        ]}
+        isBusy={isUsersBulkBusy}
+        onConfirm={handleExecuteUsersBulkStatus}
+        onCancel={() => !isUsersBulkBusy && setPendingUserBulkStatus(null)}
+      />
     </div>
   );
 };

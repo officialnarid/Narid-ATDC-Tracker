@@ -15,9 +15,11 @@ import {
   ListOrdered,
   LogIn,
   LogOut,
-  ArrowRight
+  ArrowRight,
+  Download
 } from 'lucide-react';
-import { AttendanceRecord, Floor, Section, Department, Shift, AttendanceStatus } from '../types';
+import { AttendanceRecord, Floor, Section, Department, Shift, AttendanceStatus, UserRoleRecord } from '../types';
+import { RolePermissionRecord } from '../services/permissionService';
 import { collection, getDocs, query, orderBy, limit } from 'firebase/firestore';
 import { db } from '../firebase';
 import { 
@@ -28,7 +30,7 @@ import {
   getKolkataTimeParts,
   getNextDateKey
 } from '../services/attendanceService';
-import { exportTableToExcel, exportTableToCsv } from '../services/exportService';
+import { exportTableToExcel } from '../services/exportService';
 import {
   classifyCompletedDutyStatus,
   formatDurationClock,
@@ -42,12 +44,23 @@ import {
   startPerfTimer,
   subscribeAttendanceCommitted,
 } from '../utils/perfMonitor';
+import { useBulkSelection } from '../hooks/useBulkSelection';
+import {
+  BulkActionBar,
+  BulkExecutionSummary,
+  BulkProgressState,
+  SelectAllCheckbox,
+} from './BulkActionBar';
+import { CrossPageSelectConfirmModal } from './BulkConfirmModal';
+import { exportChunkedToCsv, exportChunkedToExcel } from '../services/bulkActionService';
 
 interface AttendanceHistoryProps {
   floors: Floor[];
   sections: Section[];
   departments: Department[];
   shifts: Shift[];
+  currentUserRole?: UserRoleRecord | null;
+  rolePermissions?: Record<string, RolePermissionRecord>;
 }
 
 export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
@@ -224,8 +237,8 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
     });
   }, [records, startDate, endDate, searchEmp, filterFloor, filterDept, filterShift, filterStatus, filterPunchOutType, nowMs]);
 
-  const handleExportExcel = () => {
-    const exportData = filteredRecords.map(r => {
+  const buildAttendanceExportRows = (sourceRecords: AttendanceRecord[]) =>
+    sourceRecords.map(r => {
       const m = resolveAttendanceMetrics(r, nowMs);
       return {
         employeeId: r.employeeId,
@@ -248,25 +261,29 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
       };
     });
 
+  const ATTENDANCE_EXPORT_COLUMNS = [
+    { header: 'Employee ID', key: 'employeeId' },
+    { header: 'Employee Name', key: 'name' },
+    { header: 'Type', key: 'type' },
+    { header: 'Line', key: 'floor' },
+    { header: 'Section', key: 'section' },
+    { header: 'Department', key: 'department' },
+    { header: 'Shift', key: 'shift' },
+    { header: 'Shift Date', key: 'shiftDate' },
+    { header: 'State', key: 'state' },
+    { header: 'First In', key: 'punchIn' },
+    { header: 'Last Out', key: 'punchOut' },
+    { header: 'Punch Out Type', key: 'punchOutType' },
+    { header: 'Completed Duty', key: 'dutyHours' },
+    { header: 'OT Hours', key: 'otHours' },
+    { header: 'Attendance Status', key: 'status' },
+  ];
+
+  const handleExportExcel = () => {
+    const exportData = buildAttendanceExportRows(filteredRecords);
     exportTableToExcel(
       exportData,
-      [
-        { header: 'Employee ID', key: 'employeeId' },
-        { header: 'Employee Name', key: 'name' },
-        { header: 'Type', key: 'type' },
-        { header: 'Line', key: 'floor' },
-        { header: 'Section', key: 'section' },
-        { header: 'Department', key: 'department' },
-        { header: 'Shift', key: 'shift' },
-        { header: 'Shift Date', key: 'shiftDate' },
-        { header: 'State', key: 'state' },
-        { header: 'First In', key: 'punchIn' },
-        { header: 'Last Out', key: 'punchOut' },
-        { header: 'Punch Out Type', key: 'punchOutType' },
-        { header: 'Completed Duty', key: 'dutyHours' },
-        { header: 'OT Hours', key: 'otHours' },
-        { header: 'Attendance Status', key: 'status' },
-      ],
+      ATTENDANCE_EXPORT_COLUMNS,
       `Attendance_History_${startDate}_to_${endDate}`
     );
   };
@@ -277,6 +294,61 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
     const start = (safePage - 1) * pageSize;
     return filteredRecords.slice(start, start + pageSize);
   }, [filteredRecords, safePage, pageSize]);
+
+  const bulk = useBulkSelection<AttendanceRecord>({
+    items: filteredRecords,
+    paginatedItems: paginatedRecords,
+    getId: (r) => r.id,
+  });
+
+  const [bulkProgress, setBulkProgress] = useState<BulkProgressState | null>(null);
+  const [bulkSummary, setBulkSummary] = useState<BulkExecutionSummary | null>(null);
+
+  const handleBulkExport = async (format: 'xlsx' | 'csv') => {
+    const target = bulk.selectedItems;
+    if (target.length === 0 || bulkProgress) return;
+    setBulkSummary(null);
+    setBulkProgress({
+      label: format === 'xlsx' ? 'Exporting selected attendance records to Excel...' : 'Exporting selected attendance records to CSV...',
+      completed: 0,
+      total: target.length,
+    });
+    try {
+      const rows = buildAttendanceExportRows(target);
+      const fn = format === 'xlsx' ? exportChunkedToExcel : exportChunkedToCsv;
+      const out = await fn(
+        rows,
+        ATTENDANCE_EXPORT_COLUMNS,
+        `Attendance_History_Selected_${startDate}_to_${endDate}`,
+        {
+          onProgress: (completed, total) =>
+            setBulkProgress({
+              label: format === 'xlsx' ? 'Exporting selected attendance records to Excel...' : 'Exporting selected attendance records to CSV...',
+              completed,
+              total,
+            }),
+          auditTargetType: 'ATTENDANCE_HISTORY',
+          auditSource: 'ATTENDANCE_HISTORY',
+          auditDescription: `Bulk exported ${rows.length} selected attendance records (${format.toUpperCase()}).`,
+        }
+      );
+      setBulkSummary({
+        type: 'success',
+        title: `Exported ${out.rowCount} Attendance Records`,
+        message: `Downloaded "${out.fileName}". Selection cleared.`,
+        savedCount: out.rowCount,
+      });
+      bulk.clearSelection();
+    } catch (err: any) {
+      setBulkSummary({
+        type: 'error',
+        title: 'Bulk Export Failed',
+        message: err?.message || 'Unable to export selected attendance records.',
+      });
+    } finally {
+      setBulkProgress(null);
+    }
+  };
 
   return (
     <div className="p-6 bg-slate-50 min-h-full flex flex-col gap-6">
@@ -426,12 +498,52 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
         </select>
       </div>
 
+      {/* Bulk Selection Bar (Safe Exports Only — Historical Logs Immutable) */}
+      <BulkActionBar
+        selectedCount={bulk.selectedCount}
+        totalFilteredCount={bulk.totalFilteredCount}
+        currentPageCount={bulk.currentPageCount}
+        isAllFilteredSelected={bulk.isAllFilteredSelected}
+        isPageAllSelected={bulk.isPageAllSelected}
+        recordLabel="attendance records"
+        onSelectAllFiltered={bulk.requestSelectAllFiltered}
+        onClearSelection={bulk.clearSelection}
+        progress={bulkProgress}
+        summary={bulkSummary}
+        onDismissSummary={() => setBulkSummary(null)}
+        actions={[
+          {
+            id: 'export_excel',
+            label: 'Export Selected Excel',
+            icon: <FileSpreadsheet className="w-3.5 h-3.5" />,
+            tone: 'emerald',
+            onClick: () => handleBulkExport('xlsx'),
+          },
+          {
+            id: 'export_csv',
+            label: 'Export Selected CSV',
+            icon: <Download className="w-3.5 h-3.5" />,
+            tone: 'default',
+            onClick: () => handleBulkExport('csv'),
+          },
+        ]}
+      />
+
       {/* History Table */}
       <div className="bg-white rounded-xl border border-slate-200 shadow-2xs overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs">
             <thead className="bg-slate-50 text-slate-600 uppercase font-semibold border-b border-slate-200">
               <tr>
+                <th className="py-3 px-3 w-10 text-center">
+                  <SelectAllCheckbox
+                    checked={bulk.isPageAllSelected}
+                    indeterminate={bulk.isPageIndeterminate}
+                    disabled={paginatedRecords.length === 0 || Boolean(bulkProgress)}
+                    onChange={bulk.togglePageSelection}
+                    ariaLabel="Select all attendance records on current page"
+                  />
+                </th>
                 <th className="py-3 px-3.5">Emp ID</th>
                 <th className="py-3 px-3.5">Name</th>
                 <th className="py-3 px-3.5">Line / Dept</th>
@@ -448,10 +560,10 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
             </thead>
             <tbody className="divide-y divide-slate-100">
               {loading && records.length === 0 ? (
-                <TableSkeletonRows rows={8} cols={12} />
+                <TableSkeletonRows rows={8} cols={13} />
               ) : filteredRecords.length === 0 ? (
                 <tr>
-                  <td colSpan={12} className="py-8 text-center text-slate-400">
+                  <td colSpan={13} className="py-8 text-center text-slate-400">
                     No attendance records found for the selected filters.
                   </td>
                 </tr>
@@ -460,8 +572,19 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
                   const metrics = resolveAttendanceMetrics(rec, nowMs);
                   const state = metrics.state;
                   const punchCount = rec.punches?.length || (rec.actualPunchOut ? 2 : 1);
+                  const isChecked = bulk.isSelected(rec.id);
                   return (
-                    <tr key={rec.id} className="hover:bg-slate-50 transition">
+                    <tr key={rec.id} className={`transition ${isChecked ? 'bg-blue-50/60 hover:bg-blue-50/90' : 'hover:bg-slate-50'}`}>
+                      <td className="py-3 px-3 text-center">
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          disabled={Boolean(bulkProgress)}
+                          onChange={() => bulk.toggleOne(rec.id)}
+                          aria-label={`Select attendance record ${rec.employeeId} ${rec.shiftDate}`}
+                          className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
+                        />
+                      </td>
                       <td className="py-3 px-3.5 font-mono font-bold text-slate-900">{rec.employeeId}</td>
                       <td className="py-3 px-3.5 font-semibold text-slate-800">{rec.employeeNameSnapshot}</td>
                       <td className="py-3 px-3.5 text-slate-600">
@@ -918,6 +1041,15 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
           </div>
         </div>
       )}
+
+      <CrossPageSelectConfirmModal
+        isOpen={bulk.isCrossPageConfirmOpen}
+        totalFilteredCount={bulk.totalFilteredCount}
+        currentPageCount={bulk.currentPageCount}
+        recordLabel="attendance records"
+        onConfirm={bulk.confirmSelectAllFiltered}
+        onCancel={bulk.cancelSelectAllFiltered}
+      />
     </div>
   );
 };

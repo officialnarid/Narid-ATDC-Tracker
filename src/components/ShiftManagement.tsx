@@ -1,15 +1,31 @@
 import React, { useState } from 'react';
-import { Clock, Plus, Edit2, CheckCircle, XCircle, X, AlertCircle } from 'lucide-react';
-import { Shift } from '../types';
+import { Clock, Plus, Edit2, CheckCircle, XCircle, X, AlertCircle, FileSpreadsheet, Download } from 'lucide-react';
+import { Shift, UserRoleRecord } from '../types';
 import { saveShift } from '../services/masterService';
+import { RolePermissionRecord, hasModulePermission } from '../services/permissionService';
 import { formatMinutes } from '../services/attendanceService';
 import { ShiftManagementSkeleton } from './Skeletons';
+import { useBulkSelection } from '../hooks/useBulkSelection';
+import {
+  BulkActionBar,
+  BulkExecutionSummary,
+  BulkProgressState,
+  SelectAllCheckbox,
+} from './BulkActionBar';
+import { BulkConfirmModal } from './BulkConfirmModal';
+import {
+  executeMasterBulkStatus,
+  exportChunkedToCsv,
+  exportChunkedToExcel,
+} from '../services/bulkActionService';
 
 interface ShiftManagementProps {
   shifts: Shift[];
   isLoading?: boolean;
   loadError?: string | null;
   onRefresh: () => void;
+  currentUserRole?: UserRoleRecord | null;
+  rolePermissions?: Record<string, RolePermissionRecord>;
 }
 
 export const ShiftManagement: React.FC<ShiftManagementProps> = ({
@@ -17,7 +33,15 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({
   isLoading = false,
   loadError = null,
   onRefresh,
+  currentUserRole,
+  rolePermissions,
 }) => {
+  const canAddShift = currentUserRole
+    ? hasModulePermission(currentUserRole.role, 'shifts', 'add', rolePermissions)
+    : true;
+  const canEditShift = currentUserRole
+    ? hasModulePermission(currentUserRole.role, 'shifts', 'edit', rolePermissions)
+    : true;
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingShift, setEditingShift] = useState<Partial<Shift>>({
     id: '',
@@ -86,6 +110,136 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({
     }
   };
 
+  const bulk = useBulkSelection<Shift>({
+    items: shifts,
+    paginatedItems: shifts,
+    getId: (s) => s.id,
+  });
+
+  const [bulkProgress, setBulkProgress] = useState<BulkProgressState | null>(null);
+  const [bulkSummary, setBulkSummary] = useState<BulkExecutionSummary | null>(null);
+  const [pendingBulkStatus, setPendingBulkStatus] = useState<'Active' | 'Inactive' | null>(null);
+  const [isBulkExecuting, setIsBulkExecuting] = useState(false);
+  const [retryFailedStatus, setRetryFailedStatus] = useState<{
+    status: 'Active' | 'Inactive';
+    ids: string[];
+  } | null>(null);
+
+  const handleBulkExportShifts = async (format: 'xlsx' | 'csv') => {
+    const selected = bulk.selectedItems;
+    if (selected.length === 0 || isBulkExecuting) return;
+    setIsBulkExecuting(true);
+    setBulkSummary(null);
+    setBulkProgress({
+      label: `Exporting ${selected.length} shifts...`,
+      completed: 0,
+      total: selected.length,
+    });
+    try {
+      const cols = [
+        { header: 'Shift ID', key: 'id' },
+        { header: 'Shift Name', key: 'name' },
+        { header: 'Start Time', key: 'startTime' },
+        { header: 'End Time', key: 'endTime' },
+        { header: 'Duration (Mins)', key: 'scheduledDurationMinutes' },
+        { header: 'Punch-In Start', key: 'punchInWindowStart' },
+        { header: 'Punch-In End', key: 'punchInWindowEnd' },
+        { header: 'Overnight', key: 'isOvernight' },
+        { header: 'Status', key: 'status' },
+      ];
+      const rows = selected.map((s) => ({
+        id: s.id,
+        name: s.name,
+        startTime: s.startTime,
+        endTime: s.endTime,
+        scheduledDurationMinutes: s.scheduledDurationMinutes,
+        punchInWindowStart: s.punchInWindowStart,
+        punchInWindowEnd: s.punchInWindowEnd,
+        isOvernight: s.isOvernight ? 'Yes' : 'No',
+        status: s.status,
+      }));
+      const fn = format === 'xlsx' ? exportChunkedToExcel : exportChunkedToCsv;
+      const out = await fn(rows, cols, 'Shifts_Selected', {
+        auditTargetType: 'SHIFTS',
+        auditSource: 'SHIFT_MANAGEMENT',
+      });
+      setBulkSummary({
+        type: 'success',
+        title: `Exported ${out.rowCount} Shifts`,
+        message: `Downloaded "${out.fileName}". Selection cleared.`,
+        savedCount: out.rowCount,
+      });
+      bulk.clearSelection();
+    } catch (err: any) {
+      setBulkSummary({
+        type: 'error',
+        title: 'Shift Export Failed',
+        message: err?.message || 'Unable to export selected shifts.',
+      });
+    } finally {
+      setBulkProgress(null);
+      setIsBulkExecuting(false);
+    }
+  };
+
+  const handleExecuteBulkStatus = async (
+    statusOverride?: 'Active' | 'Inactive',
+    overrideIds?: string[]
+  ) => {
+    const status = statusOverride || pendingBulkStatus;
+    if (!status) return;
+    const ids = overrideIds || bulk.selectedIdArray;
+    if (ids.length === 0) return;
+
+    setIsBulkExecuting(true);
+    setBulkSummary(null);
+    setRetryFailedStatus(null);
+    setBulkProgress({
+      label: `${status === 'Active' ? 'Activating' : 'Deactivating'} selected shifts...`,
+      completed: 0,
+      total: ids.length,
+    });
+    try {
+      const res = await executeMasterBulkStatus({
+        resource: 'shifts',
+        ids,
+        status,
+      });
+      const failedIds = (res.failedItems || []).map((f) => f.id);
+      if (failedIds.length > 0) {
+        setRetryFailedStatus({ status, ids: failedIds });
+        bulk.setSelectedIdList(failedIds);
+        setBulkSummary({
+          type: res.savedCount > 0 ? 'partial' : 'error',
+          title: 'Shift Bulk Update Partially Completed',
+          message: `Updated ${res.savedCount} shift(s); ${res.failedCount} failed.`,
+          savedCount: res.savedCount,
+          failedCount: res.failedCount,
+          canRetryFailed: true,
+        });
+      } else {
+        setBulkSummary({
+          type: 'success',
+          title: `Updated ${res.savedCount} Shift(s)`,
+          message: `Status set to ${status}. Overnight Night Shift rules remain preserved.`,
+          savedCount: res.savedCount,
+        });
+        bulk.clearSelection();
+      }
+      setPendingBulkStatus(null);
+      onRefresh();
+    } catch (err: any) {
+      setBulkSummary({
+        type: 'error',
+        title: 'Shift Bulk Update Blocked',
+        message: err?.message || 'Failed to update shift status.',
+      });
+    } finally {
+      setBulkProgress(null);
+      setIsBulkExecuting(false);
+    }
+  };
+
   if (isLoading && shifts.length === 0 && !loadError) {
     return <ShiftManagementSkeleton />;
   }
@@ -120,14 +274,80 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({
           </p>
         </div>
 
-        <button
-          onClick={handleOpenAdd}
-          className="bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs px-4 py-2 rounded flex items-center gap-1.5 shadow-sm transition cursor-pointer"
-        >
-          <Plus className="w-4 h-4" />
-          <span>Add Custom Shift</span>
-        </button>
+        <div className="flex flex-wrap items-center gap-2.5">
+          {shifts.length > 0 && (
+            <label className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-100 border border-slate-200 text-xs font-semibold text-slate-700 cursor-pointer">
+              <SelectAllCheckbox
+                checked={bulk.isPageAllSelected}
+                indeterminate={bulk.isPageIndeterminate}
+                disabled={shifts.length === 0 || isBulkExecuting}
+                onChange={bulk.togglePageSelection}
+                ariaLabel="Select all shifts"
+              />
+              <span>Select All Shifts</span>
+            </label>
+          )}
+          {canAddShift && (
+            <button
+              onClick={handleOpenAdd}
+              className="bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs px-4 py-2 rounded flex items-center gap-1.5 shadow-sm transition cursor-pointer"
+            >
+              <Plus className="w-4 h-4" />
+              <span>Add Custom Shift</span>
+            </button>
+          )}
+        </div>
       </div>
+
+      <BulkActionBar
+        selectedCount={bulk.selectedCount}
+        totalFilteredCount={bulk.totalFilteredCount}
+        currentPageCount={bulk.currentPageCount}
+        isAllFilteredSelected={bulk.isAllFilteredSelected}
+        isPageAllSelected={bulk.isPageAllSelected}
+        recordLabel="shifts"
+        onClearSelection={bulk.clearSelection}
+        progress={bulkProgress}
+        summary={bulkSummary}
+        onDismissSummary={() => setBulkSummary(null)}
+        onRetryFailed={
+          retryFailedStatus
+            ? () => handleExecuteBulkStatus(retryFailedStatus.status, retryFailedStatus.ids)
+            : undefined
+        }
+        actions={[
+          {
+            id: 'export_shifts_xlsx',
+            label: 'Export Excel',
+            icon: <FileSpreadsheet className="w-3.5 h-3.5" />,
+            tone: 'emerald',
+            onClick: () => handleBulkExportShifts('xlsx'),
+          },
+          {
+            id: 'export_shifts_csv',
+            label: 'Export CSV',
+            icon: <Download className="w-3.5 h-3.5" />,
+            tone: 'default',
+            onClick: () => handleBulkExportShifts('csv'),
+          },
+          {
+            id: 'activate_shifts',
+            label: 'Activate',
+            icon: <CheckCircle className="w-3.5 h-3.5" />,
+            tone: 'primary',
+            hidden: !canEditShift,
+            onClick: () => setPendingBulkStatus('Active'),
+          },
+          {
+            id: 'deactivate_shifts',
+            label: 'Deactivate',
+            icon: <XCircle className="w-3.5 h-3.5" />,
+            tone: 'amber',
+            hidden: !canEditShift,
+            onClick: () => setPendingBulkStatus('Inactive'),
+          },
+        ]}
+      />
 
       {/* Shifts Card Grid */}
       {shifts.length === 0 ? (
@@ -136,14 +356,28 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({
         </div>
       ) : (
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        {shifts.map(shift => (
+        {shifts.map(shift => {
+          const isSelected = bulk.isSelected(shift.id);
+          return (
           <div
             key={shift.id}
-            className="bg-white rounded-xl border border-slate-200 p-5 shadow-2xs flex flex-col justify-between gap-4 hover:border-blue-400 transition"
+            className={`bg-white rounded-xl border p-5 shadow-2xs flex flex-col justify-between gap-4 transition ${
+              isSelected
+                ? 'border-blue-500 ring-2 ring-blue-500/20 bg-blue-50/20'
+                : 'border-slate-200 hover:border-blue-400'
+            }`}
           >
             <div>
               <div className="flex items-center justify-between pb-3 border-b border-slate-100">
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2.5">
+                  <input
+                    type="checkbox"
+                    checked={isSelected}
+                    disabled={isBulkExecuting}
+                    onChange={() => bulk.toggleOne(shift.id)}
+                    aria-label={`Select shift ${shift.name}`}
+                    className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
+                  />
                   <div className={`w-3 h-3 rounded-full ${shift.isOvernight ? 'bg-purple-600' : 'bg-blue-600'}`}></div>
                   <h3 className="font-bold text-slate-900 text-base">{shift.name}</h3>
                 </div>
@@ -196,8 +430,8 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({
 
             <div className="flex items-center justify-between pt-3 border-t border-slate-100 text-xs">
               <button
-                onClick={() => handleToggleStatus(shift)}
-                disabled={togglingShiftId === shift.id}
+                onClick={() => canEditShift && handleToggleStatus(shift)}
+                disabled={!canEditShift || togglingShiftId === shift.id}
                 className={`px-2.5 py-1 rounded text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50 ${
                   shift.status === 'Active' ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-700'
                 }`}
@@ -206,16 +440,19 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({
                 <span>{togglingShiftId === shift.id ? 'Updating...' : shift.status}</span>
               </button>
 
-              <button
-                onClick={() => handleOpenEdit(shift)}
-                className="bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium px-3 py-1 rounded flex items-center gap-1"
-              >
-                <Edit2 className="w-3 h-3" />
-                <span>Edit Configuration</span>
-              </button>
+              {canEditShift && (
+                <button
+                  onClick={() => handleOpenEdit(shift)}
+                  className="bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium px-3 py-1 rounded flex items-center gap-1 cursor-pointer"
+                >
+                  <Edit2 className="w-3 h-3" />
+                  <span>Edit Configuration</span>
+                </button>
+              )}
             </div>
           </div>
-        ))}
+          );
+        })}
       </div>
       )}
 
@@ -349,6 +586,20 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({
           </div>
         </div>
       )}
+
+      <BulkConfirmModal
+        isOpen={Boolean(pendingBulkStatus)}
+        title={pendingBulkStatus === 'Active' ? 'Bulk Activate Shifts?' : 'Bulk Deactivate Shifts?'}
+        description={`Update status to ${pendingBulkStatus} for ${bulk.selectedCount} selected shift(s). Shift timings and Night Shift cross-midnight rules remain unchanged.`}
+        selectedCount={bulk.selectedCount}
+        confirmLabel={`${pendingBulkStatus === 'Active' ? 'Activate' : 'Deactivate'} ${bulk.selectedCount} Shift(s)`}
+        tone={pendingBulkStatus === 'Inactive' ? 'amber' : 'primary'}
+        isBusy={isBulkExecuting}
+        onConfirm={() => handleExecuteBulkStatus()}
+        onCancel={() => {
+          if (!isBulkExecuting) setPendingBulkStatus(null);
+        }}
+      />
     </div>
   );
 };

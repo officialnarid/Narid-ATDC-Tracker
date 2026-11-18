@@ -9,16 +9,27 @@ import {
   AlertTriangle,
   RefreshCw,
   ChevronLeft,
-  ChevronRight
+  ChevronRight,
+  Archive
 } from 'lucide-react';
-import { Employee, Floor, Department } from '../types';
+import { Employee, Floor, Department, UserRoleRecord } from '../types';
 import { regenerateQrToken } from '../services/employeeService';
+import { RolePermissionRecord, hasModulePermission } from '../services/permissionService';
 import { QrManagementSkeleton } from './Skeletons';
 import {
   IDENTITY_CARD_HEADER_TEXT,
   buildEmployeeQrPayload,
   downloadEmployeeIdentityCardPng,
 } from '../utils/qrIdentityCard';
+import { useBulkSelection } from '../hooks/useBulkSelection';
+import {
+  BulkActionBar,
+  BulkExecutionSummary,
+  BulkProgressState,
+  SelectAllCheckbox,
+} from './BulkActionBar';
+import { CrossPageSelectConfirmModal } from './BulkConfirmModal';
+import { downloadQrIdentityCardsZip } from '../services/bulkActionService';
 
 interface EmployeeIdentityPrintCardProps {
   employee: Employee;
@@ -123,6 +134,8 @@ interface QrManagementProps {
   isLoading?: boolean;
   loadError?: string | null;
   onRefresh: () => void;
+  currentUserRole?: UserRoleRecord | null;
+  rolePermissions?: Record<string, RolePermissionRecord>;
 }
 
 export const QrManagement: React.FC<QrManagementProps> = ({
@@ -132,18 +145,26 @@ export const QrManagement: React.FC<QrManagementProps> = ({
   isLoading = false,
   loadError = null,
   onRefresh,
+  currentUserRole,
+  rolePermissions,
 }) => {
+  const canEditQr = currentUserRole
+    ? hasModulePermission(currentUserRole.role, 'qr_codes', 'edit', rolePermissions)
+    : true;
+
   const [searchTerm, setSearchTerm] = useState('');
   const [filterFloor, setFilterFloor] = useState('ALL');
   const [filterDept, setFilterDept] = useState('ALL');
   const [qrImages, setQrImages] = useState<Record<string, string>>({});
-  const [selectedForPrint, setSelectedForPrint] = useState<Set<string>>(new Set());
   const [singlePrintEmpId, setSinglePrintEmpId] = useState<string | null>(null);
   const [isPrintModalOpen, setIsPrintModalOpen] = useState(false);
   const [confirmRegenId, setConfirmRegenId] = useState<string | null>(null);
   const [regeneratingId, setRegeneratingId] = useState<string | null>(null);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [bulkProgress, setBulkProgress] = useState<BulkProgressState | null>(null);
+  const [bulkSummary, setBulkSummary] = useState<BulkExecutionSummary | null>(null);
+  const [failedZipEmpIds, setFailedZipEmpIds] = useState<string[]>([]);
   const [page, setPage] = useState<number>(1);
   const [pageSize, setPageSize] = useState<number>(24);
   const qrCacheRef = useRef<Map<string, string>>(new Map());
@@ -175,13 +196,19 @@ export const QrManagement: React.FC<QrManagementProps> = ({
     return filtered.slice(start, start + pageSize);
   }, [filtered, safePage, pageSize]);
 
+  const bulk = useBulkSelection<Employee>({
+    items: filtered,
+    paginatedItems: paginatedFiltered,
+    getId: (emp) => emp.employeeId,
+  });
+
   const printEmployees = useMemo(() => {
     if (!isPrintModalOpen) return [];
     if (singlePrintEmpId) {
       return employees.filter((e) => e.employeeId === singlePrintEmpId);
     }
-    return employees.filter((e) => selectedForPrint.has(e.employeeId));
-  }, [isPrintModalOpen, singlePrintEmpId, employees, selectedForPrint]);
+    return employees.filter((e) => bulk.selectedIds.has(e.employeeId));
+  }, [isPrintModalOpen, singlePrintEmpId, employees, bulk.selectedIds]);
 
   // Target list for QR image generation: current visible page, plus any print cards when print modal opens
   const qrRenderTargets = useMemo(() => {
@@ -268,21 +295,6 @@ export const QrManagement: React.FC<QrManagementProps> = ({
     };
   }, [qrRenderTargets]);
 
-  const toggleSelect = (empId: string) => {
-    const next = new Set(selectedForPrint);
-    if (next.has(empId)) next.delete(empId);
-    else next.add(empId);
-    setSelectedForPrint(next);
-  };
-
-  const selectAll = () => {
-    if (selectedForPrint.size === filtered.length) {
-      setSelectedForPrint(new Set());
-    } else {
-      setSelectedForPrint(new Set(filtered.map(e => e.employeeId)));
-    }
-  };
-
   const handleRegenerate = async (empId: string) => {
     setActionError(null);
     setRegeneratingId(empId);
@@ -309,6 +321,78 @@ export const QrManagement: React.FC<QrManagementProps> = ({
     }
   };
 
+  const handleDownloadBulkZip = async (overrideEmployees?: Employee[]) => {
+    const targets = overrideEmployees || bulk.selectedItems;
+    if (targets.length === 0 || bulkProgress) return;
+    setActionError(null);
+    setBulkSummary(null);
+    setFailedZipEmpIds([]);
+    setBulkProgress({
+      label: 'Generating Employee QR Identity Cards ZIP...',
+      completed: 0,
+      total: targets.length,
+    });
+
+    try {
+      const { result } = await downloadQrIdentityCardsZip(targets, {
+        auditSource: 'QR_MANAGEMENT',
+        onProgress: (p) => {
+          setBulkProgress({
+            label: 'Generating Employee QR Identity Cards ZIP...',
+            completed: p.completed,
+            total: p.total,
+            detail: p.currentEmployeeId ? `Rendering QR_ID_Card_${p.currentEmployeeId}.png` : undefined,
+          });
+        },
+      });
+
+      const failedIds = result.failedItems.map((f) => f.employeeId);
+      setFailedZipEmpIds(failedIds);
+
+      if (result.exportedCount > 0 && failedIds.length === 0 && result.skippedIds.length === 0) {
+        setBulkSummary({
+          type: 'success',
+          title: 'QR Identity Cards ZIP Downloaded',
+          message: `Successfully packaged ${result.exportedCount} QR Identity Cards into ${result.fileName}.`,
+          savedCount: result.exportedCount,
+        });
+        bulk.clearSelection();
+      } else if (result.exportedCount > 0) {
+        setBulkSummary({
+          type: 'partial',
+          title: 'QR Identity Cards ZIP Partially Completed',
+          message: `Downloaded ${result.exportedCount} cards in ${result.fileName}.`,
+          savedCount: result.exportedCount,
+          skippedCount: result.skippedIds.length,
+          failedCount: failedIds.length,
+          canRetryFailed: failedIds.length > 0,
+        });
+        if (failedIds.length > 0) {
+          bulk.setSelectedIdList(failedIds);
+        } else {
+          bulk.clearSelection();
+        }
+      } else {
+        setBulkSummary({
+          type: 'error',
+          title: 'QR ZIP Download Failed',
+          message: 'No valid QR Identity Cards could be generated from the selected records.',
+          skippedCount: result.skippedIds.length,
+          failedCount: failedIds.length,
+          canRetryFailed: failedIds.length > 0,
+        });
+      }
+    } catch (err: any) {
+      setBulkSummary({
+        type: 'error',
+        title: 'QR ZIP Download Failed',
+        message: err?.message || 'Unable to package QR Identity Cards into ZIP.',
+      });
+    } finally {
+      setBulkProgress(null);
+    }
+  };
+
   const handleOpenSinglePrint = (empId: string) => {
     setSinglePrintEmpId(empId);
     setIsPrintModalOpen(true);
@@ -316,8 +400,8 @@ export const QrManagement: React.FC<QrManagementProps> = ({
 
   const handleOpenBulkPrint = () => {
     setSinglePrintEmpId(null);
-    if (selectedForPrint.size === 0) {
-      setSelectedForPrint(new Set(filtered.map(e => e.employeeId)));
+    if (bulk.selectedCount === 0) {
+      bulk.selectAllFilteredDirect();
     }
     setIsPrintModalOpen(true);
   };
@@ -355,14 +439,26 @@ export const QrManagement: React.FC<QrManagementProps> = ({
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <button
+            type="button"
+            onClick={() => handleDownloadBulkZip(bulk.selectedCount > 0 ? bulk.selectedItems : filtered)}
+            disabled={filtered.length === 0 || Boolean(bulkProgress)}
+            className="bg-emerald-600 hover:bg-emerald-700 text-white font-medium text-xs px-3.5 py-2 rounded flex items-center gap-2 shadow-sm transition disabled:opacity-50 cursor-pointer"
+          >
+            <Archive className="w-4 h-4" />
+            <span>
+              Download QR ZIP ({bulk.selectedCount > 0 ? bulk.selectedCount : `All ${filtered.length}`})
+            </span>
+          </button>
+          <button
+            type="button"
             onClick={handleOpenBulkPrint}
-            disabled={filtered.length === 0}
-            className="bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs px-4 py-2 rounded flex items-center gap-2 shadow-sm transition disabled:opacity-50"
+            disabled={filtered.length === 0 || Boolean(bulkProgress)}
+            className="bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs px-4 py-2 rounded flex items-center gap-2 shadow-sm transition disabled:opacity-50 cursor-pointer"
           >
             <Printer className="w-4 h-4" />
-            <span>Print Selected Cards ({selectedForPrint.size > 0 ? selectedForPrint.size : 'All'})</span>
+            <span>Print Selected Cards ({bulk.selectedCount > 0 ? bulk.selectedCount : 'All'})</span>
           </button>
         </div>
       </div>
@@ -439,19 +535,69 @@ export const QrManagement: React.FC<QrManagementProps> = ({
           </select>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-3">
           <span className="text-[11px] text-slate-500">
             {filtered.length} Active {filtered.length === 1 ? 'Employee' : 'Employees'}
           </span>
+          <label className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border border-slate-300 bg-slate-50 hover:bg-slate-100 text-slate-700 font-medium cursor-pointer">
+            <SelectAllCheckbox
+              checked={bulk.isPageAllSelected}
+              indeterminate={bulk.isPageIndeterminate}
+              disabled={paginatedFiltered.length === 0}
+              onChange={bulk.togglePageSelection}
+              ariaLabel="Select all QR cards on current page"
+            />
+            <span>Select Page ({paginatedFiltered.length})</span>
+          </label>
           <button
-            onClick={selectAll}
+            type="button"
+            onClick={() =>
+              bulk.isAllFilteredSelected ? bulk.clearSelection() : bulk.requestSelectAllFiltered()
+            }
             disabled={filtered.length === 0}
-            className="text-slate-600 hover:text-slate-900 border border-slate-300 px-3 py-1.5 rounded font-medium disabled:opacity-50"
+            className="text-slate-700 hover:text-slate-900 border border-slate-300 px-3 py-1.5 rounded font-medium disabled:opacity-50 cursor-pointer"
           >
-            {selectedForPrint.size === filtered.length && filtered.length > 0 ? 'Deselect All' : 'Select All Filtered'}
+            {bulk.isAllFilteredSelected && filtered.length > 0
+              ? 'Deselect All Filtered'
+              : `Select All Filtered (${filtered.length})`}
           </button>
         </div>
       </div>
+
+      <BulkActionBar
+        selectedCount={bulk.selectedCount}
+        totalFilteredCount={bulk.totalFilteredCount}
+        currentPageCount={bulk.currentPageCount}
+        isAllFilteredSelected={bulk.isAllFilteredSelected}
+        isPageAllSelected={bulk.isPageAllSelected}
+        recordLabel="badges"
+        onSelectAllFiltered={bulk.requestSelectAllFiltered}
+        onClearSelection={bulk.clearSelection}
+        progress={bulkProgress}
+        summary={bulkSummary}
+        onRetryFailed={
+          failedZipEmpIds.length > 0
+            ? () => handleDownloadBulkZip(filtered.filter((e) => failedZipEmpIds.includes(e.employeeId)))
+            : undefined
+        }
+        onDismissSummary={() => setBulkSummary(null)}
+        actions={[
+          {
+            id: 'qr-zip',
+            label: `Download Selected ZIP (${bulk.selectedCount})`,
+            icon: <Archive className="w-3.5 h-3.5" />,
+            tone: 'emerald',
+            onClick: () => handleDownloadBulkZip(),
+          },
+          {
+            id: 'qr-print',
+            label: `Print Selected Cards (${bulk.selectedCount})`,
+            icon: <Printer className="w-3.5 h-3.5" />,
+            tone: 'primary',
+            onClick: handleOpenBulkPrint,
+          },
+        ]}
+      />
 
       {/* Empty State or QR Cards Grid */}
       {filtered.length === 0 ? (
@@ -461,7 +607,7 @@ export const QrManagement: React.FC<QrManagementProps> = ({
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
           {paginatedFiltered.map(emp => {
-            const isSelected = selectedForPrint.has(emp.employeeId);
+            const isSelected = bulk.isSelected(emp.employeeId);
             const qrUrl = qrImages[emp.employeeId];
             const isConfirming = confirmRegenId === emp.employeeId;
             const isRegenerating = regeneratingId === emp.employeeId;
@@ -478,7 +624,8 @@ export const QrManagement: React.FC<QrManagementProps> = ({
                   <input
                     type="checkbox"
                     checked={isSelected}
-                    onChange={() => toggleSelect(emp.employeeId)}
+                    onChange={() => bulk.toggleOne(emp.employeeId)}
+                    aria-label={`Select QR badge for ${emp.employeeId}`}
                     className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
                   />
                   <span className="text-[10px] bg-emerald-50 text-emerald-700 border border-emerald-200 px-1.5 py-0.5 rounded font-semibold">
@@ -530,7 +677,7 @@ export const QrManagement: React.FC<QrManagementProps> = ({
                   >
                     <Printer className="w-3.5 h-3.5" />
                   </button>
-                  {isConfirming ? (
+                  {canEditQr && (isConfirming ? (
                     <div className="flex items-center gap-1">
                       <button
                         type="button"
@@ -558,7 +705,7 @@ export const QrManagement: React.FC<QrManagementProps> = ({
                     >
                       <RotateCcw className="w-3.5 h-3.5" />
                     </button>
-                  )}
+                  ))}
                 </div>
               </div>
             );
@@ -693,6 +840,15 @@ export const QrManagement: React.FC<QrManagementProps> = ({
           </div>
         </div>
       )}
+
+      <CrossPageSelectConfirmModal
+        isOpen={bulk.isCrossPageConfirmOpen}
+        totalFilteredCount={bulk.totalFilteredCount}
+        currentPageCount={bulk.currentPageCount}
+        recordLabel="employee QR badges"
+        onConfirm={bulk.confirmSelectAllFiltered}
+        onCancel={bulk.cancelSelectAllFiltered}
+      />
     </div>
   );
 };

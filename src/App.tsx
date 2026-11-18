@@ -617,6 +617,8 @@ export default function App() {
                   isLoading={isLoadingMasterData}
                   loadError={masterDataError}
                   onRefresh={() => loadAllMasterData(false)}
+                  currentUserRole={currentUserRole}
+                  rolePermissions={rolePermissions}
                 />
               )}
 
@@ -624,6 +626,8 @@ export default function App() {
                 <FloorManagement
                   floors={floors}
                   onRefresh={() => loadAllMasterData(false)}
+                  currentUserRole={currentUserRole}
+                  rolePermissions={rolePermissions}
                 />
               )}
 
@@ -632,6 +636,8 @@ export default function App() {
                   sections={sections}
                   floors={floors}
                   onRefresh={() => loadAllMasterData(false)}
+                  currentUserRole={currentUserRole}
+                  rolePermissions={rolePermissions}
                 />
               )}
 
@@ -639,6 +645,8 @@ export default function App() {
                 <DepartmentManagement
                   departments={departments}
                   onRefresh={() => loadAllMasterData(false)}
+                  currentUserRole={currentUserRole}
+                  rolePermissions={rolePermissions}
                 />
               )}
 
@@ -648,6 +656,8 @@ export default function App() {
                   isLoading={isLoadingMasterData}
                   loadError={masterDataError}
                   onRefresh={() => loadAllMasterData(false)}
+                  currentUserRole={currentUserRole}
+                  rolePermissions={rolePermissions}
                 />
               )}
 
@@ -657,6 +667,8 @@ export default function App() {
                   sections={sections}
                   departments={departments}
                   shifts={shifts}
+                  currentUserRole={currentUserRole}
+                  rolePermissions={rolePermissions}
                 />
               )}
 
@@ -667,6 +679,8 @@ export default function App() {
                   sections={sections}
                   departments={departments}
                   shifts={shifts}
+                  currentUserRole={currentUserRole}
+                  rolePermissions={rolePermissions}
                 />
               )}
 

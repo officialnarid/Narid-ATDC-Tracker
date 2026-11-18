@@ -19,6 +19,8 @@ import {
   X,
   Clock,
   Activity,
+  FileSpreadsheet,
+  Download,
 } from 'lucide-react';
 import {
   AccountSecurityRecord,
@@ -35,6 +37,14 @@ import {
   generateTemporaryPasswordForAccount,
 } from '../services/securityService';
 import { UnauthorizedAccess } from './UnauthorizedAccess';
+import { useBulkSelection } from '../hooks/useBulkSelection';
+import {
+  BulkActionBar,
+  BulkExecutionSummary,
+  BulkProgressState,
+  SelectAllCheckbox,
+} from './BulkActionBar';
+import { exportChunkedToCsv, exportChunkedToExcel } from '../services/bulkActionService';
 
 interface SecurityManagementProps {
   currentUserRole?: UserRoleRecord | null;
@@ -115,6 +125,103 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
     generatedAt: string;
   } | null>(null);
   const [copiedTempPwd, setCopiedTempPwd] = useState<boolean>(false);
+
+  const attemptsBulk = useBulkSelection<LoginAttemptRecord>({
+    items: attemptsList,
+    paginatedItems: attemptsList,
+    getId: (att) => att.id,
+    resetKey: subTab,
+  });
+
+  const secAuditsBulk = useBulkSelection<SecurityAuditLogRecord>({
+    items: auditLogsList,
+    paginatedItems: auditLogsList,
+    getId: (log) => log.id,
+    resetKey: subTab,
+  });
+
+  const [bulkProgress, setBulkProgress] = useState<BulkProgressState | null>(null);
+  const [bulkSummary, setBulkSummary] = useState<BulkExecutionSummary | null>(null);
+
+  const handleBulkExportAttempts = async (format: 'xlsx' | 'csv') => {
+    const selected = attemptsBulk.selectedItems;
+    if (selected.length === 0 || bulkProgress) return;
+    setBulkSummary(null);
+    setBulkProgress({ label: `Exporting ${selected.length} login attempts...`, completed: 0, total: selected.length });
+    try {
+      const cols = [
+        { header: 'Timestamp', key: 'timestamp' },
+        { header: 'Login ID', key: 'loginId' },
+        { header: 'Role', key: 'role' },
+        { header: 'Outcome', key: 'outcome' },
+        { header: 'IP Address', key: 'ipAddress' },
+        { header: 'Location', key: 'location' },
+        { header: 'Device', key: 'device' },
+        { header: 'Reason', key: 'reason' },
+      ];
+      const rows = selected.map((a) => ({
+        timestamp: a.timestamp,
+        loginId: a.loginId,
+        role: a.role,
+        outcome: a.outcome,
+        ipAddress: a.ipAddress,
+        location: formatGeo(a.geoLocation),
+        device: `${a.browser} / ${a.os} (${a.deviceType})`,
+        reason: a.failureReason || (a.success ? 'Authenticated' : '--'),
+      }));
+      const fn = format === 'xlsx' ? exportChunkedToExcel : exportChunkedToCsv;
+      const out = await fn(rows, cols, 'Security_Login_Attempts_Selected', {
+        auditTargetType: 'SECURITY_LOGIN_ATTEMPTS',
+        auditSource: 'SECURITY_MANAGEMENT',
+      });
+      setBulkSummary({ type: 'success', title: `Exported ${out.rowCount} Login Attempts`, message: `Downloaded "${out.fileName}".`, savedCount: out.rowCount });
+      attemptsBulk.clearSelection();
+    } catch (err: any) {
+      setBulkSummary({ type: 'error', title: 'Export Failed', message: err?.message || 'Unable to export attempts.' });
+    } finally {
+      setBulkProgress(null);
+    }
+  };
+
+  const handleBulkExportSecAudits = async (format: 'xlsx' | 'csv') => {
+    const selected = secAuditsBulk.selectedItems;
+    if (selected.length === 0 || bulkProgress) return;
+    setBulkSummary(null);
+    setBulkProgress({ label: `Exporting ${selected.length} security audit logs...`, completed: 0, total: selected.length });
+    try {
+      const cols = [
+        { header: 'Timestamp', key: 'timestamp' },
+        { header: 'Action', key: 'action' },
+        { header: 'Severity', key: 'severity' },
+        { header: 'Target Login ID', key: 'targetLoginId' },
+        { header: 'Actor Login ID', key: 'actorLoginId' },
+        { header: 'IP Address', key: 'ipAddress' },
+        { header: 'Details', key: 'details' },
+        { header: 'Reason', key: 'reason' },
+      ];
+      const rows = selected.map((l) => ({
+        timestamp: l.timestamp,
+        action: l.action,
+        severity: l.severity,
+        targetLoginId: l.targetLoginId,
+        actorLoginId: l.actorLoginId,
+        ipAddress: l.ipAddress,
+        details: l.details,
+        reason: l.reason,
+      }));
+      const fn = format === 'xlsx' ? exportChunkedToExcel : exportChunkedToCsv;
+      const out = await fn(rows, cols, 'Security_Audit_Logs_Selected', {
+        auditTargetType: 'SECURITY_AUDIT_LOGS',
+        auditSource: 'SECURITY_MANAGEMENT',
+      });
+      setBulkSummary({ type: 'success', title: `Exported ${out.rowCount} Security Logs`, message: `Downloaded "${out.fileName}".`, savedCount: out.rowCount });
+      secAuditsBulk.clearSelection();
+    } catch (err: any) {
+      setBulkSummary({ type: 'error', title: 'Export Failed', message: err?.message || 'Unable to export security audit logs.' });
+    } finally {
+      setBulkProgress(null);
+    }
+  };
 
   const loadSecurityData = useCallback(async () => {
     if (!isSuperAdmin) return;
@@ -729,11 +836,49 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
             </select>
           </div>
 
+          <BulkActionBar
+            selectedCount={attemptsBulk.selectedCount}
+            totalFilteredCount={attemptsBulk.totalFilteredCount}
+            currentPageCount={attemptsBulk.currentPageCount}
+            isAllFilteredSelected={attemptsBulk.isAllFilteredSelected}
+            isPageAllSelected={attemptsBulk.isPageAllSelected}
+            recordLabel="login attempts"
+            onClearSelection={attemptsBulk.clearSelection}
+            progress={bulkProgress}
+            summary={bulkSummary}
+            onDismissSummary={() => setBulkSummary(null)}
+            actions={[
+              {
+                id: 'export_attempts_xlsx',
+                label: 'Export Selected Excel',
+                icon: <FileSpreadsheet className="w-3.5 h-3.5" />,
+                tone: 'emerald',
+                onClick: () => handleBulkExportAttempts('xlsx'),
+              },
+              {
+                id: 'export_attempts_csv',
+                label: 'Export Selected CSV',
+                icon: <Download className="w-3.5 h-3.5" />,
+                tone: 'default',
+                onClick: () => handleBulkExportAttempts('csv'),
+              },
+            ]}
+          />
+
           <div className="bg-white rounded-xl border border-slate-200 shadow-2xs overflow-hidden">
             <div className="overflow-x-auto">
               <table className="w-full text-left text-xs">
                 <thead className="bg-slate-50 text-slate-600 uppercase font-bold text-[10px] tracking-wider border-b border-slate-200">
                   <tr>
+                    <th className="py-3 px-3 w-10 text-center">
+                      <SelectAllCheckbox
+                        checked={attemptsBulk.isPageAllSelected}
+                        indeterminate={attemptsBulk.isPageIndeterminate}
+                        disabled={attemptsList.length === 0 || Boolean(bulkProgress)}
+                        onChange={attemptsBulk.togglePageSelection}
+                        ariaLabel="Select all login attempts"
+                      />
+                    </th>
                     <th className="py-3 px-3.5">Timestamp (IST)</th>
                     <th className="py-3 px-3.5">Login ID &amp; Role</th>
                     <th className="py-3 px-3.5">Outcome &amp; Strike</th>
@@ -745,16 +890,28 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
                 <tbody className="divide-y divide-slate-100">
                   {attemptsList.length === 0 ? (
                     <tr>
-                      <td colSpan={6} className="py-10 text-center text-slate-400">
+                      <td colSpan={7} className="py-10 text-center text-slate-400">
                         No login attempt records found.
                       </td>
                     </tr>
                   ) : (
-                    attemptsList.map((att) => (
+                    attemptsList.map((att) => {
+                      const isChecked = attemptsBulk.isSelected(att.id);
+                      return (
                       <tr
                         key={att.id}
-                        className={`hover:bg-slate-50/80 ${att.triggeredLock ? 'bg-red-50/40' : ''}`}
+                        className={isChecked ? 'bg-blue-50/60 hover:bg-blue-50/90' : `hover:bg-slate-50/80 ${att.triggeredLock ? 'bg-red-50/40' : ''}`}
                       >
+                        <td className="py-2.5 px-3 text-center">
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            disabled={Boolean(bulkProgress)}
+                            onChange={() => attemptsBulk.toggleOne(att.id)}
+                            aria-label={`Select login attempt ${att.id}`}
+                            className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
+                          />
+                        </td>
                         <td className="py-2.5 px-3.5 font-mono text-[11px] whitespace-nowrap tabular-nums text-slate-600">
                           {formatDateTime(att.timestamp)}
                         </td>
@@ -797,7 +954,8 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
                           </div>
                         </td>
                       </tr>
-                    ))
+                      );
+                    })
                   )}
                 </tbody>
               </table>
@@ -848,11 +1006,49 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
             </select>
           </div>
 
+          <BulkActionBar
+            selectedCount={secAuditsBulk.selectedCount}
+            totalFilteredCount={secAuditsBulk.totalFilteredCount}
+            currentPageCount={secAuditsBulk.currentPageCount}
+            isAllFilteredSelected={secAuditsBulk.isAllFilteredSelected}
+            isPageAllSelected={secAuditsBulk.isPageAllSelected}
+            recordLabel="security logs"
+            onClearSelection={secAuditsBulk.clearSelection}
+            progress={bulkProgress}
+            summary={bulkSummary}
+            onDismissSummary={() => setBulkSummary(null)}
+            actions={[
+              {
+                id: 'export_sec_logs_xlsx',
+                label: 'Export Selected Excel',
+                icon: <FileSpreadsheet className="w-3.5 h-3.5" />,
+                tone: 'emerald',
+                onClick: () => handleBulkExportSecAudits('xlsx'),
+              },
+              {
+                id: 'export_sec_logs_csv',
+                label: 'Export Selected CSV',
+                icon: <Download className="w-3.5 h-3.5" />,
+                tone: 'default',
+                onClick: () => handleBulkExportSecAudits('csv'),
+              },
+            ]}
+          />
+
           <div className="bg-white rounded-xl border border-slate-200 shadow-2xs overflow-hidden">
             <div className="overflow-x-auto">
               <table className="w-full text-left text-xs">
                 <thead className="bg-slate-50 text-slate-600 uppercase font-bold text-[10px] tracking-wider border-b border-slate-200">
                   <tr>
+                    <th className="py-3 px-3 w-10 text-center">
+                      <SelectAllCheckbox
+                        checked={secAuditsBulk.isPageAllSelected}
+                        indeterminate={secAuditsBulk.isPageIndeterminate}
+                        disabled={auditLogsList.length === 0 || Boolean(bulkProgress)}
+                        onChange={secAuditsBulk.togglePageSelection}
+                        ariaLabel="Select all security audit logs"
+                      />
+                    </th>
                     <th className="py-3 px-3.5">Timestamp (IST)</th>
                     <th className="py-3 px-3.5">Action &amp; Severity</th>
                     <th className="py-3 px-3.5">Target Account</th>
@@ -864,16 +1060,28 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
                 <tbody className="divide-y divide-slate-100">
                   {auditLogsList.length === 0 ? (
                     <tr>
-                      <td colSpan={6} className="py-10 text-center text-slate-400">
+                      <td colSpan={7} className="py-10 text-center text-slate-400">
                         No security audit logs match your current filters.
                       </td>
                     </tr>
                   ) : (
-                    auditLogsList.map((log) => (
+                    auditLogsList.map((log) => {
+                      const isChecked = secAuditsBulk.isSelected(log.id);
+                      return (
                       <tr
                         key={log.id}
-                        className={`hover:bg-slate-50/80 ${log.severity === 'CRITICAL' ? 'bg-red-50/25' : ''}`}
+                        className={isChecked ? 'bg-blue-50/60 hover:bg-blue-50/90' : `hover:bg-slate-50/80 ${log.severity === 'CRITICAL' ? 'bg-red-50/25' : ''}`}
                       >
+                        <td className="py-2.5 px-3 text-center">
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            disabled={Boolean(bulkProgress)}
+                            onChange={() => secAuditsBulk.toggleOne(log.id)}
+                            aria-label={`Select security log ${log.id}`}
+                            className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
+                          />
+                        </td>
                         <td className="py-2.5 px-3.5 font-mono text-[11px] whitespace-nowrap tabular-nums text-slate-600">
                           {formatDateTime(log.timestamp)}
                         </td>
@@ -910,7 +1118,8 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
                           <div className="text-[10px] text-slate-500 mt-0.5">Reason: {log.reason}</div>
                         </td>
                       </tr>
-                    ))
+                      );
+                    })
                   )}
                 </tbody>
               </table>
