@@ -20,6 +20,7 @@ import {
   X
 } from 'lucide-react';
 import { UserRoleRecord } from '../types';
+import { RolePermissionsSkeleton } from './Skeletons';
 import { 
   PERMISSION_MODULES, 
   RoleRecord,
@@ -371,6 +372,10 @@ export const RolePermissionsManagement: React.FC<RolePermissionsManagementProps>
       setIsSaving(false);
     }
   };
+
+  if (isLoading && rolesList.length === 0 && Object.keys(permissionsState).length === 0) {
+    return <RolePermissionsSkeleton />;
+  }
 
   return (
     <div className="flex flex-col gap-5">

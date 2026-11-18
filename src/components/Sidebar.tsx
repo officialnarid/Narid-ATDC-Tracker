@@ -43,6 +43,7 @@ export type NavItem =
 interface SidebarProps {
   currentTab: NavItem;
   onSelectTab: (tab: NavItem) => void;
+  onPrefetchTab?: (tab: NavItem) => void;
   activeEmployeeCount?: number;
   currentUserRole?: UserRoleRecord | null;
   onLogout?: () => void;
@@ -69,6 +70,7 @@ interface OrgSubmenuItem {
 export const Sidebar: React.FC<SidebarProps> = ({ 
   currentTab, 
   onSelectTab, 
+  onPrefetchTab,
   activeEmployeeCount = 0,
   currentUserRole,
   onLogout,
@@ -150,6 +152,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
         key={item.id}
         type="button"
         onClick={() => handleItemClick(item.id)}
+        onMouseEnter={() => onPrefetchTab?.(item.id)}
+        onFocus={() => onPrefetchTab?.(item.id)}
         className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-left transition-colors text-[13px] font-medium cursor-pointer ${
           isActive 
             ? 'bg-blue-600 text-white shadow-sm font-semibold' 
@@ -270,6 +274,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
                         key={subItem.id}
                         type="button"
                         onClick={() => handleItemClick(subItem.id)}
+                        onMouseEnter={() => onPrefetchTab?.(subItem.id)}
+                        onFocus={() => onPrefetchTab?.(subItem.id)}
                         className={`w-full flex items-center gap-2.5 px-3 py-1.5 rounded text-left transition-colors text-[12.5px] cursor-pointer ${
                           isSubActive
                             ? 'bg-blue-600 text-white font-semibold shadow-xs'

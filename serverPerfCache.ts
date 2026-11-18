@@ -25,6 +25,12 @@ interface CachedListEntry<T> {
   expiresAt: number;
 }
 
+interface CachedUidRolePointer {
+  roleDocId: string;
+  lastRole: string;
+  expiresAt: number;
+}
+
 interface DbCacheStore {
   shifts?: CachedListEntry<any[]>;
   shiftsInFlight?: Promise<any[]>;
@@ -32,6 +38,7 @@ interface DbCacheStore {
   systemSettingsInFlight?: Promise<Record<string, any>>;
   roleDefs: Map<string, CachedDocSnapshotLike>;
   rolePerms: Map<string, CachedDocSnapshotLike>;
+  uidRolePointers: Map<string, CachedUidRolePointer>;
   inFlightRequests: Map<string, Promise<any>>;
   recentIdempotentResponses: Map<string, { value: any; expiresAt: number }>;
 }
@@ -44,6 +51,7 @@ function getStore(db: AdminFirestoreLike): DbCacheStore {
     store = {
       roleDefs: new Map(),
       rolePerms: new Map(),
+      uidRolePointers: new Map(),
       inFlightRequests: new Map(),
       recentIdempotentResponses: new Map(),
     };
@@ -54,6 +62,60 @@ function getStore(db: AdminFirestoreLike): DbCacheStore {
 
 const CONFIG_TTL_MS = 30_000;
 const ROLE_TTL_MS = 15_000;
+const UID_POINTER_TTL_MS = 60_000;
+
+/**
+ * Non-authoritative structural routing hint (uid -> roleDocId) only.
+ * Callers MUST STILL read `user_roles/{roleDocId}` live from Firestore to verify
+ * active status, lock state, session revocation, and UID ownership on every request.
+ */
+export function getCachedUidRolePointer(
+  db: AdminFirestoreLike,
+  uid: string
+): { roleDocId: string; lastRole: string } | null {
+  const cleanUid = String(uid || '').trim();
+  if (!cleanUid) return null;
+  const store = getStore(db);
+  const entry = store.uidRolePointers.get(cleanUid);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    store.uidRolePointers.delete(cleanUid);
+    return null;
+  }
+  return { roleDocId: entry.roleDocId, lastRole: entry.lastRole };
+}
+
+export function setCachedUidRolePointer(
+  db: AdminFirestoreLike,
+  uid: string,
+  roleDocId: string,
+  lastRole: string
+): void {
+  const cleanUid = String(uid || '').trim();
+  const cleanDocId = String(roleDocId || '').trim();
+  if (!cleanUid || !cleanDocId) return;
+  const store = getStore(db);
+  if (store.uidRolePointers.size > 500) {
+    const now = Date.now();
+    for (const [k, v] of store.uidRolePointers.entries()) {
+      if (v.expiresAt <= now) store.uidRolePointers.delete(k);
+    }
+  }
+  store.uidRolePointers.set(cleanUid, {
+    roleDocId: cleanDocId,
+    lastRole: String(lastRole || '').trim().toLowerCase(),
+    expiresAt: Date.now() + UID_POINTER_TTL_MS,
+  });
+}
+
+export function invalidateUidRolePointer(db: AdminFirestoreLike, uid?: string): void {
+  const store = getStore(db);
+  if (uid) {
+    store.uidRolePointers.delete(String(uid).trim());
+  } else {
+    store.uidRolePointers.clear();
+  }
+}
 
 export async function getCachedShifts(
   db: AdminFirestoreLike,
@@ -178,6 +240,7 @@ export function invalidateRoleCaches(db: AdminFirestoreLike, roleId?: string): v
   } else {
     store.roleDefs.clear();
     store.rolePerms.clear();
+    store.uidRolePointers.clear();
   }
 }
 
@@ -237,14 +300,18 @@ export async function runWithOptionalClientRequestDedup<T>(
 // Non-Sensitive Pipeline Performance Instrumentation
 // ============================================================================
 export interface AttendancePerfMetrics {
+  qrParseMs?: number;
   authMs: number;
   permissionMs: number;
   lookupAndQueryMs: number;
+  tokenValidationMs?: number;
   txMs: number;
+  firestoreOpMs?: number;
   auditMs?: number;
   totalServerMs: number;
   cacheHitRolePerms?: boolean;
   cacheHitConfig?: boolean;
+  cacheHitUidRoute?: boolean;
 }
 
 export function roundMs(val: number): number {

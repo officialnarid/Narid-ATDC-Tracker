@@ -3,13 +3,21 @@ import { Clock, Plus, Edit2, CheckCircle, XCircle, X, AlertCircle } from 'lucide
 import { Shift } from '../types';
 import { saveShift } from '../services/masterService';
 import { formatMinutes } from '../services/attendanceService';
+import { ShiftManagementSkeleton } from './Skeletons';
 
 interface ShiftManagementProps {
   shifts: Shift[];
+  isLoading?: boolean;
+  loadError?: string | null;
   onRefresh: () => void;
 }
 
-export const ShiftManagement: React.FC<ShiftManagementProps> = ({ shifts, onRefresh }) => {
+export const ShiftManagement: React.FC<ShiftManagementProps> = ({
+  shifts,
+  isLoading = false,
+  loadError = null,
+  onRefresh,
+}) => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingShift, setEditingShift] = useState<Partial<Shift>>({
     id: '',
@@ -24,6 +32,8 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({ shifts, onRefr
     status: 'Active',
   });
   const [isSaving, setIsSaving] = useState(false);
+  const [togglingShiftId, setTogglingShiftId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const handleOpenAdd = () => {
     setEditingShift({
@@ -50,12 +60,13 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({ shifts, onRefr
     e.preventDefault();
     if (!editingShift.name || !editingShift.startTime || !editingShift.endTime) return;
     setIsSaving(true);
+    setActionError(null);
     try {
       await saveShift(editingShift as Shift);
       setIsModalOpen(false);
       onRefresh();
     } catch (err: any) {
-      alert(`Error saving shift: ${err.message}`);
+      setActionError(`Error saving shift: ${err.message}`);
     } finally {
       setIsSaving(false);
     }
@@ -63,16 +74,41 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({ shifts, onRefr
 
   const handleToggleStatus = async (shift: Shift) => {
     const nextStatus = shift.status === 'Active' ? 'Inactive' : 'Active';
+    setTogglingShiftId(shift.id);
+    setActionError(null);
     try {
       await saveShift({ ...shift, status: nextStatus });
       onRefresh();
     } catch (err: any) {
-      alert(`Error toggling shift: ${err.message}`);
+      setActionError(`Error toggling shift: ${err.message}`);
+    } finally {
+      setTogglingShiftId(null);
     }
   };
 
+  if (isLoading && shifts.length === 0 && !loadError) {
+    return <ShiftManagementSkeleton />;
+  }
+
+  const effectiveError = loadError || actionError;
+
   return (
     <div className="p-6 bg-slate-50 min-h-full flex flex-col gap-6">
+      {effectiveError && (
+        <div role="alert" className="bg-red-50 border border-red-200 text-red-800 rounded-xl px-4 py-3 text-xs flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+            <span>{effectiveError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={onRefresh}
+            className="bg-white hover:bg-red-100 text-red-700 border border-red-300 px-3 py-1 rounded font-semibold transition cursor-pointer"
+          >
+            Retry
+          </button>
+        </div>
+      )}
       <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-2xs flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h2 className="text-xl font-bold text-slate-800 tracking-tight flex items-center gap-2">
@@ -86,7 +122,7 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({ shifts, onRefr
 
         <button
           onClick={handleOpenAdd}
-          className="bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs px-4 py-2 rounded flex items-center gap-1.5 shadow-sm transition"
+          className="bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs px-4 py-2 rounded flex items-center gap-1.5 shadow-sm transition cursor-pointer"
         >
           <Plus className="w-4 h-4" />
           <span>Add Custom Shift</span>
@@ -94,6 +130,11 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({ shifts, onRefr
       </div>
 
       {/* Shifts Card Grid */}
+      {shifts.length === 0 ? (
+        <div className="bg-white rounded-xl border border-slate-200 p-8 text-center text-xs text-slate-500 shadow-2xs">
+          No shifts configured yet. Click &ldquo;Add Custom Shift&rdquo; or retry loading master configuration.
+        </div>
+      ) : (
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         {shifts.map(shift => (
           <div
@@ -156,12 +197,13 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({ shifts, onRefr
             <div className="flex items-center justify-between pt-3 border-t border-slate-100 text-xs">
               <button
                 onClick={() => handleToggleStatus(shift)}
-                className={`px-2.5 py-1 rounded text-xs font-bold inline-flex items-center gap-1.5 ${
+                disabled={togglingShiftId === shift.id}
+                className={`px-2.5 py-1 rounded text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50 ${
                   shift.status === 'Active' ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-700'
                 }`}
               >
                 {shift.status === 'Active' ? <CheckCircle className="w-3.5 h-3.5 text-emerald-600" /> : <XCircle className="w-3.5 h-3.5 text-slate-500" />}
-                <span>{shift.status}</span>
+                <span>{togglingShiftId === shift.id ? 'Updating...' : shift.status}</span>
               </button>
 
               <button
@@ -175,6 +217,7 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({ shifts, onRefr
           </div>
         ))}
       </div>
+      )}
 
       {/* EDIT / CREATE MODAL */}
       {isModalOpen && (

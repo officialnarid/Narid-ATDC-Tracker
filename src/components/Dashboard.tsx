@@ -50,6 +50,8 @@ import {
   UserPermissionRecordWithOverride,
   normalizeRoleId,
 } from '../services/permissionService';
+import { DashboardSkeleton } from './Skeletons';
+import { recordPerfMetric } from '../utils/perfMonitor';
 
 interface DashboardProps {
   employees: Employee[];
@@ -57,6 +59,8 @@ interface DashboardProps {
   floors: Floor[];
   sections: Section[];
   departments: Department[];
+  isLoadingMasterData?: boolean;
+  masterDataError?: string | null;
   onNavigateToScanner: () => void;
   onNavigateToReports: () => void;
   onRefreshData?: () => void;
@@ -74,6 +78,8 @@ export const Dashboard: React.FC<DashboardProps> = ({
   floors,
   sections,
   departments,
+  isLoadingMasterData = false,
+  masterDataError = null,
   onNavigateToScanner,
   onNavigateToReports,
   onRefreshData,
@@ -99,6 +105,10 @@ export const Dashboard: React.FC<DashboardProps> = ({
   const [attendanceRecords, setAttendanceRecords] = useState<AttendanceRecord[]>([]);
   const [rosterRecords, setRosterRecords] = useState<ShiftRoster[]>([]);
   const [loading, setLoading] = useState(true);
+  const [hasLoadedAttendance, setHasLoadedAttendance] = useState(false);
+  const [attendanceError, setAttendanceError] = useState<string | null>(null);
+  const [retryNonce, setRetryNonce] = useState(0);
+  const skeletonStartRef = React.useRef<number | null>(performance.now());
 
   // Drilldown modal state
   const [drilldownTitle, setDrilldownTitle] = useState<string | null>(null);
@@ -138,6 +148,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
   useEffect(() => {
     if (!auth.currentUser) return;
     setLoading(true);
+    setAttendanceError(null);
     let attQuery = query(
       collection(db, 'attendance'),
       where('shiftDate', '==', selectedDate)
@@ -153,14 +164,16 @@ export const Dashboard: React.FC<DashboardProps> = ({
     const unsubscribe = onSnapshot(attQuery, (snapshot) => {
       const records = snapshot.docs.map(d => d.data() as AttendanceRecord);
       setAttendanceRecords(records);
+      setHasLoadedAttendance(true);
       setLoading(false);
     }, (err) => {
       console.error('[Dashboard] Real-time attendance error:', err);
+      setAttendanceError(err?.message || 'Unable to synchronize attendance stream.');
       setLoading(false);
     });
 
     return () => unsubscribe();
-  }, [selectedDate, selectedShift]);
+  }, [selectedDate, selectedShift, retryNonce]);
 
   // 3. Fetch Roster records for selected date
   const loadRosterData = async () => {
@@ -185,6 +198,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
   // Handle manual refresh
   const handleManualRefresh = () => {
+    setRetryNonce((n) => n + 1);
     loadRosterData();
     if (onRefreshData) onRefreshData();
   };
@@ -599,8 +613,47 @@ export const Dashboard: React.FC<DashboardProps> = ({
     }
   };
 
+  const showInitialSkeleton =
+    (loading || isLoadingMasterData) &&
+    !hasLoadedAttendance &&
+    employees.length === 0 &&
+    attendanceRecords.length === 0 &&
+    !attendanceError &&
+    !masterDataError;
+
+  useEffect(() => {
+    if (!showInitialSkeleton && skeletonStartRef.current !== null) {
+      recordPerfMetric('skeleton_visible_ms', performance.now() - skeletonStartRef.current);
+      skeletonStartRef.current = null;
+    }
+  }, [showInitialSkeleton]);
+
+  if (showInitialSkeleton) {
+    return <DashboardSkeleton cardCount={permittedCardIds.length || 6} />;
+  }
+
+  const combinedError = attendanceError || masterDataError;
+
   return (
     <div className="p-4 sm:p-6 bg-slate-50 min-h-full flex flex-col gap-6 transition-all duration-200 ease-in-out w-full relative">
+      {combinedError && (
+        <div
+          role="alert"
+          className="bg-red-50 border border-red-200 text-red-800 rounded-xl px-4 py-3 text-xs flex flex-wrap items-center justify-between gap-3"
+        >
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+            <span>{combinedError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={handleManualRefresh}
+            className="bg-white hover:bg-red-100 text-red-700 border border-red-300 px-3 py-1 rounded font-semibold transition cursor-pointer"
+          >
+            Retry
+          </button>
+        </div>
+      )}
       {/* Floating Exit Full Screen Button in Top-Right Corner */}
       {isFullscreen && onExitFullscreen && (
         <div className="fixed top-3 right-4 z-50 animate-fadeIn flex items-center gap-2 drop-shadow-md">

@@ -40,8 +40,11 @@ import {
 } from './services/permissionService';
 
 import { lazyWithRetry, ModuleErrorBoundary } from './components/LazyModuleBoundary';
+import { ModuleSkeleton } from './components/Skeletons';
+import { MODULE_LOADERS, prefetchTabModule, scheduleIdleModulePrefetch } from './config/moduleRegistry';
+import { recordPerfMetric, startPerfTimer } from './utils/perfMonitor';
 
-// Secondary Modules (code-split via resilient lazyWithRetry for smaller initial JS bundle & automatic recovery)
+// Secondary Modules (code-split via resilient lazyWithRetry + moduleRegistry prefetching)
 const EmployeeMaster = lazyWithRetry(() => import('./components/EmployeeMaster'), m => m.EmployeeMaster, 'employees');
 const ExcelImport = lazyWithRetry(() => import('./components/ExcelImport'), m => m.ExcelImport, 'excel_import');
 const QrManagement = lazyWithRetry(() => import('./components/QrManagement'), m => m.QrManagement, 'qr_codes');
@@ -113,8 +116,11 @@ export default function App() {
   const [departments, setDepartments] = useState<Department[]>([]);
   const [shifts, setShifts] = useState<Shift[]>([]);
   const [isLoadingMasterData, setIsLoadingMasterData] = useState<boolean>(false);
+  const [masterDataError, setMasterDataError] = useState<string | null>(null);
   const [rolePermissions, setRolePermissions] = useState<Record<string, RolePermissionRecord>>({});
   const [currentUserPermOverride, setCurrentUserPermOverride] = useState<UserPermissionRecordWithOverride | null>(null);
+  const navTimerRef = useRef<(() => number) | null>(null);
+  const appBootTimerRef = useRef<(() => number) | null>(startPerfTimer());
 
   // Real-time synchronization of Role Permissions matrix (only when authenticated)
   useEffect(() => {
@@ -151,12 +157,12 @@ export default function App() {
     };
   }, []);
 
-  const employeeRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
   // Load all master collections (only when authenticated in Firebase Auth)
   const loadAllMasterData = useCallback(async (allowSeed: boolean = false) => {
     if (!auth.currentUser) return;
+    const stopTimer = startPerfTimer();
     setIsLoadingMasterData(true);
+    setMasterDataError(null);
     try {
       if (allowSeed) {
         await initializeMasterData();
@@ -175,37 +181,42 @@ export default function App() {
       setSections(secsData);
       setDepartments(deptsData);
       setShifts(sftsData);
-    } catch (err) {
+      recordPerfMetric('background_refresh_ms', stopTimer());
+    } catch (err: any) {
       console.error('Failed to load initial data:', err);
+      setMasterDataError(err?.message || 'Unable to load production master data.');
     } finally {
       setIsLoadingMasterData(false);
     }
   }, []);
 
-  // Silent debounced post-scan background refresh (avoids full master-data refetch & loading flicker during rapid punches)
-  const refreshEmployeesBackground = useCallback(() => {
-    if (!auth.currentUser) return;
-    if (employeeRefreshTimerRef.current) {
-      clearTimeout(employeeRefreshTimerRef.current);
-    }
-    employeeRefreshTimerRef.current = setTimeout(() => {
-      employeeRefreshTimerRef.current = null;
-      if (!auth.currentUser) return;
-      getEmployees()
-        .then((empsData) => {
-          setEmployees(empsData);
-        })
-        .catch(() => {});
-    }, 800);
-  }, []);
-
+  // Idle module prefetching for high-frequency routes after authentication
   useEffect(() => {
-    return () => {
-      if (employeeRefreshTimerRef.current) {
-        clearTimeout(employeeRefreshTimerRef.current);
+    if (!currentUser || !currentUserRole) return;
+    const allowedTabs = VALID_TABS.filter((tab) => isModuleAllowedForUser(currentUserRole, tab));
+    return scheduleIdleModulePrefetch(allowedTabs);
+  }, [currentUser, currentUserRole]);
+
+  // Record initial app load latency once auth + first render settle
+  useEffect(() => {
+    if (!isAuthChecking && appBootTimerRef.current) {
+      recordPerfMetric('app_initial_load_ms', appBootTimerRef.current());
+      appBootTimerRef.current = null;
+    }
+  }, [isAuthChecking]);
+
+  // Record navigation time across module switches
+  useEffect(() => {
+    if (navTimerRef.current) {
+      const elapsed = navTimerRef.current();
+      navTimerRef.current = null;
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(() => recordPerfMetric('navigation_ms', elapsed));
+      } else {
+        recordPerfMetric('navigation_ms', elapsed);
       }
-    };
-  }, []);
+    }
+  }, [currentTab]);
 
   // Initialize and observe Authentication Session
   useEffect(() => {
@@ -350,6 +361,10 @@ export default function App() {
     if (!isModuleAllowedForUser(currentUserRole, tab)) {
       console.warn(`Access denied for role ${currentUserRole.role} to module ${tab}`);
       return;
+    }
+    if (tab !== currentTab) {
+      navTimerRef.current = startPerfTimer();
+      prefetchTabModule(tab);
     }
     setCurrentTab(tab);
     setIsMobileNavOpen(false);
@@ -505,6 +520,7 @@ export default function App() {
         <Sidebar 
           currentTab={currentTab} 
           onSelectTab={handleSelectTab} 
+          onPrefetchTab={prefetchTabModule}
           activeEmployeeCount={activeEmployeeCount}
           currentUserRole={currentUserRole}
           onLogout={() => handleLogout('logout')}
@@ -529,14 +545,7 @@ export default function App() {
 
         {/* Active Page View Body */}
         <main className="flex-1 overflow-y-auto transition-all duration-200 ease-in-out">
-          {isLoadingMasterData && employees.length === 0 ? (
-            <div className="h-full flex flex-col items-center justify-center text-slate-500 gap-3">
-              <div className="w-8 h-8 border-3 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
-              <p className="text-xs font-mono font-medium tracking-wide">
-                SYNCHRONIZING PRODUCTION MASTER DATA...
-              </p>
-            </div>
-          ) : !isModuleAllowedForUser(currentUserRole, currentTab) ? (
+          {!isModuleAllowedForUser(currentUserRole, currentTab) ? (
             <UnauthorizedAccess 
               currentTab={currentTab} 
               currentUserRole={currentUserRole} 
@@ -544,14 +553,7 @@ export default function App() {
             />
           ) : (
             <ModuleErrorBoundary resetKey={currentTab}>
-              <Suspense
-                fallback={
-                  <div className="h-full flex flex-col items-center justify-center text-slate-500 gap-2 py-12">
-                    <div className="w-6 h-6 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
-                    <span className="text-xs font-mono tracking-wide">LOADING MODULE...</span>
-                  </div>
-                }
-              >
+              <Suspense fallback={<ModuleSkeleton tab={currentTab} />}>
               {currentTab === 'dashboard' && (
                 <Dashboard
                   employees={employees}
@@ -559,6 +561,8 @@ export default function App() {
                   floors={floors}
                   sections={sections}
                   departments={departments}
+                  isLoadingMasterData={isLoadingMasterData}
+                  masterDataError={masterDataError}
                   onNavigateToScanner={() => handleSelectTab('scanner')}
                   onNavigateToReports={() => handleSelectTab('reports')}
                   onRefreshData={() => loadAllMasterData(false)}
@@ -573,7 +577,6 @@ export default function App() {
 
               {currentTab === 'scanner' && isModuleAllowedForUser(currentUserRole, 'scanner') && (
                 <Scanner
-                  onAttendanceUpdated={refreshEmployeesBackground}
                   isFullscreen={isFullscreenScanner}
                   onToggleFullscreen={() => handleToggleFullscreen('scanner')}
                   onExitFullscreen={handleExitFullscreen}
@@ -589,7 +592,9 @@ export default function App() {
                   floors={floors}
                   sections={sections}
                   departments={departments}
-                  onRefresh={loadAllMasterData}
+                  isLoading={isLoadingMasterData}
+                  loadError={masterDataError}
+                  onRefresh={() => loadAllMasterData(false)}
                   currentUserRole={currentUserRole}
                   rolePermissions={rolePermissions}
                 />
@@ -600,7 +605,7 @@ export default function App() {
                   floors={floors}
                   sections={sections}
                   departments={departments}
-                  onImportComplete={loadAllMasterData}
+                  onImportComplete={() => loadAllMasterData(false)}
                 />
               )}
 
@@ -609,14 +614,16 @@ export default function App() {
                   employees={employees}
                   floors={floors}
                   departments={departments}
-                  onRefresh={loadAllMasterData}
+                  isLoading={isLoadingMasterData}
+                  loadError={masterDataError}
+                  onRefresh={() => loadAllMasterData(false)}
                 />
               )}
 
               {currentTab === 'floors' && isModuleAllowedForUser(currentUserRole, 'floors') && (
                 <FloorManagement
                   floors={floors}
-                  onRefresh={loadAllMasterData}
+                  onRefresh={() => loadAllMasterData(false)}
                 />
               )}
 
@@ -624,21 +631,23 @@ export default function App() {
                 <SectionManagement
                   sections={sections}
                   floors={floors}
-                  onRefresh={loadAllMasterData}
+                  onRefresh={() => loadAllMasterData(false)}
                 />
               )}
 
               {currentTab === 'departments' && isModuleAllowedForUser(currentUserRole, 'departments') && (
                 <DepartmentManagement
                   departments={departments}
-                  onRefresh={loadAllMasterData}
+                  onRefresh={() => loadAllMasterData(false)}
                 />
               )}
 
               {currentTab === 'shifts' && isModuleAllowedForUser(currentUserRole, 'shifts') && (
                 <ShiftManagement
                   shifts={shifts}
-                  onRefresh={loadAllMasterData}
+                  isLoading={isLoadingMasterData}
+                  loadError={masterDataError}
+                  onRefresh={() => loadAllMasterData(false)}
                 />
               )}
 
@@ -664,7 +673,7 @@ export default function App() {
               {currentTab === 'user_rights' && isModuleAllowedForUser(currentUserRole, 'user_rights') && (
                 <UserRights 
                   currentUserRole={currentUserRole}
-                  onRoleProfileUpdated={(updatedProfile) => {
+                  onRoleProfileUpdated={(updatedProfile: UserRoleRecord) => {
                     if (updatedProfile.id === currentUserRole.id) {
                       setCurrentUserRole(updatedProfile);
                     }

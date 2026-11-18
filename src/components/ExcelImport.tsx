@@ -12,11 +12,15 @@ import {
   Info
 } from 'lucide-react';
 import { Floor, Section, Department } from '../types';
-import { 
-  downloadEmployeeTemplate, 
-  parseAndValidateEmployeeExcel, 
+import {
+  downloadEmployeeTemplate,
+  parseAndValidateEmployeeExcel,
   commitImportedEmployees,
-  ImportValidationResult 
+  EmployeeImportCommitError,
+  EmployeeImportCommitResult,
+  ImportFailureCategory,
+  ImportFailedRow,
+  ImportValidationResult,
 } from '../services/exportService';
 
 interface ExcelImportProps {
@@ -24,6 +28,35 @@ interface ExcelImportProps {
   sections: Section[];
   departments: Department[];
   onImportComplete: () => void;
+}
+
+interface ImportCommitErrorState {
+  category: ImportFailureCategory;
+  message: string;
+  partialCommit: boolean;
+  savedCount: number;
+  insertedCount: number;
+  updatedCount: number;
+  skippedCount: number;
+  failedCount: number;
+  failedRows: ImportFailedRow[];
+}
+
+function getFailureCategoryLabel(category: ImportFailureCategory): string {
+  switch (category) {
+    case 'AUTHENTICATION':
+      return 'Authentication Error';
+    case 'AUTHORIZATION':
+      return 'Role / Permission Denied';
+    case 'DATABASE_AUTHORIZATION':
+      return 'Database Authorization Error';
+    case 'VALIDATION':
+      return 'Validation Error';
+    case 'NETWORK_OR_TIMEOUT':
+      return 'Network / Timeout Error';
+    default:
+      return 'Database Write Error';
+  }
 }
 
 export const ExcelImport: React.FC<ExcelImportProps> = ({
@@ -36,7 +69,9 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
   const [isValidating, setIsValidating] = useState(false);
   const [isCommitting, setIsCommitting] = useState(false);
   const [validationResult, setValidationResult] = useState<ImportValidationResult | null>(null);
-  const [commitSuccess, setCommitSuccess] = useState<string | null>(null);
+  const [validationError, setValidationError] = useState<string | null>(null);
+  const [commitSuccess, setCommitSuccess] = useState<EmployeeImportCommitResult | null>(null);
+  const [commitError, setCommitError] = useState<ImportCommitErrorState | null>(null);
   const [activeTab, setActiveTab] = useState<'valid' | 'invalid'>('valid');
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -50,6 +85,8 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
     if (!selected) return;
     setFile(selected);
     setCommitSuccess(null);
+    setCommitError(null);
+    setValidationError(null);
     setValidationResult(null);
 
     setIsValidating(true);
@@ -67,31 +104,96 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
         setActiveTab('valid');
       }
     } catch (err: any) {
-      alert(`Error reading file: ${err.message}`);
+      setValidationError(err?.message || 'Unable to parse the selected spreadsheet.');
       setFile(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
     } finally {
       setIsValidating(false);
     }
   };
 
-  const handleCommit = async () => {
-    if (!validationResult || !file) return;
+  const runCommitRows = async (
+    rowsToCommit: ImportValidationResult['validRows'],
+    sourceFileName: string,
+    priorPartial?: ImportCommitErrorState | null
+  ) => {
     setIsCommitting(true);
+    setCommitError(null);
+    setCommitSuccess(null);
     try {
-      const { savedCount } = await commitImportedEmployees(
-        validationResult.validRows,
-        file.name
-      );
-      setCommitSuccess(`Successfully imported and updated ${savedCount} employee records in Firestore database!`);
+      const res = await commitImportedEmployees(rowsToCommit, sourceFileName);
+      const mergedResult: EmployeeImportCommitResult = priorPartial
+        ? {
+            ...res,
+            savedCount: priorPartial.savedCount + res.savedCount,
+            insertedCount: priorPartial.insertedCount + res.insertedCount,
+            updatedCount: priorPartial.updatedCount + res.updatedCount,
+            skippedCount: priorPartial.skippedCount + res.skippedCount,
+          }
+        : res;
+
+      setCommitSuccess(mergedResult);
       setValidationResult(null);
       setFile(null);
       if (fileInputRef.current) fileInputRef.current.value = '';
       onImportComplete();
     } catch (err: any) {
-      alert(`Commit failed: ${err.message}`);
+      if (err instanceof EmployeeImportCommitError) {
+        const totalSaved = (priorPartial?.savedCount || 0) + err.savedCount;
+        const totalInserted = (priorPartial?.insertedCount || 0) + err.insertedCount;
+        const totalUpdated = (priorPartial?.updatedCount || 0) + err.updatedCount;
+        const totalSkipped = (priorPartial?.skippedCount || 0) + err.skippedCount;
+        const hasPartial = totalSaved > 0;
+
+        setCommitError({
+          category: err.category,
+          message: err.message,
+          partialCommit: hasPartial,
+          savedCount: totalSaved,
+          insertedCount: totalInserted,
+          updatedCount: totalUpdated,
+          skippedCount: totalSkipped,
+          failedCount: err.failedCount,
+          failedRows: err.failedRows,
+        });
+        if (err.savedCount > 0) {
+          onImportComplete();
+        }
+      } else {
+        setCommitError({
+          category: 'DATABASE_WRITE_ERROR',
+          message: err?.message || 'Unexpected error during database commit.',
+          partialCommit: Boolean(priorPartial && priorPartial.savedCount > 0),
+          savedCount: priorPartial?.savedCount || 0,
+          insertedCount: priorPartial?.insertedCount || 0,
+          updatedCount: priorPartial?.updatedCount || 0,
+          skippedCount: priorPartial?.skippedCount || 0,
+          failedCount: rowsToCommit.filter((r) => r.actionType !== 'UNCHANGED').length,
+          failedRows: [],
+        });
+      }
     } finally {
       setIsCommitting(false);
     }
+  };
+
+  const handleCommit = async () => {
+    if (!validationResult || !file || isCommitting) return;
+    await runCommitRows(validationResult.validRows, file.name, null);
+  };
+
+  const handleRetryFailedOnly = async () => {
+    if (!validationResult || !file || !commitError || isCommitting) return;
+    const failedIdSet = new Set(commitError.failedRows.map((r) => r.employeeId.toUpperCase()));
+    const failedSubset =
+      failedIdSet.size > 0
+        ? validationResult.validRows.filter((row) =>
+            failedIdSet.has(row.data.employeeId.toUpperCase())
+          )
+        : validationResult.validRows;
+
+    if (failedSubset.length === 0) return;
+    await runCommitRows(failedSubset, file.name, commitError);
   };
 
   return (
@@ -166,11 +268,100 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
         )}
       </div>
 
+      {/* File Validation Error Banner */}
+      {validationError && (
+        <div
+          role="alert"
+          className="bg-red-50 border border-red-300 rounded-xl p-4 text-red-900 text-xs flex items-start gap-3"
+        >
+          <XCircle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
+          <div className="space-y-1">
+            <div className="font-bold text-sm text-red-900">Spreadsheet Validation Failed</div>
+            <p className="text-red-800">{validationError}</p>
+          </div>
+        </div>
+      )}
+
+      {/* Commit Error / Partial Failure Banner */}
+      {commitError && (
+        <div
+          role="alert"
+          className="bg-red-50 border border-red-300 rounded-xl p-4 text-red-900 text-xs flex flex-col gap-3"
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-bold text-sm text-red-900">Import Commit Failed</span>
+                  <span className="px-2 py-0.5 rounded bg-red-100 border border-red-300 text-red-800 font-semibold text-[11px]">
+                    {getFailureCategoryLabel(commitError.category)}
+                  </span>
+                </div>
+                <p className="text-red-800">{commitError.message}</p>
+                {commitError.partialCommit ? (
+                  <p className="text-amber-900 font-semibold">
+                    Partial commit detected: {commitError.savedCount} saved ({commitError.insertedCount} new, {commitError.updatedCount} updated, {commitError.skippedCount} skipped), {commitError.failedCount} failed.
+                  </p>
+                ) : (
+                  <p className="text-red-700 font-medium">
+                    No database changes were applied (0 records written).
+                  </p>
+                )}
+              </div>
+            </div>
+
+            {commitError.partialCommit && commitError.failedRows.length > 0 && validationResult && (
+              <button
+                type="button"
+                onClick={handleRetryFailedOnly}
+                disabled={isCommitting}
+                className="bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold px-3.5 py-2 rounded-lg flex items-center gap-1.5 shrink-0 transition disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isCommitting ? 'animate-spin' : ''}`} />
+                <span>Retry Failed Only ({commitError.failedRows.length})</span>
+              </button>
+            )}
+          </div>
+
+          {commitError.failedRows.length > 0 && (
+            <div className="bg-white/80 border border-red-200 rounded-lg p-2.5 max-h-36 overflow-y-auto">
+              <div className="text-[11px] font-semibold text-red-900 mb-1">
+                Uncommitted Employee Records ({commitError.failedRows.length}):
+              </div>
+              <ul className="space-y-0.5 text-[11px] text-red-800 font-mono">
+                {commitError.failedRows.slice(0, 25).map((fr, idx) => (
+                  <li key={`${fr.employeeId}-${idx}`}>
+                    {fr.rowNumber ? `Row ${fr.rowNumber} • ` : ''}
+                    {fr.employeeId}: {fr.error}
+                  </li>
+                ))}
+                {commitError.failedRows.length > 25 && (
+                  <li className="text-red-600 font-sans">
+                    ...and {commitError.failedRows.length - 25} more failed record(s).
+                  </li>
+                )}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Commit Success Alert */}
       {commitSuccess && (
         <div className="bg-emerald-50 border border-emerald-300 rounded-xl p-4 text-emerald-900 text-xs flex items-center gap-3">
           <CheckCircle2 className="w-6 h-6 text-emerald-600 shrink-0" />
-          <div className="font-semibold text-sm">{commitSuccess}</div>
+          <div>
+            <div className="font-semibold text-sm">
+              Successfully committed {commitSuccess.savedCount} employee record{commitSuccess.savedCount === 1 ? '' : 's'} to the database!
+            </div>
+            <div className="text-[11px] text-emerald-800 mt-0.5">
+              New Inserted: <strong>{commitSuccess.insertedCount}</strong> • Updated:{' '}
+              <strong>{commitSuccess.updatedCount}</strong> • Unchanged Skipped:{' '}
+              <strong>{commitSuccess.skippedCount}</strong> • Failed:{' '}
+              <strong>{commitSuccess.failedCount}</strong>
+            </div>
+          </div>
         </div>
       )}
 

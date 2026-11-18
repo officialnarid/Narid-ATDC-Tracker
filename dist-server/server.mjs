@@ -3,8 +3,8 @@ import express from "express";
 import cors from "cors";
 import fs2 from "fs";
 import path2 from "path";
-import crypto4 from "crypto";
-import { z as z3 } from "zod";
+import crypto5 from "crypto";
+import { z as z4 } from "zod";
 
 // serverFirebaseAdmin.ts
 import fs from "fs";
@@ -282,6 +282,7 @@ function getStore(db) {
     store = {
       roleDefs: /* @__PURE__ */ new Map(),
       rolePerms: /* @__PURE__ */ new Map(),
+      uidRolePointers: /* @__PURE__ */ new Map(),
       inFlightRequests: /* @__PURE__ */ new Map(),
       recentIdempotentResponses: /* @__PURE__ */ new Map()
     };
@@ -291,6 +292,44 @@ function getStore(db) {
 }
 var CONFIG_TTL_MS = 3e4;
 var ROLE_TTL_MS = 15e3;
+var UID_POINTER_TTL_MS = 6e4;
+function getCachedUidRolePointer(db, uid) {
+  const cleanUid = String(uid || "").trim();
+  if (!cleanUid) return null;
+  const store = getStore(db);
+  const entry = store.uidRolePointers.get(cleanUid);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    store.uidRolePointers.delete(cleanUid);
+    return null;
+  }
+  return { roleDocId: entry.roleDocId, lastRole: entry.lastRole };
+}
+function setCachedUidRolePointer(db, uid, roleDocId, lastRole) {
+  const cleanUid = String(uid || "").trim();
+  const cleanDocId = String(roleDocId || "").trim();
+  if (!cleanUid || !cleanDocId) return;
+  const store = getStore(db);
+  if (store.uidRolePointers.size > 500) {
+    const now = Date.now();
+    for (const [k, v] of store.uidRolePointers.entries()) {
+      if (v.expiresAt <= now) store.uidRolePointers.delete(k);
+    }
+  }
+  store.uidRolePointers.set(cleanUid, {
+    roleDocId: cleanDocId,
+    lastRole: String(lastRole || "").trim().toLowerCase(),
+    expiresAt: Date.now() + UID_POINTER_TTL_MS
+  });
+}
+function invalidateUidRolePointer(db, uid) {
+  const store = getStore(db);
+  if (uid) {
+    store.uidRolePointers.delete(String(uid).trim());
+  } else {
+    store.uidRolePointers.clear();
+  }
+}
 async function getCachedShifts(db, defaultShifts) {
   const store = getStore(db);
   const now = Date.now();
@@ -385,6 +424,7 @@ function invalidateRoleCaches(db, roleId) {
   } else {
     store.roleDefs.clear();
     store.rolePerms.clear();
+    store.uidRolePointers.clear();
   }
 }
 async function runWithOptionalClientRequestDedup(db, dedupKey, task) {
@@ -487,7 +527,7 @@ async function removeUserUidIndex(db, uid) {
   } catch {
   }
 }
-async function verifyCallerIdentity(req, db, auth, _projectId) {
+async function verifyCallerIdentity(req, db, auth, _projectId, options) {
   const authHeader = req.headers.authorization || "";
   if (!authHeader.startsWith("Bearer ")) {
     return null;
@@ -519,17 +559,55 @@ async function verifyCallerIdentity(req, db, auth, _projectId) {
   }
   const verifiedUid = decoded.uid.trim();
   const decodedEmail = String(decoded.email || "").toLowerCase();
+  const shouldPrefetchUserPerm = Boolean(options?.prefetchUserPermission);
   let matchedDoc = null;
-  const idxSnap = await db.collection("user_uid_index").doc(verifiedUid).get();
-  if (idxSnap.exists) {
-    const idxData2 = idxSnap.data() || {};
-    if (idxData2.roleDocId) {
-      const roleDocSnap = await db.collection("user_roles").doc(String(idxData2.roleDocId)).get();
-      if (roleDocSnap.exists) {
-        const d = roleDocSnap.data() || {};
-        const linked = Array.isArray(d.linkedAuthUids) ? d.linkedAuthUids : [];
-        if (d.authUid === verifiedUid || d.uid === verifiedUid || roleDocSnap.id === verifiedUid || linked.includes(verifiedUid)) {
-          matchedDoc = { id: roleDocSnap.id, data: d };
+  let prefetchedUserPermSnap = void 0;
+  let idxSnap = null;
+  let usedPointerHit = false;
+  const doesDocOwnUid = (docId, d) => {
+    const linked = Array.isArray(d.linkedAuthUids) ? d.linkedAuthUids : [];
+    return d.authUid === verifiedUid || d.uid === verifiedUid || docId === verifiedUid || linked.includes(verifiedUid);
+  };
+  const pointer = getCachedUidRolePointer(db, verifiedUid);
+  if (pointer) {
+    const prefetchPermNow = shouldPrefetchUserPerm && pointer.lastRole !== "super_admin";
+    const [roleDocSnap, userPermSnap] = await Promise.all([
+      db.collection("user_roles").doc(pointer.roleDocId).get(),
+      prefetchPermNow ? db.collection("user_permissions").doc(pointer.roleDocId).get() : Promise.resolve(null)
+    ]);
+    if (roleDocSnap.exists) {
+      const d = roleDocSnap.data() || {};
+      if (doesDocOwnUid(roleDocSnap.id, d)) {
+        matchedDoc = { id: roleDocSnap.id, data: d };
+        if (prefetchPermNow && userPermSnap) {
+          prefetchedUserPermSnap = userPermSnap;
+        }
+        usedPointerHit = true;
+      }
+    }
+    if (!matchedDoc) {
+      invalidateUidRolePointer(db, verifiedUid);
+    }
+  }
+  if (!matchedDoc) {
+    idxSnap = await db.collection("user_uid_index").doc(verifiedUid).get();
+    if (idxSnap.exists) {
+      const idxData = idxSnap.data() || {};
+      if (idxData.roleDocId) {
+        const targetDocId = String(idxData.roleDocId);
+        const prefetchPermNow = shouldPrefetchUserPerm && String(idxData.role || "").toLowerCase() !== "super_admin";
+        const [roleDocSnap, userPermSnap] = await Promise.all([
+          db.collection("user_roles").doc(targetDocId).get(),
+          prefetchPermNow ? db.collection("user_permissions").doc(targetDocId).get() : Promise.resolve(null)
+        ]);
+        if (roleDocSnap.exists) {
+          const d = roleDocSnap.data() || {};
+          if (doesDocOwnUid(roleDocSnap.id, d)) {
+            matchedDoc = { id: roleDocSnap.id, data: d };
+            if (prefetchPermNow && userPermSnap) {
+              prefetchedUserPermSnap = userPermSnap;
+            }
+          }
         }
       }
     }
@@ -588,19 +666,22 @@ async function verifyCallerIdentity(req, db, auth, _projectId) {
   const resolvedLoginId = String(
     matchedDoc.data.loginId || matchedDoc.id.replace(/^role_/, "")
   ).toLowerCase();
-  const targetStatus = String(matchedDoc.data.status || "Active");
-  const targetLockStatus = String(matchedDoc.data.lockStatus || "ACTIVE");
-  const idxData = idxSnap.exists ? idxSnap.data() || {} : null;
-  if (!idxData || idxData.roleDocId !== matchedDoc.id || idxData.role !== normalizedRole || idxData.status !== targetStatus || idxData.lockStatus !== targetLockStatus || idxData.loginId !== resolvedLoginId) {
-    await syncUserUidIndex(db, {
-      uid: verifiedUid,
-      roleDocId: matchedDoc.id,
-      role: normalizedRole,
-      status: targetStatus,
-      lockStatus: targetLockStatus,
-      loginId: resolvedLoginId
-    });
+  if (idxSnap !== null) {
+    const targetStatus = String(matchedDoc.data.status || "Active");
+    const targetLockStatus = String(matchedDoc.data.lockStatus || "ACTIVE");
+    const idxData = idxSnap.exists ? idxSnap.data() || {} : null;
+    if (!idxData || idxData.roleDocId !== matchedDoc.id || idxData.role !== normalizedRole || idxData.status !== targetStatus || idxData.lockStatus !== targetLockStatus || idxData.loginId !== resolvedLoginId) {
+      await syncUserUidIndex(db, {
+        uid: verifiedUid,
+        roleDocId: matchedDoc.id,
+        role: normalizedRole,
+        status: targetStatus,
+        lockStatus: targetLockStatus,
+        loginId: resolvedLoginId
+      });
+    }
   }
+  setCachedUidRolePointer(db, verifiedUid, matchedDoc.id, normalizedRole);
   return {
     uid: verifiedUid,
     email: decodedEmail || String(matchedDoc.data.email || ""),
@@ -608,7 +689,9 @@ async function verifyCallerIdentity(req, db, auth, _projectId) {
     role: normalizedRole,
     profileDocId: matchedDoc.id,
     authTime,
-    modulesAllowed: Array.isArray(matchedDoc.data.modulesAllowed) ? matchedDoc.data.modulesAllowed : void 0
+    modulesAllowed: Array.isArray(matchedDoc.data.modulesAllowed) ? matchedDoc.data.modulesAllowed : [],
+    prefetchedUserPermSnap: normalizedRole !== "super_admin" && prefetchedUserPermSnap !== void 0 ? prefetchedUserPermSnap : void 0,
+    cacheHitUidRoute: usedPointerHit
   };
 }
 function extractTrustedClientIp(req) {
@@ -4081,7 +4164,7 @@ async function resolveCallerAttendancePermissions(db, caller) {
   }
   try {
     const [userPermSnap, rolePermSnap] = await Promise.all([
-      db.collection("user_permissions").doc(caller.profileDocId).get(),
+      caller.prefetchedUserPermSnap ? Promise.resolve(caller.prefetchedUserPermSnap) : db.collection("user_permissions").doc(caller.profileDocId).get(),
       getCachedRolePermissionsDoc(db, caller.role)
     ]);
     const userPermData = userPermSnap.exists ? userPermSnap.data() : void 0;
@@ -4165,7 +4248,8 @@ function registerAttendanceRoutes(app, deps) {
         req,
         res,
         "*",
-        "Attendance Scan Processing"
+        "Attendance Scan Processing",
+        { prefetchUserPermission: true }
       );
       if (!caller) return;
       const authDoneMs = performance.now();
@@ -4185,7 +4269,8 @@ function registerAttendanceRoutes(app, deps) {
           targetId: "/api/attendance/scan",
           actionSource: "ATTENDANCE_PERMISSION_GUARD",
           description: `User "${caller.loginId}" (${caller.role}) blocked from /api/attendance/scan due to missing attendance.qr.scan permission.`,
-          success: false
+          success: false,
+          captureGeo: false
         });
         return res.status(403).json({
           success: false,
@@ -4216,7 +4301,10 @@ function registerAttendanceRoutes(app, deps) {
       }
       const kolkata = getKolkataTimeParts(now);
       const timeDisplay = kolkata.timeWithSeconds;
+      const qrParseStartMs = performance.now();
       const { employeeId, token, format } = parseQrPayload(rawPayload);
+      const qrParseDoneMs = performance.now();
+      const qrParseMs = roundMs(qrParseDoneMs - qrParseStartMs);
       if (format === "INVALID" || !employeeId) {
         await writePunchLog({
           employeeId: "UNKNOWN",
@@ -4274,6 +4362,7 @@ function registerAttendanceRoutes(app, deps) {
               }
             };
           }
+          const tokenValStartMs = performance.now();
           const employee = empSnap.data();
           if (employee.employeeStatus !== "Active") {
             await writePunchLog({
@@ -4326,6 +4415,7 @@ function registerAttendanceRoutes(app, deps) {
               }
             };
           }
+          const tokenValDoneMs = performance.now();
           const qrVerificationMode = token ? "TOKEN_VERIFIED" : "UNTOKENIZED_EMPLOYEE";
           const txStartMs = performance.now();
           const punchRes = await executePunchForVerifiedEmployee({
@@ -4343,14 +4433,20 @@ function registerAttendanceRoutes(app, deps) {
             candidateSnap
           });
           const txDoneMs = performance.now();
+          const lookupDuration = lookupDoneMs - lookupStartMs;
+          const txDuration = txDoneMs - txStartMs;
           const perf = {
+            qrParseMs,
             authMs: roundMs(authDoneMs - reqStartMs),
             permissionMs: roundMs(permDoneMs - authDoneMs),
-            lookupAndQueryMs: roundMs(lookupDoneMs - lookupStartMs),
-            txMs: roundMs(txDoneMs - txStartMs),
+            lookupAndQueryMs: roundMs(lookupDuration),
+            tokenValidationMs: roundMs(tokenValDoneMs - tokenValStartMs),
+            txMs: roundMs(txDuration),
+            firestoreOpMs: roundMs(lookupDuration + txDuration),
             totalServerMs: roundMs(txDoneMs - reqStartMs),
             cacheHitRolePerms: perms.cacheHitRolePerms,
-            cacheHitConfig: shiftsRes.cacheHit && settingsRes.cacheHit
+            cacheHitConfig: shiftsRes.cacheHit && settingsRes.cacheHit,
+            cacheHitUidRoute: Boolean(caller.cacheHitUidRoute)
           };
           emitNonSensitivePerfLog("attendance.scan", {
             status: punchRes.httpStatus,
@@ -4380,7 +4476,8 @@ function registerAttendanceRoutes(app, deps) {
         req,
         res,
         "*",
-        "Manual Employee ID Punch"
+        "Manual Employee ID Punch",
+        { prefetchUserPermission: true }
       );
       if (!caller) return;
       const authDoneMs = performance.now();
@@ -4400,7 +4497,8 @@ function registerAttendanceRoutes(app, deps) {
           targetId: "/api/attendance/manual-punch",
           actionSource: "ATTENDANCE_PERMISSION_GUARD",
           description: `User "${caller.loginId}" (${caller.role}) blocked from /api/attendance/manual-punch due to missing attendance.manual.entry permission.`,
-          success: false
+          success: false,
+          captureGeo: false
         });
         return res.status(403).json({
           success: false,
@@ -4531,15 +4629,19 @@ function registerAttendanceRoutes(app, deps) {
             });
             auditDoneMs = performance.now();
           }
+          const lookupDuration = lookupDoneMs - lookupStartMs;
+          const txDuration = txDoneMs - txStartMs;
           const perf = {
             authMs: roundMs(authDoneMs - reqStartMs),
             permissionMs: roundMs(permDoneMs - authDoneMs),
-            lookupAndQueryMs: roundMs(lookupDoneMs - lookupStartMs),
-            txMs: roundMs(txDoneMs - txStartMs),
+            lookupAndQueryMs: roundMs(lookupDuration),
+            txMs: roundMs(txDuration),
+            firestoreOpMs: roundMs(lookupDuration + txDuration),
             auditMs: roundMs(auditDoneMs - txDoneMs),
             totalServerMs: roundMs(auditDoneMs - reqStartMs),
             cacheHitRolePerms: perms.cacheHitRolePerms,
-            cacheHitConfig: shiftsRes.cacheHit && settingsRes.cacheHit
+            cacheHitConfig: shiftsRes.cacheHit && settingsRes.cacheHit,
+            cacheHitUidRoute: Boolean(caller.cacheHitUidRoute)
           };
           emitNonSensitivePerfLog("attendance.manual_punch", {
             status: result.httpStatus,
@@ -5442,6 +5544,387 @@ function registerAttendanceRoutes(app, deps) {
   });
 }
 
+// serverEmployees.ts
+import crypto4 from "crypto";
+import { z as z3 } from "zod";
+var EMPLOYEE_ID_PATTERN2 = /^[A-Za-z0-9_.\-]+$/;
+var EMPLOYEE_BULK_BATCH_SIZE = 400;
+var BulkImportRowSchema = z3.object({
+  employeeId: z3.string().trim().min(1, "Employee ID is required.").max(128, "Employee ID must be 128 characters or fewer.").regex(
+    EMPLOYEE_ID_PATTERN2,
+    "Employee ID may only contain letters, numbers, underscores (_), hyphens (-), and periods (.)."
+  ),
+  employeeName: z3.string().trim().min(1, "Employee Name is required.").max(200, "Employee Name must be 200 characters or fewer."),
+  employeeType: z3.enum(["Permanent", "Staff", "Offroll"]),
+  section: z3.string().trim().min(1, "Section is required.").max(100),
+  department: z3.string().trim().min(1, "Department is required.").max(100),
+  floor: z3.string().trim().min(1, "Production Line is required.").max(100),
+  designation: z3.string().trim().min(1).max(120).default("Operator"),
+  employeeStatus: z3.enum(["Active", "Inactive"]),
+  rowNumber: z3.number().int().positive().optional()
+});
+var BulkImportRequestSchema = z3.object({
+  fileName: z3.string().trim().min(1, "File name is required.").max(255),
+  rows: z3.array(BulkImportRowSchema).min(1, "At least one employee row is required for import.").max(2e3, "A single import request supports up to 2,000 employee rows.")
+});
+function generateServerQrToken(employeeId) {
+  const rand = crypto4.randomBytes(4).toString("hex").toUpperCase();
+  const ts = Date.now().toString(36).toUpperCase();
+  return `QR_${employeeId}_${ts}_${rand}`;
+}
+var ADMIN_EXCEL_DEFAULTS = {
+  excel_import: { view: true, add: true, edit: true },
+  employees: { view: true, add: true, edit: true }
+};
+function evalModuleAction(caller, userPermData, rolePermData, moduleKey, action) {
+  if (caller.role === "super_admin") return true;
+  if (userPermData && userPermData.isCustomOverride !== false) {
+    const mod = userPermData.permissions?.[moduleKey];
+    if (mod && typeof mod[action] === "boolean") {
+      return mod[action] === true && (action === "view" || mod.view !== false);
+    }
+  }
+  if (rolePermData) {
+    const mod = rolePermData.modulePermissions?.[moduleKey];
+    if (mod && typeof mod[action] === "boolean") {
+      return mod[action] === true && (action === "view" || mod.view !== false);
+    }
+  }
+  if (caller.role === "admin") {
+    return Boolean(ADMIN_EXCEL_DEFAULTS[moduleKey]?.[action]);
+  }
+  return false;
+}
+async function resolveCallerEmployeeImportPermissions(db, caller) {
+  if (caller.role === "super_admin") {
+    return { canAdd: true, canEdit: true };
+  }
+  try {
+    const [userPermSnap, rolePermSnap] = await Promise.all([
+      caller.prefetchedUserPermSnap ? Promise.resolve(caller.prefetchedUserPermSnap) : db.collection("user_permissions").doc(caller.profileDocId).get(),
+      getCachedRolePermissionsDoc(db, caller.role)
+    ]);
+    const userPermData = userPermSnap.exists ? userPermSnap.data() : void 0;
+    const rolePermData = rolePermSnap.exists ? rolePermSnap.data : void 0;
+    const canImportView = evalModuleAction(caller, userPermData, rolePermData, "excel_import", "view");
+    const canImportAdd = evalModuleAction(caller, userPermData, rolePermData, "excel_import", "add");
+    const canImportEdit = evalModuleAction(caller, userPermData, rolePermData, "excel_import", "edit");
+    const canEmpAdd = evalModuleAction(caller, userPermData, rolePermData, "employees", "add");
+    const canEmpEdit = evalModuleAction(caller, userPermData, rolePermData, "employees", "edit");
+    return {
+      canAdd: canImportView && canImportAdd && canEmpAdd,
+      canEdit: canImportView && canImportEdit && canEmpEdit
+    };
+  } catch (err) {
+    console.warn("[Employee Import Permission Guard] Lookup failed; failing closed:", err?.message || err);
+    return { canAdd: false, canEdit: false };
+  }
+}
+function classifyBatchWriteError(err) {
+  const rawMsg = err instanceof Error ? err.message : String(err || "Unknown database error");
+  const lower = rawMsg.toLowerCase();
+  if (isFirestorePermissionDeniedError(err)) {
+    return {
+      status: 503,
+      code: "FIRESTORE_ADMIN_PERMISSION_DENIED",
+      category: "DATABASE_AUTHORIZATION",
+      message: "Database authorization failed on server Admin SDK credentials. Contact Super Admin / infrastructure administrator."
+    };
+  }
+  if (lower.includes("deadline") || lower.includes("timeout") || lower.includes("unavailable") || lower.includes("econnreset") || lower.includes("network")) {
+    return {
+      status: 503,
+      code: "FIRESTORE_TEMPORARY_UNAVAILABLE",
+      category: "NETWORK_OR_TIMEOUT",
+      message: "Database connection timed out or became temporarily unavailable during batch commit. Verify committed counts before retrying remaining rows."
+    };
+  }
+  return {
+    status: 500,
+    code: "BATCH_COMMIT_FAILED",
+    category: "DATABASE_WRITE_ERROR",
+    message: rawMsg || "Database batch write failed."
+  };
+}
+function registerEmployeeRoutes(app, deps) {
+  const { db, requireVerifiedCaller } = deps;
+  app.post("/api/employees/bulk-import", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        "*",
+        "Employee Master Excel Bulk Import",
+        { prefetchUserPermission: true }
+      );
+      if (!caller) return;
+      const perms = await resolveCallerEmployeeImportPermissions(db, caller);
+      if (!perms.canAdd && !perms.canEdit) {
+        await recordEnterpriseAuditEvent(db, {
+          req,
+          action: "unauthorized_access_attempt",
+          category: "SECURITY",
+          severity: "CRITICAL",
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: caller.role.toUpperCase(),
+          targetType: "EMPLOYEE_IMPORT",
+          targetId: "/api/employees/bulk-import",
+          actionSource: "EMPLOYEE_IMPORT_RBAC_GUARD",
+          description: `User "${caller.loginId}" (${caller.role}) blocked from Employee Master Excel import due to missing excel_import/employees write permissions.`,
+          success: false
+        });
+        return res.status(403).json({
+          success: false,
+          code: "IMPORT_FORBIDDEN",
+          category: "AUTHORIZATION",
+          error: `Forbidden: Role "${caller.role.toUpperCase()}" is not authorized to import or update Employee Master records.`
+        });
+      }
+      const parsed = BulkImportRequestSchema.safeParse(req.body || {});
+      if (!parsed.success) {
+        const firstIssue = parsed.error.issues[0];
+        return res.status(400).json({
+          success: false,
+          code: "VALIDATION_ERROR",
+          category: "VALIDATION",
+          error: firstIssue?.message || "Invalid employee import payload.",
+          issues: parsed.error.issues.slice(0, 10).map((issue) => ({
+            path: issue.path.join("."),
+            message: issue.message
+          }))
+        });
+      }
+      const { fileName, rows } = parsed.data;
+      const seenIds = /* @__PURE__ */ new Set();
+      const duplicateIds = [];
+      for (const row of rows) {
+        const cleanId = row.employeeId.trim().toUpperCase();
+        if (seenIds.has(cleanId)) {
+          duplicateIds.push(cleanId);
+        } else {
+          seenIds.add(cleanId);
+        }
+      }
+      if (duplicateIds.length > 0) {
+        return res.status(400).json({
+          success: false,
+          code: "DUPLICATE_EMPLOYEE_IDS_IN_PAYLOAD",
+          category: "VALIDATION",
+          error: `Duplicate Employee ID(s) found in import batch: ${Array.from(new Set(duplicateIds)).slice(0, 5).join(", ")}`,
+          duplicateIds: Array.from(new Set(duplicateIds))
+        });
+      }
+      const existingSnap = await db.collection("employees").get();
+      const existingByUpperId = /* @__PURE__ */ new Map();
+      for (const d of existingSnap.docs) {
+        const data = d.data() || {};
+        const key = String(data.employeeId || d.id).trim().toUpperCase();
+        if (key) {
+          existingByUpperId.set(key, { docId: d.id, data });
+        }
+        const docIdUpper = String(d.id).trim().toUpperCase();
+        if (docIdUpper && !existingByUpperId.has(docIdUpper)) {
+          existingByUpperId.set(docIdUpper, { docId: d.id, data });
+        }
+      }
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      const operations = [];
+      const skippedIds = [];
+      for (const row of rows) {
+        const cleanId = row.employeeId.trim().toUpperCase();
+        const cleanName = row.employeeName.trim().toUpperCase();
+        const cleanSection = row.section.trim();
+        const cleanDepartment = row.department.trim();
+        const cleanFloor = row.floor.trim();
+        const cleanDesignation = (row.designation || "Operator").trim();
+        const existing = existingByUpperId.get(cleanId);
+        if (!existing) {
+          operations.push({
+            actionType: "NEW",
+            employeeId: cleanId,
+            rowNumber: row.rowNumber,
+            ref: db.collection("employees").doc(cleanId),
+            payload: {
+              employeeId: cleanId,
+              employeeName: cleanName,
+              employeeType: row.employeeType,
+              section: cleanSection,
+              department: cleanDepartment,
+              floor: cleanFloor,
+              designation: cleanDesignation,
+              qrCodeToken: generateServerQrToken(cleanId),
+              employeeStatus: row.employeeStatus,
+              createdAt: now,
+              updatedAt: now
+            }
+          });
+          continue;
+        }
+        const prev = existing.data;
+        const hasChanged = String(prev.employeeName || "").trim().toUpperCase() !== cleanName || String(prev.employeeType || "") !== row.employeeType || String(prev.section || "").trim() !== cleanSection || String(prev.department || "").trim() !== cleanDepartment || String(prev.floor || "").trim() !== cleanFloor || String(prev.designation || "").trim() !== cleanDesignation || String(prev.employeeStatus || "") !== row.employeeStatus;
+        if (!hasChanged) {
+          skippedIds.push(cleanId);
+          continue;
+        }
+        operations.push({
+          actionType: "UPDATE",
+          employeeId: cleanId,
+          rowNumber: row.rowNumber,
+          ref: db.collection("employees").doc(existing.docId),
+          payload: {
+            ...prev,
+            employeeId: cleanId,
+            employeeName: cleanName,
+            employeeType: row.employeeType,
+            section: cleanSection,
+            department: cleanDepartment,
+            floor: cleanFloor,
+            designation: cleanDesignation,
+            // Strictly preserve existing QR code token and historical creation timestamp
+            qrCodeToken: prev.qrCodeToken || generateServerQrToken(cleanId),
+            employeeStatus: row.employeeStatus,
+            createdAt: prev.createdAt || now,
+            updatedAt: now
+          }
+        });
+      }
+      const needsInsert = operations.some((op) => op.actionType === "NEW");
+      const needsUpdate = operations.some((op) => op.actionType === "UPDATE");
+      if (needsInsert && !perms.canAdd || needsUpdate && !perms.canEdit) {
+        await recordEnterpriseAuditEvent(db, {
+          req,
+          action: "unauthorized_access_attempt",
+          category: "SECURITY",
+          severity: "CRITICAL",
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: caller.role.toUpperCase(),
+          targetType: "EMPLOYEE_IMPORT",
+          targetId: "/api/employees/bulk-import",
+          actionSource: "EMPLOYEE_IMPORT_RBAC_GUARD",
+          description: `User "${caller.loginId}" (${caller.role}) attempted unauthorized employee import action (needsInsert=${needsInsert}, needsUpdate=${needsUpdate}).`,
+          success: false
+        });
+        return res.status(403).json({
+          success: false,
+          code: "IMPORT_ACTION_FORBIDDEN",
+          category: "AUTHORIZATION",
+          error: "Forbidden: Missing permission for the requested employee insert/update operation."
+        });
+      }
+      const insertedIds = [];
+      const updatedIds = [];
+      const committedIds = [];
+      const failedRows = [];
+      for (let i = 0; i < operations.length; i += EMPLOYEE_BULK_BATCH_SIZE) {
+        const chunk = operations.slice(i, i + EMPLOYEE_BULK_BATCH_SIZE);
+        try {
+          if (typeof db.batch === "function") {
+            const batch = db.batch();
+            for (const op of chunk) {
+              batch.set(op.ref, op.payload);
+            }
+            await batch.commit();
+          } else {
+            await Promise.all(chunk.map((op) => op.ref.set(op.payload)));
+          }
+          for (const op of chunk) {
+            committedIds.push(op.employeeId);
+            if (op.actionType === "NEW") {
+              insertedIds.push(op.employeeId);
+            } else {
+              updatedIds.push(op.employeeId);
+            }
+          }
+        } catch (batchErr) {
+          const classified = classifyBatchWriteError(batchErr);
+          const remainingOps = operations.slice(i);
+          for (const rem of remainingOps) {
+            failedRows.push({
+              employeeId: rem.employeeId,
+              rowNumber: rem.rowNumber,
+              actionType: rem.actionType,
+              error: classified.message
+            });
+          }
+          const partialCommit = committedIds.length > 0;
+          await recordEnterpriseAuditEvent(db, {
+            req,
+            action: partialCommit ? "EXCEL_EMPLOYEE_IMPORT_PARTIAL" : "EXCEL_EMPLOYEE_IMPORT_FAILED",
+            category: "EMPLOYEE",
+            severity: "WARNING",
+            actorUid: caller.uid,
+            actorLoginId: caller.loginId,
+            actorRole: caller.role.toUpperCase(),
+            targetType: "EMPLOYEE",
+            targetId: fileName,
+            newValue: `Committed ${committedIds.length} (New: ${insertedIds.length}, Updated: ${updatedIds.length}), Skipped: ${skippedIds.length}, Failed: ${failedRows.length} from ${fileName}`,
+            actionSource: "EXCEL_IMPORT",
+            reason: classified.message,
+            success: false
+          }).catch(() => {
+          });
+          return res.status(classified.status).json({
+            success: false,
+            code: classified.code,
+            category: classified.category,
+            error: classified.message,
+            partialCommit,
+            savedCount: committedIds.length,
+            insertedCount: insertedIds.length,
+            updatedCount: updatedIds.length,
+            skippedCount: skippedIds.length,
+            failedCount: failedRows.length,
+            committedIds,
+            insertedIds,
+            updatedIds,
+            skippedIds,
+            failedRows
+          });
+        }
+      }
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: "EXCEL_EMPLOYEE_IMPORT",
+        category: "EMPLOYEE",
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        targetType: "EMPLOYEE",
+        targetId: fileName,
+        newValue: `Committed ${committedIds.length} employees (New: ${insertedIds.length}, Updated: ${updatedIds.length}, Skipped: ${skippedIds.length}) from ${fileName}`,
+        actionSource: "EXCEL_IMPORT",
+        reason: `File upload: ${rows.length} validated rows`,
+        success: true
+      });
+      return res.json({
+        success: true,
+        savedCount: committedIds.length,
+        insertedCount: insertedIds.length,
+        updatedCount: updatedIds.length,
+        skippedCount: skippedIds.length,
+        failedCount: 0,
+        committedIds,
+        insertedIds,
+        updatedIds,
+        skippedIds,
+        failedRows: [],
+        partialCommit: false
+      });
+    } catch (err) {
+      console.error("[Employee Bulk Import API] Error:", err);
+      const classified = classifyBatchWriteError(err);
+      return res.status(classified.status).json({
+        success: false,
+        code: classified.code,
+        category: classified.category,
+        error: classified.message
+      });
+    }
+  });
+}
+
 // src/config/dashboardCardsConfig.ts
 var DASHBOARD_CARDS = [
   {
@@ -5704,19 +6187,19 @@ function resolveDashboardVisibility(params) {
 
 // server.ts
 function hashPassword(password) {
-  const salt = crypto4.randomBytes(16).toString("hex");
-  const hash = crypto4.scryptSync(password, salt, 64).toString("hex");
+  const salt = crypto5.randomBytes(16).toString("hex");
+  const hash = crypto5.scryptSync(password, salt, 64).toString("hex");
   return `${salt}:${hash}`;
 }
 function verifyPassword(password, storedHash) {
   if (!storedHash || !storedHash.includes(":")) return false;
   const [salt, expectedHash] = storedHash.split(":");
   if (!salt || !expectedHash) return false;
-  const actualHash = crypto4.scryptSync(password, salt, 64).toString("hex");
+  const actualHash = crypto5.scryptSync(password, salt, 64).toString("hex");
   const actualBuf = Buffer.from(actualHash, "hex");
   const expectedBuf = Buffer.from(expectedHash, "hex");
   if (actualBuf.length !== expectedBuf.length) return false;
-  return crypto4.timingSafeEqual(actualBuf, expectedBuf);
+  return crypto5.timingSafeEqual(actualBuf, expectedBuf);
 }
 async function syncExistingFirebaseAuthPassword(email, targetUid, newPassword, knownCurrentPassword) {
   if (typeof knownCurrentPassword !== "string" || knownCurrentPassword.length === 0) {
@@ -5782,17 +6265,17 @@ async function syncExistingFirebaseAuthPassword(email, targetUid, newPassword, k
     return { success: false, error: err?.message || "Firebase Auth sync error." };
   }
 }
-var VerifySessionInputSchema = z3.object({
-  loginId: z3.string().trim().min(1).max(64).optional(),
-  userId: z3.string().trim().min(1).max(128).optional()
+var VerifySessionInputSchema = z4.object({
+  loginId: z4.string().trim().min(1).max(64).optional(),
+  userId: z4.string().trim().min(1).max(128).optional()
 });
-var AdminSetPasswordInputSchema = z3.object({
-  targetLoginId: z3.string().trim().min(1, "targetLoginId is required.").max(64),
-  newPassword: z3.string().min(6, "Password must be at least 6 characters.").max(128),
-  mustChangePassword: z3.boolean().optional(),
-  unlockAccount: z3.boolean().optional(),
-  revokeSessions: z3.boolean().optional(),
-  currentTargetPassword: z3.string().optional()
+var AdminSetPasswordInputSchema = z4.object({
+  targetLoginId: z4.string().trim().min(1, "targetLoginId is required.").max(64),
+  newPassword: z4.string().min(6, "Password must be at least 6 characters.").max(128),
+  mustChangePassword: z4.boolean().optional(),
+  unlockAccount: z4.boolean().optional(),
+  revokeSessions: z4.boolean().optional(),
+  currentTargetPassword: z4.string().optional()
 });
 var RESERVED_CUSTOM_ROLE_ALIASES = /* @__PURE__ */ new Set([
   "superadmin",
@@ -5801,66 +6284,66 @@ var RESERVED_CUSTOM_ROLE_ALIASES = /* @__PURE__ */ new Set([
   "system",
   "super_admin_root"
 ]);
-var DynamicRoleIdSchema = z3.string().trim().min(2, "Role ID must be at least 2 characters.").max(64, "Role ID must be 64 characters or fewer.").transform((val) => deriveStrictRoleId(val)).refine((val) => VALID_ROLE_ID_REGEX.test(val), {
+var DynamicRoleIdSchema = z4.string().trim().min(2, "Role ID must be at least 2 characters.").max(64, "Role ID must be 64 characters or fewer.").transform((val) => deriveStrictRoleId(val)).refine((val) => VALID_ROLE_ID_REGEX.test(val), {
   message: "Role ID must start with a letter and contain only lowercase letters, numbers, or underscores."
 });
-var RoleDefinitionInputSchema = z3.object({
-  roleId: z3.string().trim().max(64).optional(),
-  roleName: z3.string().trim().min(2, "Role name must be at least 2 characters.").max(48, "Role name must be 48 characters or fewer."),
-  description: z3.string().trim().min(3, "Role description must be at least 3 characters.").max(500, "Role description must be 500 characters or fewer."),
-  isActive: z3.boolean().default(true),
-  defaultPermissions: z3.record(
-    z3.string(),
-    z3.object({
-      view: z3.boolean().optional(),
-      add: z3.boolean().optional(),
-      edit: z3.boolean().optional(),
-      delete: z3.boolean().optional()
+var RoleDefinitionInputSchema = z4.object({
+  roleId: z4.string().trim().max(64).optional(),
+  roleName: z4.string().trim().min(2, "Role name must be at least 2 characters.").max(48, "Role name must be 48 characters or fewer."),
+  description: z4.string().trim().min(3, "Role description must be at least 3 characters.").max(500, "Role description must be 500 characters or fewer."),
+  isActive: z4.boolean().default(true),
+  defaultPermissions: z4.record(
+    z4.string(),
+    z4.object({
+      view: z4.boolean().optional(),
+      add: z4.boolean().optional(),
+      edit: z4.boolean().optional(),
+      delete: z4.boolean().optional()
     })
   ).optional()
 });
-var CreateUserInputSchema = z3.object({
-  callerLoginId: z3.string().trim().min(1).max(64).optional(),
-  loginId: z3.string().trim().min(2, "Login ID must be at least 2 characters.").max(64).regex(/^[a-zA-Z0-9_.-]+$/, "Login ID can only contain letters, numbers, hyphens, underscores, and dots."),
-  name: z3.string().trim().min(1, "Name is required.").max(128),
-  email: z3.string().trim().email("Valid email is required.").max(128),
+var CreateUserInputSchema = z4.object({
+  callerLoginId: z4.string().trim().min(1).max(64).optional(),
+  loginId: z4.string().trim().min(2, "Login ID must be at least 2 characters.").max(64).regex(/^[a-zA-Z0-9_.-]+$/, "Login ID can only contain letters, numbers, hyphens, underscores, and dots."),
+  name: z4.string().trim().min(1, "Name is required.").max(128),
+  email: z4.string().trim().email("Valid email is required.").max(128),
   role: DynamicRoleIdSchema,
-  password: z3.string().min(6, "Password must be at least 6 characters.").max(128),
-  modulesAllowed: z3.array(z3.string().max(64)).optional(),
-  status: z3.enum(["Active", "Inactive"]).default("Active"),
-  mustChangePassword: z3.boolean().optional()
+  password: z4.string().min(6, "Password must be at least 6 characters.").max(128),
+  modulesAllowed: z4.array(z4.string().max(64)).optional(),
+  status: z4.enum(["Active", "Inactive"]).default("Active"),
+  mustChangePassword: z4.boolean().optional()
 });
-var DeleteUserInputSchema = z3.object({
-  callerLoginId: z3.string().trim().min(1).max(64).optional(),
-  targetId: z3.string().trim().min(1).max(128).optional(),
-  targetLoginId: z3.string().trim().min(1).max(64).optional()
+var DeleteUserInputSchema = z4.object({
+  callerLoginId: z4.string().trim().min(1).max(64).optional(),
+  targetId: z4.string().trim().min(1).max(128).optional(),
+  targetLoginId: z4.string().trim().min(1).max(64).optional()
 });
-var SetUserPermissionsInputSchema = z3.object({
-  callerLoginId: z3.string().trim().min(1).max(64).optional(),
-  targetId: z3.string().trim().min(1).max(128),
+var SetUserPermissionsInputSchema = z4.object({
+  callerLoginId: z4.string().trim().min(1).max(64).optional(),
+  targetId: z4.string().trim().min(1).max(128),
   role: DynamicRoleIdSchema.optional(),
-  status: z3.enum(["Active", "Inactive"]).optional(),
-  modulesAllowed: z3.array(z3.string().max(64)).optional(),
-  permissions: z3.record(
-    z3.string(),
-    z3.object({
-      view: z3.boolean().optional(),
-      add: z3.boolean().optional(),
-      edit: z3.boolean().optional(),
-      delete: z3.boolean().optional()
+  status: z4.enum(["Active", "Inactive"]).optional(),
+  modulesAllowed: z4.array(z4.string().max(64)).optional(),
+  permissions: z4.record(
+    z4.string(),
+    z4.object({
+      view: z4.boolean().optional(),
+      add: z4.boolean().optional(),
+      edit: z4.boolean().optional(),
+      delete: z4.boolean().optional()
     })
   ).optional()
 });
-var RolePermissionsInputSchema = z3.object({
-  callerLoginId: z3.string().trim().min(1).max(64).optional(),
+var RolePermissionsInputSchema = z4.object({
+  callerLoginId: z4.string().trim().min(1).max(64).optional(),
   roleId: DynamicRoleIdSchema,
-  modulePermissions: z3.record(
-    z3.string(),
-    z3.object({
-      view: z3.boolean().optional(),
-      add: z3.boolean().optional(),
-      edit: z3.boolean().optional(),
-      delete: z3.boolean().optional()
+  modulePermissions: z4.record(
+    z4.string(),
+    z4.object({
+      view: z4.boolean().optional(),
+      add: z4.boolean().optional(),
+      edit: z4.boolean().optional(),
+      delete: z4.boolean().optional()
     })
   )
 });
@@ -6149,7 +6632,7 @@ async function seedInitialAccounts(db) {
       const userRef = db.collection("user_roles").doc(docId);
       const snap = await userRef.get();
       if (!snap.exists) {
-        const randomInitialHash = hashPassword(crypto4.randomBytes(24).toString("hex"));
+        const randomInitialHash = hashPassword(crypto5.randomBytes(24).toString("hex"));
         await userRef.set({
           id: docId,
           loginId: acc.loginId,
@@ -6437,9 +6920,9 @@ function createApp(options = {}) {
       sessionId: params.sessionId
     });
   }
-  async function requireVerifiedCaller(req, res, allowedRoles, actionLabel) {
+  async function requireVerifiedCaller(req, res, allowedRoles, actionLabel, options2) {
     try {
-      const caller = await verifyCallerIdentity(req, adminDb, auth, projectId);
+      const caller = await verifyCallerIdentity(req, adminDb, auth, projectId, options2);
       if (!caller) {
         await logAuditEvent({
           req,
@@ -6562,6 +7045,10 @@ function createApp(options = {}) {
     requireVerifiedCaller
   });
   registerAttendanceRoutes(app, {
+    db: adminDb,
+    requireVerifiedCaller
+  });
+  registerEmployeeRoutes(app, {
     db: adminDb,
     requireVerifiedCaller
   });
@@ -6853,7 +7340,7 @@ function createApp(options = {}) {
           },
           details: `Password reset by Super Admin "${cleanCallerId}" for "${cleanTargetId}" (${targetRole}, UID: ${targetUid}, email: ${matchedFirebaseEmail}). Force next login change: ${forceChange}.`
         });
-        const resetLogId = `reset_${Date.now()}_${crypto4.randomBytes(3).toString("hex")}`;
+        const resetLogId = `reset_${Date.now()}_${crypto5.randomBytes(3).toString("hex")}`;
         await adminDb.collection("password_reset_logs").doc(resetLogId).set({
           id: resetLogId,
           targetLoginId: cleanTargetId,
@@ -7365,6 +7852,7 @@ function createApp(options = {}) {
       });
       if (targetUid && !targetUid.startsWith("role_")) {
         await removeUserUidIndex(adminDb, targetUid);
+        invalidateUidRolePointer(adminDb, targetUid);
         if (auth) {
           await auth.revokeRefreshTokens(targetUid).catch(() => {
           });
@@ -7507,6 +7995,9 @@ function createApp(options = {}) {
         details: `Updated permissions and role for user "${oldData.loginId}"`
       });
       invalidateRoleCaches(adminDb, effectiveRole);
+      if (oldData.authUid) {
+        invalidateUidRolePointer(adminDb, String(oldData.authUid));
+      }
       return res.json({ success: true, message: `Permissions for "${oldData.loginId}" updated successfully.` });
     } catch (err) {
       console.error("[Set User Permissions] Error:", err);
@@ -8006,6 +8497,7 @@ function createApp(options = {}) {
           linkedUids: Array.from(authUids)
         });
       }
+      invalidateUidRolePointer(adminDb);
       const remainingSnap = await adminDb.collection("user_roles").get();
       return res.json({
         success: true,
@@ -8227,6 +8719,8 @@ async function startServer() {
       `NARID ATDC Tracker API running at http://0.0.0.0:${PORT} (project=${projectId}, db=${databaseId}, credMode=${credentialMode})`
     );
   });
+  server.keepAliveTimeout = 65e3;
+  server.headersTimeout = 66e3;
   const shutdown = (signal) => {
     console.log(`[Server] Received ${signal}, closing HTTP server cleanly.`);
     server.close(() => process.exit(0));

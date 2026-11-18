@@ -894,7 +894,7 @@ describe('Server-Side Attendance Engine, Concurrent 3-Strike Lockout & Persisten
         .send({
           rawPayload: JSON.stringify({ employeeId: 'EMP001', token: 'QR_EMP001_VALID' }),
           scannerType: 'IN',
-          customScanTime: '2026-11-18T09:00:00+05:30',
+          customScanTime: '2026-12-01T09:00:00+05:30',
         });
       expect(bothQrIn.status).toBe(200);
 
@@ -904,7 +904,7 @@ describe('Server-Side Attendance Engine, Concurrent 3-Strike Lockout & Persisten
         .send({
           employeeId: 'EMP001',
           scannerType: 'OUT',
-          customScanTime: '2026-11-18T17:30:00+05:30',
+          customScanTime: '2026-12-01T17:30:00+05:30',
         });
       expect(bothManualOut.status).toBe(200);
 
@@ -915,7 +915,7 @@ describe('Server-Side Attendance Engine, Concurrent 3-Strike Lockout & Persisten
         .send({
           rawPayload: 'EMP_LEGACY_NP',
           scannerType: 'IN',
-          customScanTime: '2026-11-18T09:00:00+05:30',
+          customScanTime: '2026-12-01T09:00:00+05:30',
         });
       expect(legacyQrRes.status).toBe(200);
       expect(legacyQrRes.body.attendance.qrVerificationMode).toBe('UNTOKENIZED_EMPLOYEE');

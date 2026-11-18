@@ -34,6 +34,7 @@ import {
   Power
 } from 'lucide-react';
 import { RolePermissionsManagement } from './RolePermissionsManagement';
+import { TableSkeletonRows } from './Skeletons';
 import { onSnapshot, collection } from 'firebase/firestore';
 import { db } from '../firebase';
 import { LoginHistoryEntry, UserRoleRecord, UserRoleType } from '../types';
@@ -134,6 +135,7 @@ interface UserRightsProps {
 export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleProfileUpdated }) => {
   const [users, setUsers] = useState<UserRoleRecord[]>([]);
   const [isLoadingUsers, setIsLoadingUsers] = useState(false);
+  const [usersLoadError, setUsersLoadError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'users' | 'role_permissions' | 'matrix' | 'roles' | 'passwords'>('users');
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
@@ -303,6 +305,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
         });
 
         setUsers(deduplicated);
+        setUsersLoadError(null);
         setIsLoadingUsers(false);
 
         // Update default matrix selection if not selected
@@ -362,11 +365,13 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
 
   const loadUsersManual = async () => {
     setIsLoadingUsers(true);
+    setUsersLoadError(null);
     try {
       const data = await getAllUserRoles();
       setUsers(data);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to load user roles:', err);
+      setUsersLoadError(err?.message || 'Unable to load user accounts from server.');
     } finally {
       setIsLoadingUsers(false);
     }
@@ -1236,11 +1241,22 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {isLoadingUsers && users.length === 0 ? (
+                {isLoadingUsers && users.length === 0 && !usersLoadError ? (
+                  <TableSkeletonRows rows={6} cols={7} rowHeightClass="py-3 px-4" />
+                ) : usersLoadError && users.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="py-8 text-center text-slate-400">
-                      <div className="w-5 h-5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto mb-2" />
-                      Loading accounts from Firebase...
+                    <td colSpan={7} className="py-8 px-4 text-center">
+                      <div className="inline-flex flex-col items-center gap-2 text-red-700">
+                        <span className="font-semibold text-xs">{usersLoadError}</span>
+                        <button
+                          type="button"
+                          onClick={loadUsersManual}
+                          className="px-3 py-1.5 rounded bg-red-600 hover:bg-red-700 text-white text-xs font-semibold flex items-center gap-1 cursor-pointer"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                          <span>Retry</span>
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ) : users.length === 0 ? (

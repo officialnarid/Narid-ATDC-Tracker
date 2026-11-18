@@ -299,6 +299,7 @@ export async function processDualAttendanceScan({
 
   assertApiBaseConfigured();
   const headers = await getAuthHeaders();
+  const tokenFetchMs = Number((nowMs() - apiStart).toFixed(2));
   const res = await executeApiFetch(
     apiUrl('/api/attendance/scan'),
     {
@@ -312,12 +313,14 @@ export async function processDualAttendanceScan({
         ...(customScanTime ? { customScanTime: customScanTime.toISOString() } : {}),
       }),
     },
-    'POST /api/attendance/scan'
+    'POST /api/attendance/scan',
+    { timeoutMs: 12000 }
   );
 
   const parsed = await safeParseJsonResponse<any>(res, 'POST /api/attendance/scan');
   const networkApiMs = Number((nowMs() - apiStart).toFixed(2));
   const data = parsed.data || {};
+  const srvPerf = data?.perf && typeof data.perf === 'object' ? data.perf : undefined;
   return {
     success: Boolean(parsed.ok && data?.success),
     action: data?.action || 'REJECTED',
@@ -332,7 +335,15 @@ export async function processDualAttendanceScan({
     otFormatted: data?.otFormatted,
     punchCount: data?.punchCount,
     perf: {
-      totalServerMs: typeof data?.perf?.totalServerMs === 'number' ? data.perf.totalServerMs : undefined,
+      qrParseMs: typeof srvPerf?.qrParseMs === 'number' ? srvPerf.qrParseMs : undefined,
+      tokenFetchMs,
+      authMs: typeof srvPerf?.authMs === 'number' ? srvPerf.authMs : undefined,
+      permissionMs: typeof srvPerf?.permissionMs === 'number' ? srvPerf.permissionMs : undefined,
+      lookupAndQueryMs: typeof srvPerf?.lookupAndQueryMs === 'number' ? srvPerf.lookupAndQueryMs : undefined,
+      tokenValidationMs: typeof srvPerf?.tokenValidationMs === 'number' ? srvPerf.tokenValidationMs : undefined,
+      txMs: typeof srvPerf?.txMs === 'number' ? srvPerf.txMs : undefined,
+      firestoreOpMs: typeof srvPerf?.firestoreOpMs === 'number' ? srvPerf.firestoreOpMs : undefined,
+      totalServerMs: typeof srvPerf?.totalServerMs === 'number' ? srvPerf.totalServerMs : undefined,
       networkApiMs,
     },
   };
@@ -363,6 +374,7 @@ export async function processManualAttendancePunch({
 
   assertApiBaseConfigured();
   const headers = await getAuthHeaders();
+  const tokenFetchMs = Number((nowMs() - apiStart).toFixed(2));
   const res = await executeApiFetch(
     apiUrl('/api/attendance/manual-punch'),
     {
@@ -376,12 +388,14 @@ export async function processManualAttendancePunch({
         ...(customScanTime ? { customScanTime: customScanTime.toISOString() } : {}),
       }),
     },
-    'POST /api/attendance/manual-punch'
+    'POST /api/attendance/manual-punch',
+    { timeoutMs: 12000 }
   );
 
   const parsed = await safeParseJsonResponse<any>(res, 'POST /api/attendance/manual-punch');
   const networkApiMs = Number((nowMs() - apiStart).toFixed(2));
   const data = parsed.data || {};
+  const srvPerf = data?.perf && typeof data.perf === 'object' ? data.perf : undefined;
   return {
     success: Boolean(parsed.ok && data?.success),
     action: data?.action || 'REJECTED',
@@ -396,7 +410,13 @@ export async function processManualAttendancePunch({
     otFormatted: data?.otFormatted,
     punchCount: data?.punchCount,
     perf: {
-      totalServerMs: typeof data?.perf?.totalServerMs === 'number' ? data.perf.totalServerMs : undefined,
+      tokenFetchMs,
+      authMs: typeof srvPerf?.authMs === 'number' ? srvPerf.authMs : undefined,
+      permissionMs: typeof srvPerf?.permissionMs === 'number' ? srvPerf.permissionMs : undefined,
+      lookupAndQueryMs: typeof srvPerf?.lookupAndQueryMs === 'number' ? srvPerf.lookupAndQueryMs : undefined,
+      txMs: typeof srvPerf?.txMs === 'number' ? srvPerf.txMs : undefined,
+      firestoreOpMs: typeof srvPerf?.firestoreOpMs === 'number' ? srvPerf.firestoreOpMs : undefined,
+      totalServerMs: typeof srvPerf?.totalServerMs === 'number' ? srvPerf.totalServerMs : undefined,
       networkApiMs,
     },
   };

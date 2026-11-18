@@ -23,7 +23,11 @@ import {
   Keyboard,
   Lock
 } from 'lucide-react';
-import { processDualAttendanceScan, processManualAttendancePunch } from '../services/attendanceService';
+import {
+  parseQrPayload,
+  processDualAttendanceScan,
+  processManualAttendancePunch,
+} from '../services/attendanceService';
 import {
   RolePermissionRecord,
   UserPermissionRecordWithOverride,
@@ -35,6 +39,15 @@ import {
   isAttendanceLate,
   resolveAttendanceMetrics,
 } from '../utils/attendanceStatus';
+import {
+  notifyAttendanceCommitted,
+  recordPerfMetric,
+} from '../utils/perfMonitor';
+import {
+  applyQrInputChange,
+  getMaskedQrInputValue,
+  sanitizeQrErrorMessage,
+} from '../utils/qrInputMask';
 
 function createClientRequestId(prefix: string): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -70,9 +83,9 @@ export const Scanner: React.FC<ScannerProps> = ({
   // Mode selection: Dual side-by-side or dedicated single station
   const [activeStationMode, setActiveStationMode] = useState<'DUAL' | 'IN_ONLY' | 'OUT_ONLY'>('DUAL');
 
-  // QR Input states for IN and OUT (Strict QR Verification)
-  const [inInput, setInInput] = useState('');
-  const [outInput, setOutInput] = useState('');
+  // Masked QR status flags for IN and OUT (raw QR payloads stay internal in refs)
+  const [inQrDetected, setInQrDetected] = useState(false);
+  const [outQrDetected, setOutQrDetected] = useState(false);
   const [isProcessingIn, setIsProcessingIn] = useState(false);
   const [isProcessingOut, setIsProcessingOut] = useState(false);
 
@@ -102,11 +115,22 @@ export const Scanner: React.FC<ScannerProps> = ({
   const webcamScannerRef = useRef<any>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
 
+  // Internal QR payload storage (never exposed in visible input value or logs; cleared only after API completes)
+  const rawInPayloadRef = useRef('');
+  const rawOutPayloadRef = useRef('');
+  const usbInScanStartRef = useRef<number | null>(null);
+  const usbOutScanStartRef = useRef<number | null>(null);
+
   // Synchronous ref locks prevent rapid duplicate Enter/click double-submissions in the same frame
   const inFlightInRef = useRef(false);
   const inFlightOutRef = useRef(false);
   const inFlightManualInRef = useRef(false);
   const inFlightManualOutRef = useRef(false);
+  const lastWebcamScanRef = useRef<{ key: string; at: number } | null>(null);
+  const [pendingGateFeedback, setPendingGateFeedback] = useState<{
+    IN?: { mode: 'QR' | 'MANUAL'; detectedAt: number };
+    OUT?: { mode: 'QR' | 'MANUAL'; detectedAt: number };
+  }>({});
 
   // Audio synthesizer reusing a single AudioContext instance for zero overhead
   const playSound = useCallback((type: 'success_in' | 'success_out' | 'error' | 'warning') => {
@@ -213,9 +237,15 @@ export const Scanner: React.FC<ScannerProps> = ({
 
   // Process Punch In Scan
   const handlePunchIn = useCallback(async (payload: string, source: 'USB_SCANNER' | 'WEBCAM' | 'MANUAL' = 'USB_SCANNER') => {
+    const detectStart = performance.now();
     const clean = payload.trim();
     if (!clean || inFlightInRef.current) return;
+    const usbStart = usbInScanStartRef.current;
+    usbInScanStartRef.current = null;
+
     if (!canQrScan) {
+      rawInPayloadRef.current = '';
+      setInQrDetected(false);
       setLastInResult({
         success: false,
         action: 'REJECTED',
@@ -227,12 +257,26 @@ export const Scanner: React.FC<ScannerProps> = ({
       return;
     }
 
+    // Keep internal scanned payload preserved until the Punch In API request completes
+    rawInPayloadRef.current = clean;
+    setInQrDetected(true);
     inFlightInRef.current = true;
     const e2eStart = performance.now();
+    const parseStart = performance.now();
+    parseQrPayload(clean);
+    const clientParseMs = Math.max(0.01, performance.now() - parseStart);
+    const qrDetectMs =
+      source === 'USB_SCANNER' && usbStart !== null
+        ? Math.max(0.01, e2eStart - usbStart)
+        : Math.max(0.01, e2eStart - detectStart);
+    recordPerfMetric('qr_detect_ms', qrDetectMs);
+    recordPerfMetric('qr_parse_ms', clientParseMs);
+
+    setPendingGateFeedback(prev => ({ ...prev, IN: { mode: 'QR', detectedAt: Date.now() } }));
     setIsProcessingIn(true);
     try {
       const result = await processDualAttendanceScan({
-        rawPayload: clean,
+        rawPayload: rawInPayloadRef.current,
         scannerType: 'IN',
         scannerDevice: source,
         clientRequestId: createClientRequestId('qrin'),
@@ -240,15 +284,37 @@ export const Scanner: React.FC<ScannerProps> = ({
 
       const uiDisplayStart = performance.now();
       const networkApiMs = result.perf?.networkApiMs ?? (uiDisplayStart - e2eStart);
+      const totalE2eMs = performance.now() - e2eStart;
+      const sanitizedMessage = result.success
+        ? result.message
+        : sanitizeQrErrorMessage(result.message, clean);
+      const totalPunchInMs = Number(totalE2eMs.toFixed(2));
       const enriched: ScanResult = {
         ...result,
+        message: sanitizedMessage,
         perf: {
           ...result.perf,
+          qrDetectMs: Number(qrDetectMs.toFixed(2)),
+          qrParseMs: Number(((result.perf?.qrParseMs ?? 0) + clientParseMs).toFixed(2)),
           networkApiMs: Number(networkApiMs.toFixed(2)),
           uiDisplayMs: Number((performance.now() - uiDisplayStart).toFixed(2)),
-          totalEndToEndMs: Number((performance.now() - e2eStart).toFixed(2)),
+          totalEndToEndMs: totalPunchInMs,
+          totalPunchInMs,
         },
       };
+
+      recordPerfMetric('qr_api_ms', networkApiMs);
+      recordPerfMetric('qr_scan_e2e_ms', totalE2eMs);
+      recordPerfMetric('qr_punch_in_e2e_ms', totalE2eMs);
+      if (typeof result.perf?.totalServerMs === 'number') {
+        recordPerfMetric('qr_scan_server_ms', result.perf.totalServerMs);
+      }
+      if (typeof result.perf?.authMs === 'number') {
+        recordPerfMetric('qr_auth_token_ms', result.perf.authMs + (result.perf.tokenValidationMs ?? 0));
+      }
+      if (typeof result.perf?.firestoreOpMs === 'number') {
+        recordPerfMetric('qr_firestore_ms', result.perf.firestoreOpMs);
+      }
 
       setLastInResult(enriched);
       setRecentEvents(prev => [enriched, ...prev.slice(0, 9)]);
@@ -259,34 +325,56 @@ export const Scanner: React.FC<ScannerProps> = ({
         } else {
           playSound('success_in');
         }
+        notifyAttendanceCommitted({
+          scannerType: 'IN',
+          action: 'PUNCH_IN',
+          attendanceId: enriched.attendance?.id,
+          shiftDate: enriched.attendance?.shiftDate,
+          timestamp: Date.now(),
+        });
         onAttendanceUpdated?.();
       } else {
         playSound('error');
       }
     } catch (err: any) {
-      console.error('Punch In Error:', err);
+      const safeErrMsg = sanitizeQrErrorMessage(
+        String(err?.message || 'System error processing Punch In.'),
+        clean
+      );
+      console.error('Punch In Error:', safeErrMsg);
       const fallback: ScanResult = {
         success: false,
         action: 'REJECTED',
         scannerType: 'IN',
-        message: err.message || 'System error processing Punch In.',
+        message: safeErrMsg.includes('timed out') || safeErrMsg.includes('Unable to reach')
+          ? `Network interrupted: ${safeErrMsg}`
+          : safeErrMsg,
         time: new Date().toLocaleTimeString(),
       };
       setLastInResult(fallback);
       playSound('error');
     } finally {
       inFlightInRef.current = false;
+      rawInPayloadRef.current = '';
+      usbInScanStartRef.current = null;
+      setInQrDetected(false);
       setIsProcessingIn(false);
-      setInInput('');
+      setPendingGateFeedback(prev => ({ ...prev, IN: undefined }));
       restoreTargetFocus('IN', 'QR');
     }
   }, [canQrScan, onAttendanceUpdated, playSound, restoreTargetFocus]);
 
   // Process Punch Out Scan
   const handlePunchOut = useCallback(async (payload: string, source: 'USB_SCANNER' | 'WEBCAM' | 'MANUAL' = 'USB_SCANNER') => {
+    const detectStart = performance.now();
     const clean = payload.trim();
     if (!clean || inFlightOutRef.current) return;
+    const usbStart = usbOutScanStartRef.current;
+    usbOutScanStartRef.current = null;
+
     if (!canQrScan) {
+      rawOutPayloadRef.current = '';
+      setOutQrDetected(false);
       setLastOutResult({
         success: false,
         action: 'REJECTED',
@@ -298,12 +386,26 @@ export const Scanner: React.FC<ScannerProps> = ({
       return;
     }
 
+    // Keep internal scanned payload preserved until the Punch Out API request completes
+    rawOutPayloadRef.current = clean;
+    setOutQrDetected(true);
     inFlightOutRef.current = true;
     const e2eStart = performance.now();
+    const parseStart = performance.now();
+    parseQrPayload(clean);
+    const clientParseMs = Math.max(0.01, performance.now() - parseStart);
+    const qrDetectMs =
+      source === 'USB_SCANNER' && usbStart !== null
+        ? Math.max(0.01, e2eStart - usbStart)
+        : Math.max(0.01, e2eStart - detectStart);
+    recordPerfMetric('qr_detect_ms', qrDetectMs);
+    recordPerfMetric('qr_parse_ms', clientParseMs);
+
+    setPendingGateFeedback(prev => ({ ...prev, OUT: { mode: 'QR', detectedAt: Date.now() } }));
     setIsProcessingOut(true);
     try {
       const result = await processDualAttendanceScan({
-        rawPayload: clean,
+        rawPayload: rawOutPayloadRef.current,
         scannerType: 'OUT',
         scannerDevice: source,
         clientRequestId: createClientRequestId('qrout'),
@@ -311,43 +413,86 @@ export const Scanner: React.FC<ScannerProps> = ({
 
       const uiDisplayStart = performance.now();
       const networkApiMs = result.perf?.networkApiMs ?? (uiDisplayStart - e2eStart);
+      const totalE2eMs = performance.now() - e2eStart;
+      const sanitizedMessage = result.success
+        ? result.message
+        : sanitizeQrErrorMessage(result.message, clean);
+      const totalPunchOutMs = Number(totalE2eMs.toFixed(2));
       const enriched: ScanResult = {
         ...result,
+        message: sanitizedMessage,
         perf: {
           ...result.perf,
+          qrDetectMs: Number(qrDetectMs.toFixed(2)),
+          qrParseMs: Number(((result.perf?.qrParseMs ?? 0) + clientParseMs).toFixed(2)),
           networkApiMs: Number(networkApiMs.toFixed(2)),
           uiDisplayMs: Number((performance.now() - uiDisplayStart).toFixed(2)),
-          totalEndToEndMs: Number((performance.now() - e2eStart).toFixed(2)),
+          totalEndToEndMs: totalPunchOutMs,
+          totalPunchOutMs,
         },
       };
+
+      recordPerfMetric('qr_api_ms', networkApiMs);
+      recordPerfMetric('qr_scan_e2e_ms', totalE2eMs);
+      recordPerfMetric('qr_punch_out_e2e_ms', totalE2eMs);
+      if (typeof result.perf?.totalServerMs === 'number') {
+        recordPerfMetric('qr_scan_server_ms', result.perf.totalServerMs);
+      }
+      if (typeof result.perf?.authMs === 'number') {
+        recordPerfMetric('qr_auth_token_ms', result.perf.authMs + (result.perf.tokenValidationMs ?? 0));
+      }
+      if (typeof result.perf?.firestoreOpMs === 'number') {
+        recordPerfMetric('qr_firestore_ms', result.perf.firestoreOpMs);
+      }
 
       setLastOutResult(enriched);
       setRecentEvents(prev => [enriched, ...prev.slice(0, 9)]);
 
       if (enriched.success) {
         playSound('success_out');
+        notifyAttendanceCommitted({
+          scannerType: 'OUT',
+          action: 'PUNCH_OUT',
+          attendanceId: enriched.attendance?.id,
+          shiftDate: enriched.attendance?.shiftDate,
+          timestamp: Date.now(),
+        });
         onAttendanceUpdated?.();
       } else {
         playSound('error');
       }
     } catch (err: any) {
-      console.error('Punch Out Error:', err);
+      const safeErrMsg = sanitizeQrErrorMessage(
+        String(err?.message || 'System error processing Punch Out.'),
+        clean
+      );
+      console.error('Punch Out Error:', safeErrMsg);
       const fallback: ScanResult = {
         success: false,
         action: 'REJECTED',
         scannerType: 'OUT',
-        message: err.message || 'System error processing Punch Out.',
+        message: safeErrMsg.includes('timed out') || safeErrMsg.includes('Unable to reach')
+          ? `Network interrupted: ${safeErrMsg}`
+          : safeErrMsg,
         time: new Date().toLocaleTimeString(),
       };
       setLastOutResult(fallback);
       playSound('error');
     } finally {
       inFlightOutRef.current = false;
+      rawOutPayloadRef.current = '';
+      usbOutScanStartRef.current = null;
+      setOutQrDetected(false);
       setIsProcessingOut(false);
-      setOutInput('');
+      setPendingGateFeedback(prev => ({ ...prev, OUT: undefined }));
       restoreTargetFocus('OUT', 'QR');
     }
   }, [canQrScan, onAttendanceUpdated, playSound, restoreTargetFocus]);
+
+  const handlePunchInRef = useRef(handlePunchIn);
+  const handlePunchOutRef = useRef(handlePunchOut);
+  handlePunchInRef.current = handlePunchIn;
+  handlePunchOutRef.current = handlePunchOut;
 
   // Process Authorized Manual Employee ID Punch In
   const handleManualPunchIn = useCallback(async (empId: string) => {
@@ -367,6 +512,7 @@ export const Scanner: React.FC<ScannerProps> = ({
 
     inFlightManualInRef.current = true;
     const e2eStart = performance.now();
+    setPendingGateFeedback(prev => ({ ...prev, IN: { mode: 'MANUAL', detectedAt: Date.now() } }));
     setIsProcessingManualIn(true);
     try {
       const result = await processManualAttendancePunch({
@@ -377,15 +523,21 @@ export const Scanner: React.FC<ScannerProps> = ({
 
       const uiDisplayStart = performance.now();
       const networkApiMs = result.perf?.networkApiMs ?? (uiDisplayStart - e2eStart);
+      const totalE2eMs = performance.now() - e2eStart;
       const enriched: ScanResult = {
         ...result,
         perf: {
           ...result.perf,
           networkApiMs: Number(networkApiMs.toFixed(2)),
           uiDisplayMs: Number((performance.now() - uiDisplayStart).toFixed(2)),
-          totalEndToEndMs: Number((performance.now() - e2eStart).toFixed(2)),
+          totalEndToEndMs: Number(totalE2eMs.toFixed(2)),
         },
       };
+
+      recordPerfMetric('manual_punch_e2e_ms', totalE2eMs);
+      if (typeof result.perf?.totalServerMs === 'number') {
+        recordPerfMetric('manual_punch_server_ms', result.perf.totalServerMs);
+      }
 
       setLastInResult(enriched);
       setRecentEvents(prev => [enriched, ...prev.slice(0, 9)]);
@@ -397,17 +549,27 @@ export const Scanner: React.FC<ScannerProps> = ({
         } else {
           playSound('success_in');
         }
+        notifyAttendanceCommitted({
+          scannerType: 'IN',
+          action: 'PUNCH_IN',
+          attendanceId: enriched.attendance?.id,
+          shiftDate: enriched.attendance?.shiftDate,
+          timestamp: Date.now(),
+        });
         onAttendanceUpdated?.();
       } else {
         playSound('error');
       }
     } catch (err: any) {
       console.error('Manual Punch In Error:', err);
+      const msg = String(err?.message || 'System error processing manual Punch In.');
       const fallback: ScanResult = {
         success: false,
         action: 'REJECTED',
         scannerType: 'IN',
-        message: err.message || 'System error processing manual Punch In.',
+        message: msg.includes('timed out') || msg.includes('Unable to reach')
+          ? `Network interrupted: ${msg}`
+          : msg,
         time: new Date().toLocaleTimeString(),
       };
       setLastInResult(fallback);
@@ -415,6 +577,7 @@ export const Scanner: React.FC<ScannerProps> = ({
     } finally {
       inFlightManualInRef.current = false;
       setIsProcessingManualIn(false);
+      setPendingGateFeedback(prev => ({ ...prev, IN: undefined }));
       restoreTargetFocus('IN', 'MANUAL');
     }
   }, [canManualEntry, onAttendanceUpdated, playSound, restoreTargetFocus]);
@@ -437,6 +600,7 @@ export const Scanner: React.FC<ScannerProps> = ({
 
     inFlightManualOutRef.current = true;
     const e2eStart = performance.now();
+    setPendingGateFeedback(prev => ({ ...prev, OUT: { mode: 'MANUAL', detectedAt: Date.now() } }));
     setIsProcessingManualOut(true);
     try {
       const result = await processManualAttendancePunch({
@@ -447,15 +611,21 @@ export const Scanner: React.FC<ScannerProps> = ({
 
       const uiDisplayStart = performance.now();
       const networkApiMs = result.perf?.networkApiMs ?? (uiDisplayStart - e2eStart);
+      const totalE2eMs = performance.now() - e2eStart;
       const enriched: ScanResult = {
         ...result,
         perf: {
           ...result.perf,
           networkApiMs: Number(networkApiMs.toFixed(2)),
           uiDisplayMs: Number((performance.now() - uiDisplayStart).toFixed(2)),
-          totalEndToEndMs: Number((performance.now() - e2eStart).toFixed(2)),
+          totalEndToEndMs: Number(totalE2eMs.toFixed(2)),
         },
       };
+
+      recordPerfMetric('manual_punch_e2e_ms', totalE2eMs);
+      if (typeof result.perf?.totalServerMs === 'number') {
+        recordPerfMetric('manual_punch_server_ms', result.perf.totalServerMs);
+      }
 
       setLastOutResult(enriched);
       setRecentEvents(prev => [enriched, ...prev.slice(0, 9)]);
@@ -463,17 +633,27 @@ export const Scanner: React.FC<ScannerProps> = ({
       if (enriched.success) {
         setManualOutId('');
         playSound('success_out');
+        notifyAttendanceCommitted({
+          scannerType: 'OUT',
+          action: 'PUNCH_OUT',
+          attendanceId: enriched.attendance?.id,
+          shiftDate: enriched.attendance?.shiftDate,
+          timestamp: Date.now(),
+        });
         onAttendanceUpdated?.();
       } else {
         playSound('error');
       }
     } catch (err: any) {
       console.error('Manual Punch Out Error:', err);
+      const msg = String(err?.message || 'System error processing manual Punch Out.');
       const fallback: ScanResult = {
         success: false,
         action: 'REJECTED',
         scannerType: 'OUT',
-        message: err.message || 'System error processing manual Punch Out.',
+        message: msg.includes('timed out') || msg.includes('Unable to reach')
+          ? `Network interrupted: ${msg}`
+          : msg,
         time: new Date().toLocaleTimeString(),
       };
       setLastOutResult(fallback);
@@ -481,6 +661,7 @@ export const Scanner: React.FC<ScannerProps> = ({
     } finally {
       inFlightManualOutRef.current = false;
       setIsProcessingManualOut(false);
+      setPendingGateFeedback(prev => ({ ...prev, OUT: undefined }));
       restoreTargetFocus('OUT', 'MANUAL');
     }
   }, [canManualEntry, onAttendanceUpdated, playSound, restoreTargetFocus]);
@@ -508,16 +689,28 @@ export const Scanner: React.FC<ScannerProps> = ({
         if (!containerEl) return;
         const scanner = new Html5QrcodeScanner(
           'dual-qr-reader-container',
-          { fps: 15, qrbox: { width: 250, height: 250 } },
+          {
+            fps: 24,
+            qrbox: { width: 250, height: 250 },
+            rememberLastUsedCamera: true,
+            experimentalFeatures: { useBarCodeDetectorIfSupported: true },
+          } as any,
           false
         );
 
         scanner.render(
           (decodedText: string) => {
+            const frameKey = `${webcamStation}:${decodedText.trim()}`;
+            const nowTs = Date.now();
+            const last = lastWebcamScanRef.current;
+            if (last && last.key === frameKey && nowTs - last.at < 1800) {
+              return;
+            }
+            lastWebcamScanRef.current = { key: frameKey, at: nowTs };
             if (webcamStation === 'IN') {
-              handlePunchIn(decodedText, 'WEBCAM');
+              handlePunchInRef.current(decodedText, 'WEBCAM');
             } else if (webcamStation === 'OUT') {
-              handlePunchOut(decodedText, 'WEBCAM');
+              handlePunchOutRef.current(decodedText, 'WEBCAM');
             }
           },
           () => {}
@@ -532,7 +725,7 @@ export const Scanner: React.FC<ScannerProps> = ({
       cancelled = true;
       cleanupScanner();
     };
-  }, [webcamStation, handlePunchIn, handlePunchOut]);
+  }, [webcamStation]);
 
   return (
     <div className="flex flex-col h-full bg-slate-950 text-white overflow-y-auto">
@@ -749,29 +942,90 @@ export const Scanner: React.FC<ScannerProps> = ({
                       <input
                         ref={inInputRef}
                         type="text"
-                        value={inInput}
-                        onChange={(e) => setInInput(e.target.value)}
+                        aria-label="Punch In QR Scanner Input"
+                        autoComplete="off"
+                        spellCheck={false}
+                        data-qr-masked="true"
+                        value={getMaskedQrInputValue(inQrDetected, isProcessingIn)}
+                        onChange={(e) => {
+                          if (isProcessingIn) return;
+                          if (!rawInPayloadRef.current && usbInScanStartRef.current === null) {
+                            usbInScanStartRef.current = performance.now();
+                          }
+                          const maskVal = getMaskedQrInputValue(inQrDetected, isProcessingIn);
+                          const { nextRawPayload, hasDetectedPayload } = applyQrInputChange(
+                            rawInPayloadRef.current,
+                            e.target.value,
+                            maskVal
+                          );
+                          rawInPayloadRef.current = nextRawPayload;
+                          if (!hasDetectedPayload) {
+                            usbInScanStartRef.current = null;
+                          }
+                          setInQrDetected(hasDetectedPayload);
+                          if (hasDetectedPayload && lastInResult && !lastInResult.success) {
+                            setLastInResult(null);
+                          }
+                        }}
+                        onPaste={(e) => {
+                          e.preventDefault();
+                          if (isProcessingIn) return;
+                          const pasted = e.clipboardData?.getData('text') || '';
+                          if (pasted.trim()) {
+                            usbInScanStartRef.current = performance.now();
+                            rawInPayloadRef.current = pasted;
+                            setInQrDetected(true);
+                            if (lastInResult && !lastInResult.success) {
+                              setLastInResult(null);
+                            }
+                          }
+                        }}
                         onFocus={() => setActiveFocus('IN')}
                         onKeyDown={(e) => {
+                          if (isProcessingIn) {
+                            e.preventDefault();
+                            return;
+                          }
                           if (e.key === 'Enter') {
                             e.preventDefault();
-                            handlePunchIn(inInput, 'USB_SCANNER');
+                            if (rawInPayloadRef.current.trim()) {
+                              handlePunchIn(rawInPayloadRef.current, 'USB_SCANNER');
+                            }
+                          } else if (e.key === 'Backspace' || e.key === 'Delete' || e.key === 'Escape') {
+                            e.preventDefault();
+                            rawInPayloadRef.current = '';
+                            usbInScanStartRef.current = null;
+                            setInQrDetected(false);
+                          } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                            e.preventDefault();
+                            if (!rawInPayloadRef.current && usbInScanStartRef.current === null) {
+                              usbInScanStartRef.current = performance.now();
+                            }
+                            rawInPayloadRef.current += e.key;
+                            if (!inQrDetected) setInQrDetected(true);
+                            if (lastInResult && !lastInResult.success) {
+                              setLastInResult(null);
+                            }
                           }
                         }}
                         disabled={isProcessingIn}
                         placeholder="Scan QR Badge (Punch In Ready)..."
-                        className="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-lg px-3.5 py-2.5 pr-24 text-sm text-white font-mono placeholder-slate-500 focus:outline-hidden focus:ring-1 focus:ring-emerald-500 transition"
+                        className={`w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-lg px-3.5 py-2.5 pr-28 text-sm font-mono placeholder-slate-500 focus:outline-hidden focus:ring-1 focus:ring-emerald-500 transition ${
+                          isProcessingIn || inQrDetected ? 'text-emerald-300 font-semibold' : 'text-white'
+                        }`}
                       />
                       <button
                         type="button"
                         onClick={(e) => {
                           e.stopPropagation();
-                          handlePunchIn(inInput, 'USB_SCANNER');
+                          if (rawInPayloadRef.current.trim()) {
+                            handlePunchIn(rawInPayloadRef.current, 'USB_SCANNER');
+                          }
                         }}
-                        disabled={isProcessingIn || !inInput.trim()}
+                        disabled={isProcessingIn || !inQrDetected}
                         className="absolute right-1.5 top-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-semibold px-3 py-1.5 rounded transition"
                       >
-                        {isProcessingIn ? 'Scanning...' : 'Scan In'}
+                        {isProcessingIn ? 'Verifying...' : 'Scan In'}
                       </button>
                     </div>
                   ) : (
@@ -838,7 +1092,21 @@ export const Scanner: React.FC<ScannerProps> = ({
                 </div>
 
                 {/* Latest Punch In Result Badge */}
-                <div className="mt-4 flex-1 flex flex-col justify-center">
+                <div className="mt-4 flex-1 flex flex-col justify-center gap-2.5">
+                  {pendingGateFeedback.IN && (
+                    <div
+                      role="status"
+                      className="px-3.5 py-2.5 rounded-lg border border-emerald-500/60 bg-emerald-950/40 text-emerald-200 flex items-center justify-between text-xs"
+                    >
+                      <span className="flex items-center gap-2 font-semibold">
+                        <span className="w-3.5 h-3.5 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin shrink-0" />
+                        {pendingGateFeedback.IN.mode === 'QR'
+                          ? 'QR Code Detected ✓ — Verifying QR...'
+                          : 'Submitting manual Punch In...'}
+                      </span>
+                      <span className="text-[10px] font-mono text-emerald-300">WAIT</span>
+                    </div>
+                  )}
                   {lastInResult ? (
                     <div 
                       className={`p-4 rounded-lg border flex flex-col gap-3 transition-all ${
@@ -982,29 +1250,90 @@ export const Scanner: React.FC<ScannerProps> = ({
                       <input
                         ref={outInputRef}
                         type="text"
-                        value={outInput}
-                        onChange={(e) => setOutInput(e.target.value)}
+                        aria-label="Punch Out QR Scanner Input"
+                        autoComplete="off"
+                        spellCheck={false}
+                        data-qr-masked="true"
+                        value={getMaskedQrInputValue(outQrDetected, isProcessingOut)}
+                        onChange={(e) => {
+                          if (isProcessingOut) return;
+                          if (!rawOutPayloadRef.current && usbOutScanStartRef.current === null) {
+                            usbOutScanStartRef.current = performance.now();
+                          }
+                          const maskVal = getMaskedQrInputValue(outQrDetected, isProcessingOut);
+                          const { nextRawPayload, hasDetectedPayload } = applyQrInputChange(
+                            rawOutPayloadRef.current,
+                            e.target.value,
+                            maskVal
+                          );
+                          rawOutPayloadRef.current = nextRawPayload;
+                          if (!hasDetectedPayload) {
+                            usbOutScanStartRef.current = null;
+                          }
+                          setOutQrDetected(hasDetectedPayload);
+                          if (hasDetectedPayload && lastOutResult && !lastOutResult.success) {
+                            setLastOutResult(null);
+                          }
+                        }}
+                        onPaste={(e) => {
+                          e.preventDefault();
+                          if (isProcessingOut) return;
+                          const pasted = e.clipboardData?.getData('text') || '';
+                          if (pasted.trim()) {
+                            usbOutScanStartRef.current = performance.now();
+                            rawOutPayloadRef.current = pasted;
+                            setOutQrDetected(true);
+                            if (lastOutResult && !lastOutResult.success) {
+                              setLastOutResult(null);
+                            }
+                          }
+                        }}
                         onFocus={() => setActiveFocus('OUT')}
                         onKeyDown={(e) => {
+                          if (isProcessingOut) {
+                            e.preventDefault();
+                            return;
+                          }
                           if (e.key === 'Enter') {
                             e.preventDefault();
-                            handlePunchOut(outInput, 'USB_SCANNER');
+                            if (rawOutPayloadRef.current.trim()) {
+                              handlePunchOut(rawOutPayloadRef.current, 'USB_SCANNER');
+                            }
+                          } else if (e.key === 'Backspace' || e.key === 'Delete' || e.key === 'Escape') {
+                            e.preventDefault();
+                            rawOutPayloadRef.current = '';
+                            usbOutScanStartRef.current = null;
+                            setOutQrDetected(false);
+                          } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                            e.preventDefault();
+                            if (!rawOutPayloadRef.current && usbOutScanStartRef.current === null) {
+                              usbOutScanStartRef.current = performance.now();
+                            }
+                            rawOutPayloadRef.current += e.key;
+                            if (!outQrDetected) setOutQrDetected(true);
+                            if (lastOutResult && !lastOutResult.success) {
+                              setLastOutResult(null);
+                            }
                           }
                         }}
                         disabled={isProcessingOut}
                         placeholder="Scan QR Badge (Punch Out Ready)..."
-                        className="w-full bg-slate-950 border border-slate-700 focus:border-indigo-500 rounded-lg px-3.5 py-2.5 pr-24 text-sm text-white font-mono placeholder-slate-500 focus:outline-hidden focus:ring-1 focus:ring-indigo-500 transition"
+                        className={`w-full bg-slate-950 border border-slate-700 focus:border-indigo-500 rounded-lg px-3.5 py-2.5 pr-28 text-sm font-mono placeholder-slate-500 focus:outline-hidden focus:ring-1 focus:ring-indigo-500 transition ${
+                          isProcessingOut || outQrDetected ? 'text-indigo-300 font-semibold' : 'text-white'
+                        }`}
                       />
                       <button
                         type="button"
                         onClick={(e) => {
                           e.stopPropagation();
-                          handlePunchOut(outInput, 'USB_SCANNER');
+                          if (rawOutPayloadRef.current.trim()) {
+                            handlePunchOut(rawOutPayloadRef.current, 'USB_SCANNER');
+                          }
                         }}
-                        disabled={isProcessingOut || !outInput.trim()}
+                        disabled={isProcessingOut || !outQrDetected}
                         className="absolute right-1.5 top-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-xs font-semibold px-3 py-1.5 rounded transition"
                       >
-                        {isProcessingOut ? 'Scanning...' : 'Scan Out'}
+                        {isProcessingOut ? 'Verifying...' : 'Scan Out'}
                       </button>
                     </div>
                   ) : (
@@ -1071,7 +1400,21 @@ export const Scanner: React.FC<ScannerProps> = ({
                 </div>
 
                 {/* Latest Punch Out Result Badge */}
-                <div className="mt-4 flex-1 flex flex-col justify-center">
+                <div className="mt-4 flex-1 flex flex-col justify-center gap-2.5">
+                  {pendingGateFeedback.OUT && (
+                    <div
+                      role="status"
+                      className="px-3.5 py-2.5 rounded-lg border border-indigo-500/60 bg-indigo-950/40 text-indigo-200 flex items-center justify-between text-xs"
+                    >
+                      <span className="flex items-center gap-2 font-semibold">
+                        <span className="w-3.5 h-3.5 border-2 border-indigo-400 border-t-transparent rounded-full animate-spin shrink-0" />
+                        {pendingGateFeedback.OUT.mode === 'QR'
+                          ? 'QR Code Detected ✓ — Verifying QR...'
+                          : 'Submitting manual Punch Out...'}
+                      </span>
+                      <span className="text-[10px] font-mono text-indigo-300">WAIT</span>
+                    </div>
+                  )}
                   {lastOutResult ? (
                     <div 
                       className={`p-4 rounded-lg border flex flex-col gap-3 transition-all ${

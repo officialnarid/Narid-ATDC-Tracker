@@ -1,9 +1,90 @@
 import { Employee, AttendanceRecord, EmployeeType, EmployeeStatus } from '../types';
 import { formatMinutes, formatTimeDisplay } from './attendanceService';
 import { getEmployees, generateQrToken } from './employeeService';
-import { recordAuditLog } from './masterService';
-import { doc, writeBatch } from 'firebase/firestore';
-import { db } from '../firebase';
+import { getAuthHeaders } from './auditService';
+import {
+  apiUrl,
+  assertApiBaseConfigured,
+  executeApiFetch,
+  safeParseJsonResponse,
+} from '../config/api';
+import { auth } from '../firebase';
+
+export const EMPLOYEE_ID_PATTERN = /^[A-Za-z0-9_.\-]+$/;
+
+export type ImportFailureCategory =
+  | 'AUTHENTICATION'
+  | 'AUTHORIZATION'
+  | 'DATABASE_AUTHORIZATION'
+  | 'VALIDATION'
+  | 'NETWORK_OR_TIMEOUT'
+  | 'DATABASE_WRITE_ERROR';
+
+export interface ImportFailedRow {
+  employeeId: string;
+  rowNumber?: number;
+  actionType?: 'NEW' | 'UPDATE';
+  error: string;
+}
+
+export interface EmployeeImportCommitResult {
+  savedCount: number;
+  insertedCount: number;
+  updatedCount: number;
+  skippedCount: number;
+  failedCount: number;
+  committedIds: string[];
+  insertedIds: string[];
+  updatedIds: string[];
+  skippedIds: string[];
+  failedRows: ImportFailedRow[];
+  partialCommit: boolean;
+}
+
+export class EmployeeImportCommitError extends Error {
+  category: ImportFailureCategory;
+  code?: string;
+  status?: number;
+  partialCommit: boolean;
+  savedCount: number;
+  insertedCount: number;
+  updatedCount: number;
+  skippedCount: number;
+  failedCount: number;
+  committedIds: string[];
+  failedRows: ImportFailedRow[];
+
+  constructor(
+    message: string,
+    details: {
+      category: ImportFailureCategory;
+      code?: string;
+      status?: number;
+      partialCommit?: boolean;
+      savedCount?: number;
+      insertedCount?: number;
+      updatedCount?: number;
+      skippedCount?: number;
+      failedCount?: number;
+      committedIds?: string[];
+      failedRows?: ImportFailedRow[];
+    }
+  ) {
+    super(message);
+    this.name = 'EmployeeImportCommitError';
+    this.category = details.category;
+    this.code = details.code;
+    this.status = details.status;
+    this.partialCommit = Boolean(details.partialCommit);
+    this.savedCount = Number(details.savedCount || 0);
+    this.insertedCount = Number(details.insertedCount || 0);
+    this.updatedCount = Number(details.updatedCount || 0);
+    this.skippedCount = Number(details.skippedCount || 0);
+    this.failedCount = Number(details.failedCount || 0);
+    this.committedIds = Array.isArray(details.committedIds) ? details.committedIds : [];
+    this.failedRows = Array.isArray(details.failedRows) ? details.failedRows : [];
+  }
+}
 
 export interface ExcelImportRow {
   employeeId: string;
@@ -22,6 +103,7 @@ export interface ImportValidationResult {
     data: Employee;
     actionType: 'NEW' | 'UPDATE' | 'UNCHANGED';
     diffs?: string[];
+    rowNumber?: number;
   }[];
   invalidRows: {
     rowNumber: number;
@@ -148,9 +230,15 @@ export async function parseAndValidateEmployeeExcel(
 
     const errors: string[] = [];
 
-    // Validation 1: Required Employee ID
+    // Validation 1: Required & deterministic Employee ID format
     if (!rawId) {
       errors.push('Employee ID is missing');
+    } else if (rawId.length > 128) {
+      errors.push(`Employee ID "${rawId}" exceeds maximum length of 128 characters`);
+    } else if (!EMPLOYEE_ID_PATTERN.test(rawId)) {
+      errors.push(
+        `Invalid Employee ID "${rawId}". Only letters, numbers, underscores (_), hyphens (-), and periods (.) are allowed (no spaces or slashes).`
+      );
     }
 
     // Validation 2: Required Employee Name
@@ -217,7 +305,7 @@ export async function parseAndValidateEmployeeExcel(
         createdAt: now,
         updatedAt: now,
       };
-      validRows.push({ data: newEmp, actionType: 'NEW' });
+      validRows.push({ data: newEmp, actionType: 'NEW', rowNumber: rowNum });
     } else {
       const diffs: string[] = [];
       if (existing.employeeName !== rawName) diffs.push(`Name: ${existing.employeeName} -> ${rawName}`);
@@ -243,9 +331,9 @@ export async function parseAndValidateEmployeeExcel(
       };
 
       if (diffs.length > 0) {
-        validRows.push({ data: updatedEmp, actionType: 'UPDATE', diffs });
+        validRows.push({ data: updatedEmp, actionType: 'UPDATE', diffs, rowNumber: rowNum });
       } else {
-        validRows.push({ data: updatedEmp, actionType: 'UNCHANGED' });
+        validRows.push({ data: updatedEmp, actionType: 'UNCHANGED', rowNumber: rowNum });
       }
     }
   }
@@ -268,31 +356,142 @@ export async function parseAndValidateEmployeeExcel(
   };
 }
 
-// 3. Commit Validated Rows to Firestore using batched writes
+// 3. Commit Validated Rows via Authenticated Server Admin SDK API
 export async function commitImportedEmployees(
   items: ImportValidationResult['validRows'],
   fileName: string
-): Promise<{ savedCount: number }> {
+): Promise<EmployeeImportCommitResult> {
+  const unchangedItems = items.filter((item) => item.actionType === 'UNCHANGED');
   const toSave = items.filter((item) => item.actionType !== 'UNCHANGED');
-  const BATCH_CHUNK_SIZE = 400;
-  for (let i = 0; i < toSave.length; i += BATCH_CHUNK_SIZE) {
-    const chunk = toSave.slice(i, i + BATCH_CHUNK_SIZE);
-    const batch = writeBatch(db);
-    for (const item of chunk) {
-      batch.set(doc(db, 'employees', item.data.employeeId), item.data);
-    }
-    await batch.commit();
+
+  if (toSave.length === 0) {
+    return {
+      savedCount: 0,
+      insertedCount: 0,
+      updatedCount: 0,
+      skippedCount: unchangedItems.length,
+      failedCount: 0,
+      committedIds: [],
+      insertedIds: [],
+      updatedIds: [],
+      skippedIds: unchangedItems.map((i) => i.data.employeeId),
+      failedRows: [],
+      partialCommit: false,
+    };
   }
 
-  const savedCount = toSave.length;
-  await recordAuditLog({
-    action: 'EXCEL_EMPLOYEE_IMPORT',
-    newValue: `Committed ${savedCount} employees from ${fileName}`,
-    actionSource: 'EXCEL_IMPORT',
-    reason: `File upload: ${items.length} validated rows`,
-  });
+  if (!auth.currentUser) {
+    throw new EmployeeImportCommitError(
+      'Your authentication session is not active. Please sign in again before importing employees.',
+      {
+        category: 'AUTHENTICATION',
+        code: 'AUTH_SESSION_REQUIRED',
+        status: 401,
+        skippedCount: unchangedItems.length,
+        failedCount: toSave.length,
+      }
+    );
+  }
 
-  return { savedCount };
+  assertApiBaseConfigured();
+  const headers = await getAuthHeaders();
+  if (!headers.Authorization) {
+    throw new EmployeeImportCommitError(
+      'Unable to obtain a verified Firebase authentication token. Please sign out and sign in again.',
+      {
+        category: 'AUTHENTICATION',
+        code: 'AUTH_TOKEN_MISSING',
+        status: 401,
+        skippedCount: unchangedItems.length,
+        failedCount: toSave.length,
+      }
+    );
+  }
+
+  const payloadRows = toSave.map((item) => ({
+    employeeId: item.data.employeeId,
+    employeeName: item.data.employeeName,
+    employeeType: item.data.employeeType,
+    section: item.data.section,
+    department: item.data.department,
+    floor: item.data.floor,
+    designation: item.data.designation,
+    employeeStatus: item.data.employeeStatus,
+    ...(typeof item.rowNumber === 'number' ? { rowNumber: item.rowNumber } : {}),
+  }));
+
+  let res: Response;
+  try {
+    res = await executeApiFetch(
+      apiUrl('/api/employees/bulk-import'),
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          fileName: fileName || 'employee_import.xlsx',
+          rows: payloadRows,
+        }),
+      },
+      'POST /api/employees/bulk-import',
+      { timeoutMs: 30000 }
+    );
+  } catch (networkErr: any) {
+    throw new EmployeeImportCommitError(
+      networkErr?.message ||
+        'Network or timeout error while contacting the import server. Refresh Employee Master before retrying.',
+      {
+        category: 'NETWORK_OR_TIMEOUT',
+        code: 'NETWORK_OR_TIMEOUT',
+        skippedCount: unchangedItems.length,
+        failedCount: toSave.length,
+      }
+    );
+  }
+
+  const parsed = await safeParseJsonResponse<any>(res, 'POST /api/employees/bulk-import');
+  const data = parsed.data || {};
+
+  if (!parsed.ok) {
+    let category: ImportFailureCategory = 'DATABASE_WRITE_ERROR';
+    if (res.status === 401) category = 'AUTHENTICATION';
+    else if (res.status === 403) category = 'AUTHORIZATION';
+    else if (res.status === 400) category = 'VALIDATION';
+    else if (data.category) category = data.category as ImportFailureCategory;
+
+    throw new EmployeeImportCommitError(
+      parsed.errorMessage || data.error || 'Failed to save imported employee records.',
+      {
+        category,
+        code: data.code,
+        status: res.status,
+        partialCommit: Boolean(data.partialCommit),
+        savedCount: Number(data.savedCount || 0),
+        insertedCount: Number(data.insertedCount || 0),
+        updatedCount: Number(data.updatedCount || 0),
+        skippedCount: Number(data.skippedCount ?? unchangedItems.length),
+        failedCount: Number(data.failedCount ?? toSave.length),
+        committedIds: Array.isArray(data.committedIds) ? data.committedIds : [],
+        failedRows: Array.isArray(data.failedRows) ? data.failedRows : [],
+      }
+    );
+  }
+
+  return {
+    savedCount: Number(data.savedCount || 0),
+    insertedCount: Number(data.insertedCount || 0),
+    updatedCount: Number(data.updatedCount || 0),
+    skippedCount: Number(data.skippedCount || 0) + unchangedItems.length,
+    failedCount: Number(data.failedCount || 0),
+    committedIds: Array.isArray(data.committedIds) ? data.committedIds : [],
+    insertedIds: Array.isArray(data.insertedIds) ? data.insertedIds : [],
+    updatedIds: Array.isArray(data.updatedIds) ? data.updatedIds : [],
+    skippedIds: [
+      ...unchangedItems.map((i) => i.data.employeeId),
+      ...(Array.isArray(data.skippedIds) ? data.skippedIds : []),
+    ],
+    failedRows: Array.isArray(data.failedRows) ? data.failedRows : [],
+    partialCommit: Boolean(data.partialCommit),
+  };
 }
 
 // 4. Export Generic Table Data to Excel (.xlsx) & CSV

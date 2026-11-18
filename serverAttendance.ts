@@ -478,7 +478,9 @@ async function resolveCallerAttendancePermissions(
 
   try {
     const [userPermSnap, rolePermSnap] = await Promise.all([
-      db.collection('user_permissions').doc(caller.profileDocId).get(),
+      caller.prefetchedUserPermSnap
+        ? Promise.resolve(caller.prefetchedUserPermSnap)
+        : db.collection('user_permissions').doc(caller.profileDocId).get(),
       getCachedRolePermissionsDoc(db, caller.role),
     ]);
 
@@ -576,7 +578,8 @@ export interface AttendanceRoutesDeps {
     req: Request,
     res: Response,
     allowedRoles: string[] | '*',
-    actionLabel: string
+    actionLabel: string,
+    options?: { prefetchUserPermission?: boolean }
   ) => Promise<VerifiedCaller | null>;
 }
 
@@ -601,7 +604,8 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         req,
         res,
         '*',
-        'Attendance Scan Processing'
+        'Attendance Scan Processing',
+        { prefetchUserPermission: true }
       );
       if (!caller) return;
       const authDoneMs = performance.now();
@@ -624,6 +628,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           actionSource: 'ATTENDANCE_PERMISSION_GUARD',
           description: `User "${caller.loginId}" (${caller.role}) blocked from /api/attendance/scan due to missing attendance.qr.scan permission.`,
           success: false,
+          captureGeo: false,
         });
         return res.status(403).json({
           success: false,
@@ -660,7 +665,10 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
 
       const kolkata = getKolkataTimeParts(now);
       const timeDisplay = kolkata.timeWithSeconds;
+      const qrParseStartMs = performance.now();
       const { employeeId, token, format } = parseQrPayload(rawPayload);
+      const qrParseDoneMs = performance.now();
+      const qrParseMs = roundMs(qrParseDoneMs - qrParseStartMs);
 
       if (format === 'INVALID' || !employeeId) {
         await writePunchLog({
@@ -726,6 +734,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             };
           }
 
+          const tokenValStartMs = performance.now();
           const employee = empSnap.data()!;
           if (employee.employeeStatus !== 'Active') {
             await writePunchLog({
@@ -786,6 +795,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
               },
             };
           }
+          const tokenValDoneMs = performance.now();
 
           const qrVerificationMode = token ? 'TOKEN_VERIFIED' : 'UNTOKENIZED_EMPLOYEE';
           const txStartMs = performance.now();
@@ -805,14 +815,20 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           });
           const txDoneMs = performance.now();
 
+          const lookupDuration = lookupDoneMs - lookupStartMs;
+          const txDuration = txDoneMs - txStartMs;
           const perf: AttendancePerfMetrics = {
+            qrParseMs,
             authMs: roundMs(authDoneMs - reqStartMs),
             permissionMs: roundMs(permDoneMs - authDoneMs),
-            lookupAndQueryMs: roundMs(lookupDoneMs - lookupStartMs),
-            txMs: roundMs(txDoneMs - txStartMs),
+            lookupAndQueryMs: roundMs(lookupDuration),
+            tokenValidationMs: roundMs(tokenValDoneMs - tokenValStartMs),
+            txMs: roundMs(txDuration),
+            firestoreOpMs: roundMs(lookupDuration + txDuration),
             totalServerMs: roundMs(txDoneMs - reqStartMs),
             cacheHitRolePerms: perms.cacheHitRolePerms,
             cacheHitConfig: shiftsRes.cacheHit && settingsRes.cacheHit,
+            cacheHitUidRoute: Boolean(caller.cacheHitUidRoute),
           };
           emitNonSensitivePerfLog('attendance.scan', {
             status: punchRes.httpStatus,
@@ -848,7 +864,8 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         req,
         res,
         '*',
-        'Manual Employee ID Punch'
+        'Manual Employee ID Punch',
+        { prefetchUserPermission: true }
       );
       if (!caller) return;
       const authDoneMs = performance.now();
@@ -871,6 +888,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           actionSource: 'ATTENDANCE_PERMISSION_GUARD',
           description: `User "${caller.loginId}" (${caller.role}) blocked from /api/attendance/manual-punch due to missing attendance.manual.entry permission.`,
           success: false,
+          captureGeo: false,
         });
         return res.status(403).json({
           success: false,
@@ -1015,15 +1033,19 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             auditDoneMs = performance.now();
           }
 
+          const lookupDuration = lookupDoneMs - lookupStartMs;
+          const txDuration = txDoneMs - txStartMs;
           const perf: AttendancePerfMetrics = {
             authMs: roundMs(authDoneMs - reqStartMs),
             permissionMs: roundMs(permDoneMs - authDoneMs),
-            lookupAndQueryMs: roundMs(lookupDoneMs - lookupStartMs),
-            txMs: roundMs(txDoneMs - txStartMs),
+            lookupAndQueryMs: roundMs(lookupDuration),
+            txMs: roundMs(txDuration),
+            firestoreOpMs: roundMs(lookupDuration + txDuration),
             auditMs: roundMs(auditDoneMs - txDoneMs),
             totalServerMs: roundMs(auditDoneMs - reqStartMs),
             cacheHitRolePerms: perms.cacheHitRolePerms,
             cacheHitConfig: shiftsRes.cacheHit && settingsRes.cacheHit,
+            cacheHitUidRoute: Boolean(caller.cacheHitUidRoute),
           };
           emitNonSensitivePerfLog('attendance.manual_punch', {
             status: result.httpStatus,

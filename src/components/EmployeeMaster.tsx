@@ -34,12 +34,15 @@ import {
 } from '../services/employeeService';
 import { UserRoleRecord } from '../types';
 import { RolePermissionRecord, hasModulePermission } from '../services/permissionService';
+import { EmployeeMasterSkeleton, TableSkeletonRows } from './Skeletons';
 
 interface EmployeeMasterProps {
   employees: Employee[];
   floors: Floor[];
   sections: Section[];
   departments: Department[];
+  isLoading?: boolean;
+  loadError?: string | null;
   onRefresh: () => void;
   currentUserRole?: UserRoleRecord | null;
   rolePermissions?: Record<string, RolePermissionRecord>;
@@ -50,6 +53,8 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
   floors,
   sections,
   departments,
+  isLoading = false,
+  loadError = null,
   onRefresh,
   currentUserRole,
   rolePermissions,
@@ -59,6 +64,8 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
   const canDelete = hasModulePermission(currentUserRole?.role, 'employees', 'delete', rolePermissions);
 
   const [searchTerm, setSearchTerm] = useState('');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
   const [filterFloor, setFilterFloor] = useState('ALL');
   const [filterSection, setFilterSection] = useState('ALL');
   const [filterDept, setFilterDept] = useState('ALL');
@@ -216,14 +223,46 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
     });
   }, [employees, searchTerm, filterFloor, filterSection, filterDept, filterType, filterStatus]);
 
+  const totalPages = Math.max(1, Math.ceil(filteredList.length / pageSize));
+  const safePage = Math.min(page, totalPages);
+  const paginatedList = useMemo(() => {
+    const start = (safePage - 1) * pageSize;
+    return filteredList.slice(start, start + pageSize);
+  }, [filteredList, safePage, pageSize]);
+
+  if (isLoading && employees.length === 0 && !loadError) {
+    return <EmployeeMasterSkeleton />;
+  }
+
   return (
     <div className="p-6 bg-slate-50 min-h-full flex flex-col gap-6">
+      {loadError && (
+        <div role="alert" className="bg-red-50 border border-red-200 text-red-800 rounded-xl px-4 py-3 text-xs flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+            <span>{loadError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={onRefresh}
+            className="bg-white hover:bg-red-100 text-red-700 border border-red-300 px-3 py-1 rounded font-semibold transition cursor-pointer"
+          >
+            Retry
+          </button>
+        </div>
+      )}
       {/* Top Header & Action */}
       <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-2xs flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h2 className="text-xl font-bold text-slate-800 tracking-tight flex items-center gap-2">
             <Users className="w-5 h-5 text-blue-600" />
             <span>EMPLOYEE MASTER</span>
+            {isLoading && employees.length > 0 && (
+              <span className="inline-flex items-center gap-1 text-[11px] font-medium text-blue-600 ml-2">
+                <RotateCcw className="w-3 h-3 animate-spin" />
+                Refreshing
+              </span>
+            )}
           </h2>
           <p className="text-xs text-slate-500">
             Total {employees.length} records • {activeCount} Active
@@ -348,14 +387,16 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {filteredList.length === 0 ? (
+              {isLoading && filteredList.length === 0 ? (
+                <TableSkeletonRows rows={6} cols={9} />
+              ) : filteredList.length === 0 ? (
                 <tr>
                   <td colSpan={9} className="py-8 text-center text-slate-400">
                     No employees matching the criteria found.
                   </td>
                 </tr>
               ) : (
-                filteredList.map((emp) => (
+                paginatedList.map((emp) => (
                   <tr key={emp.employeeId} className="hover:bg-slate-50/70 transition">
                     <td className="py-3 px-3.5 font-mono font-bold text-slate-900">{emp.employeeId}</td>
                     <td className="py-3 px-3.5 font-semibold text-slate-800">{emp.employeeName}</td>
@@ -430,6 +471,49 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
             </tbody>
           </table>
         </div>
+        {filteredList.length > 0 && (
+          <div className="px-4 py-3 border-t border-slate-200 bg-slate-50/70 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-600">
+            <div>
+              Showing <span className="font-semibold text-slate-800">{(safePage - 1) * pageSize + 1}</span>–
+              <span className="font-semibold text-slate-800">{Math.min(safePage * pageSize, filteredList.length)}</span> of{' '}
+              <span className="font-semibold text-slate-800">{filteredList.length}</span> employees
+            </div>
+            <div className="flex items-center gap-2">
+              <select
+                value={pageSize}
+                onChange={(e) => {
+                  setPageSize(Number(e.target.value));
+                  setPage(1);
+                }}
+                aria-label="Rows per page"
+                className="bg-white border border-slate-300 rounded px-2 py-1 text-xs"
+              >
+                <option value={25}>25 / page</option>
+                <option value={50}>50 / page</option>
+                <option value={100}>100 / page</option>
+              </select>
+              <button
+                type="button"
+                disabled={safePage <= 1}
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                className="px-2.5 py-1 rounded border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-40 cursor-pointer"
+              >
+                Prev
+              </button>
+              <span className="font-mono text-[11px]">
+                {safePage} / {totalPages}
+              </span>
+              <button
+                type="button"
+                disabled={safePage >= totalPages}
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                className="px-2.5 py-1 rounded border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-40 cursor-pointer"
+              >
+                Next
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* CREATE / EDIT EMPLOYEE MODAL */}

@@ -422,9 +422,20 @@ export interface ScanResult {
   otFormatted?: string;
   punchCount?: number;
   perf?: {
+    qrDetectMs?: number;
+    qrParseMs?: number;
+    tokenFetchMs?: number;
+    authMs?: number;
+    permissionMs?: number;
+    lookupAndQueryMs?: number;
+    tokenValidationMs?: number;
+    txMs?: number;
+    firestoreOpMs?: number;
     totalServerMs?: number;
     networkApiMs?: number;
     uiDisplayMs?: number;
     totalEndToEndMs?: number;
+    totalPunchInMs?: number;
+    totalPunchOutMs?: number;
   };
 }

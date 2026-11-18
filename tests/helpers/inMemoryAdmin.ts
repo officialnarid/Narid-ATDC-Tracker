@@ -9,6 +9,7 @@ import {
   AdminQuerySnapLike,
   AdminTransactionLike,
   AdminUserRecordLike,
+  AdminWriteBatchLike,
 } from '../../serverSecurityAudit.ts';
 import { hashPassword } from '../../server.ts';
 
@@ -230,6 +231,26 @@ export class InMemoryFirestore implements AdminFirestoreLike {
     const next = this.txQueue.then(run, run);
     this.txQueue = next.catch(() => undefined);
     return next;
+  }
+
+  public batch(): AdminWriteBatchLike {
+    const ops: Array<() => Promise<void>> = [];
+    return {
+      set: (ref: AdminDocRefLike, data: Record<string, any>, options?: { merge?: boolean }) => {
+        ops.push(() => ref.set(data, options));
+      },
+      update: (ref: AdminDocRefLike, data: Record<string, any>) => {
+        ops.push(() => ref.update(data));
+      },
+      delete: (ref: AdminDocRefLike) => {
+        ops.push(() => ref.delete());
+      },
+      commit: async () => {
+        for (const op of ops) {
+          await op();
+        }
+      },
+    };
   }
 }
 

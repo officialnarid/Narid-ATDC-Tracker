@@ -1,6 +1,12 @@
 import express, { type Request, type Response } from 'express';
 import crypto from 'crypto';
-import { getCachedRoleDefDoc, getCachedSystemSettings } from './serverPerfCache.ts';
+import {
+  getCachedRoleDefDoc,
+  getCachedSystemSettings,
+  getCachedUidRolePointer,
+  setCachedUidRolePointer,
+  invalidateUidRolePointer,
+} from './serverPerfCache.ts';
 
 const KOLKATA_CA_DATE_FORMATTER = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' });
 
@@ -94,6 +100,8 @@ export interface VerifiedCaller {
   profileDocId: string;
   authTime?: number;
   modulesAllowed?: string[];
+  prefetchedUserPermSnap?: AdminDocSnapLike | null;
+  cacheHitUidRoute?: boolean;
 }
 
 export interface GeoLocationInfo {
@@ -208,7 +216,8 @@ export async function verifyCallerIdentity(
   req: Request,
   db: AdminFirestoreLike,
   auth: AdminAuthLike | null,
-  _projectId?: string
+  _projectId?: string,
+  options?: { prefetchUserPermission?: boolean }
 ): Promise<VerifiedCaller | null> {
   const authHeader = req.headers.authorization || '';
   if (!authHeader.startsWith('Bearer ')) {
@@ -248,26 +257,74 @@ export async function verifyCallerIdentity(
 
   const verifiedUid = decoded.uid.trim();
   const decodedEmail = String(decoded.email || '').toLowerCase();
+  const shouldPrefetchUserPerm = Boolean(options?.prefetchUserPermission);
 
   // Strictly UID-based RBAC lookup (zero hardcoded emails or @narid.com prefix guessing)
   let matchedDoc: { id: string; data: Record<string, any> } | null = null;
+  let prefetchedUserPermSnap: AdminDocSnapLike | null | undefined = undefined;
+  let idxSnap: AdminDocSnapLike | null = null;
+  let usedPointerHit = false;
 
-  // 1. Fast direct lookup via user_uid_index/{uid}
-  const idxSnap = await db.collection('user_uid_index').doc(verifiedUid).get();
-  if (idxSnap.exists) {
-    const idxData = idxSnap.data() || {};
-    if (idxData.roleDocId) {
-      const roleDocSnap = await db.collection('user_roles').doc(String(idxData.roleDocId)).get();
-      if (roleDocSnap.exists) {
-        const d = roleDocSnap.data() || {};
-        const linked: string[] = Array.isArray(d.linkedAuthUids) ? d.linkedAuthUids : [];
-        if (
-          d.authUid === verifiedUid ||
-          d.uid === verifiedUid ||
-          roleDocSnap.id === verifiedUid ||
-          linked.includes(verifiedUid)
-        ) {
-          matchedDoc = { id: roleDocSnap.id, data: d };
+  const doesDocOwnUid = (docId: string, d: Record<string, any>): boolean => {
+    const linked: string[] = Array.isArray(d.linkedAuthUids) ? d.linkedAuthUids : [];
+    return (
+      d.authUid === verifiedUid ||
+      d.uid === verifiedUid ||
+      docId === verifiedUid ||
+      linked.includes(verifiedUid)
+    );
+  };
+
+  // 0. Fast warm route via non-authoritative uid -> roleDocId structural pointer
+  //    Reads `user_roles/{roleDocId}` (and optionally `user_permissions/{roleDocId}`)
+  //    LIVE from Firestore in 1 parallel RTT without trusting cached status/locks.
+  const pointer = getCachedUidRolePointer(db, verifiedUid);
+  if (pointer) {
+    const prefetchPermNow = shouldPrefetchUserPerm && pointer.lastRole !== 'super_admin';
+    const [roleDocSnap, userPermSnap] = await Promise.all([
+      db.collection('user_roles').doc(pointer.roleDocId).get(),
+      prefetchPermNow
+        ? db.collection('user_permissions').doc(pointer.roleDocId).get()
+        : Promise.resolve(null),
+    ]);
+    if (roleDocSnap.exists) {
+      const d = roleDocSnap.data() || {};
+      if (doesDocOwnUid(roleDocSnap.id, d)) {
+        matchedDoc = { id: roleDocSnap.id, data: d };
+        if (prefetchPermNow && userPermSnap) {
+          prefetchedUserPermSnap = userPermSnap;
+        }
+        usedPointerHit = true;
+      }
+    }
+    if (!matchedDoc) {
+      invalidateUidRolePointer(db, verifiedUid);
+    }
+  }
+
+  // 1. Live lookup via user_uid_index/{uid}
+  if (!matchedDoc) {
+    idxSnap = await db.collection('user_uid_index').doc(verifiedUid).get();
+    if (idxSnap.exists) {
+      const idxData = idxSnap.data() || {};
+      if (idxData.roleDocId) {
+        const targetDocId = String(idxData.roleDocId);
+        const prefetchPermNow =
+          shouldPrefetchUserPerm && String(idxData.role || '').toLowerCase() !== 'super_admin';
+        const [roleDocSnap, userPermSnap] = await Promise.all([
+          db.collection('user_roles').doc(targetDocId).get(),
+          prefetchPermNow
+            ? db.collection('user_permissions').doc(targetDocId).get()
+            : Promise.resolve(null),
+        ]);
+        if (roleDocSnap.exists) {
+          const d = roleDocSnap.data() || {};
+          if (doesDocOwnUid(roleDocSnap.id, d)) {
+            matchedDoc = { id: roleDocSnap.id, data: d };
+            if (prefetchPermNow && userPermSnap) {
+              prefetchedUserPermSnap = userPermSnap;
+            }
+          }
         }
       }
     }
@@ -349,27 +406,32 @@ export async function verifyCallerIdentity(
     matchedDoc.data.loginId || matchedDoc.id.replace(/^role_/, '')
   ).toLowerCase();
 
-  // Keep user_uid_index synchronized synchronously when missing or drifted so serverless handlers never drop writes
-  const targetStatus = String(matchedDoc.data.status || 'Active');
-  const targetLockStatus = String(matchedDoc.data.lockStatus || 'ACTIVE');
-  const idxData = idxSnap.exists ? idxSnap.data() || {} : null;
-  if (
-    !idxData ||
-    idxData.roleDocId !== matchedDoc.id ||
-    idxData.role !== normalizedRole ||
-    idxData.status !== targetStatus ||
-    idxData.lockStatus !== targetLockStatus ||
-    idxData.loginId !== resolvedLoginId
-  ) {
-    await syncUserUidIndex(db, {
-      uid: verifiedUid,
-      roleDocId: matchedDoc.id,
-      role: normalizedRole,
-      status: targetStatus,
-      lockStatus: targetLockStatus,
-      loginId: resolvedLoginId,
-    });
+  // Keep user_uid_index synchronized when resolved via cold/fallback lookup
+  if (idxSnap !== null) {
+    const targetStatus = String(matchedDoc.data.status || 'Active');
+    const targetLockStatus = String(matchedDoc.data.lockStatus || 'ACTIVE');
+    const idxData = idxSnap.exists ? idxSnap.data() || {} : null;
+    if (
+      !idxData ||
+      idxData.roleDocId !== matchedDoc.id ||
+      idxData.role !== normalizedRole ||
+      idxData.status !== targetStatus ||
+      idxData.lockStatus !== targetLockStatus ||
+      idxData.loginId !== resolvedLoginId
+    ) {
+      await syncUserUidIndex(db, {
+        uid: verifiedUid,
+        roleDocId: matchedDoc.id,
+        role: normalizedRole,
+        status: targetStatus,
+        lockStatus: targetLockStatus,
+        loginId: resolvedLoginId,
+      });
+    }
   }
+
+  // Record structural UID -> roleDocId pointer for faster live lookup on subsequent requests
+  setCachedUidRolePointer(db, verifiedUid, matchedDoc.id, normalizedRole);
 
   return {
     uid: verifiedUid,
@@ -380,7 +442,12 @@ export async function verifyCallerIdentity(
     authTime,
     modulesAllowed: Array.isArray(matchedDoc.data.modulesAllowed)
       ? matchedDoc.data.modulesAllowed
-      : undefined,
+      : [],
+    prefetchedUserPermSnap:
+      normalizedRole !== 'super_admin' && prefetchedUserPermSnap !== undefined
+        ? prefetchedUserPermSnap
+        : undefined,
+    cacheHitUidRoute: usedPointerHit,
   };
 }
 

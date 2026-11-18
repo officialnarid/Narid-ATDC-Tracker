@@ -37,10 +37,12 @@ import {
   MAX_CONSECUTIVE_FAILED_ATTEMPTS,
 } from './serverLoginSecurity.ts';
 import { registerAttendanceRoutes } from './serverAttendance.ts';
+import { registerEmployeeRoutes } from './serverEmployees.ts';
 import {
   getCachedRoleDefDoc,
   getCachedRolePermissionsDoc,
   invalidateRoleCaches,
+  invalidateUidRolePointer,
 } from './serverPerfCache.ts';
 import { resolveAttendanceMetrics } from './src/utils/attendanceStatus.ts';
 import {
@@ -973,10 +975,11 @@ export function createApp(options: ServerAppOptions = {}) {
     req: Request,
     res: Response,
     allowedRoles: string[] | '*',
-    actionLabel: string
+    actionLabel: string,
+    options?: { prefetchUserPermission?: boolean }
   ): Promise<VerifiedCaller | null> {
     try {
-      const caller = await verifyCallerIdentity(req, adminDb, auth, projectId);
+      const caller = await verifyCallerIdentity(req, adminDb, auth, projectId, options);
       if (!caller) {
         await logAuditEvent({
           req,
@@ -1135,6 +1138,11 @@ export function createApp(options: ServerAppOptions = {}) {
   });
 
   registerAttendanceRoutes(app, {
+    db: adminDb,
+    requireVerifiedCaller,
+  });
+
+  registerEmployeeRoutes(app, {
     db: adminDb,
     requireVerifiedCaller,
   });
@@ -2129,6 +2137,7 @@ export function createApp(options: ServerAppOptions = {}) {
       await adminDb.collection('user_permissions').doc(targetDocId).delete().catch(() => {});
       if (targetUid && !targetUid.startsWith('role_')) {
         await removeUserUidIndex(adminDb, targetUid);
+        invalidateUidRolePointer(adminDb, targetUid);
         if (auth) {
           await auth.revokeRefreshTokens(targetUid).catch(() => {});
           await auth.deleteUser(targetUid).catch(() => {});
@@ -2295,6 +2304,9 @@ export function createApp(options: ServerAppOptions = {}) {
       });
 
       invalidateRoleCaches(adminDb, effectiveRole);
+      if (oldData.authUid) {
+        invalidateUidRolePointer(adminDb, String(oldData.authUid));
+      }
 
       return res.json({ success: true, message: `Permissions for "${oldData.loginId}" updated successfully.` });
     } catch (err: any) {
@@ -2896,6 +2908,7 @@ export function createApp(options: ServerAppOptions = {}) {
         });
       }
 
+      invalidateUidRolePointer(adminDb);
       const remainingSnap = await adminDb.collection('user_roles').get();
       return res.json({
         success: true,
@@ -3150,6 +3163,8 @@ export async function startServer() {
       `NARID ATDC Tracker API running at http://0.0.0.0:${PORT} (project=${projectId}, db=${databaseId}, credMode=${credentialMode})`
     );
   });
+  server.keepAliveTimeout = 65_000;
+  server.headersTimeout = 66_000;
 
   const shutdown = (signal: string) => {
     console.log(`[Server] Received ${signal}, closing HTTP server cleanly.`);

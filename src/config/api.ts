@@ -186,10 +186,16 @@ export class ApiRequestError<T = any> extends Error {
   }
 }
 
+export interface ExecuteApiFetchOptions {
+  timeoutMs?: number;
+  noRetryOnNetworkError?: boolean;
+}
+
 export async function executeApiFetch(
   url: string,
   init?: RequestInit,
-  endpointLabel?: string
+  endpointLabel?: string,
+  options?: ExecuteApiFetchOptions
 ): Promise<Response> {
   const isPreviewToVercel =
     typeof window !== 'undefined' &&
@@ -199,13 +205,25 @@ export async function executeApiFetch(
     ? url.slice(SHARED_VERCEL_BACKEND_URL.length) || '/api/health'
     : '';
 
+  const timeoutMs = options?.timeoutMs && options.timeoutMs > 0 ? options.timeoutMs : 0;
+  const controller =
+    timeoutMs > 0 && !init?.signal && typeof AbortController !== 'undefined'
+      ? new AbortController()
+      : null;
+  const timeoutId = controller
+    ? setTimeout(() => controller.abort(), timeoutMs)
+    : null;
+  const effectiveInit: RequestInit | undefined = controller
+    ? { ...(init || {}), signal: controller.signal }
+    : init;
+
   try {
-    const res = await fetch(url, init);
+    const res = await fetch(url, effectiveInit);
     if (isPreviewToVercel && res.status === 404 && sameOriginPath) {
       try {
         const clonedBody = await res.clone().json();
         if (clonedBody && clonedBody.error === 'API endpoint not found.') {
-          return await fetch(sameOriginPath, init);
+          return await fetch(sameOriginPath, effectiveInit);
         }
       } catch {
         // Non-JSON 404: return original response cleanly
@@ -213,11 +231,20 @@ export async function executeApiFetch(
     }
     return res;
   } catch (err: any) {
+    const isAborted = err?.name === 'AbortError' || controller?.signal?.aborted;
+    // NEVER blindly retry aborted/timed-out attendance requests — server may have already started/committed.
+    if (isAborted) {
+      const label = endpointLabel || url;
+      throw new Error(
+        `Request timed out for ${label}. Do not assume failure — verify Dual Gate Activity or Attendance History before retrying.`
+      );
+    }
+
     // In Google AI Studio Preview, both the shared Vercel backend and the local Express server (/api/*)
     // connect to the same Firebase project/Firestore database. If a cross-origin request to Vercel fails
-    // at the network/CORS layer (e.g., transient gateway timeout or preview browser restriction),
-    // transparently retry against same-origin /api/* once.
-    if (isPreviewToVercel && sameOriginPath) {
+    // at the network/CORS layer before reaching Vercel (e.g., preview browser restriction),
+    // transparently retry against same-origin /api/* once unless disabled.
+    if (isPreviewToVercel && sameOriginPath && !options?.noRetryOnNetworkError) {
       try {
         return await fetch(sameOriginPath, init);
       } catch {
@@ -233,6 +260,10 @@ export async function executeApiFetch(
     throw new Error(
       `Unable to reach ${label} at ${targetDesc}${detail}. Verify Vercel /api Serverless Functions (or VITE_API_BASE_URL) are deployed and reachable.`
     );
+  } finally {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
   }
 }
 
