@@ -391,5 +391,261 @@ describe('QR Punch In & Punch Out Pipeline Optimization & Compatibility Suite', 
     expect(manualIn.body.action).toBe('PUNCH_IN');
     expect(manualIn.body.perf.cacheHitUidRoute).toBe(false);
     expect(typeof manualIn.body.perf.firestoreOpMs).toBe('number');
+    expect(typeof manualIn.body.perf.auditMs).toBe('number');
+    expect(typeof manualIn.body.perf.employeeLookupMs).toBe('number');
+    expect(typeof manualIn.body.perf.attendanceLookupMs).toBe('number');
+  });
+
+  it('overlaps post-token employee+attendance+config reads with caller lookup to eliminate 1 full Firestore RTT and emits all granular stage timings', async () => {
+    const wrapped = wrapDbWithLatency(rawDb, { readMs: 90, queryMs: 90, txMs: 40 });
+    const latencyAuth = wrapAuthWithLatency(rawAuth, 40);
+    const { app } = createApp({
+      db: wrapped.db,
+      auth: latencyAuth,
+      projectId: 'narid-atdc-tracker',
+      databaseId: 'ai-studio-manpowertracker-9b87a863-5c0d-4126-accb-7a3be802b10b',
+      credentialMode: 'ADC',
+      disableBackgroundBoot: true,
+    });
+    const adminToken = rawAuth.issueToken(TEST_CANONICAL_ACCOUNTS.admin.uid);
+
+    // Cold scan warms uid pointer, role_permissions, shifts, settings
+    const coldRes = await request(app)
+      .post('/api/attendance/scan')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        rawPayload: JSON.stringify({
+          employeeId: 'AUU679',
+          token: 'QR_AUU679_MWL01A6O_3VUKP8Y',
+        }),
+        scannerType: 'IN',
+        scannerDevice: 'USB_SCANNER',
+        customScanTime: '2026-11-18T09:00:00+05:30',
+      });
+    expect(coldRes.status).toBe(200);
+    expect(coldRes.body.perf.parallelPrefetchUsed).toBe(true);
+    // Cold role_permissions was prefetched inside caller lookup, so permissionMs is near 0ms
+    expect(coldRes.body.perf.permissionMs).toBeLessThan(25);
+
+    // Warm scan: employees + attendance run in parallel with user_roles + user_permissions (90ms RTT)
+    wrapped.resetCounts();
+    const warmRes = await request(app)
+      .post('/api/attendance/scan')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        rawPayload: JSON.stringify({
+          employeeId: 'AUU680',
+          token: 'QR_AUU680_MWL01A6O_3VUKP8Y',
+        }),
+        scannerType: 'IN',
+        scannerDevice: 'USB_SCANNER',
+        customScanTime: '2026-11-18T09:05:00+05:30',
+      });
+
+    expect(warmRes.status).toBe(200);
+    const p = warmRes.body.perf;
+    expect(p.parallelPrefetchUsed).toBe(true);
+    expect(p.tokenVerifyMs).toBeGreaterThanOrEqual(30);
+    expect(p.callerLookupMs).toBeGreaterThanOrEqual(75);
+    expect(p.employeeLookupMs).toBeGreaterThanOrEqual(75);
+    expect(p.attendanceLookupMs).toBeGreaterThanOrEqual(75);
+    expect(typeof p.configLookupMs).toBe('number');
+    expect(typeof p.txMs).toBe('number');
+    expect(p.auditMs).toBe(0);
+    expect(typeof p.totalServerMs).toBe('number');
+    expect(p.firestoreReads).toBeLessThanOrEqual(5);
+    expect(p.firestoreWrites).toBe(3);
+    // Because employee+attendance overlapped with callerLookup (90ms), post-auth lookup wait is near 0ms (< 30ms instead of ~90ms!)
+    expect(p.lookupAndQueryMs).toBeLessThan(30);
+    expect(p.permissionMs).toBeLessThan(20);
+  });
+
+  it('performs zero Firestore reads on invalid or revoked Firebase ID tokens (401) and fails closed on missing QR permission (403)', async () => {
+    const wrapped = wrapDbWithLatency(rawDb, { readMs: 10, queryMs: 10, txMs: 10 });
+    const { app } = createApp({
+      db: wrapped.db,
+      auth: rawAuth,
+      projectId: 'narid-atdc-tracker',
+      databaseId: 'ai-studio-manpowertracker-9b87a863-5c0d-4126-accb-7a3be802b10b',
+      credentialMode: 'ADC',
+      disableBackgroundBoot: true,
+    });
+
+    // 1. Invalid token -> 401 with zero Firestore reads or queries
+    wrapped.resetCounts();
+    const invalidRes = await request(app)
+      .post('/api/attendance/scan')
+      .set('Authorization', 'Bearer invalid-token-xyz')
+      .send({
+        rawPayload: JSON.stringify({
+          employeeId: 'AUU679',
+          token: 'QR_AUU679_MWL01A6O_3VUKP8Y',
+        }),
+        scannerType: 'IN',
+      });
+    expect(invalidRes.status).toBe(401);
+    expect(wrapped.counts.reads).toBe(0);
+    expect(wrapped.counts.queries).toBe(0);
+
+    // 2. Revoked token -> verifyIdToken(token, true) rejects with 401 and zero Firestore reads
+    const revokedToken = rawAuth.issueToken(TEST_CANONICAL_ACCOUNTS.admin.uid);
+    await rawAuth.revokeRefreshTokens(TEST_CANONICAL_ACCOUNTS.admin.uid);
+    wrapped.resetCounts();
+    const revokedRes = await request(app)
+      .post('/api/attendance/scan')
+      .set('Authorization', `Bearer ${revokedToken}`)
+      .send({
+        rawPayload: JSON.stringify({
+          employeeId: 'AUU679',
+          token: 'QR_AUU679_MWL01A6O_3VUKP8Y',
+        }),
+        scannerType: 'IN',
+      });
+    expect(revokedRes.status).toBe(401);
+    expect(wrapped.counts.reads).toBe(0);
+    expect(wrapped.counts.queries).toBe(0);
+
+    // 3. Authenticated user without attendance.qr.scan -> 403 and no employee/attendance returned
+    await rawDb.collection('user_permissions').doc('role_user').set({
+      userId: 'role_user',
+      isCustomOverride: true,
+      permissions: {
+        'attendance.qr.scan': { view: false, add: false, edit: false, delete: false },
+        scanner: { view: false, add: false, edit: false, delete: false },
+      },
+      updatedAt: new Date().toISOString(),
+    });
+    const userToken = rawAuth.issueToken(TEST_CANONICAL_ACCOUNTS.user.uid);
+    const forbiddenRes = await request(app)
+      .post('/api/attendance/scan')
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({
+        rawPayload: JSON.stringify({
+          employeeId: 'AUU679',
+          token: 'QR_AUU679_MWL01A6O_3VUKP8Y',
+        }),
+        scannerType: 'IN',
+      });
+    expect(forbiddenRes.status).toBe(403);
+    expect(forbiddenRes.body.employee).toBeUndefined();
+    expect(forbiddenRes.body.attendance).toBeUndefined();
+  });
+
+  it('prevents stale prefetched attendance reads under concurrent same-employee burst scans (duplicate IN rejected)', async () => {
+    const wrapped = wrapDbWithLatency(rawDb, { readMs: 25, queryMs: 25, txMs: 30 });
+    const { app } = createApp({
+      db: wrapped.db,
+      auth: rawAuth,
+      projectId: 'narid-atdc-tracker',
+      databaseId: 'ai-studio-manpowertracker-9b87a863-5c0d-4126-accb-7a3be802b10b',
+      credentialMode: 'ADC',
+      disableBackgroundBoot: true,
+    });
+    const adminToken = rawAuth.issueToken(TEST_CANONICAL_ACCOUNTS.admin.uid);
+    const payload = JSON.stringify({
+      employeeId: 'AUU681',
+      token: 'QR_AUU681_MWL01A6O_3VUKP8Y',
+    });
+
+    // Fire two concurrent Punch IN scans for the same employee with different clientRequestIds
+    const [r1, r2] = await Promise.all([
+      request(app)
+        .post('/api/attendance/scan')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          rawPayload: payload,
+          scannerType: 'IN',
+          scannerDevice: 'USB_SCANNER',
+          clientRequestId: 'burst_req_1',
+          customScanTime: '2026-11-18T09:00:00+05:30',
+        }),
+      request(app)
+        .post('/api/attendance/scan')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          rawPayload: payload,
+          scannerType: 'IN',
+          scannerDevice: 'USB_SCANNER',
+          clientRequestId: 'burst_req_2',
+          customScanTime: '2026-11-18T09:00:05+05:30',
+        }),
+    ]);
+
+    const statuses = [r1.status, r2.status].sort((a, b) => a - b);
+    expect(statuses).toEqual([200, 409]);
+    const winner = r1.status === 200 ? r1 : r2;
+    const rejected = r1.status === 409 ? r1 : r2;
+    expect(winner.body.action).toBe('PUNCH_IN');
+    expect(rejected.body.action).toBe('REJECTED_DUPLICATE');
+    // The 2nd scan waited on the employee mutex and refreshed attendance state instead of trusting stale prefetch
+    expect(rejected.body.perf.parallelPrefetchUsed).toBe(false);
+  });
+
+  it('invalidates cached shift config immediately when shifts are updated via /api/masters/bulk-status', async () => {
+    const { app } = createApp({
+      db: rawDb,
+      auth: rawAuth,
+      projectId: 'narid-atdc-tracker',
+      databaseId: 'ai-studio-manpowertracker-9b87a863-5c0d-4126-accb-7a3be802b10b',
+      credentialMode: 'ADC',
+      disableBackgroundBoot: true,
+    });
+    const superToken = rawAuth.issueToken(TEST_CANONICAL_ACCOUNTS.superadmin.uid);
+
+    // Warm shift cache with first scan
+    const s1 = await request(app)
+      .post('/api/attendance/scan')
+      .set('Authorization', `Bearer ${superToken}`)
+      .send({
+        rawPayload: JSON.stringify({
+          employeeId: 'AUU679',
+          token: 'QR_AUU679_MWL01A6O_3VUKP8Y',
+        }),
+        scannerType: 'IN',
+        customScanTime: '2026-11-18T09:00:00+05:30',
+      });
+    expect(s1.status).toBe(200);
+
+    // Second scan hits warm shift cache
+    const s2 = await request(app)
+      .post('/api/attendance/scan')
+      .set('Authorization', `Bearer ${superToken}`)
+      .send({
+        rawPayload: JSON.stringify({
+          employeeId: 'AUU680',
+          token: 'QR_AUU680_MWL01A6O_3VUKP8Y',
+        }),
+        scannerType: 'IN',
+        customScanTime: '2026-11-18T09:01:00+05:30',
+      });
+    expect(s2.status).toBe(200);
+    expect(s2.body.perf.cacheHitConfig).toBe(true);
+
+    // Update shift via master bulk-status API -> invalidates shifts cache
+    const updateRes = await request(app)
+      .post('/api/masters/bulk-status')
+      .set('Authorization', `Bearer ${superToken}`)
+      .send({
+        resource: 'shifts',
+        status: 'Inactive',
+        ids: ['NIGHT'],
+        confirmed: true,
+      });
+    expect(updateRes.status).toBe(200);
+
+    // Next scan MUST re-fetch fresh shift config (cacheHitConfig === false)
+    const s3 = await request(app)
+      .post('/api/attendance/scan')
+      .set('Authorization', `Bearer ${superToken}`)
+      .send({
+        rawPayload: JSON.stringify({
+          employeeId: 'AUU681',
+          token: 'QR_AUU681_MWL01A6O_3VUKP8Y',
+        }),
+        scannerType: 'IN',
+        customScanTime: '2026-11-18T09:02:00+05:30',
+      });
+    expect(s3.status).toBe(200);
+    expect(s3.body.perf.cacheHitConfig).toBe(false);
   });
 });

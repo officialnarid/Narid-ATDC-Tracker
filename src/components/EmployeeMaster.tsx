@@ -36,7 +36,7 @@ import {
   deleteEmployee 
 } from '../services/employeeService';
 import { UserRoleRecord } from '../types';
-import { RolePermissionRecord, hasModulePermission } from '../services/permissionService';
+import { RolePermissionRecord, hasModulePermission, normalizeRoleId } from '../services/permissionService';
 import { EmployeeMasterSkeleton, TableSkeletonRows } from './Skeletons';
 import { useBulkSelection } from '../hooks/useBulkSelection';
 import {
@@ -82,6 +82,11 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
   const canAdd = hasModulePermission(currentUserRole?.role, 'employees', 'add', rolePermissions);
   const canEdit = hasModulePermission(currentUserRole?.role, 'employees', 'edit', rolePermissions);
   const canDelete = hasModulePermission(currentUserRole?.role, 'employees', 'delete', rolePermissions);
+  const isAdminRole = normalizeRoleId(currentUserRole?.role) === 'admin';
+  const canReissueQr =
+    Boolean(currentUserRole) &&
+    !isAdminRole &&
+    hasModulePermission(currentUserRole?.role, 'qr_codes', 'edit', rolePermissions);
 
   const [searchTerm, setSearchTerm] = useState('');
   const [page, setPage] = useState(1);
@@ -203,6 +208,7 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
   };
 
   const handleRegenerateToken = async (employeeId: string) => {
+    if (!canReissueQr) return;
     if (!confirm(`Are you sure you want to regenerate the QR token for ${employeeId}? Old QR code will be invalidated.`)) return;
     try {
       await regenerateQrToken(employeeId);
@@ -1143,14 +1149,16 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
                   <Download className="w-3.5 h-3.5" />
                   <span>Download QR</span>
                 </a>
-                <button
-                  onClick={() => handleRegenerateToken(viewEmployee.employeeId)}
-                  className="bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 text-xs px-3 py-2 rounded font-medium flex items-center gap-1 transition"
-                  title="Revoke and generate new QR token"
-                >
-                  <RotateCcw className="w-3.5 h-3.5" />
-                  <span>Reissue</span>
-                </button>
+                {canReissueQr && (
+                  <button
+                    onClick={() => handleRegenerateToken(viewEmployee.employeeId)}
+                    className="bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 text-xs px-3 py-2 rounded font-medium flex items-center gap-1 transition"
+                    title="Revoke and generate new QR token"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Reissue</span>
+                  </button>
+                )}
               </div>
             </div>
           </div>

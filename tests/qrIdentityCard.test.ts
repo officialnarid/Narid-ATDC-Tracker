@@ -290,4 +290,56 @@ describe('Employee QR Identity Card Download & Print Rendering', () => {
     // Existing QR tokens untouched
     expect(SAMPLE_EMPLOYEES.map((e) => e.qrCodeToken)).toEqual(tokenBefore);
   });
+
+  it('5. Hides QR Reissue control for Admin role while keeping Download QR, Print, and Super Admin Reissue intact', () => {
+    const baseProps = {
+      employees: SAMPLE_EMPLOYEES,
+      floors: [
+        { id: 'f1', name: 'MI-01', code: 'MI-01', order: 1, status: 'Active' as const },
+      ],
+      departments: [
+        { id: 'd1', name: 'Production', code: 'PRD', status: 'Active' as const },
+      ],
+      onRefresh: () => {},
+    };
+
+    const adminHtml = renderToStaticMarkup(
+      React.createElement(QrManagement, {
+        ...baseProps,
+        currentUserRole: {
+          id: 'role_admin',
+          loginId: 'admin',
+          email: 'admin@narid.com',
+          name: 'Admin',
+          role: 'admin',
+          modulesAllowed: ['employees', 'qr_codes'],
+          status: 'Active',
+          createdAt: '2025-01-01T00:00:00.000Z',
+          updatedAt: '2025-01-01T00:00:00.000Z',
+        },
+      })
+    );
+    expect(adminHtml).toContain('Download QR');
+    expect(adminHtml).toContain('aria-label="Print TST_CARD_101"');
+    expect(adminHtml).not.toContain('Revoke &amp; Re-issue Security Token');
+
+    const superAdminHtml = renderToStaticMarkup(
+      React.createElement(QrManagement, {
+        ...baseProps,
+        currentUserRole: {
+          id: 'role_superadmin',
+          loginId: 'superadmin',
+          email: 'superadmin@narid.com',
+          name: 'Super Admin',
+          role: 'super_admin',
+          modulesAllowed: ['all'],
+          status: 'Active',
+          createdAt: '2025-01-01T00:00:00.000Z',
+          updatedAt: '2025-01-01T00:00:00.000Z',
+        },
+      })
+    );
+    expect(superAdminHtml).toContain('Download QR');
+    expect(superAdminHtml).toContain('Revoke &amp; Re-issue Security Token');
+  });
 });

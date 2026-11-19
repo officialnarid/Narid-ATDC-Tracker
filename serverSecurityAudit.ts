@@ -2,10 +2,12 @@ import express, { type Request, type Response } from 'express';
 import crypto from 'crypto';
 import {
   getCachedRoleDefDoc,
+  getCachedRolePermissionsDoc,
   getCachedSystemSettings,
   getCachedUidRolePointer,
   setCachedUidRolePointer,
   invalidateUidRolePointer,
+  roundMs,
 } from './serverPerfCache.ts';
 
 const KOLKATA_CA_DATE_FORMATTER = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' });
@@ -101,7 +103,17 @@ export interface VerifiedCaller {
   authTime?: number;
   modulesAllowed?: string[];
   prefetchedUserPermSnap?: AdminDocSnapLike | null;
+  prefetchedRolePerm?: {
+    role: string;
+    exists: boolean;
+    data: Record<string, any> | undefined;
+    cacheHit: boolean;
+  };
   cacheHitUidRoute?: boolean;
+  tokenVerifyMs?: number;
+  callerLookupMs?: number;
+  authFirestoreReads?: number;
+  authFirestoreWrites?: number;
 }
 
 export interface GeoLocationInfo {
@@ -243,7 +255,11 @@ export async function verifyCallerIdentity(
   db: AdminFirestoreLike,
   auth: AdminAuthLike | null,
   _projectId?: string,
-  options?: { prefetchUserPermission?: boolean; nowMs?: number }
+  options?: {
+    prefetchUserPermission?: boolean;
+    nowMs?: number;
+    onTokenVerified?: (verifiedUid: string) => void;
+  }
 ): Promise<VerifiedCaller | null> {
   const authHeader = req.headers.authorization || '';
   if (!authHeader.startsWith('Bearer ')) {
@@ -260,9 +276,10 @@ export async function verifyCallerIdentity(
     throw err;
   }
 
+  const tokenVerifyStartMs = performance.now();
   let decoded: AdminDecodedTokenLike;
   try {
-    // Strictly checkRevoked = true via Firebase Admin SDK
+    // Strictly checkRevoked = true via Firebase Admin SDK (never weakened)
     decoded = await auth.verifyIdToken(token, true);
   } catch (verifyErr: any) {
     const msg = String(verifyErr?.message || verifyErr?.code || 'Invalid or revoked Firebase ID token.');
@@ -274,6 +291,7 @@ export async function verifyCallerIdentity(
     err.statusCode = 401;
     throw err;
   }
+  const tokenVerifyMs = roundMs(performance.now() - tokenVerifyStartMs);
 
   if (!decoded || typeof decoded.uid !== 'string' || !decoded.uid.trim()) {
     const err: any = new Error('Verified Firebase token missing subject UID.');
@@ -285,9 +303,30 @@ export async function verifyCallerIdentity(
   const decodedEmail = String(decoded.email || '').toLowerCase();
   const shouldPrefetchUserPerm = Boolean(options?.prefetchUserPermission);
 
+  // Strictly AFTER cryptographic token + revocation verification succeeds,
+  // allow latency-critical routes (e.g. QR scan) to overlap independent reads
+  // with the caller's live Firestore profile lookup.
+  if (typeof options?.onTokenVerified === 'function') {
+    try {
+      options.onTokenVerified(verifiedUid);
+    } catch {
+      // Never interrupt auth verification if an optional prefetch callback throws
+    }
+  }
+
+  const callerLookupStartMs = performance.now();
+  let authFirestoreReads = 0;
+  let authFirestoreWrites = 0;
+
   // Strictly UID-based RBAC lookup (zero hardcoded emails or @narid.com prefix guessing)
   let matchedDoc: { id: string; data: Record<string, any> } | null = null;
   let prefetchedUserPermSnap: AdminDocSnapLike | null | undefined = undefined;
+  let prefetchedRolePerm:
+    | { role: string; exists: boolean; data: Record<string, any> | undefined; cacheHit: boolean }
+    | undefined = undefined;
+  let prefetchedRoleDef:
+    | { role: string; exists: boolean; data: Record<string, any> | undefined; cacheHit: boolean }
+    | undefined = undefined;
   let idxSnap: AdminDocSnapLike | null = null;
   let usedPointerHit = false;
 
@@ -302,23 +341,38 @@ export async function verifyCallerIdentity(
   };
 
   // 0. Fast warm route via non-authoritative uid -> roleDocId structural pointer
-  //    Reads `user_roles/{roleDocId}` (and optionally `user_permissions/{roleDocId}`)
-  //    LIVE from Firestore in 1 parallel RTT without trusting cached status/locks.
+  //    Reads `user_roles/{roleDocId}`, `user_permissions/{roleDocId}`, and (if needed)
+  //    role_permissions / custom role def in ONE parallel Firestore RTT without trusting cached status/locks.
   const pointer = getCachedUidRolePointer(db, verifiedUid);
   if (pointer) {
-    const prefetchPermNow = shouldPrefetchUserPerm && pointer.lastRole !== 'super_admin';
-    const [roleDocSnap, userPermSnap] = await Promise.all([
+    const predictedRole = normalizeRoleValue(pointer.lastRole);
+    const prefetchPermNow = shouldPrefetchUserPerm && predictedRole !== 'super_admin';
+    const prefetchRoleDefNow = Boolean(predictedRole && !SYSTEM_ROLE_IDS.has(predictedRole));
+    authFirestoreReads += 1 + (prefetchPermNow ? 1 : 0);
+    const [roleDocSnap, userPermSnap, rolePermRes, roleDefRes] = await Promise.all([
       db.collection('user_roles').doc(pointer.roleDocId).get(),
       prefetchPermNow
         ? db.collection('user_permissions').doc(pointer.roleDocId).get()
         : Promise.resolve(null),
+      prefetchPermNow && predictedRole
+        ? getCachedRolePermissionsDoc(db, predictedRole)
+        : Promise.resolve(null),
+      prefetchRoleDefNow ? getCachedRoleDefDoc(db, predictedRole) : Promise.resolve(null),
     ]);
+    if (rolePermRes && !rolePermRes.cacheHit) authFirestoreReads += 1;
+    if (roleDefRes && !roleDefRes.cacheHit) authFirestoreReads += 1;
     if (roleDocSnap.exists) {
       const d = roleDocSnap.data() || {};
       if (doesDocOwnUid(roleDocSnap.id, d)) {
         matchedDoc = { id: roleDocSnap.id, data: d };
         if (prefetchPermNow && userPermSnap) {
           prefetchedUserPermSnap = userPermSnap;
+        }
+        if (rolePermRes && predictedRole) {
+          prefetchedRolePerm = { role: predictedRole, ...rolePermRes };
+        }
+        if (roleDefRes && predictedRole) {
+          prefetchedRoleDef = { role: predictedRole, ...roleDefRes };
         }
         usedPointerHit = true;
       }
@@ -330,25 +384,40 @@ export async function verifyCallerIdentity(
 
   // 1. Live lookup via user_uid_index/{uid}
   if (!matchedDoc) {
+    authFirestoreReads += 1;
     idxSnap = await db.collection('user_uid_index').doc(verifiedUid).get();
     if (idxSnap.exists) {
       const idxData = idxSnap.data() || {};
       if (idxData.roleDocId) {
         const targetDocId = String(idxData.roleDocId);
-        const prefetchPermNow =
-          shouldPrefetchUserPerm && String(idxData.role || '').toLowerCase() !== 'super_admin';
-        const [roleDocSnap, userPermSnap] = await Promise.all([
+        const predictedRole = idxData.role ? normalizeRoleValue(idxData.role) : '';
+        const prefetchPermNow = shouldPrefetchUserPerm && predictedRole !== 'super_admin';
+        const prefetchRoleDefNow = Boolean(predictedRole && !SYSTEM_ROLE_IDS.has(predictedRole));
+        authFirestoreReads += 1 + (prefetchPermNow ? 1 : 0);
+        const [roleDocSnap, userPermSnap, rolePermRes, roleDefRes] = await Promise.all([
           db.collection('user_roles').doc(targetDocId).get(),
           prefetchPermNow
             ? db.collection('user_permissions').doc(targetDocId).get()
             : Promise.resolve(null),
+          prefetchPermNow && predictedRole
+            ? getCachedRolePermissionsDoc(db, predictedRole)
+            : Promise.resolve(null),
+          prefetchRoleDefNow ? getCachedRoleDefDoc(db, predictedRole) : Promise.resolve(null),
         ]);
+        if (rolePermRes && !rolePermRes.cacheHit) authFirestoreReads += 1;
+        if (roleDefRes && !roleDefRes.cacheHit) authFirestoreReads += 1;
         if (roleDocSnap.exists) {
           const d = roleDocSnap.data() || {};
           if (doesDocOwnUid(roleDocSnap.id, d)) {
             matchedDoc = { id: roleDocSnap.id, data: d };
             if (prefetchPermNow && userPermSnap) {
               prefetchedUserPermSnap = userPermSnap;
+            }
+            if (rolePermRes && predictedRole) {
+              prefetchedRolePerm = { role: predictedRole, ...rolePermRes };
+            }
+            if (roleDefRes && predictedRole) {
+              prefetchedRoleDef = { role: predictedRole, ...roleDefRes };
             }
           }
         }
@@ -358,6 +427,7 @@ export async function verifyCallerIdentity(
 
   // 2. Direct document ID match user_roles/{uid}
   if (!matchedDoc) {
+    authFirestoreReads += 1;
     const directSnap = await db.collection('user_roles').doc(verifiedUid).get();
     if (directSnap.exists) {
       matchedDoc = { id: directSnap.id, data: directSnap.data() || {} };
@@ -366,6 +436,7 @@ export async function verifyCallerIdentity(
 
   // 3. Query by authUid == decoded.uid
   if (!matchedDoc) {
+    authFirestoreReads += 1;
     const byAuthUidSnap = await db
       .collection('user_roles')
       .where('authUid', '==', verifiedUid)
@@ -379,6 +450,7 @@ export async function verifyCallerIdentity(
 
   // 4. Query by linkedAuthUids array-contains decoded.uid
   if (!matchedDoc) {
+    authFirestoreReads += 1;
     const byLinkedSnap = await db
       .collection('user_roles')
       .where('linkedAuthUids', 'array-contains', verifiedUid)
@@ -452,7 +524,13 @@ export async function verifyCallerIdentity(
 
   const normalizedRole = normalizeRoleValue(matchedDoc.data.role);
   if (!SYSTEM_ROLE_IDS.has(normalizedRole)) {
-    const roleDefSnap = await getCachedRoleDefDoc(db, normalizedRole);
+    const roleDefSnap =
+      prefetchedRoleDef && prefetchedRoleDef.role === normalizedRole
+        ? prefetchedRoleDef
+        : await getCachedRoleDefDoc(db, normalizedRole);
+    if (prefetchedRoleDef?.role !== normalizedRole && !roleDefSnap.cacheHit) {
+      authFirestoreReads += 1;
+    }
     if (roleDefSnap.exists && roleDefSnap.data?.isActive === false) {
       const err: any = new Error('Assigned role is currently inactive. Access denied.');
       err.statusCode = 403;
@@ -477,6 +555,7 @@ export async function verifyCallerIdentity(
       idxData.lockStatus !== targetLockStatus ||
       idxData.loginId !== resolvedLoginId
     ) {
+      authFirestoreWrites += 1;
       await syncUserUidIndex(db, {
         uid: verifiedUid,
         roleDocId: matchedDoc.id,
@@ -490,6 +569,7 @@ export async function verifyCallerIdentity(
 
   // Record structural UID -> roleDocId pointer for faster live lookup on subsequent requests
   setCachedUidRolePointer(db, verifiedUid, matchedDoc.id, normalizedRole);
+  const callerLookupMs = roundMs(performance.now() - callerLookupStartMs);
 
   return {
     uid: verifiedUid,
@@ -505,7 +585,17 @@ export async function verifyCallerIdentity(
       normalizedRole !== 'super_admin' && prefetchedUserPermSnap !== undefined
         ? prefetchedUserPermSnap
         : undefined,
+    prefetchedRolePerm:
+      normalizedRole !== 'super_admin' &&
+      prefetchedRolePerm &&
+      prefetchedRolePerm.role === normalizedRole
+        ? prefetchedRolePerm
+        : undefined,
     cacheHitUidRoute: usedPointerHit,
+    tokenVerifyMs,
+    callerLookupMs,
+    authFirestoreReads,
+    authFirestoreWrites,
   };
 }
 

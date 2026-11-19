@@ -90,9 +90,14 @@ const DEFAULT_SETTINGS = {
 // Per-employee async mutex to serialize burst scans cleanly in addition to Firestore transactions
 const employeeScanLocks = new Map<string, Promise<unknown>>();
 
-async function withEmployeeScanLock<T>(employeeId: string, task: () => Promise<T>): Promise<T> {
+async function withEmployeeScanLock<T>(
+  employeeId: string,
+  task: (lockInfo: { waitedForLock: boolean }) => Promise<T>
+): Promise<T> {
   const key = employeeId.trim().toUpperCase() || '__UNKNOWN__';
-  const prev = employeeScanLocks.get(key) || Promise.resolve();
+  const existing = employeeScanLocks.get(key);
+  const waitedForLock = Boolean(existing);
+  const prev = existing || Promise.resolve();
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {
     release = resolve;
@@ -101,7 +106,7 @@ async function withEmployeeScanLock<T>(employeeId: string, task: () => Promise<T
   employeeScanLocks.set(key, chained);
   try {
     await prev;
-    return await task();
+    return await task({ waitedForLock });
   } finally {
     release();
     if (employeeScanLocks.get(key) === chained) {
@@ -493,6 +498,7 @@ async function resolveCallerAttendancePermissions(
   canManualEntry: boolean;
   canCustomTime: boolean;
   cacheHitRolePerms: boolean;
+  extraReads: number;
 }> {
   if (caller.role === 'super_admin') {
     return {
@@ -500,15 +506,28 @@ async function resolveCallerAttendancePermissions(
       canManualEntry: true,
       canCustomTime: true,
       cacheHitRolePerms: true,
+      extraReads: 0,
     };
   }
 
+  let extraReads = 0;
   try {
+    const hasPrefetchedRolePerm =
+      Boolean(caller.prefetchedRolePerm) && caller.prefetchedRolePerm!.role === caller.role;
     const [userPermSnap, rolePermSnap] = await Promise.all([
       caller.prefetchedUserPermSnap
         ? Promise.resolve(caller.prefetchedUserPermSnap)
-        : db.collection('user_permissions').doc(caller.profileDocId).get(),
-      getCachedRolePermissionsDoc(db, caller.role),
+        : (extraReads += 1, db.collection('user_permissions').doc(caller.profileDocId).get()),
+      hasPrefetchedRolePerm
+        ? Promise.resolve({
+            exists: caller.prefetchedRolePerm!.exists,
+            data: caller.prefetchedRolePerm!.data,
+            cacheHit: caller.prefetchedRolePerm!.cacheHit,
+          })
+        : getCachedRolePermissionsDoc(db, caller.role).then((res) => {
+            if (!res.cacheHit) extraReads += 1;
+            return res;
+          }),
     ]);
 
     const userPermData = userPermSnap.exists ? userPermSnap.data() : undefined;
@@ -516,6 +535,7 @@ async function resolveCallerAttendancePermissions(
 
     let fallbackModules = caller.modulesAllowed;
     if (fallbackModules === undefined && caller.role !== 'admin') {
+      extraReads += 1;
       const userSnap = await db.collection('user_roles').doc(caller.profileDocId).get();
       if (userSnap.exists && Array.isArray(userSnap.data()?.modulesAllowed)) {
         fallbackModules = userSnap.data()!.modulesAllowed;
@@ -587,6 +607,7 @@ async function resolveCallerAttendancePermissions(
       canManualEntry,
       canCustomTime,
       cacheHitRolePerms: rolePermSnap.cacheHit,
+      extraReads,
     };
   } catch (err) {
     console.warn('[Attendance Permission Context] Lookup failed; failing closed:', (err as any)?.message || err);
@@ -595,6 +616,7 @@ async function resolveCallerAttendancePermissions(
       canManualEntry: false,
       canCustomTime: false,
       cacheHitRolePerms: false,
+      extraReads,
     };
   }
 }
@@ -606,7 +628,10 @@ export interface AttendanceRoutesDeps {
     res: Response,
     allowedRoles: string[] | '*',
     actionLabel: string,
-    options?: { prefetchUserPermission?: boolean }
+    options?: {
+      prefetchUserPermission?: boolean;
+      onTokenVerified?: (verifiedUid: string) => void;
+    }
   ) => Promise<VerifiedCaller | null>;
 }
 
@@ -627,17 +652,83 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
   app.post('/api/attendance/scan', async (req: Request, res: Response) => {
     const reqStartMs = performance.now();
     try {
+      // Pure CPU pre-parse of body & QR payload so that strictly AFTER Firebase ID token
+      // verification succeeds (verifyIdToken(token, true)), independent employee/attendance/config
+      // reads can overlap with user_roles + user_permissions lookup (saving 1 full Firestore RTT).
+      // HTTP status precedence remains unchanged: 401 -> 403 -> 400.
+      const parsed = AttendanceScanSchema.safeParse(req.body);
+      let preQrParseMs = 0;
+      let preQr: ReturnType<typeof parseQrPayload> | null = null;
+      let preNow: Date | null = null;
+      let preYesterdayKey: string | null = null;
+      if (parsed.success) {
+        const qrParseStart = performance.now();
+        preQr = parseQrPayload(parsed.data.rawPayload);
+        preQrParseMs = roundMs(performance.now() - qrParseStart);
+        const candidateNow = parsed.data.customScanTime ? new Date(parsed.data.customScanTime) : new Date();
+        if (!Number.isNaN(candidateNow.getTime())) {
+          preNow = candidateNow;
+          preYesterdayKey = getYesterdayKolkataDateKey(candidateNow);
+        }
+      }
+
+      let prefetchedEmployee: Promise<{ snap: any; ms: number }> | null = null;
+      let prefetchedAttendance: Promise<{ snap: AdminQuerySnapLike; ms: number; yesterdayKey: string }> | null = null;
+      let prefetchedConfig: Promise<{
+        shiftsRes: { shifts: any[]; cacheHit: boolean };
+        settingsRes: { exists: boolean; data: Record<string, any>; cacheHit: boolean };
+        ms: number;
+      }> | null = null;
+
       const caller = await requireVerifiedCaller(
         req,
         res,
         '*',
         'Attendance Scan Processing',
-        { prefetchUserPermission: true }
+        {
+          prefetchUserPermission: true,
+          onTokenVerified: () => {
+            if (!preQr || preQr.format === 'INVALID' || !preQr.employeeId) return;
+            const empId = preQr.employeeId;
+            const empStart = performance.now();
+            prefetchedEmployee = db
+              .collection('employees')
+              .doc(empId)
+              .get()
+              .then((snap) => ({ snap, ms: roundMs(performance.now() - empStart) }));
+            prefetchedEmployee.catch(() => {});
+
+            // Concurrency safety: ONLY prefetch attendance query when no other scan for
+            // this employee holds the mutex; if another scan arrives concurrently, the
+            // mutex callback discards this snapshot and queries Firestore fresh.
+            if (preYesterdayKey && !employeeScanLocks.has(empId)) {
+              const attStart = performance.now();
+              const yKey = preYesterdayKey;
+              prefetchedAttendance = db
+                .collection('attendance')
+                .where('employeeId', '==', empId)
+                .where('shiftDate', '>=', yKey)
+                .get()
+                .then((snap) => ({ snap, ms: roundMs(performance.now() - attStart), yesterdayKey: yKey }));
+              prefetchedAttendance.catch(() => {});
+            }
+
+            const cfgStart = performance.now();
+            prefetchedConfig = Promise.all([
+              getCachedShifts(db, DEFAULT_SHIFTS),
+              getCachedSystemSettings(db, DEFAULT_SETTINGS),
+            ]).then(([shiftsRes, settingsRes]) => ({
+              shiftsRes,
+              settingsRes,
+              ms: roundMs(performance.now() - cfgStart),
+            }));
+            prefetchedConfig.catch(() => {});
+          },
+        }
       );
       if (!caller) return;
       const authDoneMs = performance.now();
 
-      const parsed = AttendanceScanSchema.safeParse(req.body);
       const perms = await resolveCallerAttendancePermissions(db, caller);
       const permDoneMs = performance.now();
 
@@ -685,17 +776,21 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         });
       }
 
-      const now = customScanTime ? new Date(customScanTime) : new Date();
+      const now = preNow || (customScanTime ? new Date(customScanTime) : new Date());
       if (Number.isNaN(now.getTime())) {
         return res.status(400).json({ success: false, error: 'Invalid customScanTime timestamp.' });
       }
 
       const kolkata = getKolkataTimeParts(now);
       const timeDisplay = kolkata.timeWithSeconds;
-      const qrParseStartMs = performance.now();
-      const { employeeId, token, format } = parseQrPayload(rawPayload);
-      const qrParseDoneMs = performance.now();
-      const qrParseMs = roundMs(qrParseDoneMs - qrParseStartMs);
+      let qrParseMs = preQrParseMs;
+      let qrParsed = preQr;
+      if (!qrParsed) {
+        const qrParseStartMs = performance.now();
+        qrParsed = parseQrPayload(rawPayload);
+        qrParseMs = roundMs(performance.now() - qrParseStartMs);
+      }
+      const { employeeId, token, format } = qrParsed;
 
       if (format === 'INVALID' || !employeeId) {
         await writePunchLog({
@@ -720,21 +815,57 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
 
       const dedupKey = clientRequestId ? `scan:${caller.uid}:${employeeId}:${clientRequestId}` : null;
       const outcome = await runWithOptionalClientRequestDedup(db, dedupKey, () =>
-        withEmployeeScanLock(employeeId, async () => {
+        withEmployeeScanLock(employeeId, async ({ waitedForLock }) => {
           const lookupStartMs = performance.now();
           const yesterdayKey = getYesterdayKolkataDateKey(now);
 
-          // Single parallel batch: authoritative employee doc + attendance window + cached shifts & settings
-          const [empSnap, candidateSnap, shiftsRes, settingsRes] = await Promise.all([
-            db.collection('employees').doc(employeeId).get(),
-            db
-              .collection('attendance')
-              .where('employeeId', '==', employeeId)
-              .where('shiftDate', '>=', yesterdayKey)
-              .get(),
-            getCachedShifts(db, DEFAULT_SHIFTS),
-            getCachedSystemSettings(db, DEFAULT_SETTINGS),
-          ]);
+          const canReuseEmployee = Boolean(prefetchedEmployee);
+          const canReuseAttendance = !waitedForLock && Boolean(prefetchedAttendance) && preYesterdayKey === yesterdayKey;
+          const canReuseConfig = Boolean(prefetchedConfig);
+          const parallelPrefetchUsed = canReuseEmployee && canReuseAttendance;
+
+          const empTask = canReuseEmployee
+            ? prefetchedEmployee!
+            : (() => {
+                const s = performance.now();
+                return db
+                  .collection('employees')
+                  .doc(employeeId)
+                  .get()
+                  .then((snap) => ({ snap, ms: roundMs(performance.now() - s) }));
+              })();
+
+          const attTask = canReuseAttendance
+            ? prefetchedAttendance!
+            : (() => {
+                const s = performance.now();
+                return db
+                  .collection('attendance')
+                  .where('employeeId', '==', employeeId)
+                  .where('shiftDate', '>=', yesterdayKey)
+                  .get()
+                  .then((snap) => ({ snap, ms: roundMs(performance.now() - s), yesterdayKey }));
+              })();
+
+          const cfgTask = canReuseConfig
+            ? prefetchedConfig!
+            : (() => {
+                const s = performance.now();
+                return Promise.all([
+                  getCachedShifts(db, DEFAULT_SHIFTS),
+                  getCachedSystemSettings(db, DEFAULT_SETTINGS),
+                ]).then(([shiftsRes, settingsRes]) => ({
+                  shiftsRes,
+                  settingsRes,
+                  ms: roundMs(performance.now() - s),
+                }));
+              })();
+
+          // Single parallel batch (or near-zero await if already overlapped with caller lookup)
+          const [empResult, attResult, cfgResult] = await Promise.all([empTask, attTask, cfgTask]);
+          const empSnap = empResult.snap;
+          const candidateSnap = attResult.snap;
+          const { shiftsRes, settingsRes } = cfgResult;
           const lookupDoneMs = performance.now();
 
           if (!empSnap.exists) {
@@ -844,15 +975,39 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
 
           const lookupDuration = lookupDoneMs - lookupStartMs;
           const txDuration = txDoneMs - txStartMs;
+          const isCommittedPunch =
+            punchRes.httpStatus === 200 && Boolean(punchRes.body?.success);
+          const isDuplicateReject = punchRes.body?.action === 'REJECTED_DUPLICATE';
+          const txReads = isCommittedPunch || isDuplicateReject ? 1 : 0;
+          const txWrites = isCommittedPunch ? 3 : 1;
+          const configReads = (shiftsRes.cacheHit ? 0 : 1) + (settingsRes.cacheHit ? 0 : 1);
+          const totalFirestoreReads =
+            (caller.authFirestoreReads ?? 0) +
+            perms.extraReads +
+            1 + // employees/{id}
+            1 + // attendance query
+            configReads +
+            txReads;
+          const totalFirestoreWrites = (caller.authFirestoreWrites ?? 0) + txWrites;
+
           const perf: AttendancePerfMetrics = {
             qrParseMs,
+            tokenVerifyMs: caller.tokenVerifyMs,
+            callerLookupMs: caller.callerLookupMs,
             authMs: roundMs(authDoneMs - reqStartMs),
             permissionMs: roundMs(permDoneMs - authDoneMs),
+            employeeLookupMs: empResult.ms,
+            attendanceLookupMs: attResult.ms,
+            configLookupMs: cfgResult.ms,
             lookupAndQueryMs: roundMs(lookupDuration),
             tokenValidationMs: roundMs(tokenValDoneMs - tokenValStartMs),
             txMs: roundMs(txDuration),
             firestoreOpMs: roundMs(lookupDuration + txDuration),
+            auditMs: 0,
             totalServerMs: roundMs(txDoneMs - reqStartMs),
+            firestoreReads: totalFirestoreReads,
+            firestoreWrites: totalFirestoreWrites,
+            parallelPrefetchUsed,
             cacheHitRolePerms: perms.cacheHitRolePerms,
             cacheHitConfig: shiftsRes.cacheHit && settingsRes.cacheHit,
             cacheHitUidRoute: Boolean(caller.cacheHitUidRoute),
@@ -883,12 +1038,20 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         isDuplicateRejection: isDuplicate,
         timedOut: outcome.httpStatus === 408 || outcome.httpStatus === 504,
         qrParseMs,
+        tokenVerifyMs: outcomePerf?.tokenVerifyMs ?? caller.tokenVerifyMs,
+        callerLookupMs: outcomePerf?.callerLookupMs ?? caller.callerLookupMs,
         authMs: outcomePerf?.authMs ?? roundMs(authDoneMs - reqStartMs),
         permissionMs: outcomePerf?.permissionMs ?? roundMs(permDoneMs - authDoneMs),
+        employeeLookupMs: outcomePerf?.employeeLookupMs,
+        attendanceLookupMs: outcomePerf?.attendanceLookupMs,
+        configLookupMs: outcomePerf?.configLookupMs,
         lookupAndQueryMs: outcomePerf?.lookupAndQueryMs,
         tokenValidationMs: outcomePerf?.tokenValidationMs,
         txMs: outcomePerf?.txMs,
         firestoreOpMs: outcomePerf?.firestoreOpMs,
+        auditMs: outcomePerf?.auditMs ?? 0,
+        firestoreReads: outcomePerf?.firestoreReads,
+        firestoreWrites: outcomePerf?.firestoreWrites,
         totalServerMs: outcomePerf?.totalServerMs ?? scanTotalMs,
         reasonCode: isSuccess ? undefined : outcomeAction,
         correlationId: (req as any).correlationId,
@@ -968,17 +1131,71 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
   app.post('/api/attendance/manual-punch', async (req: Request, res: Response) => {
     const reqStartMs = performance.now();
     try {
+      const parsed = ManualPunchSchema.safeParse(req.body);
+      let preNow: Date | null = null;
+      let preYesterdayKey: string | null = null;
+      if (parsed.success) {
+        const candidateNow = parsed.data.customScanTime ? new Date(parsed.data.customScanTime) : new Date();
+        if (!Number.isNaN(candidateNow.getTime())) {
+          preNow = candidateNow;
+          preYesterdayKey = getYesterdayKolkataDateKey(candidateNow);
+        }
+      }
+
+      let prefetchedEmployee: Promise<{ snap: any; ms: number }> | null = null;
+      let prefetchedAttendance: Promise<{ snap: AdminQuerySnapLike; ms: number; yesterdayKey: string }> | null = null;
+      let prefetchedConfig: Promise<{
+        shiftsRes: { shifts: any[]; cacheHit: boolean };
+        settingsRes: { exists: boolean; data: Record<string, any>; cacheHit: boolean };
+        ms: number;
+      }> | null = null;
+
       const caller = await requireVerifiedCaller(
         req,
         res,
         '*',
         'Manual Employee ID Punch',
-        { prefetchUserPermission: true }
+        {
+          prefetchUserPermission: true,
+          onTokenVerified: () => {
+            if (!parsed.success) return;
+            const empId = parsed.data.employeeId;
+            const empStart = performance.now();
+            prefetchedEmployee = db
+              .collection('employees')
+              .doc(empId)
+              .get()
+              .then((snap) => ({ snap, ms: roundMs(performance.now() - empStart) }));
+            prefetchedEmployee.catch(() => {});
+
+            if (preYesterdayKey && !employeeScanLocks.has(empId)) {
+              const attStart = performance.now();
+              const yKey = preYesterdayKey;
+              prefetchedAttendance = db
+                .collection('attendance')
+                .where('employeeId', '==', empId)
+                .where('shiftDate', '>=', yKey)
+                .get()
+                .then((snap) => ({ snap, ms: roundMs(performance.now() - attStart), yesterdayKey: yKey }));
+              prefetchedAttendance.catch(() => {});
+            }
+
+            const cfgStart = performance.now();
+            prefetchedConfig = Promise.all([
+              getCachedShifts(db, DEFAULT_SHIFTS),
+              getCachedSystemSettings(db, DEFAULT_SETTINGS),
+            ]).then(([shiftsRes, settingsRes]) => ({
+              shiftsRes,
+              settingsRes,
+              ms: roundMs(performance.now() - cfgStart),
+            }));
+            prefetchedConfig.catch(() => {});
+          },
+        }
       );
       if (!caller) return;
       const authDoneMs = performance.now();
 
-      const parsed = ManualPunchSchema.safeParse(req.body);
       const perms = await resolveCallerAttendancePermissions(db, caller);
       const permDoneMs = performance.now();
 
@@ -1024,7 +1241,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         });
       }
 
-      const now = customScanTime ? new Date(customScanTime) : new Date();
+      const now = preNow || (customScanTime ? new Date(customScanTime) : new Date());
       if (Number.isNaN(now.getTime())) {
         return res.status(400).json({ success: false, error: 'Invalid customScanTime timestamp.' });
       }
@@ -1035,20 +1252,56 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
 
       const dedupKey = clientRequestId ? `manual:${caller.uid}:${employeeId}:${clientRequestId}` : null;
       const outcome = await runWithOptionalClientRequestDedup(db, dedupKey, () =>
-        withEmployeeScanLock(employeeId, async () => {
+        withEmployeeScanLock(employeeId, async ({ waitedForLock }) => {
           const lookupStartMs = performance.now();
           const yesterdayKey = getYesterdayKolkataDateKey(now);
 
-          const [empSnap, candidateSnap, shiftsRes, settingsRes] = await Promise.all([
-            db.collection('employees').doc(employeeId).get(),
-            db
-              .collection('attendance')
-              .where('employeeId', '==', employeeId)
-              .where('shiftDate', '>=', yesterdayKey)
-              .get(),
-            getCachedShifts(db, DEFAULT_SHIFTS),
-            getCachedSystemSettings(db, DEFAULT_SETTINGS),
-          ]);
+          const canReuseEmployee = Boolean(prefetchedEmployee);
+          const canReuseAttendance = !waitedForLock && Boolean(prefetchedAttendance) && preYesterdayKey === yesterdayKey;
+          const canReuseConfig = Boolean(prefetchedConfig);
+          const parallelPrefetchUsed = canReuseEmployee && canReuseAttendance;
+
+          const empTask = canReuseEmployee
+            ? prefetchedEmployee!
+            : (() => {
+                const s = performance.now();
+                return db
+                  .collection('employees')
+                  .doc(employeeId)
+                  .get()
+                  .then((snap) => ({ snap, ms: roundMs(performance.now() - s) }));
+              })();
+
+          const attTask = canReuseAttendance
+            ? prefetchedAttendance!
+            : (() => {
+                const s = performance.now();
+                return db
+                  .collection('attendance')
+                  .where('employeeId', '==', employeeId)
+                  .where('shiftDate', '>=', yesterdayKey)
+                  .get()
+                  .then((snap) => ({ snap, ms: roundMs(performance.now() - s), yesterdayKey }));
+              })();
+
+          const cfgTask = canReuseConfig
+            ? prefetchedConfig!
+            : (() => {
+                const s = performance.now();
+                return Promise.all([
+                  getCachedShifts(db, DEFAULT_SHIFTS),
+                  getCachedSystemSettings(db, DEFAULT_SETTINGS),
+                ]).then(([shiftsRes, settingsRes]) => ({
+                  shiftsRes,
+                  settingsRes,
+                  ms: roundMs(performance.now() - s),
+                }));
+              })();
+
+          const [empResult, attResult, cfgResult] = await Promise.all([empTask, attTask, cfgTask]);
+          const empSnap = empResult.snap;
+          const candidateSnap = attResult.snap;
+          const { shiftsRes, settingsRes } = cfgResult;
           const lookupDoneMs = performance.now();
 
           if (!empSnap.exists) {
@@ -1122,6 +1375,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           const txDoneMs = performance.now();
 
           let auditDoneMs = txDoneMs;
+          let auditWrites = 0;
           if (result.httpStatus === 200 && result.body.success) {
             await recordEnterpriseAuditEvent(db, {
               req,
@@ -1138,19 +1392,43 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
               reason: reason || 'Authorized operator manual Employee ID punch',
               captureGeo: false,
             });
+            auditWrites = 1;
             auditDoneMs = performance.now();
           }
 
           const lookupDuration = lookupDoneMs - lookupStartMs;
           const txDuration = txDoneMs - txStartMs;
+          const isCommittedPunch =
+            result.httpStatus === 200 && Boolean(result.body?.success);
+          const isDuplicateReject = result.body?.action === 'REJECTED_DUPLICATE';
+          const txReads = isCommittedPunch || isDuplicateReject ? 1 : 0;
+          const txWrites = isCommittedPunch ? 3 : 1;
+          const configReads = (shiftsRes.cacheHit ? 0 : 1) + (settingsRes.cacheHit ? 0 : 1);
+          const totalFirestoreReads =
+            (caller.authFirestoreReads ?? 0) +
+            perms.extraReads +
+            1 +
+            1 +
+            configReads +
+            txReads;
+          const totalFirestoreWrites = (caller.authFirestoreWrites ?? 0) + txWrites + auditWrites;
+
           const perf: AttendancePerfMetrics = {
+            tokenVerifyMs: caller.tokenVerifyMs,
+            callerLookupMs: caller.callerLookupMs,
             authMs: roundMs(authDoneMs - reqStartMs),
             permissionMs: roundMs(permDoneMs - authDoneMs),
+            employeeLookupMs: empResult.ms,
+            attendanceLookupMs: attResult.ms,
+            configLookupMs: cfgResult.ms,
             lookupAndQueryMs: roundMs(lookupDuration),
             txMs: roundMs(txDuration),
             firestoreOpMs: roundMs(lookupDuration + txDuration),
             auditMs: roundMs(auditDoneMs - txDoneMs),
             totalServerMs: roundMs(auditDoneMs - reqStartMs),
+            firestoreReads: totalFirestoreReads,
+            firestoreWrites: totalFirestoreWrites,
+            parallelPrefetchUsed,
             cacheHitRolePerms: perms.cacheHitRolePerms,
             cacheHitConfig: shiftsRes.cacheHit && settingsRes.cacheHit,
             cacheHitUidRoute: Boolean(caller.cacheHitUidRoute),
@@ -1179,11 +1457,19 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         success: isSuccess,
         isDuplicateRejection: isDuplicate,
         timedOut: outcome.httpStatus === 408 || outcome.httpStatus === 504,
+        tokenVerifyMs: outcomePerf?.tokenVerifyMs ?? caller.tokenVerifyMs,
+        callerLookupMs: outcomePerf?.callerLookupMs ?? caller.callerLookupMs,
         authMs: outcomePerf?.authMs ?? roundMs(authDoneMs - reqStartMs),
         permissionMs: outcomePerf?.permissionMs ?? roundMs(permDoneMs - authDoneMs),
+        employeeLookupMs: outcomePerf?.employeeLookupMs,
+        attendanceLookupMs: outcomePerf?.attendanceLookupMs,
+        configLookupMs: outcomePerf?.configLookupMs,
         lookupAndQueryMs: outcomePerf?.lookupAndQueryMs,
         txMs: outcomePerf?.txMs,
         firestoreOpMs: outcomePerf?.firestoreOpMs,
+        auditMs: outcomePerf?.auditMs,
+        firestoreReads: outcomePerf?.firestoreReads,
+        firestoreWrites: outcomePerf?.firestoreWrites,
         totalServerMs: outcomePerf?.totalServerMs ?? manualTotalMs,
         reasonCode: isSuccess ? undefined : outcomeAction,
         correlationId: (req as any).correlationId,

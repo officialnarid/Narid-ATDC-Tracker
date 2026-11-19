@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { 
   ScanLine, 
   Camera, 
@@ -66,6 +66,269 @@ interface ScannerProps {
   userPermissionOverride?: UserPermissionRecordWithOverride | null;
 }
 
+const PunchInResultCard = React.memo<{ result: ScanResult | null }>(({ result }) => {
+  const resolvedIn = useMemo(
+    () => (result?.employee ? resolveAttendanceMetrics(result.attendance) : null),
+    [result]
+  );
+
+  if (!result) {
+    return (
+      <div className="border border-dashed border-slate-800 rounded-lg p-6 text-center text-xs text-slate-500">
+        <LogIn className="w-6 h-6 text-emerald-600/50 mx-auto mb-1.5" />
+        <span>Ready to scan employee entry QR codes</span>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={`p-4 rounded-lg border flex flex-col gap-3 transition-all ${
+        result.success
+          ? isAttendanceLate(result.attendance)
+            ? 'bg-amber-950/30 border-amber-600/70 text-amber-200'
+            : 'bg-emerald-950/30 border-emerald-600/70 text-emerald-200'
+          : 'bg-red-950/40 border-red-700 text-red-200'
+      }`}
+    >
+      <div className="flex items-start justify-between">
+        <div className="flex items-center gap-2">
+          {result.success ? (
+            <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+          ) : (
+            <XCircle className="w-5 h-5 text-red-400 shrink-0" />
+          )}
+          <div>
+            <div className="text-[10px] uppercase font-bold tracking-wider opacity-80">
+              {result.success ? 'ENTRY CONFIRMED' : 'ENTRY REJECTED'}
+            </div>
+            <div className="text-sm font-bold text-white leading-tight">
+              {result.message}
+            </div>
+          </div>
+        </div>
+        <span className="text-xs font-mono font-bold text-slate-300">
+          {result.time}
+        </span>
+      </div>
+
+      {result.employee && resolvedIn && (
+        <div className="grid grid-cols-2 gap-2 pt-2 border-t border-white/10 text-xs">
+          <div>
+            <span className="text-slate-400 block text-[10px]">EMPLOYEE</span>
+            <span className="font-bold text-white truncate block">
+              {result.employee.employeeName} ({result.employee.employeeId})
+            </span>
+          </div>
+          <div>
+            <span className="text-slate-400 block text-[10px]">LINE / SECTION</span>
+            <span className="font-semibold text-slate-200 block truncate">
+              {result.employee.floor} • {result.employee.section}
+            </span>
+          </div>
+          <div>
+            <span className="text-slate-400 block text-[10px]">SCHEDULED START</span>
+            <span className="font-semibold text-slate-200 block truncate">
+              {resolvedIn.scheduledStartDisplay}
+              {resolvedIn.earlyArrivalMinutes > 0
+                ? ` • Early ${formatDurationClock(resolvedIn.earlyArrivalMinutes)}`
+                : ''}
+            </span>
+          </div>
+          <div>
+            <span className="text-slate-400 block text-[10px]">SHIFT / STATUS</span>
+            <span className="font-semibold text-emerald-400 block">
+              {result.shift?.name || 'DAY SHIFT'} • INSIDE / IN PROGRESS
+              {isAttendanceLate(result.attendance) ? ' (LATE)' : ''}
+            </span>
+            {resolvedIn.provisionalEarlyOtMinutes > 0 && (
+              <span className="text-[10px] font-semibold text-amber-300 block">
+                Provisional Early OT: {formatDurationClock(resolvedIn.provisionalEarlyOtMinutes)} (Pending Punch Out)
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+});
+
+const PunchOutResultCard = React.memo<{ result: ScanResult | null }>(({ result }) => {
+  const resolvedOut = useMemo(
+    () => (result?.employee ? resolveAttendanceMetrics(result.attendance) : null),
+    [result]
+  );
+
+  if (!result) {
+    return (
+      <div className="border border-dashed border-slate-800 rounded-lg p-6 text-center text-xs text-slate-500">
+        <LogOut className="w-6 h-6 text-indigo-600/50 mx-auto mb-1.5" />
+        <span>Ready to scan employee exit QR codes</span>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={`p-4 rounded-lg border flex flex-col gap-3 transition-all ${
+        result.success
+          ? 'bg-indigo-950/30 border-indigo-600/70 text-indigo-200'
+          : 'bg-red-950/40 border-red-700 text-red-200'
+      }`}
+    >
+      <div className="flex items-start justify-between">
+        <div className="flex items-center gap-2">
+          {result.success ? (
+            <CheckCircle2 className="w-5 h-5 text-indigo-400 shrink-0" />
+          ) : (
+            <XCircle className="w-5 h-5 text-red-400 shrink-0" />
+          )}
+          <div>
+            <div className="text-[10px] uppercase font-bold tracking-wider opacity-80">
+              {result.success ? 'EXIT CONFIRMED' : 'EXIT REJECTED'}
+            </div>
+            <div className="text-sm font-bold text-white leading-tight">
+              {result.message}
+            </div>
+          </div>
+        </div>
+        <span className="text-xs font-mono font-bold text-slate-300">
+          {result.time}
+        </span>
+      </div>
+
+      {result.employee && resolvedOut && (
+        <div className="grid grid-cols-2 gap-2 pt-2 border-t border-white/10 text-xs">
+          <div>
+            <span className="text-slate-400 block text-[10px]">EMPLOYEE</span>
+            <span className="font-bold text-white truncate block">
+              {result.employee.employeeName} ({result.employee.employeeId})
+            </span>
+          </div>
+          <div>
+            <span className="text-slate-400 block text-[10px]">DUTY RECORDED</span>
+            <span className="font-bold text-emerald-400 block">
+              {result.attendance
+                ? `${formatDurationClock(resolvedOut.completedDutyMinutes)} Hours`
+                : result.dutyFormatted || '08:30 Hours'}
+            </span>
+          </div>
+          <div>
+            <span className="text-slate-400 block text-[10px]">TOTAL OVERTIME (OT)</span>
+            <span className="font-bold text-amber-400 block">
+              {resolvedOut.overtimeMinutes > 0
+                ? resolvedOut.otLabel
+                : result.otFormatted && result.otFormatted !== '00:00 Hours'
+                  ? result.otFormatted
+                  : '00:00 Hours'}
+            </span>
+            {(resolvedOut.earlyOtMinutes > 0 || resolvedOut.postShiftOtMinutes > 0) && (
+              <span className="text-[10px] text-slate-300 block">
+                Early: {formatDurationClock(resolvedOut.earlyOtMinutes)} • Post: {formatDurationClock(resolvedOut.postShiftOtMinutes)}
+              </span>
+            )}
+          </div>
+          <div>
+            <span className="text-slate-400 block text-[10px]">STATE &amp; STATUS</span>
+            <span className="font-semibold text-slate-200 block">
+              OUTSIDE • {resolvedOut.status} (Punch #{result.punchCount || 2})
+            </span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+});
+
+const ScannerGuidanceCards = React.memo(() => (
+  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+    <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl">
+      <div className="flex items-center gap-2 text-xs font-bold text-emerald-400 uppercase mb-1">
+        <LogIn className="w-4 h-4" />
+        <span>First Punch In Rule</span>
+      </div>
+      <p className="text-xs text-slate-400">
+        Earliest valid scan of the day is official daily <strong>firstPunchIn</strong>. Preserved across all multiple punches.
+      </p>
+    </div>
+
+    <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl">
+      <div className="flex items-center gap-2 text-xs font-bold text-indigo-400 uppercase mb-1">
+        <LogOut className="w-4 h-4" />
+        <span>Last Punch Out Rule</span>
+      </div>
+      <p className="text-xs text-slate-400">
+        Latest valid scan of the day is official daily <strong>lastPunchOut</strong>. Duty = Last Out - First In.
+      </p>
+    </div>
+
+    <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl">
+      <div className="flex items-center gap-2 text-xs font-bold text-amber-400 uppercase mb-1">
+        <Clock className="w-4 h-4" />
+        <span>Standard 08:30 Duty</span>
+      </div>
+      <p className="text-xs text-slate-400">
+        Standard shift duty is 08h 30m (510 mins). Early arrival &ge; 60m counts full Early OT + Post-shift OT on Punch Out. Missed punch auto-closes with 0 OT.
+      </p>
+    </div>
+  </div>
+));
+
+const RecentActivityList = React.memo<{ events: ScanResult[] }>(({ events }) => (
+  <div className="flex-1 overflow-y-auto mt-3 space-y-2.5 max-h-[600px] pr-1">
+    {events.length === 0 ? (
+      <div className="text-center py-16 text-xs text-slate-500">
+        <ScanLine className="w-8 h-8 text-slate-700 mx-auto mb-2" />
+        No punch activity in this session yet.
+      </div>
+    ) : (
+      events.map((ev, i) => (
+        <div
+          key={`${ev.employee?.employeeId || 'unknown'}_${ev.time}_${i}`}
+          className={`p-3 rounded-lg border text-xs flex flex-col gap-1 transition ${
+            ev.success
+              ? ev.action === 'PUNCH_IN'
+                ? 'bg-emerald-950/20 border-emerald-900/60 text-slate-200'
+                : 'bg-indigo-950/20 border-indigo-900/60 text-slate-200'
+              : 'bg-red-950/20 border-red-900/60 text-red-200'
+          }`}
+        >
+          <div className="flex items-center justify-between font-mono">
+            <div className="flex items-center gap-1.5">
+              <span className={`w-2 h-2 rounded-full ${
+                ev.action === 'PUNCH_IN' ? 'bg-emerald-400' : ev.action === 'PUNCH_OUT' ? 'bg-indigo-400' : 'bg-red-400'
+              }`}></span>
+              <span className="font-bold text-white">
+                {ev.employee?.employeeId || 'ID_NOT_FOUND'}
+              </span>
+            </div>
+            <span className="text-[10px] text-slate-400">{ev.time}</span>
+          </div>
+
+          <div className="font-medium text-slate-300 truncate">
+            {ev.employee?.employeeName || ev.message}
+          </div>
+
+          <div className="flex items-center justify-between text-[11px] text-slate-400 mt-1 pt-1 border-t border-white/5">
+            <span className="truncate">
+              {ev.employee ? `${ev.employee.floor} • ${ev.employee.department}` : ''}
+            </span>
+            <span className={`px-1.5 py-0.5 rounded font-bold uppercase text-[9px] ${
+              ev.action === 'PUNCH_IN'
+                ? 'bg-emerald-900/80 text-emerald-300'
+                : ev.action === 'PUNCH_OUT'
+                  ? 'bg-indigo-900/80 text-indigo-300'
+                  : 'bg-red-900/80 text-red-300'
+            }`}>
+              GATE {ev.scannerType || (ev.action === 'PUNCH_IN' ? 'IN' : 'OUT')}
+            </span>
+          </div>
+        </div>
+      ))
+    )}
+  </div>
+));
+
 export const Scanner: React.FC<ScannerProps> = ({
   onAttendanceUpdated,
   isFullscreen = false,
@@ -75,11 +338,15 @@ export const Scanner: React.FC<ScannerProps> = ({
   rolePermissions,
   userPermissionOverride,
 }) => {
-  const { canQrScan, canManualEntry } = resolveScannerCapabilities({
-    profile: currentUserRole,
-    rolePermissions,
-    userPermissionOverride,
-  });
+  const { canQrScan, canManualEntry } = useMemo(
+    () =>
+      resolveScannerCapabilities({
+        profile: currentUserRole,
+        rolePermissions,
+        userPermissionOverride,
+      }),
+    [currentUserRole, rolePermissions, userPermissionOverride]
+  );
   // Mode selection: Dual side-by-side or dedicated single station
   const [activeStationMode, setActiveStationMode] = useState<'DUAL' | 'IN_ONLY' | 'OUT_ONLY'>('DUAL');
 
@@ -127,6 +394,9 @@ export const Scanner: React.FC<ScannerProps> = ({
   const inFlightManualInRef = useRef(false);
   const inFlightManualOutRef = useRef(false);
   const lastWebcamScanRef = useRef<{ key: string; at: number } | null>(null);
+  const lastUsbScanRef = useRef<{ key: string; at: number } | null>(null);
+  const webcamStationRef = useRef(webcamStation);
+  webcamStationRef.current = webcamStation;
   const [pendingGateFeedback, setPendingGateFeedback] = useState<{
     IN?: { mode: 'QR' | 'MANUAL'; detectedAt: number };
     OUT?: { mode: 'QR' | 'MANUAL'; detectedAt: number };
@@ -186,8 +456,27 @@ export const Scanner: React.FC<ScannerProps> = ({
     }
   }, [soundEnabled]);
 
+  // Pre-warm singleton AudioContext on first user interaction so first punch chime has zero init lag
   useEffect(() => {
+    const warmAudio = () => {
+      try {
+        const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+        if (!AudioCtx) return;
+        if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
+          audioCtxRef.current = new AudioCtx();
+        }
+        if (audioCtxRef.current.state === 'suspended') {
+          audioCtxRef.current.resume().catch(() => {});
+        }
+      } catch {
+        // Ignore browser autoplay restrictions
+      }
+    };
+    window.addEventListener('pointerdown', warmAudio, { once: true, passive: true });
+    window.addEventListener('keydown', warmAudio, { once: true, passive: true });
     return () => {
+      window.removeEventListener('pointerdown', warmAudio);
+      window.removeEventListener('keydown', warmAudio);
       if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
         audioCtxRef.current.close().catch(() => {});
       }
@@ -240,6 +529,18 @@ export const Scanner: React.FC<ScannerProps> = ({
     const detectStart = performance.now();
     const clean = payload.trim();
     if (!clean || inFlightInRef.current) return;
+    if (source === 'USB_SCANNER') {
+      const usbKey = `IN:${clean}`;
+      const nowTs = Date.now();
+      const lastUsb = lastUsbScanRef.current;
+      if (lastUsb && lastUsb.key === usbKey && nowTs - lastUsb.at < 1200) {
+        rawInPayloadRef.current = '';
+        usbInScanStartRef.current = null;
+        setInQrDetected(false);
+        return;
+      }
+      lastUsbScanRef.current = { key: usbKey, at: nowTs };
+    }
     const usbStart = usbInScanStartRef.current;
     usbInScanStartRef.current = null;
 
@@ -312,6 +613,24 @@ export const Scanner: React.FC<ScannerProps> = ({
       if (typeof result.perf?.authMs === 'number') {
         recordPerfMetric('qr_auth_token_ms', result.perf.authMs + (result.perf.tokenValidationMs ?? 0));
       }
+      if (typeof result.perf?.tokenVerifyMs === 'number') {
+        recordPerfMetric('qr_token_verify_ms', result.perf.tokenVerifyMs);
+      }
+      if (typeof result.perf?.employeeLookupMs === 'number') {
+        recordPerfMetric('qr_employee_lookup_ms', result.perf.employeeLookupMs);
+      }
+      if (typeof result.perf?.attendanceLookupMs === 'number') {
+        recordPerfMetric('qr_attendance_lookup_ms', result.perf.attendanceLookupMs);
+      }
+      if (typeof result.perf?.configLookupMs === 'number') {
+        recordPerfMetric('qr_config_lookup_ms', result.perf.configLookupMs);
+      }
+      if (typeof result.perf?.txMs === 'number') {
+        recordPerfMetric('qr_tx_ms', result.perf.txMs);
+      }
+      if (typeof result.perf?.auditMs === 'number') {
+        recordPerfMetric('qr_audit_ms', result.perf.auditMs);
+      }
       if (typeof result.perf?.firestoreOpMs === 'number') {
         recordPerfMetric('qr_firestore_ms', result.perf.firestoreOpMs);
       }
@@ -369,6 +688,18 @@ export const Scanner: React.FC<ScannerProps> = ({
     const detectStart = performance.now();
     const clean = payload.trim();
     if (!clean || inFlightOutRef.current) return;
+    if (source === 'USB_SCANNER') {
+      const usbKey = `OUT:${clean}`;
+      const nowTs = Date.now();
+      const lastUsb = lastUsbScanRef.current;
+      if (lastUsb && lastUsb.key === usbKey && nowTs - lastUsb.at < 1200) {
+        rawOutPayloadRef.current = '';
+        usbOutScanStartRef.current = null;
+        setOutQrDetected(false);
+        return;
+      }
+      lastUsbScanRef.current = { key: usbKey, at: nowTs };
+    }
     const usbStart = usbOutScanStartRef.current;
     usbOutScanStartRef.current = null;
 
@@ -440,6 +771,24 @@ export const Scanner: React.FC<ScannerProps> = ({
       }
       if (typeof result.perf?.authMs === 'number') {
         recordPerfMetric('qr_auth_token_ms', result.perf.authMs + (result.perf.tokenValidationMs ?? 0));
+      }
+      if (typeof result.perf?.tokenVerifyMs === 'number') {
+        recordPerfMetric('qr_token_verify_ms', result.perf.tokenVerifyMs);
+      }
+      if (typeof result.perf?.employeeLookupMs === 'number') {
+        recordPerfMetric('qr_employee_lookup_ms', result.perf.employeeLookupMs);
+      }
+      if (typeof result.perf?.attendanceLookupMs === 'number') {
+        recordPerfMetric('qr_attendance_lookup_ms', result.perf.attendanceLookupMs);
+      }
+      if (typeof result.perf?.configLookupMs === 'number') {
+        recordPerfMetric('qr_config_lookup_ms', result.perf.configLookupMs);
+      }
+      if (typeof result.perf?.txMs === 'number') {
+        recordPerfMetric('qr_tx_ms', result.perf.txMs);
+      }
+      if (typeof result.perf?.auditMs === 'number') {
+        recordPerfMetric('qr_audit_ms', result.perf.auditMs);
       }
       if (typeof result.perf?.firestoreOpMs === 'number') {
         recordPerfMetric('qr_firestore_ms', result.perf.firestoreOpMs);
@@ -666,7 +1015,8 @@ export const Scanner: React.FC<ScannerProps> = ({
     }
   }, [canManualEntry, onAttendanceUpdated, playSound, restoreTargetFocus]);
 
-  // Dynamically load Webcam QR Reader only when webcam camera is opened
+  // Dynamically load Webcam QR Reader once when opened; reuse camera stream seamlessly across IN <-> OUT switching
+  const isWebcamOpen = webcamStation !== 'NONE';
   useEffect(() => {
     let cancelled = false;
 
@@ -677,7 +1027,7 @@ export const Scanner: React.FC<ScannerProps> = ({
       }
     };
 
-    if (webcamStation === 'NONE') {
+    if (!isWebcamOpen) {
       cleanupScanner();
       return cleanupScanner;
     }
@@ -700,17 +1050,27 @@ export const Scanner: React.FC<ScannerProps> = ({
 
         scanner.render(
           (decodedText: string) => {
-            const frameKey = `${webcamStation}:${decodedText.trim()}`;
+            const activeStation = webcamStationRef.current;
+            if (activeStation === 'NONE') return;
+            const trimmed = decodedText.trim();
+            if (!trimmed) return;
+            if (
+              (activeStation === 'IN' && inFlightInRef.current) ||
+              (activeStation === 'OUT' && inFlightOutRef.current)
+            ) {
+              return;
+            }
+            const frameKey = `${activeStation}:${trimmed}`;
             const nowTs = Date.now();
             const last = lastWebcamScanRef.current;
-            if (last && last.key === frameKey && nowTs - last.at < 1800) {
+            if (last && last.key === frameKey && nowTs - last.at < 2200) {
               return;
             }
             lastWebcamScanRef.current = { key: frameKey, at: nowTs };
-            if (webcamStation === 'IN') {
-              handlePunchInRef.current(decodedText, 'WEBCAM');
-            } else if (webcamStation === 'OUT') {
-              handlePunchOutRef.current(decodedText, 'WEBCAM');
+            if (activeStation === 'IN') {
+              handlePunchInRef.current(trimmed, 'WEBCAM');
+            } else if (activeStation === 'OUT') {
+              handlePunchOutRef.current(trimmed, 'WEBCAM');
             }
           },
           () => {}
@@ -725,7 +1085,7 @@ export const Scanner: React.FC<ScannerProps> = ({
       cancelled = true;
       cleanupScanner();
     };
-  }, [webcamStation]);
+  }, [isWebcamOpen]);
 
   return (
     <div className="flex flex-col h-full bg-slate-950 text-white overflow-y-auto">
@@ -1107,84 +1467,7 @@ export const Scanner: React.FC<ScannerProps> = ({
                       <span className="text-[10px] font-mono text-emerald-300">WAIT</span>
                     </div>
                   )}
-                  {lastInResult ? (
-                    <div 
-                      className={`p-4 rounded-lg border flex flex-col gap-3 transition-all ${
-                        lastInResult.success
-                          ? isAttendanceLate(lastInResult.attendance)
-                            ? 'bg-amber-950/30 border-amber-600/70 text-amber-200'
-                            : 'bg-emerald-950/30 border-emerald-600/70 text-emerald-200'
-                          : 'bg-red-950/40 border-red-700 text-red-200'
-                      }`}
-                    >
-                      <div className="flex items-start justify-between">
-                        <div className="flex items-center gap-2">
-                          {lastInResult.success ? (
-                            <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
-                          ) : (
-                            <XCircle className="w-5 h-5 text-red-400 shrink-0" />
-                          )}
-                          <div>
-                            <div className="text-[10px] uppercase font-bold tracking-wider opacity-80">
-                              {lastInResult.success ? 'ENTRY CONFIRMED' : 'ENTRY REJECTED'}
-                            </div>
-                            <div className="text-sm font-bold text-white leading-tight">
-                              {lastInResult.message}
-                            </div>
-                          </div>
-                        </div>
-                        <span className="text-xs font-mono font-bold text-slate-300">
-                          {lastInResult.time}
-                        </span>
-                      </div>
-
-                      {lastInResult.employee && (() => {
-                        const resolvedIn = resolveAttendanceMetrics(lastInResult.attendance);
-                        return (
-                          <div className="grid grid-cols-2 gap-2 pt-2 border-t border-white/10 text-xs">
-                            <div>
-                              <span className="text-slate-400 block text-[10px]">EMPLOYEE</span>
-                              <span className="font-bold text-white truncate block">
-                                {lastInResult.employee.employeeName} ({lastInResult.employee.employeeId})
-                              </span>
-                            </div>
-                            <div>
-                              <span className="text-slate-400 block text-[10px]">LINE / SECTION</span>
-                              <span className="font-semibold text-slate-200 block truncate">
-                                {lastInResult.employee.floor} • {lastInResult.employee.section}
-                              </span>
-                            </div>
-                            <div>
-                              <span className="text-slate-400 block text-[10px]">SCHEDULED START</span>
-                              <span className="font-semibold text-slate-200 block truncate">
-                                {resolvedIn.scheduledStartDisplay}
-                                {resolvedIn.earlyArrivalMinutes > 0
-                                  ? ` • Early ${formatDurationClock(resolvedIn.earlyArrivalMinutes)}`
-                                  : ''}
-                              </span>
-                            </div>
-                            <div>
-                              <span className="text-slate-400 block text-[10px]">SHIFT / STATUS</span>
-                              <span className="font-semibold text-emerald-400 block">
-                                {lastInResult.shift?.name || 'DAY SHIFT'} • INSIDE / IN PROGRESS
-                                {isAttendanceLate(lastInResult.attendance) ? ' (LATE)' : ''}
-                              </span>
-                              {resolvedIn.provisionalEarlyOtMinutes > 0 && (
-                                <span className="text-[10px] font-semibold text-amber-300 block">
-                                  Provisional Early OT: {formatDurationClock(resolvedIn.provisionalEarlyOtMinutes)} (Pending Punch Out)
-                                </span>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })()}
-                    </div>
-                  ) : (
-                    <div className="border border-dashed border-slate-800 rounded-lg p-6 text-center text-xs text-slate-500">
-                      <LogIn className="w-6 h-6 text-emerald-600/50 mx-auto mb-1.5" />
-                      <span>Ready to scan employee entry QR codes</span>
-                    </div>
-                  )}
+                  <PunchInResultCard result={lastInResult} />
                 </div>
 
                 {/* Validation Note */}
@@ -1426,84 +1709,7 @@ export const Scanner: React.FC<ScannerProps> = ({
                       <span className="text-[10px] font-mono text-indigo-300">WAIT</span>
                     </div>
                   )}
-                  {lastOutResult ? (
-                    <div 
-                      className={`p-4 rounded-lg border flex flex-col gap-3 transition-all ${
-                        lastOutResult.success
-                          ? 'bg-indigo-950/30 border-indigo-600/70 text-indigo-200'
-                          : 'bg-red-950/40 border-red-700 text-red-200'
-                      }`}
-                    >
-                      <div className="flex items-start justify-between">
-                        <div className="flex items-center gap-2">
-                          {lastOutResult.success ? (
-                            <CheckCircle2 className="w-5 h-5 text-indigo-400 shrink-0" />
-                          ) : (
-                            <XCircle className="w-5 h-5 text-red-400 shrink-0" />
-                          )}
-                          <div>
-                            <div className="text-[10px] uppercase font-bold tracking-wider opacity-80">
-                              {lastOutResult.success ? 'EXIT CONFIRMED' : 'EXIT REJECTED'}
-                            </div>
-                            <div className="text-sm font-bold text-white leading-tight">
-                              {lastOutResult.message}
-                            </div>
-                          </div>
-                        </div>
-                        <span className="text-xs font-mono font-bold text-slate-300">
-                          {lastOutResult.time}
-                        </span>
-                      </div>
-
-                      {lastOutResult.employee && (() => {
-                        const resolvedOut = resolveAttendanceMetrics(lastOutResult.attendance);
-                        return (
-                          <div className="grid grid-cols-2 gap-2 pt-2 border-t border-white/10 text-xs">
-                            <div>
-                              <span className="text-slate-400 block text-[10px]">EMPLOYEE</span>
-                              <span className="font-bold text-white truncate block">
-                                {lastOutResult.employee.employeeName} ({lastOutResult.employee.employeeId})
-                              </span>
-                            </div>
-                            <div>
-                              <span className="text-slate-400 block text-[10px]">DUTY RECORDED</span>
-                              <span className="font-bold text-emerald-400 block">
-                                {lastOutResult.attendance
-                                  ? `${formatDurationClock(resolvedOut.completedDutyMinutes)} Hours`
-                                  : lastOutResult.dutyFormatted || '08:30 Hours'}
-                              </span>
-                            </div>
-                            <div>
-                              <span className="text-slate-400 block text-[10px]">TOTAL OVERTIME (OT)</span>
-                              <span className="font-bold text-amber-400 block">
-                                {resolvedOut.overtimeMinutes > 0
-                                  ? resolvedOut.otLabel
-                                  : lastOutResult.otFormatted && lastOutResult.otFormatted !== '00:00 Hours'
-                                    ? lastOutResult.otFormatted
-                                    : '00:00 Hours'}
-                              </span>
-                              {(resolvedOut.earlyOtMinutes > 0 || resolvedOut.postShiftOtMinutes > 0) && (
-                                <span className="text-[10px] text-slate-300 block">
-                                  Early: {formatDurationClock(resolvedOut.earlyOtMinutes)} • Post: {formatDurationClock(resolvedOut.postShiftOtMinutes)}
-                                </span>
-                              )}
-                            </div>
-                            <div>
-                              <span className="text-slate-400 block text-[10px]">STATE &amp; STATUS</span>
-                              <span className="font-semibold text-slate-200 block">
-                                OUTSIDE • {resolvedOut.status} (Punch #{lastOutResult.punchCount || 2})
-                              </span>
-                            </div>
-                          </div>
-                        );
-                      })()}
-                    </div>
-                  ) : (
-                    <div className="border border-dashed border-slate-800 rounded-lg p-6 text-center text-xs text-slate-500">
-                      <LogOut className="w-6 h-6 text-indigo-600/50 mx-auto mb-1.5" />
-                      <span>Ready to scan employee exit QR codes</span>
-                    </div>
-                  )}
+                  <PunchOutResultCard result={lastOutResult} />
                 </div>
 
                 {/* Validation Note */}
@@ -1516,37 +1722,7 @@ export const Scanner: React.FC<ScannerProps> = ({
           </div>
 
           {/* Industrial First-In Last-Out Guidance Cards */}
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl">
-              <div className="flex items-center gap-2 text-xs font-bold text-emerald-400 uppercase mb-1">
-                <LogIn className="w-4 h-4" />
-                <span>First Punch In Rule</span>
-              </div>
-              <p className="text-xs text-slate-400">
-                Earliest valid scan of the day is official daily <strong>firstPunchIn</strong>. Preserved across all multiple punches.
-              </p>
-            </div>
-
-            <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl">
-              <div className="flex items-center gap-2 text-xs font-bold text-indigo-400 uppercase mb-1">
-                <LogOut className="w-4 h-4" />
-                <span>Last Punch Out Rule</span>
-              </div>
-              <p className="text-xs text-slate-400">
-                Latest valid scan of the day is official daily <strong>lastPunchOut</strong>. Duty = Last Out - First In.
-              </p>
-            </div>
-
-            <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl">
-              <div className="flex items-center gap-2 text-xs font-bold text-amber-400 uppercase mb-1">
-                <Clock className="w-4 h-4" />
-                <span>Standard 08:30 Duty</span>
-              </div>
-              <p className="text-xs text-slate-400">
-                Standard shift duty is 08h 30m (510 mins). Early arrival &ge; 60m counts full Early OT + Post-shift OT on Punch Out. Missed punch auto-closes with 0 OT.
-              </p>
-            </div>
-          </div>
+          <ScannerGuidanceCards />
         </div>
 
         {/* Right Column: Live Punch Activity Stream (4 cols) */}
@@ -1562,58 +1738,7 @@ export const Scanner: React.FC<ScannerProps> = ({
               </span>
             </div>
 
-            <div className="flex-1 overflow-y-auto mt-3 space-y-2.5 max-h-[600px] pr-1">
-              {recentEvents.length === 0 ? (
-                <div className="text-center py-16 text-xs text-slate-500">
-                  <ScanLine className="w-8 h-8 text-slate-700 mx-auto mb-2" />
-                  No punch activity in this session yet.
-                </div>
-              ) : (
-                recentEvents.map((ev, i) => (
-                  <div
-                    key={i}
-                    className={`p-3 rounded-lg border text-xs flex flex-col gap-1 transition ${
-                      ev.success
-                        ? ev.action === 'PUNCH_IN'
-                          ? 'bg-emerald-950/20 border-emerald-900/60 text-slate-200'
-                          : 'bg-indigo-950/20 border-indigo-900/60 text-slate-200'
-                        : 'bg-red-950/20 border-red-900/60 text-red-200'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between font-mono">
-                      <div className="flex items-center gap-1.5">
-                        <span className={`w-2 h-2 rounded-full ${
-                          ev.action === 'PUNCH_IN' ? 'bg-emerald-400' : ev.action === 'PUNCH_OUT' ? 'bg-indigo-400' : 'bg-red-400'
-                        }`}></span>
-                        <span className="font-bold text-white">
-                          {ev.employee?.employeeId || 'ID_NOT_FOUND'}
-                        </span>
-                      </div>
-                      <span className="text-[10px] text-slate-400">{ev.time}</span>
-                    </div>
-
-                    <div className="font-medium text-slate-300 truncate">
-                      {ev.employee?.employeeName || ev.message}
-                    </div>
-
-                    <div className="flex items-center justify-between text-[11px] text-slate-400 mt-1 pt-1 border-t border-white/5">
-                      <span className="truncate">
-                        {ev.employee ? `${ev.employee.floor} • ${ev.employee.department}` : ''}
-                      </span>
-                      <span className={`px-1.5 py-0.5 rounded font-bold uppercase text-[9px] ${
-                        ev.action === 'PUNCH_IN'
-                          ? 'bg-emerald-900/80 text-emerald-300'
-                          : ev.action === 'PUNCH_OUT'
-                            ? 'bg-indigo-900/80 text-indigo-300'
-                            : 'bg-red-900/80 text-red-300'
-                      }`}>
-                        GATE {ev.scannerType || (ev.action === 'PUNCH_IN' ? 'IN' : 'OUT')}
-                      </span>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
+            <RecentActivityList events={recentEvents} />
           </div>
         </div>
       </div>

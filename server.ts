@@ -1057,7 +1057,10 @@ export function createApp(options: ServerAppOptions = {}) {
     res: Response,
     allowedRoles: string[] | '*',
     actionLabel: string,
-    options?: { prefetchUserPermission?: boolean }
+    options?: {
+      prefetchUserPermission?: boolean;
+      onTokenVerified?: (verifiedUid: string) => void;
+    }
   ): Promise<VerifiedCaller | null> {
     try {
       const caller = await verifyCallerIdentity(req, adminDb, auth, projectId, {

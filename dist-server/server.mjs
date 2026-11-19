@@ -3,8 +3,8 @@ import express from "express";
 import cors from "cors";
 import fs2 from "fs";
 import path2 from "path";
-import crypto5 from "crypto";
-import { z as z4 } from "zod";
+import crypto6 from "crypto";
+import { z as z6 } from "zod";
 
 // serverFirebaseAdmin.ts
 import fs from "fs";
@@ -281,7 +281,9 @@ function getStore(db) {
   if (!store) {
     store = {
       roleDefs: /* @__PURE__ */ new Map(),
+      roleDefsInFlight: /* @__PURE__ */ new Map(),
       rolePerms: /* @__PURE__ */ new Map(),
+      rolePermsInFlight: /* @__PURE__ */ new Map(),
       uidRolePointers: /* @__PURE__ */ new Map(),
       inFlightRequests: /* @__PURE__ */ new Map(),
       recentIdempotentResponses: /* @__PURE__ */ new Map()
@@ -290,9 +292,9 @@ function getStore(db) {
   }
   return store;
 }
-var CONFIG_TTL_MS = 3e4;
-var ROLE_TTL_MS = 15e3;
-var UID_POINTER_TTL_MS = 6e4;
+var CONFIG_TTL_MS = 12e4;
+var ROLE_TTL_MS = 6e4;
+var UID_POINTER_TTL_MS = 3e5;
 function getCachedUidRolePointer(db, uid) {
   const cleanUid = String(uid || "").trim();
   if (!cleanUid) return null;
@@ -388,13 +390,22 @@ async function getCachedRoleDefDoc(db, roleId) {
   if (cached && cached.expiresAt > now) {
     return { exists: cached.exists, data: cached.data, cacheHit: true };
   }
-  const snap = await db.collection("roles").doc(cleanRole).get();
-  const entry = {
-    exists: snap.exists,
-    data: snap.exists ? snap.data() || {} : void 0,
-    expiresAt: Date.now() + ROLE_TTL_MS
-  };
-  store.roleDefs.set(cleanRole, entry);
+  let inFlight = store.roleDefsInFlight.get(cleanRole);
+  if (!inFlight) {
+    inFlight = db.collection("roles").doc(cleanRole).get().then((snap) => {
+      const entry2 = {
+        exists: snap.exists,
+        data: snap.exists ? snap.data() || {} : void 0,
+        expiresAt: Date.now() + ROLE_TTL_MS
+      };
+      store.roleDefs.set(cleanRole, entry2);
+      return entry2;
+    }).finally(() => {
+      store.roleDefsInFlight.delete(cleanRole);
+    });
+    store.roleDefsInFlight.set(cleanRole, inFlight);
+  }
+  const entry = await inFlight;
   return { exists: entry.exists, data: entry.data, cacheHit: false };
 }
 async function getCachedRolePermissionsDoc(db, roleId) {
@@ -406,13 +417,22 @@ async function getCachedRolePermissionsDoc(db, roleId) {
   if (cached && cached.expiresAt > now) {
     return { exists: cached.exists, data: cached.data, cacheHit: true };
   }
-  const snap = await db.collection("role_permissions").doc(cleanRole).get();
-  const entry = {
-    exists: snap.exists,
-    data: snap.exists ? snap.data() || {} : void 0,
-    expiresAt: Date.now() + ROLE_TTL_MS
-  };
-  store.rolePerms.set(cleanRole, entry);
+  let inFlight = store.rolePermsInFlight.get(cleanRole);
+  if (!inFlight) {
+    inFlight = db.collection("role_permissions").doc(cleanRole).get().then((snap) => {
+      const entry2 = {
+        exists: snap.exists,
+        data: snap.exists ? snap.data() || {} : void 0,
+        expiresAt: Date.now() + ROLE_TTL_MS
+      };
+      store.rolePerms.set(cleanRole, entry2);
+      return entry2;
+    }).finally(() => {
+      store.rolePermsInFlight.delete(cleanRole);
+    });
+    store.rolePermsInFlight.set(cleanRole, inFlight);
+  }
+  const entry = await inFlight;
   return { exists: entry.exists, data: entry.data, cacheHit: false };
 }
 function invalidateRoleCaches(db, roleId) {
@@ -426,6 +446,11 @@ function invalidateRoleCaches(db, roleId) {
     store.rolePerms.clear();
     store.uidRolePointers.clear();
   }
+}
+function invalidateConfigCaches(db) {
+  const store = getStore(db);
+  store.shifts = void 0;
+  store.systemSettings = void 0;
 }
 async function runWithOptionalClientRequestDedup(db, dedupKey, task) {
   if (!dedupKey) {
@@ -471,6 +496,15 @@ function emitNonSensitivePerfLog(operation, metrics) {
 
 // serverSecurityAudit.ts
 var KOLKATA_CA_DATE_FORMATTER = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" });
+var CANONICAL_SUPER_ADMIN_UID = "oX2vdSx5jGcoUDxyA0SIYN3SEig2";
+function isCanonicalSuperAdminAccount(docId, data) {
+  const roleNorm = normalizeRoleValue(data?.role);
+  if (roleNorm !== "super_admin") return false;
+  const cleanLogin = String(data?.loginId || "").trim().toLowerCase();
+  const cleanDocId = String(docId || "").trim().toLowerCase();
+  const cleanUid = String(data?.authUid || data?.uid || "").trim();
+  return cleanLogin === "superadmin" || cleanDocId === "role_superadmin" || cleanUid === CANONICAL_SUPER_ADMIN_UID;
+}
 var CRITICAL_PROTECTED_ACTIONS = /* @__PURE__ */ new Set([
   "account_deleted",
   "accounts_consolidated",
@@ -480,6 +514,10 @@ var CRITICAL_PROTECTED_ACTIONS = /* @__PURE__ */ new Set([
   "unauthorized_access_attempt",
   "unauthorized_password_reset_attempt",
   "unauthorized_self_password_change",
+  "super_admin_progressive_lockout",
+  "super_admin_lockout_expired",
+  "login_success_after_lockout",
+  "super_admin_lockout_level_reset",
   "login_locked_rate_limit",
   "audit_controlled_deleted"
 ]);
@@ -506,18 +544,21 @@ async function syncUserUidIndex(db, params) {
     return;
   }
   const now = (/* @__PURE__ */ new Date()).toISOString();
-  await db.collection("user_uid_index").doc(uid).set(
-    {
-      uid,
-      roleDocId: params.roleDocId,
-      role: normalizeRoleValue(params.role),
-      status: params.status || "Active",
-      lockStatus: params.lockStatus || "ACTIVE",
-      loginId: String(params.loginId || "").trim().toLowerCase(),
-      updatedAt: now
-    },
-    { merge: true }
-  );
+  const payload = {
+    uid,
+    roleDocId: params.roleDocId,
+    role: normalizeRoleValue(params.role),
+    status: params.status || "Active",
+    lockStatus: params.lockStatus || "ACTIVE",
+    loginId: String(params.loginId || "").trim().toLowerCase(),
+    updatedAt: now
+  };
+  if (params.lockedUntilMs !== void 0) {
+    payload.lockedUntilMs = params.lockedUntilMs;
+  } else if (payload.lockStatus !== "LOCKED") {
+    payload.lockedUntilMs = null;
+  }
+  await db.collection("user_uid_index").doc(uid).set(payload, { merge: true });
 }
 async function removeUserUidIndex(db, uid) {
   const clean = String(uid || "").trim();
@@ -541,6 +582,7 @@ async function verifyCallerIdentity(req, db, auth, _projectId, options) {
     err.statusCode = 503;
     throw err;
   }
+  const tokenVerifyStartMs = performance.now();
   let decoded;
   try {
     decoded = await auth.verifyIdToken(token, true);
@@ -552,6 +594,7 @@ async function verifyCallerIdentity(req, db, auth, _projectId, options) {
     err.statusCode = 401;
     throw err;
   }
+  const tokenVerifyMs = roundMs(performance.now() - tokenVerifyStartMs);
   if (!decoded || typeof decoded.uid !== "string" || !decoded.uid.trim()) {
     const err = new Error("Verified Firebase token missing subject UID.");
     err.statusCode = 401;
@@ -560,8 +603,19 @@ async function verifyCallerIdentity(req, db, auth, _projectId, options) {
   const verifiedUid = decoded.uid.trim();
   const decodedEmail = String(decoded.email || "").toLowerCase();
   const shouldPrefetchUserPerm = Boolean(options?.prefetchUserPermission);
+  if (typeof options?.onTokenVerified === "function") {
+    try {
+      options.onTokenVerified(verifiedUid);
+    } catch {
+    }
+  }
+  const callerLookupStartMs = performance.now();
+  let authFirestoreReads = 0;
+  let authFirestoreWrites = 0;
   let matchedDoc = null;
   let prefetchedUserPermSnap = void 0;
+  let prefetchedRolePerm = void 0;
+  let prefetchedRoleDef = void 0;
   let idxSnap = null;
   let usedPointerHit = false;
   const doesDocOwnUid = (docId, d) => {
@@ -570,17 +624,30 @@ async function verifyCallerIdentity(req, db, auth, _projectId, options) {
   };
   const pointer = getCachedUidRolePointer(db, verifiedUid);
   if (pointer) {
-    const prefetchPermNow = shouldPrefetchUserPerm && pointer.lastRole !== "super_admin";
-    const [roleDocSnap, userPermSnap] = await Promise.all([
+    const predictedRole = normalizeRoleValue(pointer.lastRole);
+    const prefetchPermNow = shouldPrefetchUserPerm && predictedRole !== "super_admin";
+    const prefetchRoleDefNow = Boolean(predictedRole && !SYSTEM_ROLE_IDS.has(predictedRole));
+    authFirestoreReads += 1 + (prefetchPermNow ? 1 : 0);
+    const [roleDocSnap, userPermSnap, rolePermRes, roleDefRes] = await Promise.all([
       db.collection("user_roles").doc(pointer.roleDocId).get(),
-      prefetchPermNow ? db.collection("user_permissions").doc(pointer.roleDocId).get() : Promise.resolve(null)
+      prefetchPermNow ? db.collection("user_permissions").doc(pointer.roleDocId).get() : Promise.resolve(null),
+      prefetchPermNow && predictedRole ? getCachedRolePermissionsDoc(db, predictedRole) : Promise.resolve(null),
+      prefetchRoleDefNow ? getCachedRoleDefDoc(db, predictedRole) : Promise.resolve(null)
     ]);
+    if (rolePermRes && !rolePermRes.cacheHit) authFirestoreReads += 1;
+    if (roleDefRes && !roleDefRes.cacheHit) authFirestoreReads += 1;
     if (roleDocSnap.exists) {
       const d = roleDocSnap.data() || {};
       if (doesDocOwnUid(roleDocSnap.id, d)) {
         matchedDoc = { id: roleDocSnap.id, data: d };
         if (prefetchPermNow && userPermSnap) {
           prefetchedUserPermSnap = userPermSnap;
+        }
+        if (rolePermRes && predictedRole) {
+          prefetchedRolePerm = { role: predictedRole, ...rolePermRes };
+        }
+        if (roleDefRes && predictedRole) {
+          prefetchedRoleDef = { role: predictedRole, ...roleDefRes };
         }
         usedPointerHit = true;
       }
@@ -590,16 +657,24 @@ async function verifyCallerIdentity(req, db, auth, _projectId, options) {
     }
   }
   if (!matchedDoc) {
+    authFirestoreReads += 1;
     idxSnap = await db.collection("user_uid_index").doc(verifiedUid).get();
     if (idxSnap.exists) {
       const idxData = idxSnap.data() || {};
       if (idxData.roleDocId) {
         const targetDocId = String(idxData.roleDocId);
-        const prefetchPermNow = shouldPrefetchUserPerm && String(idxData.role || "").toLowerCase() !== "super_admin";
-        const [roleDocSnap, userPermSnap] = await Promise.all([
+        const predictedRole = idxData.role ? normalizeRoleValue(idxData.role) : "";
+        const prefetchPermNow = shouldPrefetchUserPerm && predictedRole !== "super_admin";
+        const prefetchRoleDefNow = Boolean(predictedRole && !SYSTEM_ROLE_IDS.has(predictedRole));
+        authFirestoreReads += 1 + (prefetchPermNow ? 1 : 0);
+        const [roleDocSnap, userPermSnap, rolePermRes, roleDefRes] = await Promise.all([
           db.collection("user_roles").doc(targetDocId).get(),
-          prefetchPermNow ? db.collection("user_permissions").doc(targetDocId).get() : Promise.resolve(null)
+          prefetchPermNow ? db.collection("user_permissions").doc(targetDocId).get() : Promise.resolve(null),
+          prefetchPermNow && predictedRole ? getCachedRolePermissionsDoc(db, predictedRole) : Promise.resolve(null),
+          prefetchRoleDefNow ? getCachedRoleDefDoc(db, predictedRole) : Promise.resolve(null)
         ]);
+        if (rolePermRes && !rolePermRes.cacheHit) authFirestoreReads += 1;
+        if (roleDefRes && !roleDefRes.cacheHit) authFirestoreReads += 1;
         if (roleDocSnap.exists) {
           const d = roleDocSnap.data() || {};
           if (doesDocOwnUid(roleDocSnap.id, d)) {
@@ -607,18 +682,26 @@ async function verifyCallerIdentity(req, db, auth, _projectId, options) {
             if (prefetchPermNow && userPermSnap) {
               prefetchedUserPermSnap = userPermSnap;
             }
+            if (rolePermRes && predictedRole) {
+              prefetchedRolePerm = { role: predictedRole, ...rolePermRes };
+            }
+            if (roleDefRes && predictedRole) {
+              prefetchedRoleDef = { role: predictedRole, ...roleDefRes };
+            }
           }
         }
       }
     }
   }
   if (!matchedDoc) {
+    authFirestoreReads += 1;
     const directSnap = await db.collection("user_roles").doc(verifiedUid).get();
     if (directSnap.exists) {
       matchedDoc = { id: directSnap.id, data: directSnap.data() || {} };
     }
   }
   if (!matchedDoc) {
+    authFirestoreReads += 1;
     const byAuthUidSnap = await db.collection("user_roles").where("authUid", "==", verifiedUid).limit(1).get();
     if (!byAuthUidSnap.empty) {
       const first = byAuthUidSnap.docs[0];
@@ -626,6 +709,7 @@ async function verifyCallerIdentity(req, db, auth, _projectId, options) {
     }
   }
   if (!matchedDoc) {
+    authFirestoreReads += 1;
     const byLinkedSnap = await db.collection("user_roles").where("linkedAuthUids", "array-contains", verifiedUid).limit(1).get();
     if (!byLinkedSnap.empty) {
       const first = byLinkedSnap.docs[0];
@@ -640,7 +724,28 @@ async function verifyCallerIdentity(req, db, auth, _projectId, options) {
     err.statusCode = 403;
     throw err;
   }
-  if (matchedDoc.data.lockStatus === "LOCKED" || matchedDoc.data.isLocked === true) {
+  const currentNowMs = typeof options?.nowMs === "number" ? options.nowMs : Date.now();
+  const isLocked = matchedDoc.data.lockStatus === "LOCKED" || matchedDoc.data.isLocked === true;
+  if (isLocked) {
+    const isCanonicalSuper = isCanonicalSuperAdminAccount(matchedDoc.id, matchedDoc.data);
+    const parsedIsoUntil = matchedDoc.data.lockoutUntil ? Date.parse(String(matchedDoc.data.lockoutUntil)) : matchedDoc.data.lockedUntil ? Date.parse(String(matchedDoc.data.lockedUntil)) : NaN;
+    const lockedUntilMs = typeof matchedDoc.data.lockedUntilMs === "number" && matchedDoc.data.lockedUntilMs > 0 ? matchedDoc.data.lockedUntilMs : Number.isFinite(parsedIsoUntil) && parsedIsoUntil > 0 ? parsedIsoUntil : null;
+    if (isCanonicalSuper && lockedUntilMs) {
+      if (currentNowMs < lockedUntilMs) {
+        const remainingSec = Math.max(1, Math.ceil((lockedUntilMs - currentNowMs) / 1e3));
+        const mins = Math.floor(remainingSec / 60);
+        const secs = remainingSec % 60;
+        const waitText = mins > 0 ? `${mins}m ${String(secs).padStart(2, "0")}s` : `${secs}s`;
+        const err3 = new Error(
+          `Super Admin account is temporarily locked. Try again in ${waitText}.`
+        );
+        err3.statusCode = 403;
+        throw err3;
+      }
+      const err2 = new Error("Temporary lockout has expired. Please sign in again to reactivate your session.");
+      err2.statusCode = 401;
+      throw err2;
+    }
     const err = new Error("Your account has been temporarily blocked. Please contact Super Admin.");
     err.statusCode = 403;
     throw err;
@@ -656,7 +761,10 @@ async function verifyCallerIdentity(req, db, auth, _projectId, options) {
   }
   const normalizedRole = normalizeRoleValue(matchedDoc.data.role);
   if (!SYSTEM_ROLE_IDS.has(normalizedRole)) {
-    const roleDefSnap = await getCachedRoleDefDoc(db, normalizedRole);
+    const roleDefSnap = prefetchedRoleDef && prefetchedRoleDef.role === normalizedRole ? prefetchedRoleDef : await getCachedRoleDefDoc(db, normalizedRole);
+    if (prefetchedRoleDef?.role !== normalizedRole && !roleDefSnap.cacheHit) {
+      authFirestoreReads += 1;
+    }
     if (roleDefSnap.exists && roleDefSnap.data?.isActive === false) {
       const err = new Error("Assigned role is currently inactive. Access denied.");
       err.statusCode = 403;
@@ -671,6 +779,7 @@ async function verifyCallerIdentity(req, db, auth, _projectId, options) {
     const targetLockStatus = String(matchedDoc.data.lockStatus || "ACTIVE");
     const idxData = idxSnap.exists ? idxSnap.data() || {} : null;
     if (!idxData || idxData.roleDocId !== matchedDoc.id || idxData.role !== normalizedRole || idxData.status !== targetStatus || idxData.lockStatus !== targetLockStatus || idxData.loginId !== resolvedLoginId) {
+      authFirestoreWrites += 1;
       await syncUserUidIndex(db, {
         uid: verifiedUid,
         roleDocId: matchedDoc.id,
@@ -682,6 +791,7 @@ async function verifyCallerIdentity(req, db, auth, _projectId, options) {
     }
   }
   setCachedUidRolePointer(db, verifiedUid, matchedDoc.id, normalizedRole);
+  const callerLookupMs = roundMs(performance.now() - callerLookupStartMs);
   return {
     uid: verifiedUid,
     email: decodedEmail || String(matchedDoc.data.email || ""),
@@ -691,7 +801,12 @@ async function verifyCallerIdentity(req, db, auth, _projectId, options) {
     authTime,
     modulesAllowed: Array.isArray(matchedDoc.data.modulesAllowed) ? matchedDoc.data.modulesAllowed : [],
     prefetchedUserPermSnap: normalizedRole !== "super_admin" && prefetchedUserPermSnap !== void 0 ? prefetchedUserPermSnap : void 0,
-    cacheHitUidRoute: usedPointerHit
+    prefetchedRolePerm: normalizedRole !== "super_admin" && prefetchedRolePerm && prefetchedRolePerm.role === normalizedRole ? prefetchedRolePerm : void 0,
+    cacheHitUidRoute: usedPointerHit,
+    tokenVerifyMs,
+    callerLookupMs,
+    authFirestoreReads,
+    authFirestoreWrites
   };
 }
 function extractTrustedClientIp(req) {
@@ -1906,10 +2021,2557 @@ firebase auth:export auth-backup.json --project ${projectId}` : null,
 }
 
 // serverLoginSecurity.ts
+import crypto3 from "crypto";
+import { z as z2 } from "zod";
+
+// serverMonitoring.ts
 import crypto2 from "crypto";
 import { z } from "zod";
+
+// src/utils/networkDiagnostics.ts
+var DEFAULT_NETWORK_THRESHOLDS = {
+  netLatencyGoodMaxMs: 50,
+  netLatencyWarnMaxMs: 100,
+  netLatencyPoorMaxMs: 200,
+  netLatencyCriticalMinMs: 400,
+  netJitterGoodMaxMs: 20,
+  netJitterWarnMaxMs: 50,
+  netPacketLossGoodMaxPct: 0.5,
+  netPacketLossWarnMaxPct: 2,
+  netDownloadGoodMinMbps: 10,
+  netDownloadWarnMinMbps: 5,
+  netUploadGoodMinMbps: 5,
+  netUploadWarnMinMbps: 2,
+  netProbeIntervalSec: 30,
+  netNetworkFailureSpikeCount: 3,
+  apiP95WarningMs: 1200
+};
+function round2(v) {
+  return Math.round(v * 100) / 100;
+}
+function computeNumericStats(values) {
+  const clean = values.filter((v) => typeof v === "number" && Number.isFinite(v) && v >= 0);
+  if (clean.length === 0) {
+    return { count: 0, min: null, avg: null, p50: null, p95: null, max: null, last: null };
+  }
+  const sorted = [...clean].sort((a, b) => a - b);
+  const sum = sorted.reduce((acc, v) => acc + v, 0);
+  const p = (pct) => round2(sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(pct / 100 * sorted.length) - 1))]);
+  return {
+    count: sorted.length,
+    min: round2(sorted[0]),
+    avg: round2(sum / sorted.length),
+    p50: p(50),
+    p95: p(95),
+    max: round2(sorted[sorted.length - 1]),
+    last: round2(clean[clean.length - 1])
+  };
+}
+function classifyLatencyRating(rttMs, cfg = {}) {
+  if (rttMs === null || rttMs === void 0 || !Number.isFinite(rttMs) || rttMs < 0) {
+    return "UNKNOWN";
+  }
+  const goodMax = cfg.netLatencyGoodMaxMs ?? DEFAULT_NETWORK_THRESHOLDS.netLatencyGoodMaxMs;
+  const warnMax = cfg.netLatencyWarnMaxMs ?? DEFAULT_NETWORK_THRESHOLDS.netLatencyWarnMaxMs;
+  const poorMax = cfg.netLatencyPoorMaxMs ?? DEFAULT_NETWORK_THRESHOLDS.netLatencyPoorMaxMs;
+  const critMin = cfg.netLatencyCriticalMinMs ?? DEFAULT_NETWORK_THRESHOLDS.netLatencyCriticalMinMs;
+  if (rttMs <= goodMax) return "EXCELLENT";
+  if (rttMs <= warnMax) return "GOOD";
+  if (rttMs <= poorMax) return "WARNING";
+  if (rttMs <= critMin) return "POOR";
+  return "CRITICAL";
+}
+function classifyJitterRating(jitterMs, cfg = {}) {
+  if (jitterMs === null || jitterMs === void 0 || !Number.isFinite(jitterMs) || jitterMs < 0) {
+    return "UNKNOWN";
+  }
+  const goodMax = cfg.netJitterGoodMaxMs ?? DEFAULT_NETWORK_THRESHOLDS.netJitterGoodMaxMs;
+  const warnMax = cfg.netJitterWarnMaxMs ?? DEFAULT_NETWORK_THRESHOLDS.netJitterWarnMaxMs;
+  if (jitterMs < goodMax) return "GOOD";
+  if (jitterMs <= warnMax) return "WARNING";
+  return "CRITICAL";
+}
+function classifyPacketLossRating(lossPct, cfg = {}) {
+  if (lossPct === null || lossPct === void 0 || !Number.isFinite(lossPct) || lossPct < 0) {
+    return "UNKNOWN";
+  }
+  const goodMax = cfg.netPacketLossGoodMaxPct ?? DEFAULT_NETWORK_THRESHOLDS.netPacketLossGoodMaxPct;
+  const warnMax = cfg.netPacketLossWarnMaxPct ?? DEFAULT_NETWORK_THRESHOLDS.netPacketLossWarnMaxPct;
+  if (lossPct <= goodMax) return "GOOD";
+  if (lossPct <= warnMax) return "WARNING";
+  return "CRITICAL";
+}
+function classifyDownloadRating(mbps, cfg = {}) {
+  if (mbps === null || mbps === void 0 || !Number.isFinite(mbps) || mbps < 0) {
+    return "UNKNOWN";
+  }
+  const goodMin = cfg.netDownloadGoodMinMbps ?? DEFAULT_NETWORK_THRESHOLDS.netDownloadGoodMinMbps;
+  const warnMin = cfg.netDownloadWarnMinMbps ?? DEFAULT_NETWORK_THRESHOLDS.netDownloadWarnMinMbps;
+  if (mbps >= goodMin) return "GOOD";
+  if (mbps >= warnMin) return "WARNING";
+  return "CRITICAL";
+}
+function classifyUploadRating(mbps, cfg = {}) {
+  if (mbps === null || mbps === void 0 || !Number.isFinite(mbps) || mbps < 0) {
+    return "UNKNOWN";
+  }
+  const goodMin = cfg.netUploadGoodMinMbps ?? DEFAULT_NETWORK_THRESHOLDS.netUploadGoodMinMbps;
+  const warnMin = cfg.netUploadWarnMinMbps ?? DEFAULT_NETWORK_THRESHOLDS.netUploadWarnMinMbps;
+  if (mbps >= goodMin) return "GOOD";
+  if (mbps >= warnMin) return "WARNING";
+  return "CRITICAL";
+}
+function computeJitterFromRttSeries(successfulRtts) {
+  const clean = successfulRtts.filter((v) => typeof v === "number" && Number.isFinite(v) && v >= 0);
+  if (clean.length < 3) return null;
+  let totalDiff = 0;
+  for (let i = 1; i < clean.length; i++) {
+    totalDiff += Math.abs(clean[i] - clean[i - 1]);
+  }
+  return round2(totalDiff / (clean.length - 1));
+}
+function evaluatePacketLoss(probeOutcomes, cfg = {}) {
+  const total = probeOutcomes.length;
+  const failed = probeOutcomes.filter((p) => !p.success).length;
+  if (total < 5) {
+    return {
+      totalProbes: total,
+      failedProbes: failed,
+      rawFailurePct: total > 0 ? round2(failed / total * 100) : null,
+      reportablePacketLossPct: null,
+      rating: "UNKNOWN",
+      note: `Collecting samples (${total}/5 minimum probes required before classifying packet loss)`
+    };
+  }
+  const rawPct = round2(failed / total * 100);
+  if (failed === 1) {
+    return {
+      totalProbes: total,
+      failedProbes: 1,
+      rawFailurePct: rawPct,
+      reportablePacketLossPct: 0,
+      rating: "GOOD",
+      note: `1 isolated failed HTTPS probe out of ${total} (not classified as sustained packet loss)`
+    };
+  }
+  return {
+    totalProbes: total,
+    failedProbes: failed,
+    rawFailurePct: rawPct,
+    reportablePacketLossPct: rawPct,
+    rating: classifyPacketLossRating(rawPct, cfg),
+    note: failed === 0 ? `0% probe loss across ${total} measured HTTP probes` : `${failed}/${total} probes failed (${rawPct}% loss)`
+  };
+}
+function computeInternetHealthScore(params) {
+  const cfg = { ...DEFAULT_NETWORK_THRESHOLDS, ...params.thresholds || {} };
+  if (!params.online) {
+    return {
+      score: 0,
+      tier: "CRITICAL",
+      formulaSummary: "Browser offline or all active health probes unreachable (Score = 0 / CRITICAL).",
+      factors: [
+        {
+          factor: "Latency (App RTT)",
+          measuredValue: "Offline / Unreachable",
+          weightPct: 100,
+          subScore: 0,
+          status: "CRITICAL",
+          included: true
+        }
+      ]
+    };
+  }
+  if (params.probeCount < 3 || params.successfulProbeCount < 1 || params.avgRttMs === null) {
+    if (params.probeCount >= 3 && params.successfulProbeCount === 0) {
+      return {
+        score: 0,
+        tier: "CRITICAL",
+        formulaSummary: `${params.probeCount} consecutive HTTP probes failed with zero responses (Score = 0 / CRITICAL).`,
+        factors: [
+          {
+            factor: "Packet Loss",
+            measuredValue: "100%",
+            weightPct: 100,
+            subScore: 0,
+            status: "CRITICAL",
+            included: true
+          }
+        ]
+      };
+    }
+    return {
+      score: null,
+      tier: "UNKNOWN",
+      formulaSummary: `Insufficient probes (${params.probeCount}/3 minimum). Waiting for real measurements rather than estimating.`,
+      factors: []
+    };
+  }
+  const latRating = classifyLatencyRating(params.avgRttMs, cfg);
+  const latSubScore = latRating === "EXCELLENT" ? 100 : latRating === "GOOD" ? 85 : latRating === "WARNING" ? 62 : latRating === "POOR" ? 35 : 10;
+  const jitterRating = classifyJitterRating(params.jitterMs, cfg);
+  const jitterSubScore = jitterRating === "GOOD" ? 100 : jitterRating === "WARNING" ? 60 : jitterRating === "CRITICAL" ? 15 : null;
+  const lossRating = classifyPacketLossRating(params.packetLossPct, cfg);
+  const lossSubScore = lossRating === "GOOD" ? 100 : lossRating === "WARNING" ? 55 : lossRating === "CRITICAL" ? 10 : null;
+  const dlRating = classifyDownloadRating(params.downloadMbps, cfg);
+  const ulRating = classifyUploadRating(params.uploadMbps, cfg);
+  const scoreMap = { GOOD: 100, WARNING: 60, CRITICAL: 20 };
+  const speedScores = [];
+  if (dlRating !== "UNKNOWN") speedScores.push(scoreMap[dlRating]);
+  if (ulRating !== "UNKNOWN") speedScores.push(scoreMap[ulRating]);
+  const throughputSubScore = speedScores.length > 0 ? round2(speedScores.reduce((a, b) => a + b, 0) / speedScores.length) : null;
+  const rawFactors = [
+    {
+      factor: "Latency (App RTT)",
+      measuredValue: `${params.avgRttMs} ms`,
+      baseWeight: 40,
+      subScore: latSubScore,
+      status: latRating
+    },
+    {
+      factor: "Jitter",
+      measuredValue: params.jitterMs !== null ? `${params.jitterMs} ms` : "Pending (>=3 probes)",
+      baseWeight: 25,
+      subScore: jitterSubScore,
+      status: jitterRating
+    },
+    {
+      factor: "Packet Loss",
+      measuredValue: params.packetLossPct !== null ? `${params.packetLossPct}%` : "Pending (>=5 probes)",
+      baseWeight: 25,
+      subScore: lossSubScore,
+      status: lossRating
+    },
+    {
+      factor: "Throughput",
+      measuredValue: params.downloadMbps !== null || params.uploadMbps !== null ? `\u2193${params.downloadMbps ?? "\u2014"} / \u2191${params.uploadMbps ?? "\u2014"} Mbps` : "Not tested yet",
+      baseWeight: 10,
+      subScore: throughputSubScore,
+      status: throughputSubScore === null ? "UNKNOWN" : throughputSubScore >= 85 ? "GOOD" : throughputSubScore >= 50 ? "WARNING" : "CRITICAL"
+    }
+  ];
+  const activeWeightSum = rawFactors.reduce(
+    (sum, f) => f.subScore !== null ? sum + f.baseWeight : sum,
+    0
+  );
+  let weightedScore = 0;
+  const factors = rawFactors.map((f) => {
+    const included = f.subScore !== null && activeWeightSum > 0;
+    const effectiveWeightPct = included ? round2(f.baseWeight / activeWeightSum * 100) : 0;
+    if (included && f.subScore !== null) {
+      weightedScore += f.subScore * effectiveWeightPct / 100;
+    }
+    return {
+      factor: f.factor,
+      measuredValue: f.measuredValue,
+      weightPct: effectiveWeightPct,
+      subScore: f.subScore,
+      status: f.status,
+      included
+    };
+  });
+  const finalScore = Math.max(0, Math.min(100, Math.round(weightedScore)));
+  let tier = "EXCELLENT";
+  if (finalScore >= 90) tier = "EXCELLENT";
+  else if (finalScore >= 75) tier = "GOOD";
+  else if (finalScore >= 55) tier = "FAIR";
+  else if (finalScore >= 35) tier = "POOR";
+  else tier = "CRITICAL";
+  const includedLabels = factors.filter((f) => f.included).map((f) => `${f.factor} (${f.weightPct}%)`).join(" + ");
+  return {
+    score: finalScore,
+    tier,
+    formulaSummary: `Weighted score (${finalScore}/100) computed from ${includedLabels}.`,
+    factors
+  };
+}
+function diagnoseNetworkVsServer(input) {
+  const cfg = { ...DEFAULT_NETWORK_THRESHOLDS, ...input.thresholds || {} };
+  const evidence = [];
+  const comparison = {
+    appRttAvgMs: input.avgRttMs,
+    backendApiP95Ms: input.apiP95Ms,
+    firestoreP95Ms: input.dbP95OpMs,
+    frontendSlowRenderAvgMs: input.frontendSlowRenderAvgMs
+  };
+  if (!input.online) {
+    return {
+      primaryCause: "User Internet Problem",
+      confidence: "High",
+      summary: "Browser reports offline state \u2014 device lacks an active internet connection.",
+      evidenceBullets: ["navigator.onLine is false", "No outbound requests can complete until connectivity resumes."],
+      comparison
+    };
+  }
+  if (input.probeCount >= 2 && input.successfulProbeCount === 0) {
+    return {
+      primaryCause: "User Internet Problem",
+      confidence: "High",
+      summary: "All recent HTTP connectivity probes failed to reach the server.",
+      evidenceBullets: [
+        `0 of ${input.probeCount} lightweight HTTP probes succeeded.`,
+        "Check local Wi-Fi, ISP link, VPN, or corporate firewall."
+      ],
+      comparison
+    };
+  }
+  if (input.probeCount < 2 && input.apiSampleCount < 3 && input.dbOpCount === 0 && input.frontendPerfCount === 0) {
+    return {
+      primaryCause: "Cause Unknown",
+      confidence: "Unknown",
+      summary: "Insufficient measured network, API, or database telemetry samples to determine root cause.",
+      evidenceBullets: ["Collect at least 3 network probes and API samples before isolating latency origin."],
+      comparison
+    };
+  }
+  const netGoodMax = cfg.netLatencyWarnMaxMs;
+  const netPoorMax = cfg.netLatencyPoorMaxMs;
+  let internetScore = 0;
+  let firebaseScore = 0;
+  let backendScore = 0;
+  let frontendScore = 0;
+  const pureTransportRtt = input.avgRttMs !== null ? Math.max(0, input.avgRttMs - (input.avgServerProbeProcessMs ?? 0)) : null;
+  if (pureTransportRtt !== null && pureTransportRtt > netPoorMax) {
+    internetScore += pureTransportRtt > cfg.netLatencyCriticalMinMs ? 50 : 35;
+    evidence.push(
+      `High application HTTP transport RTT (${round2(pureTransportRtt)} ms avg, P95 ${input.p95RttMs ?? "\u2014"} ms) while probe handler processing took ${input.avgServerProbeProcessMs ?? 0} ms.`
+    );
+  }
+  if (input.jitterMs !== null && input.jitterMs > cfg.netJitterWarnMaxMs) {
+    internetScore += 30;
+    evidence.push(`Elevated connection jitter (${input.jitterMs} ms > ${cfg.netJitterWarnMaxMs} ms threshold).`);
+  } else if (input.jitterMs !== null && input.jitterMs > cfg.netJitterGoodMaxMs) {
+    internetScore += 15;
+    evidence.push(`Moderate jitter (${input.jitterMs} ms).`);
+  }
+  if (input.packetLossPct !== null && input.packetLossPct > cfg.netPacketLossWarnMaxPct) {
+    internetScore += 45;
+    evidence.push(`Sustained HTTP probe packet loss (${input.packetLossPct}% > ${cfg.netPacketLossWarnMaxPct}%).`);
+  }
+  if (input.downloadMbps !== null && input.downloadMbps < cfg.netDownloadWarnMinMbps || input.uploadMbps !== null && input.uploadMbps < cfg.netUploadWarnMinMbps) {
+    internetScore += 30;
+    evidence.push(
+      `Low measured bandwidth (\u2193${input.downloadMbps ?? "\u2014"} Mbps / \u2191${input.uploadMbps ?? "\u2014"} Mbps).`
+    );
+  }
+  if (input.networkRequestFailureRatePct !== null && input.networkRequestFailureRatePct >= 10 && input.apiServerErrorCount === 0) {
+    internetScore += 25;
+    evidence.push(
+      `Client network requests failing (${input.networkRequestFailureRatePct}%) without server 5xx errors.`
+    );
+  }
+  const dbP95Slow = input.dbP95OpMs !== null && input.dbP95OpMs >= 500;
+  const dbAvgSlow = input.dbAvgOpMs !== null && input.dbAvgOpMs >= 300;
+  if (dbP95Slow || dbAvgSlow) {
+    firebaseScore += input.dbP95OpMs && input.dbP95OpMs >= 900 ? 55 : 40;
+    evidence.push(
+      `Firestore operation latency elevated (Avg ${input.dbAvgOpMs ?? "\u2014"} ms, P95 ${input.dbP95OpMs ?? "\u2014"} ms across ${input.dbOpCount} op(s)).`
+    );
+  }
+  if (input.dbErrorCount > 0 || input.dbTxFailureCount > 0) {
+    firebaseScore += 50;
+    evidence.push(
+      `Firestore recorded ${input.dbErrorCount} DB error(s) and ${input.dbTxFailureCount} failed transaction(s).`
+    );
+  }
+  const netIsHealthyOrNormal = pureTransportRtt === null || pureTransportRtt <= netPoorMax;
+  const apiIsSlow = input.apiP95Ms !== null && input.apiP95Ms >= Math.min(cfg.apiP95WarningMs, 800) || input.apiAvgMs !== null && input.apiAvgMs >= 450;
+  const dbExplainsApiSlow = dbP95Slow && input.apiP95Ms !== null && (input.dbP95OpMs ?? 0) >= input.apiP95Ms * 0.45;
+  if (apiIsSlow && !dbExplainsApiSlow) {
+    backendScore += input.apiP95Ms && input.apiP95Ms >= cfg.apiP95WarningMs ? 45 : 30;
+    evidence.push(
+      `Backend API latency elevated (Avg ${input.apiAvgMs ?? "\u2014"} ms, P95 ${input.apiP95Ms ?? "\u2014"} ms)${netIsHealthyOrNormal ? " while network RTT remains normal" : ""}.`
+    );
+  }
+  if (input.apiServerErrorCount > 0 || input.apiTimeoutCount > 0) {
+    backendScore += 40;
+    evidence.push(
+      `Backend returned ${input.apiServerErrorCount} HTTP 5xx error(s) and ${input.apiTimeoutCount} timeout(s).`
+    );
+  }
+  const backendHealthy = !apiIsSlow && input.apiServerErrorCount === 0;
+  if (netIsHealthyOrNormal && backendHealthy && (input.frontendSlowRenderAvgMs !== null && input.frontendSlowRenderAvgMs >= 250 || input.frontendSlowRenderCount >= 2 || input.frontendNavAvgMs !== null && input.frontendNavAvgMs >= 1e3)) {
+    frontendScore += 40;
+    evidence.push(
+      `Browser main-thread / navigation delay detected (slow render avg ${input.frontendSlowRenderAvgMs ?? "\u2014"} ms, nav avg ${input.frontendNavAvgMs ?? "\u2014"} ms) while network & API are fast.`
+    );
+  }
+  const candidates = [
+    { cat: "User Internet Problem", score: internetScore },
+    { cat: "Firebase / Database Problem", score: firebaseScore },
+    { cat: "Backend Server Problem", score: backendScore },
+    { cat: "Frontend Problem", score: frontendScore }
+  ];
+  const ranked = candidates.sort((a, b) => b.score - a.score);
+  const top = ranked[0];
+  if (top.score === 0) {
+    if (input.probeCount >= 2 || input.apiSampleCount >= 3) {
+      const healthyBullets = [];
+      if (pureTransportRtt !== null) {
+        healthyBullets.push(
+          `Application HTTP RTT avg ${round2(pureTransportRtt)} ms (within <= ${netGoodMax}\u2013${netPoorMax} ms SLA).`
+        );
+      }
+      if (input.apiP95Ms !== null) {
+        healthyBullets.push(`Backend API P95 ${input.apiP95Ms} ms with ${input.apiServerErrorCount} server errors.`);
+      }
+      if (input.dbP95OpMs !== null) {
+        healthyBullets.push(`Firestore P95 ${input.dbP95OpMs} ms with ${input.dbErrorCount} DB errors.`);
+      }
+      return {
+        primaryCause: "All Systems Nominal",
+        confidence: input.probeCount >= 3 ? "High" : "Medium",
+        summary: "Network transport, backend handlers, database operations, and frontend timings are operating within thresholds.",
+        evidenceBullets: healthyBullets,
+        comparison
+      };
+    }
+    return {
+      primaryCause: "Cause Unknown",
+      confidence: "Unknown",
+      summary: "Measured samples are insufficient to isolate latency origin.",
+      evidenceBullets: evidence,
+      comparison
+    };
+  }
+  const confidence = top.score >= 45 ? "High" : top.score >= 25 ? "Medium" : "Low";
+  const summaryMap = {
+    "User Internet Problem": "Latency or failures originate primarily on the client network link (high HTTP RTT, jitter, packet loss, or low throughput).",
+    "Backend Server Problem": "Client network and database timings are healthy, but backend Express API processing or error rates are elevated.",
+    "Firebase / Database Problem": "Client connectivity and backend ingress are healthy; delays or errors stem from Firestore queries, writes, or transactions.",
+    "Frontend Problem": "Network RTT and API responses are fast; slowness is isolated to browser UI rendering or module loading."
+  };
+  return {
+    primaryCause: top.cat,
+    confidence,
+    summary: top.cat === "User Internet Problem" || top.cat === "Backend Server Problem" || top.cat === "Firebase / Database Problem" || top.cat === "Frontend Problem" ? summaryMap[top.cat] : "Measured symptoms evaluated.",
+    evidenceBullets: evidence,
+    comparison
+  };
+}
+
+// serverMonitoring.ts
+var DEFAULT_MONITORING_THRESHOLDS = {
+  apiP95WarningMs: 1200,
+  apiErrorRateWarningPct: 10,
+  qrPunchAvgWarningMs: 1200,
+  qrFailureSpikeCount: 5,
+  txFailureWarningCount: 3,
+  frontendErrorSpikeCount: 8,
+  unauthorizedSpikeCount: 3,
+  alertCooldownMinutes: 15,
+  clientSampleRate: 1,
+  retentionDays: 14,
+  netLatencyGoodMaxMs: DEFAULT_NETWORK_THRESHOLDS.netLatencyGoodMaxMs,
+  netLatencyWarnMaxMs: DEFAULT_NETWORK_THRESHOLDS.netLatencyWarnMaxMs,
+  netLatencyPoorMaxMs: DEFAULT_NETWORK_THRESHOLDS.netLatencyPoorMaxMs,
+  netLatencyCriticalMinMs: DEFAULT_NETWORK_THRESHOLDS.netLatencyCriticalMinMs,
+  netJitterGoodMaxMs: DEFAULT_NETWORK_THRESHOLDS.netJitterGoodMaxMs,
+  netJitterWarnMaxMs: DEFAULT_NETWORK_THRESHOLDS.netJitterWarnMaxMs,
+  netPacketLossGoodMaxPct: DEFAULT_NETWORK_THRESHOLDS.netPacketLossGoodMaxPct,
+  netPacketLossWarnMaxPct: DEFAULT_NETWORK_THRESHOLDS.netPacketLossWarnMaxPct,
+  netDownloadGoodMinMbps: DEFAULT_NETWORK_THRESHOLDS.netDownloadGoodMinMbps,
+  netDownloadWarnMinMbps: DEFAULT_NETWORK_THRESHOLDS.netDownloadWarnMinMbps,
+  netUploadGoodMinMbps: DEFAULT_NETWORK_THRESHOLDS.netUploadGoodMinMbps,
+  netUploadWarnMinMbps: DEFAULT_NETWORK_THRESHOLDS.netUploadWarnMinMbps,
+  netProbeIntervalSec: DEFAULT_NETWORK_THRESHOLDS.netProbeIntervalSec,
+  netNetworkFailureSpikeCount: DEFAULT_NETWORK_THRESHOLDS.netNetworkFailureSpikeCount
+};
+var MAX_API_TRACES = 600;
+var MAX_DB_OPS = 600;
+var MAX_QR_PUNCHES = 400;
+var MAX_CLIENT_PERF = 500;
+var MAX_ERROR_EVENTS = 300;
+var MAX_ACTIVITY_EVENTS = 500;
+var MAX_IMPORT_EXPORT = 200;
+var MAX_NETWORK_SAMPLES = 600;
+var MAX_SPEED_TESTS = 100;
+var monitoringStoreWeakMap = /* @__PURE__ */ new WeakMap();
+function getStore2(db) {
+  let store = monitoringStoreWeakMap.get(db);
+  if (!store) {
+    store = {
+      apiTraces: [],
+      dbOps: [],
+      qrPunches: [],
+      clientPerf: [],
+      errors: [],
+      activities: [],
+      importExports: [],
+      networkSamples: [],
+      speedTests: [],
+      lastDisconnectionAt: null,
+      disconnectionCount: 0,
+      alerts: /* @__PURE__ */ new Map(),
+      thresholds: { ...DEFAULT_MONITORING_THRESHOLDS },
+      lastHealthCheckAt: null,
+      lastHealthCheckStatus: null,
+      lastHealthProbeMs: null,
+      lastTelemetryUpdateAt: null,
+      lastPersistAtMs: 0,
+      hydratedFromDb: false,
+      pendingDirty: false,
+      persistTimer: null,
+      firestoreErrorsCount: 0
+    };
+    monitoringStoreWeakMap.set(db, store);
+  }
+  return store;
+}
+function pushBounded(arr, item, maxLen) {
+  arr.push(item);
+  if (arr.length > maxLen) {
+    arr.splice(0, arr.length - maxLen);
+  }
+}
+function makeId(prefix) {
+  return `${prefix}_${Date.now().toString(36)}_${crypto2.randomBytes(3).toString("hex")}`;
+}
+function roundMs2(v) {
+  return Math.round(v * 100) / 100;
+}
+function sanitizeTelemetryMessage(raw, maxLen = 280) {
+  let s = String(raw ?? "").trim();
+  if (!s) return "";
+  s = s.replace(/Bearer\s+[A-Za-z0-9\-._~+/=]+/gi, "Bearer [REDACTED]");
+  s = s.replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\b/g, "[REDACTED_JWT]");
+  s = s.replace(/\bQR_[A-Za-z0-9_.-]+\b/g, "[REDACTED_QR]");
+  s = s.replace(/\{\s*"employeeId"[^}]*"token"[^}]*\}/gi, "[REDACTED_QR_JSON]");
+  if (s.length > maxLen) {
+    s = `${s.slice(0, maxLen - 3)}...`;
+  }
+  return s;
+}
+function normalizeApiEndpointPath(rawPath) {
+  const pathOnly = String(rawPath || "/").split("?")[0].trim() || "/";
+  return pathOnly.replace(/\/att_[A-Za-z0-9_.-]+/g, "/:attendanceId").replace(/\/log_[A-Za-z0-9_.-]+/g, "/:logId").replace(/\/alert_[A-Za-z0-9_.-]+/g, "/:alertId").replace(/\/role_[A-Za-z0-9_.-]+/g, "/:roleDocId").replace(/\/([0-9]{4,}|[a-f0-9-]{16,})/gi, "/:id");
+}
+function classifyHttpErrorCategory(status, timedOut) {
+  if (timedOut || status === 408 || status === 504) return "TIMEOUT";
+  if (status === 401) return "AUTH";
+  if (status === 403) return "PERMISSION";
+  if (status === 400 || status === 422) return "VALIDATION";
+  if (status === 404) return "NOT_FOUND";
+  if (status === 409) return "CONFLICT";
+  if (status === 429) return "RATE_LIMIT";
+  if (status === 503) return "SERVICE_UNAVAILABLE";
+  if (status >= 500) return "SERVER";
+  return "NONE";
+}
+function mapEndpointToModule(endpoint) {
+  if (endpoint.startsWith("/api/auth") || endpoint.startsWith("/api/login-security")) return "Authentication";
+  if (endpoint.startsWith("/api/attendance/scan") || endpoint.startsWith("/api/attendance/manual-punch")) return "Attendance Scanner";
+  if (endpoint.startsWith("/api/attendance/")) return "Attendance History";
+  if (endpoint.startsWith("/api/employees/bulk-import")) return "Excel Import / Update";
+  if (endpoint.startsWith("/api/employees")) return "Employee Master";
+  if (endpoint.startsWith("/api/masters")) return "Organization Management";
+  if (endpoint.startsWith("/api/dashboard")) return "Dashboard";
+  if (endpoint.startsWith("/api/audit")) return "Audit Logs & Security";
+  if (endpoint.startsWith("/api/security")) return "Audit Logs & Security";
+  if (endpoint.startsWith("/api/admin")) return "User Rights & Permissions";
+  if (endpoint.startsWith("/api/monitoring")) return "System Performance";
+  return "Backend APIs";
+}
+function computeLatencyStats(durations) {
+  if (!durations || durations.length === 0) {
+    return { count: 0, minMs: null, avgMs: null, p50Ms: null, p95Ms: null, maxMs: null };
+  }
+  const sorted = [...durations].sort((a, b) => a - b);
+  const sum = sorted.reduce((acc, v) => acc + v, 0);
+  const pct = (p) => {
+    const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil(p / 100 * sorted.length) - 1));
+    return roundMs2(sorted[idx]);
+  };
+  return {
+    count: sorted.length,
+    minMs: roundMs2(sorted[0]),
+    avgMs: roundMs2(sum / sorted.length),
+    p50Ms: pct(50),
+    p95Ms: pct(95),
+    maxMs: roundMs2(sorted[sorted.length - 1])
+  };
+}
+function raiseOrGroupAlert(db, params) {
+  const store = getStore2(db);
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const cooldownMs = Math.max(1, store.thresholds.alertCooldownMinutes) * 6e4;
+  const existing = store.alerts.get(params.groupKey);
+  if (existing) {
+    const withinCooldown = nowMs - existing.lastTriggeredMs < cooldownMs;
+    if (existing.status !== "RESOLVED" || withinCooldown) {
+      existing.occurrenceCount += 1;
+      existing.lastTriggeredAt = nowIso;
+      existing.lastTriggeredMs = nowMs;
+      existing.description = params.description;
+      existing.lastMetricValue = params.metricValue;
+      existing.thresholdValue = params.thresholdValue;
+      if (params.severity === "CRITICAL") existing.severity = "CRITICAL";
+      if (existing.status === "RESOLVED" && !withinCooldown) {
+        existing.status = "ACTIVE";
+        existing.resolvedAt = null;
+        existing.resolvedBy = null;
+      }
+      store.pendingDirty = true;
+      return;
+    }
+  }
+  const created = {
+    id: makeId("alert"),
+    groupKey: params.groupKey,
+    severity: params.severity,
+    module: params.module,
+    title: params.title,
+    description: params.description,
+    affectedOperation: params.affectedOperation,
+    status: "ACTIVE",
+    occurrenceCount: 1,
+    firstTriggeredAt: nowIso,
+    firstTriggeredMs: nowMs,
+    lastTriggeredAt: nowIso,
+    lastTriggeredMs: nowMs,
+    acknowledgedAt: null,
+    acknowledgedBy: null,
+    resolvedAt: null,
+    resolvedBy: null,
+    lastMetricValue: params.metricValue,
+    thresholdValue: params.thresholdValue
+  };
+  store.alerts.set(params.groupKey, created);
+  store.pendingDirty = true;
+  if (store.alerts.size > 200) {
+    const entries = Array.from(store.alerts.entries()).sort(
+      (a, b) => a[1].lastTriggeredMs - b[1].lastTriggeredMs
+    );
+    for (const [k, v] of entries) {
+      if (store.alerts.size <= 150) break;
+      if (v.status === "RESOLVED") store.alerts.delete(k);
+    }
+  }
+}
+function evaluateAlertThresholds(db) {
+  const store = getStore2(db);
+  const nowMs = Date.now();
+  const window15m = nowMs - 15 * 6e4;
+  const th = store.thresholds;
+  const recentApis = store.apiTraces.filter((a) => a.timestampMs >= window15m);
+  if (recentApis.length >= 5) {
+    const stats = computeLatencyStats(recentApis.map((a) => a.durationMs));
+    if (stats.p95Ms !== null && stats.p95Ms > th.apiP95WarningMs) {
+      raiseOrGroupAlert(db, {
+        groupKey: "ALERT_HIGH_API_LATENCY",
+        severity: stats.p95Ms > th.apiP95WarningMs * 2 ? "CRITICAL" : "WARNING",
+        module: "Backend APIs",
+        title: "API P95 Latency Threshold Exceeded",
+        description: `15-minute API P95 response time is ${stats.p95Ms}ms (threshold ${th.apiP95WarningMs}ms across ${recentApis.length} calls).`,
+        affectedOperation: "HTTP API Pipeline",
+        metricValue: stats.p95Ms,
+        thresholdValue: th.apiP95WarningMs
+      });
+    }
+    const failedCount = recentApis.filter((a) => !a.success && a.status >= 500).length;
+    const timeoutCount = recentApis.filter((a) => a.timedOut).length;
+    const errRatePct = roundMs2(failedCount / recentApis.length * 100);
+    if (errRatePct > th.apiErrorRateWarningPct && failedCount >= 2) {
+      raiseOrGroupAlert(db, {
+        groupKey: "ALERT_API_ERROR_SPIKE",
+        severity: "CRITICAL",
+        module: "Backend APIs",
+        title: "Backend 5xx Error Rate Spike",
+        description: `Server 5xx error rate reached ${errRatePct}% (${failedCount}/${recentApis.length} requests in 15m).`,
+        affectedOperation: "Express API Handlers",
+        metricValue: errRatePct,
+        thresholdValue: th.apiErrorRateWarningPct
+      });
+    }
+    if (timeoutCount >= 3) {
+      raiseOrGroupAlert(db, {
+        groupKey: "ALERT_API_TIMEOUT_SPIKE",
+        severity: "CRITICAL",
+        module: "Backend APIs",
+        title: "API Timeout Spike Detected",
+        description: `${timeoutCount} API request timeouts recorded in the last 15 minutes.`,
+        affectedOperation: "HTTP / Firestore Upstream",
+        metricValue: timeoutCount,
+        thresholdValue: 3
+      });
+    }
+  }
+  const recentQr = store.qrPunches.filter((q) => q.timestampMs >= window15m);
+  if (recentQr.length > 0) {
+    const qrDurations = recentQr.map((q) => q.totalE2eMs ?? q.totalServerMs ?? 0).filter((v) => v > 0);
+    const qrStats = computeLatencyStats(qrDurations);
+    if (qrStats.avgMs !== null && qrStats.avgMs > th.qrPunchAvgWarningMs) {
+      raiseOrGroupAlert(db, {
+        groupKey: "ALERT_HIGH_QR_LATENCY",
+        severity: qrStats.avgMs > th.qrPunchAvgWarningMs * 1.5 ? "CRITICAL" : "WARNING",
+        module: "Attendance Scanner",
+        title: "High QR / Attendance Punch Latency",
+        description: `Average punch latency is ${qrStats.avgMs}ms (threshold ${th.qrPunchAvgWarningMs}ms over ${recentQr.length} punches).`,
+        affectedOperation: "POST /api/attendance/scan",
+        metricValue: qrStats.avgMs,
+        thresholdValue: th.qrPunchAvgWarningMs
+      });
+    }
+    const failedQr = recentQr.filter((q) => !q.success && !q.isDuplicateRejection).length;
+    if (failedQr >= th.qrFailureSpikeCount) {
+      raiseOrGroupAlert(db, {
+        groupKey: "ALERT_REPEATED_QR_FAILURES",
+        severity: "WARNING",
+        module: "Attendance Scanner",
+        title: "Repeated Failed QR / Punch Operations",
+        description: `${failedQr} non-duplicate failed QR/attendance punch attempts in the last 15 minutes (threshold ${th.qrFailureSpikeCount}).`,
+        affectedOperation: "QR Validation & Punch Processing",
+        metricValue: failedQr,
+        thresholdValue: th.qrFailureSpikeCount
+      });
+    }
+  }
+  const recentDb = store.dbOps.filter((d) => d.timestampMs >= window15m);
+  const failedTxOrPerm = recentDb.filter((d) => !d.success || d.isPermissionDenied);
+  if (failedTxOrPerm.length >= th.txFailureWarningCount) {
+    raiseOrGroupAlert(db, {
+      groupKey: "ALERT_DB_FAILURE_RATE",
+      severity: failedTxOrPerm.some((d) => d.isPermissionDenied) ? "CRITICAL" : "WARNING",
+      module: "Firebase / Firestore",
+      title: "Firestore Operation / Transaction Failures",
+      description: `${failedTxOrPerm.length} failed Firestore database operations in the last 15 minutes.`,
+      affectedOperation: "Firestore Admin / Client Operations",
+      metricValue: failedTxOrPerm.length,
+      thresholdValue: th.txFailureWarningCount
+    });
+  }
+  const recentFeErrors = store.errors.filter(
+    (e) => e.timestampMs >= window15m && e.source === "FRONTEND"
+  );
+  if (recentFeErrors.length >= th.frontendErrorSpikeCount) {
+    raiseOrGroupAlert(db, {
+      groupKey: "ALERT_FRONTEND_ERROR_SPIKE",
+      severity: "WARNING",
+      module: "Frontend Application",
+      title: "Excessive Browser-Side JavaScript Errors",
+      description: `${recentFeErrors.length} frontend runtime/promise errors captured in the last 15 minutes.`,
+      affectedOperation: "Browser Client Runtime",
+      metricValue: recentFeErrors.length,
+      thresholdValue: th.frontendErrorSpikeCount
+    });
+  }
+  const recentUnauth = store.errors.filter(
+    (e) => e.timestampMs >= window15m && (e.category === "PERMISSION" || e.category === "AUTH" || e.statusCode === 403)
+  );
+  if (recentUnauth.length >= th.unauthorizedSpikeCount) {
+    raiseOrGroupAlert(db, {
+      groupKey: "ALERT_UNAUTHORIZED_SPIKE",
+      severity: "CRITICAL",
+      module: "Audit Logs & Security",
+      title: "Unauthorized Access Attempts Detected",
+      description: `${recentUnauth.length} blocked unauthorized/permission errors recorded in the last 15 minutes.`,
+      affectedOperation: "RBAC Authorization Guards",
+      metricValue: recentUnauth.length,
+      thresholdValue: th.unauthorizedSpikeCount
+    });
+  }
+  const recentNet = store.networkSamples.filter((n) => n.timestampMs >= window15m);
+  const recentSpeed = store.speedTests.filter((s) => s.timestampMs >= window15m);
+  if (recentNet.length > 0) {
+    const latestProbe = recentNet[recentNet.length - 1];
+    if (!latestProbe.online || latestProbe.disconnectionEvent) {
+      raiseOrGroupAlert(db, {
+        groupKey: "NET_ALERT_DISCONNECTED",
+        severity: "CRITICAL",
+        module: "Internet & Network",
+        title: "User Internet Disconnection Detected",
+        description: `Session ${latestProbe.sessionId} reported browser offline / network loss at ${latestProbe.timestamp}.`,
+        affectedOperation: "Network Connectivity Probe"
+      });
+    }
+    const okRtts = recentNet.filter((n) => n.probeSucceeded && typeof n.rttMs === "number").map((n) => n.rttMs);
+    const rttSummary = computeNumericStats(okRtts);
+    if (rttSummary.avg !== null && rttSummary.avg > th.netLatencyPoorMaxMs) {
+      raiseOrGroupAlert(db, {
+        groupKey: "NET_ALERT_HIGH_LATENCY",
+        severity: rttSummary.avg > th.netLatencyCriticalMinMs ? "CRITICAL" : "WARNING",
+        module: "Internet & Network",
+        title: "High Application Network RTT Latency",
+        description: `Measured HTTP probe RTT averaged ${rttSummary.avg} ms (P95 ${rttSummary.p95 ?? "\u2014"} ms, threshold > ${th.netLatencyPoorMaxMs} ms).`,
+        affectedOperation: "GET /api/network/ping",
+        metricValue: rttSummary.avg,
+        thresholdValue: th.netLatencyPoorMaxMs
+      });
+    }
+    const jitterMs = computeJitterFromRttSeries(okRtts);
+    if (jitterMs !== null && jitterMs >= th.netJitterGoodMaxMs) {
+      raiseOrGroupAlert(db, {
+        groupKey: "NET_ALERT_HIGH_JITTER",
+        severity: jitterMs > th.netJitterWarnMaxMs ? "CRITICAL" : "WARNING",
+        module: "Internet & Network",
+        title: "Elevated Network Jitter / Instability",
+        description: `Measured RTT jitter is ${jitterMs} ms across ${okRtts.length} probes (threshold ${th.netJitterWarnMaxMs} ms).`,
+        affectedOperation: "HTTP RTT Stability",
+        metricValue: jitterMs,
+        thresholdValue: th.netJitterWarnMaxMs
+      });
+    }
+    const lossEval = evaluatePacketLoss(
+      recentNet.map((n) => ({ success: n.probeSucceeded })),
+      th
+    );
+    if (lossEval.reportablePacketLossPct !== null && lossEval.reportablePacketLossPct > th.netPacketLossGoodMaxPct) {
+      raiseOrGroupAlert(db, {
+        groupKey: "NET_ALERT_PACKET_LOSS",
+        severity: lossEval.reportablePacketLossPct > th.netPacketLossWarnMaxPct ? "CRITICAL" : "WARNING",
+        module: "Internet & Network",
+        title: "Sustained HTTP Probe Packet Loss Detected",
+        description: `${lossEval.note} (threshold ${th.netPacketLossWarnMaxPct}%).`,
+        affectedOperation: "Repeated Connectivity Probes",
+        metricValue: lossEval.reportablePacketLossPct,
+        thresholdValue: th.netPacketLossWarnMaxPct
+      });
+    }
+    const clientNetErrors = store.errors.filter(
+      (e) => e.timestampMs >= window15m && e.source === "FRONTEND" && (e.category === "NETWORK_FAILURE" || e.category === "CLIENT_TIMEOUT")
+    );
+    if (clientNetErrors.length >= th.netNetworkFailureSpikeCount) {
+      raiseOrGroupAlert(db, {
+        groupKey: "NET_ALERT_REQUEST_FAILURES",
+        severity: clientNetErrors.length >= th.netNetworkFailureSpikeCount * 2 ? "CRITICAL" : "WARNING",
+        module: "Internet & Network",
+        title: "Repeated Client Network Request Failures",
+        description: `${clientNetErrors.length} failed/timed-out HTTP requests detected in client browser telemetry (15m).`,
+        affectedOperation: "Client API Fetch Pipeline",
+        metricValue: clientNetErrors.length,
+        thresholdValue: th.netNetworkFailureSpikeCount
+      });
+    }
+    const apiSummary = computeNumericStats(recentApis.map((a) => a.durationMs));
+    const dbSummary = computeNumericStats(recentDb.map((d) => d.durationMs));
+    if (rttSummary.avg !== null && rttSummary.avg <= th.netLatencyWarnMaxMs && apiSummary.p95 !== null && apiSummary.p95 > th.apiP95WarningMs && (dbSummary.p95 === null || dbSummary.p95 < apiSummary.p95 * 0.45)) {
+      raiseOrGroupAlert(db, {
+        groupKey: "NET_ALERT_SLOW_BACKEND_HEALTHY_NET",
+        severity: "WARNING",
+        module: "Backend APIs",
+        title: "Backend Reachable Quickly But API Processing Slow",
+        description: `Client HTTP RTT is healthy (${rttSummary.avg} ms avg), while Backend API P95 is ${apiSummary.p95} ms.`,
+        affectedOperation: "Backend Express API Layer",
+        metricValue: apiSummary.p95,
+        thresholdValue: th.apiP95WarningMs
+      });
+    }
+  }
+  if (recentSpeed.length > 0) {
+    const latestSp = recentSpeed[recentSpeed.length - 1];
+    const dlBad = latestSp.downloadMbps !== null && latestSp.downloadMbps < th.netDownloadGoodMinMbps;
+    const ulBad = latestSp.uploadMbps !== null && latestSp.uploadMbps < th.netUploadGoodMinMbps;
+    if (dlBad || ulBad) {
+      const isCrit = latestSp.downloadMbps !== null && latestSp.downloadMbps < th.netDownloadWarnMinMbps || latestSp.uploadMbps !== null && latestSp.uploadMbps < th.netUploadWarnMinMbps;
+      raiseOrGroupAlert(db, {
+        groupKey: "NET_ALERT_LOW_THROUGHPUT",
+        severity: isCrit ? "CRITICAL" : "WARNING",
+        module: "Internet & Network",
+        title: "Low Measured Network Bandwidth",
+        description: `Controlled speed test measured \u2193${latestSp.downloadMbps ?? "\u2014"} Mbps / \u2191${latestSp.uploadMbps ?? "\u2014"} Mbps (targets \u2265${th.netDownloadGoodMinMbps} / \u2265${th.netUploadGoodMinMbps} Mbps).`,
+        affectedOperation: "Controlled Speed Test",
+        metricValue: latestSp.downloadMbps ?? latestSp.uploadMbps ?? 0,
+        thresholdValue: th.netDownloadGoodMinMbps
+      });
+    }
+  }
+}
+function scheduleMonitoringPersist(db) {
+  if (process.env.VITEST) return;
+  const store = getStore2(db);
+  store.pendingDirty = true;
+  if (store.persistTimer) return;
+  store.persistTimer = setTimeout(() => {
+    store.persistTimer = null;
+    void flushMonitoringToFirestore(db);
+  }, 15e3);
+  if (typeof store.persistTimer?.unref === "function") {
+    store.persistTimer.unref();
+  }
+}
+async function flushMonitoringToFirestore(db) {
+  const store = getStore2(db);
+  if (!store.pendingDirty) return;
+  store.pendingDirty = false;
+  store.lastPersistAtMs = Date.now();
+  try {
+    const todayKey = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+    const recentApis = store.apiTraces.slice(-200);
+    const apiStats = computeLatencyStats(recentApis.map((a) => a.durationMs));
+    const qrDurations = store.qrPunches.slice(-200).map((q) => q.totalE2eMs ?? q.totalServerMs ?? 0).filter((v) => v > 0);
+    const qrStats = computeLatencyStats(qrDurations);
+    await db.collection("monitoring_rollups").doc(todayKey).set(
+      {
+        dateKey: todayKey,
+        updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+        apiCountWindow: recentApis.length,
+        apiAvgMs: apiStats.avgMs,
+        apiP95Ms: apiStats.p95Ms,
+        apiErrorCount: recentApis.filter((a) => !a.success).length,
+        qrCountWindow: store.qrPunches.length,
+        qrAvgMs: qrStats.avgMs,
+        qrP95Ms: qrStats.p95Ms,
+        dbOpsCount: store.dbOps.length,
+        errorCount: store.errors.length,
+        activityCount: store.activities.length
+      },
+      { merge: true }
+    );
+    const alertList = Array.from(store.alerts.values()).sort((a, b) => b.lastTriggeredMs - a.lastTriggeredMs).slice(0, 25);
+    if (typeof db.batch === "function" && alertList.length > 0) {
+      const batch = db.batch();
+      for (const al of alertList) {
+        batch.set(db.collection("monitoring_alerts").doc(al.groupKey), al, { merge: true });
+      }
+      await batch.commit();
+    }
+  } catch (err) {
+    store.firestoreErrorsCount += 1;
+    if (!process.env.VITEST) {
+      console.warn("[Monitoring] Background rollup persist notice:", err?.message || err);
+    }
+  }
+}
+function recordApiMetric(db, entry) {
+  const store = getStore2(db);
+  const tsMs = entry.timestampMs ?? Date.now();
+  const ts = entry.timestamp ?? new Date(tsMs).toISOString();
+  const cleanEndpoint = normalizeApiEndpointPath(entry.endpoint);
+  pushBounded(
+    store.apiTraces,
+    {
+      ...entry,
+      id: makeId("api"),
+      endpoint: cleanEndpoint,
+      timestamp: ts,
+      timestampMs: tsMs
+    },
+    MAX_API_TRACES
+  );
+  if (!entry.success && (entry.status >= 500 || entry.timedOut || entry.status === 403 || entry.status === 401)) {
+    pushBounded(
+      store.errors,
+      {
+        id: makeId("err"),
+        source: entry.status === 401 || entry.status === 403 ? "AUTH" : "BACKEND",
+        module: mapEndpointToModule(cleanEndpoint),
+        category: entry.errorCategory,
+        severity: entry.status >= 500 || entry.status === 403 ? "CRITICAL" : "WARNING",
+        message: `${entry.method} ${cleanEndpoint} failed with HTTP ${entry.status}${entry.timedOut ? " (timeout)" : ""}`,
+        statusCode: entry.status,
+        timestamp: ts,
+        timestampMs: tsMs,
+        correlationId: entry.correlationId
+      },
+      MAX_ERROR_EVENTS
+    );
+  }
+  store.lastTelemetryUpdateAt = ts;
+  evaluateAlertThresholds(db);
+  scheduleMonitoringPersist(db);
+}
+function recordDbOpMetric(db, params) {
+  const store = getStore2(db);
+  const tsMs = Date.now();
+  const ts = new Date(tsMs).toISOString();
+  pushBounded(
+    store.dbOps,
+    {
+      id: makeId("db"),
+      operation: params.operation,
+      collection: params.collection,
+      durationMs: roundMs2(params.durationMs),
+      success: params.success,
+      isPermissionDenied: Boolean(params.isPermissionDenied),
+      isNetworkError: Boolean(params.isNetworkError),
+      recordCount: Math.max(1, Number(params.recordCount || 1)),
+      ...params.errorCode ? { errorCode: params.errorCode } : {},
+      timestamp: ts,
+      timestampMs: tsMs,
+      correlationId: params.correlationId
+    },
+    MAX_DB_OPS
+  );
+  if (!params.success) {
+    store.firestoreErrorsCount += 1;
+    pushBounded(
+      store.errors,
+      {
+        id: makeId("err"),
+        source: "DATABASE",
+        module: "Firebase / Firestore",
+        category: params.isPermissionDenied ? "PERMISSION_DENIED" : params.isNetworkError ? "NETWORK" : "DATABASE",
+        severity: "CRITICAL",
+        message: sanitizeTelemetryMessage(
+          params.errorMessage || `Firestore ${params.operation} failed on ${params.collection}`
+        ),
+        timestamp: ts,
+        timestampMs: tsMs,
+        correlationId: params.correlationId
+      },
+      MAX_ERROR_EVENTS
+    );
+    if (params.isPermissionDenied || params.isNetworkError) {
+      raiseOrGroupAlert(db, {
+        groupKey: "ALERT_FIREBASE_CONNECTION_FAILURE",
+        severity: "CRITICAL",
+        module: "Firebase / Firestore",
+        title: params.isPermissionDenied ? "Firestore Permission Denied Detected" : "Firestore Connectivity Error",
+        description: sanitizeTelemetryMessage(
+          params.errorMessage || `Firestore ${params.operation} error on ${params.collection}.`
+        ),
+        affectedOperation: `Firestore ${params.operation}`
+      });
+    }
+  }
+  store.lastTelemetryUpdateAt = ts;
+  evaluateAlertThresholds(db);
+  scheduleMonitoringPersist(db);
+}
+function recordQrPunchTelemetry(db, params) {
+  const store = getStore2(db);
+  const tsMs = Date.now();
+  const ts = new Date(tsMs).toISOString();
+  pushBounded(
+    store.qrPunches,
+    {
+      ...params,
+      id: makeId("qr"),
+      timestamp: ts,
+      timestampMs: tsMs
+    },
+    MAX_QR_PUNCHES
+  );
+  if (!params.success && !params.isDuplicateRejection) {
+    pushBounded(
+      store.errors,
+      {
+        id: makeId("err"),
+        source: "QR",
+        module: "Attendance Scanner",
+        category: params.timedOut ? "TIMEOUT" : params.reasonCode || "QR_REJECTED",
+        severity: params.timedOut ? "CRITICAL" : "WARNING",
+        message: sanitizeTelemetryMessage(
+          `${params.mode} failed (${params.reasonCode || params.action || "REJECTED"})`
+        ),
+        timestamp: ts,
+        timestampMs: tsMs,
+        correlationId: params.correlationId
+      },
+      MAX_ERROR_EVENTS
+    );
+  }
+  store.lastTelemetryUpdateAt = ts;
+  evaluateAlertThresholds(db);
+  scheduleMonitoringPersist(db);
+}
+function recordActivityTelemetry(db, params) {
+  const store = getStore2(db);
+  const tsMs = Date.now();
+  const ts = new Date(tsMs).toISOString();
+  pushBounded(
+    store.activities,
+    {
+      id: makeId("act"),
+      timestamp: ts,
+      timestampMs: tsMs,
+      actorUid: params.actorUid,
+      actorLoginId: params.actorLoginId,
+      actorRole: String(params.actorRole || "UNKNOWN").toUpperCase(),
+      action: sanitizeTelemetryMessage(params.action, 80),
+      module: sanitizeTelemetryMessage(params.module, 60),
+      result: params.result,
+      correlationId: params.correlationId,
+      ...params.detail ? { detail: sanitizeTelemetryMessage(params.detail, 200) } : {}
+    },
+    MAX_ACTIVITY_EVENTS
+  );
+  store.lastTelemetryUpdateAt = ts;
+  scheduleMonitoringPersist(db);
+}
+function recordImportExportTelemetry(db, params) {
+  const store = getStore2(db);
+  const tsMs = Date.now();
+  const ts = new Date(tsMs).toISOString();
+  pushBounded(
+    store.importExports,
+    {
+      id: makeId("io"),
+      type: params.type,
+      module: params.module,
+      rowCount: Math.max(0, Number(params.rowCount || 0)),
+      durationMs: roundMs2(params.durationMs),
+      success: params.success,
+      actorLoginId: params.actorLoginId,
+      timestamp: ts,
+      timestampMs: tsMs,
+      correlationId: params.correlationId,
+      ...params.detail ? { detail: sanitizeTelemetryMessage(params.detail, 200) } : {}
+    },
+    MAX_IMPORT_EXPORT
+  );
+  if (!params.success) {
+    pushBounded(
+      store.errors,
+      {
+        id: makeId("err"),
+        source: params.type === "BULK_ACTION" ? "BULK" : "IMPORT_EXPORT",
+        module: params.module,
+        category: params.type,
+        severity: "CRITICAL",
+        message: sanitizeTelemetryMessage(
+          params.detail || `${params.type} failed for ${params.rowCount} records.`
+        ),
+        timestamp: ts,
+        timestampMs: tsMs,
+        correlationId: params.correlationId
+      },
+      MAX_ERROR_EVENTS
+    );
+    raiseOrGroupAlert(db, {
+      groupKey: params.type === "BULK_ACTION" ? "ALERT_BULK_OP_FAILURE" : "ALERT_EXCEL_IMPORT_FAILURE",
+      severity: "CRITICAL",
+      module: params.module,
+      title: params.type === "BULK_ACTION" ? "Bulk Batch Operation Failure" : "Excel Import / Export Failure",
+      description: sanitizeTelemetryMessage(
+        params.detail || `${params.type} encountered an error.`
+      ),
+      affectedOperation: params.type
+    });
+  }
+  store.lastTelemetryUpdateAt = ts;
+  scheduleMonitoringPersist(db);
+}
+function recordErrorTelemetry(db, params) {
+  const store = getStore2(db);
+  const tsMs = Date.now();
+  const ts = new Date(tsMs).toISOString();
+  pushBounded(
+    store.errors,
+    {
+      ...params,
+      message: sanitizeTelemetryMessage(params.message),
+      id: makeId("err"),
+      timestamp: ts,
+      timestampMs: tsMs
+    },
+    MAX_ERROR_EVENTS
+  );
+  store.lastTelemetryUpdateAt = ts;
+  evaluateAlertThresholds(db);
+  scheduleMonitoringPersist(db);
+}
+function noteServerHealthCheck(db, status, probeMs) {
+  const store = getStore2(db);
+  const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+  store.lastHealthCheckAt = nowIso;
+  store.lastHealthCheckStatus = status;
+  if (typeof probeMs === "number" && Number.isFinite(probeMs)) {
+    store.lastHealthProbeMs = roundMs2(probeMs);
+  }
+  if (status !== "ok") {
+    raiseOrGroupAlert(db, {
+      groupKey: "ALERT_BACKEND_OR_FIREBASE_DEGRADED",
+      severity: "CRITICAL",
+      module: "Backend APIs",
+      title: "Backend / Firebase Health Check Degraded",
+      description: `Server health check reported status "${status}".`,
+      affectedOperation: "GET /api/health"
+    });
+  }
+}
+function createMonitoringRequestMiddleware(getDb) {
+  return (req, res, next) => {
+    const startNs = performance.now();
+    const headerCid = String(req.headers["x-correlation-id"] || "").trim();
+    const correlationId = headerCid && /^[A-Za-z0-9_.-]{6,64}$/.test(headerCid) ? headerCid : `req_${crypto2.randomBytes(6).toString("hex")}`;
+    req.correlationId = correlationId;
+    res.setHeader("X-Correlation-ID", correlationId);
+    const pathOnly = String(req.path || req.originalUrl || "/").split("?")[0];
+    if (!pathOnly.startsWith("/api")) {
+      return next();
+    }
+    res.on("finish", () => {
+      const db = getDb();
+      if (!db) return;
+      const durationMs = roundMs2(performance.now() - startNs);
+      const status = res.statusCode || 200;
+      const timedOut = status === 408 || status === 504;
+      const success = status >= 200 && status < 400;
+      recordApiMetric(db, {
+        endpoint: pathOnly,
+        method: req.method.toUpperCase(),
+        status,
+        durationMs,
+        success,
+        timedOut,
+        errorCategory: success ? "NONE" : classifyHttpErrorCategory(status, timedOut),
+        correlationId
+      });
+    });
+    return next();
+  };
+}
+var MONITORED_MODULES = [
+  "Authentication",
+  "Dashboard",
+  "Employee Master",
+  "Attendance Scanner",
+  "QR Code Management",
+  "Excel Import / Update",
+  "Attendance History",
+  "Reports & Export",
+  "Shift Management",
+  "Organization Management",
+  "User Rights & Permissions",
+  "Audit Logs & Security",
+  "Firebase / Firestore",
+  "Backend APIs"
+];
+function computeModuleHealthMatrix(db, nowMs = Date.now()) {
+  const store = getStore2(db);
+  const window1h = nowMs - 60 * 6e4;
+  return MONITORED_MODULES.map((modName) => {
+    if (modName === "Firebase / Firestore") {
+      const ops = store.dbOps.filter((d) => d.timestampMs >= window1h);
+      const errs = ops.filter((d) => !d.success);
+      const permDenied = errs.filter((d) => d.isPermissionDenied);
+      const stats2 = computeLatencyStats(ops.map((o) => o.durationMs));
+      if (store.lastHealthCheckStatus === "unavailable" || permDenied.length > 0) {
+        return {
+          module: modName,
+          status: "Critical",
+          sampleCount: ops.length,
+          errorCount: errs.length,
+          avgLatencyMs: stats2.avgMs,
+          p95LatencyMs: stats2.p95Ms,
+          lastErrorAt: errs.length ? errs[errs.length - 1].timestamp : null,
+          lastActivityAt: ops.length ? ops[ops.length - 1].timestamp : store.lastHealthCheckAt,
+          reason: permDenied.length > 0 ? `${permDenied.length} Firestore permission error(s) in last 1h` : "Firestore connectivity degraded/unavailable"
+        };
+      }
+      if (ops.length === 0 && !store.lastHealthCheckAt) {
+        return {
+          module: modName,
+          status: "Unknown / Not Instrumented",
+          sampleCount: 0,
+          errorCount: 0,
+          avgLatencyMs: null,
+          p95LatencyMs: null,
+          lastErrorAt: null,
+          lastActivityAt: null,
+          reason: "No database operations or probe recorded yet in current window"
+        };
+      }
+      const errRate = ops.length > 0 ? errs.length / ops.length : 0;
+      const status2 = errRate > 0.1 ? "Critical" : errs.length > 0 || (stats2.p95Ms ?? 0) > 1e3 ? "Degraded" : (stats2.p95Ms ?? 0) > 600 ? "Warning" : "Healthy";
+      return {
+        module: modName,
+        status: status2,
+        sampleCount: ops.length || 1,
+        errorCount: errs.length,
+        avgLatencyMs: stats2.avgMs ?? store.lastHealthProbeMs,
+        p95LatencyMs: stats2.p95Ms ?? store.lastHealthProbeMs,
+        lastErrorAt: errs.length ? errs[errs.length - 1].timestamp : null,
+        lastActivityAt: ops.length ? ops[ops.length - 1].timestamp : store.lastHealthCheckAt,
+        reason: status2 === "Healthy" ? "Admin SDK & Firestore read/write probes operating within latency SLA" : `${errs.length} DB failure(s); P95 ${stats2.p95Ms ?? "--"}ms`
+      };
+    }
+    if (modName === "Backend APIs") {
+      const apis = store.apiTraces.filter((a) => a.timestampMs >= window1h);
+      if (apis.length === 0 && !store.lastHealthCheckAt) {
+        return {
+          module: modName,
+          status: "Unknown / Not Instrumented",
+          sampleCount: 0,
+          errorCount: 0,
+          avgLatencyMs: null,
+          p95LatencyMs: null,
+          lastErrorAt: null,
+          lastActivityAt: null,
+          reason: "No backend HTTP requests recorded yet"
+        };
+      }
+      const serverErrs = apis.filter((a) => !a.success && a.status >= 500);
+      const timeouts = apis.filter((a) => a.timedOut);
+      const stats2 = computeLatencyStats(apis.map((a) => a.durationMs));
+      const errPct = apis.length ? serverErrs.length / apis.length * 100 : 0;
+      const status2 = store.lastHealthCheckStatus === "unavailable" || errPct > 15 || timeouts.length >= 3 ? "Critical" : serverErrs.length > 0 || (stats2.p95Ms ?? 0) > store.thresholds.apiP95WarningMs ? "Degraded" : (stats2.p95Ms ?? 0) > store.thresholds.apiP95WarningMs * 0.75 ? "Warning" : "Healthy";
+      return {
+        module: modName,
+        status: status2,
+        sampleCount: apis.length,
+        errorCount: serverErrs.length + timeouts.length,
+        avgLatencyMs: stats2.avgMs,
+        p95LatencyMs: stats2.p95Ms,
+        lastErrorAt: serverErrs.length ? serverErrs[serverErrs.length - 1].timestamp : null,
+        lastActivityAt: apis.length ? apis[apis.length - 1].timestamp : store.lastHealthCheckAt,
+        reason: status2 === "Healthy" ? `All ${apis.length} recent API requests healthy` : `${serverErrs.length} 5xx errors, ${timeouts.length} timeouts, P95 ${stats2.p95Ms ?? "--"}ms`
+      };
+    }
+    const modApis = store.apiTraces.filter(
+      (a) => a.timestampMs >= window1h && mapEndpointToModule(a.endpoint) === modName
+    );
+    const modErrors = store.errors.filter(
+      (e) => e.timestampMs >= window1h && e.module === modName
+    );
+    const modPerf = store.clientPerf.filter(
+      (c) => c.timestampMs >= window1h && c.module === modName
+    );
+    const modActivities = store.activities.filter(
+      (act) => act.timestampMs >= window1h && act.module === modName
+    );
+    const isScanner = modName === "Attendance Scanner";
+    const qrRecent = isScanner ? store.qrPunches.filter((q) => q.timestampMs >= window1h) : [];
+    const totalSamples = modApis.length + modPerf.length + qrRecent.length;
+    if (totalSamples === 0 && modErrors.length === 0) {
+      return {
+        module: modName,
+        status: "Unknown / Not Instrumented",
+        sampleCount: 0,
+        errorCount: 0,
+        avgLatencyMs: null,
+        p95LatencyMs: null,
+        lastErrorAt: null,
+        lastActivityAt: modActivities.length ? modActivities[modActivities.length - 1].timestamp : null,
+        reason: "No execution samples recorded for this module in the last 1h"
+      };
+    }
+    const latencies = [
+      ...modApis.map((a) => a.durationMs),
+      ...modPerf.map((p) => p.durationMs),
+      ...qrRecent.map((q) => q.totalServerMs ?? 0).filter((v) => v > 0)
+    ];
+    const stats = computeLatencyStats(latencies);
+    const criticalErrs = modErrors.filter((e) => e.severity === "CRITICAL").length;
+    const server5xx = modApis.filter((a) => !a.success && a.status >= 500).length;
+    let status = "Healthy";
+    if (criticalErrs > 0 || server5xx > 0) {
+      status = criticalErrs >= 3 || server5xx >= 2 ? "Critical" : "Degraded";
+    } else if (modErrors.length > 0 || stats.p95Ms !== null && stats.p95Ms > store.thresholds.apiP95WarningMs) {
+      status = "Warning";
+    }
+    return {
+      module: modName,
+      status,
+      sampleCount: totalSamples,
+      errorCount: modErrors.length,
+      avgLatencyMs: stats.avgMs,
+      p95LatencyMs: stats.p95Ms,
+      lastErrorAt: modErrors.length ? modErrors[modErrors.length - 1].timestamp : null,
+      lastActivityAt: modApis[modApis.length - 1]?.timestamp || modActivities[modActivities.length - 1]?.timestamp || modPerf[modPerf.length - 1]?.timestamp || null,
+      reason: status === "Healthy" ? `${totalSamples} measured operation(s), 0 errors` : `${modErrors.length} error(s), P95 latency ${stats.p95Ms ?? "--"}ms`
+    };
+  });
+}
+var ClientTelemetryEventSchema = z.object({
+  kind: z.enum(["PERF", "ERROR", "API_CLIENT", "ACTIVITY", "NETWORK_PROBE", "SPEED_TEST"]),
+  metric: z.string().trim().min(1).max(64).optional(),
+  module: z.string().trim().min(1).max(64).default("Frontend"),
+  durationMs: z.number().min(0).max(3e5).optional(),
+  action: z.string().trim().min(1).max(80).optional(),
+  result: z.enum(["Success", "Failed"]).optional(),
+  endpoint: z.string().trim().min(1).max(160).optional(),
+  method: z.string().trim().min(1).max(10).optional(),
+  status: z.number().int().min(0).max(599).optional(),
+  timedOut: z.boolean().optional(),
+  errorCategory: z.string().trim().max(48).optional(),
+  message: z.string().trim().max(300).optional(),
+  correlationId: z.string().trim().max(64).optional(),
+  timestampMs: z.number().int().optional(),
+  // Network probe & speed-test telemetry fields
+  sessionId: z.string().trim().min(2).max(64).optional(),
+  online: z.boolean().optional(),
+  probeSucceeded: z.boolean().optional(),
+  rttMs: z.number().min(0).max(12e4).nullable().optional(),
+  serverProcessMs: z.number().min(0).max(3e4).nullable().optional(),
+  dnsMs: z.number().min(0).max(6e4).nullable().optional(),
+  tcpConnectMs: z.number().min(0).max(6e4).nullable().optional(),
+  tlsHandshakeMs: z.number().min(0).max(6e4).nullable().optional(),
+  connectionType: z.string().trim().max(32).optional(),
+  effectiveType: z.string().trim().max(16).optional(),
+  downlinkEstimateMbps: z.number().min(0).max(1e4).nullable().optional(),
+  browserRttEstimateMs: z.number().min(0).max(6e4).nullable().optional(),
+  disconnectionEvent: z.boolean().optional(),
+  userAgentShort: z.string().trim().max(64).optional(),
+  downloadMbps: z.number().min(0).max(2e4).nullable().optional(),
+  uploadMbps: z.number().min(0).max(2e4).nullable().optional(),
+  downloadBytes: z.number().int().min(0).max(1048576).optional(),
+  uploadBytes: z.number().int().min(0).max(1048576).optional(),
+  downloadDurationMs: z.number().min(0).max(12e4).optional(),
+  uploadDurationMs: z.number().min(0).max(12e4).optional()
+});
+var IngestTelemetrySchema = z.object({
+  events: z.array(ClientTelemetryEventSchema).min(1, "At least one telemetry event is required.").max(50, "Maximum 50 telemetry events allowed per ingestion batch.")
+});
+var AlertActionSchema = z.object({
+  groupKey: z.string().trim().min(1).max(100),
+  action: z.enum(["ACKNOWLEDGE", "RESOLVE", "REOPEN"])
+});
+var ThresholdUpdateSchema = z.object({
+  apiP95WarningMs: z.number().min(100).max(3e4).optional(),
+  apiErrorRateWarningPct: z.number().min(1).max(100).optional(),
+  qrPunchAvgWarningMs: z.number().min(100).max(3e4).optional(),
+  qrFailureSpikeCount: z.number().int().min(1).max(500).optional(),
+  txFailureWarningCount: z.number().int().min(1).max(200).optional(),
+  frontendErrorSpikeCount: z.number().int().min(1).max(500).optional(),
+  unauthorizedSpikeCount: z.number().int().min(1).max(100).optional(),
+  alertCooldownMinutes: z.number().int().min(1).max(1440).optional(),
+  clientSampleRate: z.number().min(0.05).max(1).optional(),
+  retentionDays: z.number().int().min(1).max(90).optional(),
+  netLatencyGoodMaxMs: z.number().min(5).max(5e3).optional(),
+  netLatencyWarnMaxMs: z.number().min(10).max(5e3).optional(),
+  netLatencyPoorMaxMs: z.number().min(20).max(1e4).optional(),
+  netLatencyCriticalMinMs: z.number().min(50).max(2e4).optional(),
+  netJitterGoodMaxMs: z.number().min(1).max(2e3).optional(),
+  netJitterWarnMaxMs: z.number().min(5).max(5e3).optional(),
+  netPacketLossGoodMaxPct: z.number().min(0).max(100).optional(),
+  netPacketLossWarnMaxPct: z.number().min(0.1).max(100).optional(),
+  netDownloadGoodMinMbps: z.number().min(0.1).max(1e3).optional(),
+  netDownloadWarnMinMbps: z.number().min(0.1).max(1e3).optional(),
+  netUploadGoodMinMbps: z.number().min(0.1).max(1e3).optional(),
+  netUploadWarnMinMbps: z.number().min(0.1).max(1e3).optional(),
+  netProbeIntervalSec: z.number().int().min(10).max(300).optional(),
+  netNetworkFailureSpikeCount: z.number().int().min(1).max(100).optional()
+});
+function registerMonitoringRoutes(app, deps) {
+  const { db, requireVerifiedCaller, projectId, databaseId, credentialMode } = deps;
+  async function ensureHydrated() {
+    const store = getStore2(db);
+    if (store.hydratedFromDb) return;
+    store.hydratedFromDb = true;
+    try {
+      const [cfgSnap, alertsSnap] = await Promise.all([
+        db.collection("monitoring_config").doc("thresholds").get(),
+        db.collection("monitoring_alerts").get()
+      ]);
+      if (cfgSnap.exists) {
+        const d = cfgSnap.data() || {};
+        store.thresholds = {
+          ...DEFAULT_MONITORING_THRESHOLDS,
+          ...Object.fromEntries(
+            Object.entries(d).filter(
+              ([k, v]) => k in DEFAULT_MONITORING_THRESHOLDS && typeof v === "number"
+            )
+          )
+        };
+      }
+      for (const docSnap of alertsSnap.docs) {
+        const d = docSnap.data();
+        if (d && d.groupKey && !store.alerts.has(d.groupKey)) {
+          store.alerts.set(d.groupKey, d);
+        }
+      }
+    } catch {
+    }
+  }
+  app.post("/api/monitoring/ingest", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "Monitoring Telemetry Ingest");
+      if (!caller) return;
+      const parsed = IngestTelemetrySchema.safeParse(req.body || {});
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          code: "TELEMETRY_VALIDATION_ERROR",
+          error: parsed.error.issues[0]?.message || "Invalid telemetry payload."
+        });
+      }
+      const store = getStore2(db);
+      const nowMs = Date.now();
+      let accepted = 0;
+      for (const ev of parsed.data.events) {
+        const tsMs = ev.timestampMs && Math.abs(nowMs - ev.timestampMs) <= 24 * 36e5 ? ev.timestampMs : nowMs;
+        const tsIso = new Date(tsMs).toISOString();
+        const cid = ev.correlationId || req.correlationId;
+        if (ev.kind === "PERF" && typeof ev.durationMs === "number") {
+          pushBounded(
+            store.clientPerf,
+            {
+              id: makeId("cperf"),
+              metric: sanitizeTelemetryMessage(ev.metric || "navigation_ms", 64),
+              module: sanitizeTelemetryMessage(ev.module, 60),
+              durationMs: roundMs2(ev.durationMs),
+              timestamp: tsIso,
+              timestampMs: tsMs,
+              correlationId: cid
+            },
+            MAX_CLIENT_PERF
+          );
+          accepted++;
+        } else if (ev.kind === "ERROR") {
+          pushBounded(
+            store.errors,
+            {
+              id: makeId("err"),
+              source: "FRONTEND",
+              module: sanitizeTelemetryMessage(ev.module, 60),
+              category: sanitizeTelemetryMessage(ev.errorCategory || "JS_ERROR", 48),
+              severity: "WARNING",
+              message: sanitizeTelemetryMessage(ev.message || "Unhandled frontend error."),
+              statusCode: ev.status,
+              timestamp: tsIso,
+              timestampMs: tsMs,
+              correlationId: cid
+            },
+            MAX_ERROR_EVENTS
+          );
+          accepted++;
+        } else if (ev.kind === "API_CLIENT" && ev.endpoint) {
+          if (ev.timedOut || ev.status === 0 || ev.status !== void 0 && ev.status >= 500) {
+            pushBounded(
+              store.errors,
+              {
+                id: makeId("err"),
+                source: "FRONTEND",
+                module: mapEndpointToModule(normalizeApiEndpointPath(ev.endpoint)),
+                category: ev.timedOut ? "CLIENT_TIMEOUT" : "NETWORK_FAILURE",
+                severity: ev.timedOut ? "CRITICAL" : "WARNING",
+                message: sanitizeTelemetryMessage(
+                  ev.message || `${ev.method || "GET"} ${normalizeApiEndpointPath(ev.endpoint)} network/timeout error`
+                ),
+                statusCode: ev.status,
+                timestamp: tsIso,
+                timestampMs: tsMs,
+                correlationId: cid
+              },
+              MAX_ERROR_EVENTS
+            );
+          }
+          if (typeof ev.durationMs === "number" && ev.metric) {
+            pushBounded(
+              store.clientPerf,
+              {
+                id: makeId("cperf"),
+                metric: sanitizeTelemetryMessage(ev.metric, 64),
+                module: mapEndpointToModule(normalizeApiEndpointPath(ev.endpoint)),
+                durationMs: roundMs2(ev.durationMs),
+                timestamp: tsIso,
+                timestampMs: tsMs,
+                correlationId: cid
+              },
+              MAX_CLIENT_PERF
+            );
+          }
+          accepted++;
+        } else if (ev.kind === "ACTIVITY" && ev.action) {
+          recordActivityTelemetry(db, {
+            actorUid: caller.uid,
+            actorLoginId: caller.loginId,
+            actorRole: caller.role.toUpperCase(),
+            action: ev.action,
+            module: ev.module,
+            result: ev.result || "Success",
+            correlationId: cid,
+            detail: ev.message
+          });
+          accepted++;
+        } else if (ev.kind === "NETWORK_PROBE") {
+          const isOffline = ev.online === false || ev.disconnectionEvent === true;
+          if (isOffline) {
+            store.disconnectionCount += 1;
+            store.lastDisconnectionAt = tsIso;
+          }
+          pushBounded(
+            store.networkSamples,
+            {
+              id: makeId("net"),
+              sessionId: sanitizeTelemetryMessage(ev.sessionId || `sess_${caller.uid.slice(0, 8)}`, 64),
+              actorLoginId: caller.loginId,
+              actorRole: caller.role.toUpperCase(),
+              online: ev.online ?? true,
+              probeSucceeded: ev.probeSucceeded ?? !isOffline,
+              rttMs: typeof ev.rttMs === "number" ? roundMs2(ev.rttMs) : null,
+              serverProcessMs: typeof ev.serverProcessMs === "number" ? roundMs2(ev.serverProcessMs) : null,
+              dnsMs: typeof ev.dnsMs === "number" && ev.dnsMs > 0 ? roundMs2(ev.dnsMs) : null,
+              tcpConnectMs: typeof ev.tcpConnectMs === "number" && ev.tcpConnectMs > 0 ? roundMs2(ev.tcpConnectMs) : null,
+              tlsHandshakeMs: typeof ev.tlsHandshakeMs === "number" && ev.tlsHandshakeMs > 0 ? roundMs2(ev.tlsHandshakeMs) : null,
+              connectionType: sanitizeTelemetryMessage(ev.connectionType || "Unavailable", 32),
+              effectiveType: sanitizeTelemetryMessage(ev.effectiveType || "Unavailable", 16),
+              downlinkEstimateMbps: typeof ev.downlinkEstimateMbps === "number" ? roundMs2(ev.downlinkEstimateMbps) : null,
+              browserRttEstimateMs: typeof ev.browserRttEstimateMs === "number" ? roundMs2(ev.browserRttEstimateMs) : null,
+              disconnectionEvent: Boolean(ev.disconnectionEvent),
+              userAgentShort: sanitizeTelemetryMessage(ev.userAgentShort || "Browser", 64),
+              timestamp: tsIso,
+              timestampMs: tsMs
+            },
+            MAX_NETWORK_SAMPLES
+          );
+          accepted++;
+        } else if (ev.kind === "SPEED_TEST") {
+          pushBounded(
+            store.speedTests,
+            {
+              id: makeId("spd"),
+              sessionId: sanitizeTelemetryMessage(ev.sessionId || `sess_${caller.uid.slice(0, 8)}`, 64),
+              actorLoginId: caller.loginId,
+              downloadMbps: typeof ev.downloadMbps === "number" ? roundMs2(ev.downloadMbps) : null,
+              uploadMbps: typeof ev.uploadMbps === "number" ? roundMs2(ev.uploadMbps) : null,
+              downloadBytes: Math.min(524288, Math.max(0, ev.downloadBytes ?? 0)),
+              uploadBytes: Math.min(524288, Math.max(0, ev.uploadBytes ?? 0)),
+              downloadDurationMs: roundMs2(ev.downloadDurationMs ?? 0),
+              uploadDurationMs: roundMs2(ev.uploadDurationMs ?? 0),
+              timestamp: tsIso,
+              timestampMs: tsMs
+            },
+            MAX_SPEED_TESTS
+          );
+          accepted++;
+        }
+      }
+      store.lastTelemetryUpdateAt = (/* @__PURE__ */ new Date()).toISOString();
+      evaluateAlertThresholds(db);
+      scheduleMonitoringPersist(db);
+      return res.json({
+        success: true,
+        accepted,
+        correlationId: req.correlationId
+      });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: err?.message || "Telemetry ingestion failed."
+      });
+    }
+  });
+  app.get("/api/monitoring/overview", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        ["super_admin"],
+        "System Performance Overview"
+      );
+      if (!caller) return;
+      await ensureHydrated();
+      const store = getStore2(db);
+      const rangeParam = String(req.query.range || "24h").toLowerCase();
+      const fromParam = req.query.from ? new Date(String(req.query.from)).getTime() : NaN;
+      const toParam = req.query.to ? new Date(String(req.query.to)).getTime() : NaN;
+      const nowMs = Date.now();
+      let windowStartMs = nowMs - 24 * 36e5;
+      let windowEndMs = nowMs;
+      if (rangeParam === "15m") windowStartMs = nowMs - 15 * 6e4;
+      else if (rangeParam === "1h") windowStartMs = nowMs - 36e5;
+      else if (rangeParam === "24h") windowStartMs = nowMs - 24 * 36e5;
+      else if (rangeParam === "7d") windowStartMs = nowMs - 7 * 24 * 36e5;
+      else if (rangeParam === "30d") windowStartMs = nowMs - 30 * 24 * 36e5;
+      else if (rangeParam === "custom" && Number.isFinite(fromParam)) {
+        windowStartMs = fromParam;
+        if (Number.isFinite(toParam) && toParam >= fromParam) {
+          windowEndMs = toParam;
+        }
+      }
+      const inWindow = (tsMs) => tsMs >= windowStartMs && tsMs <= windowEndMs;
+      const apis = store.apiTraces.filter((a) => inWindow(a.timestampMs));
+      const dbOps = store.dbOps.filter((d) => inWindow(d.timestampMs));
+      const qrList = store.qrPunches.filter((q) => inWindow(q.timestampMs));
+      const cPerf = store.clientPerf.filter((c) => inWindow(c.timestampMs));
+      const errList = store.errors.filter((e) => inWindow(e.timestampMs));
+      const actList = store.activities.filter((act) => inWindow(act.timestampMs));
+      const ioList = store.importExports.filter((io) => inWindow(io.timestampMs));
+      let activeUserSessionsCount = null;
+      let totalRegisteredAccounts = null;
+      let recentAuditCount = null;
+      let dbPingMs = null;
+      let dbConnected = true;
+      try {
+        const pingStart = performance.now();
+        const [rolesSnap, loginHistSnap] = await Promise.all([
+          db.collection("user_roles").get(),
+          db.collection("login_history").limit(200).get()
+        ]);
+        dbPingMs = roundMs2(performance.now() - pingStart);
+        noteServerHealthCheck(db, "ok", dbPingMs);
+        totalRegisteredAccounts = rolesSnap.docs.filter((d) => d.data()?.status === "Active").length;
+        const sessionCutoff = nowMs - 8 * 36e5;
+        const latestByLogin = /* @__PURE__ */ new Map();
+        for (const docSnap of loginHistSnap.docs) {
+          const d = docSnap.data() || {};
+          const lid = String(d.loginId || "").trim().toLowerCase();
+          if (!lid) continue;
+          const tsMs = typeof d.timestampMs === "number" ? d.timestampMs : new Date(d.timestamp || 0).getTime();
+          if (!Number.isFinite(tsMs)) continue;
+          const prev = latestByLogin.get(lid);
+          if (!prev || tsMs > prev.tsMs) {
+            latestByLogin.set(lid, { eventType: String(d.eventType || ""), tsMs });
+          }
+        }
+        let activeSessions = 0;
+        for (const v of latestByLogin.values()) {
+          if (v.eventType === "LOGIN_SUCCESS" && v.tsMs >= sessionCutoff) {
+            activeSessions++;
+          }
+        }
+        activeUserSessionsCount = activeSessions;
+      } catch (dbErr) {
+        dbConnected = false;
+        noteServerHealthCheck(db, "degraded");
+        recordDbOpMetric(db, {
+          operation: "QUERY",
+          collection: "monitoring_probe",
+          durationMs: 0,
+          success: false,
+          errorMessage: dbErr?.message || "Health probe Firestore read failed."
+        });
+      }
+      const apiStats = computeLatencyStats(apis.map((a) => a.durationMs));
+      const failedApiCount = apis.filter((a) => !a.success).length;
+      const timeoutApiCount = apis.filter((a) => a.timedOut).length;
+      const byEndpoint = /* @__PURE__ */ new Map();
+      for (const a of apis) {
+        const key = `${a.method} ${a.endpoint}`;
+        let group = byEndpoint.get(key);
+        if (!group) {
+          group = {
+            endpoint: a.endpoint,
+            method: a.method,
+            count: 0,
+            errorCount: 0,
+            timeoutCount: 0,
+            durations: [],
+            lastStatus: a.status,
+            lastTimestamp: a.timestamp
+          };
+          byEndpoint.set(key, group);
+        }
+        group.count++;
+        if (!a.success) group.errorCount++;
+        if (a.timedOut) group.timeoutCount++;
+        group.durations.push(a.durationMs);
+        group.lastStatus = a.status;
+        group.lastTimestamp = a.timestamp;
+      }
+      const apiEndpointSummary = Array.from(byEndpoint.values()).map((g) => {
+        const st = computeLatencyStats(g.durations);
+        return {
+          endpoint: g.endpoint,
+          method: g.method,
+          count: g.count,
+          errorCount: g.errorCount,
+          timeoutCount: g.timeoutCount,
+          avgMs: st.avgMs,
+          p50Ms: st.p50Ms,
+          p95Ms: st.p95Ms,
+          maxMs: st.maxMs,
+          lastStatus: g.lastStatus,
+          lastTimestamp: g.lastTimestamp
+        };
+      }).sort((a, b) => (b.p95Ms ?? 0) - (a.p95Ms ?? 0));
+      const qrInList = qrList.filter((q) => q.mode === "QR_IN");
+      const qrOutList = qrList.filter((q) => q.mode === "QR_OUT");
+      const manualList = qrList.filter((q) => q.mode === "MANUAL_IN" || q.mode === "MANUAL_OUT");
+      const qrOnly = qrList.filter((q) => q.mode === "QR_IN" || q.mode === "QR_OUT");
+      const qrDurations = qrOnly.map((q) => q.totalE2eMs ?? q.totalServerMs ?? 0).filter((v) => v > 0);
+      const qrStats = computeLatencyStats(qrDurations);
+      const qrSuccessCount = qrOnly.filter((q) => q.success).length;
+      const qrDuplicateRejects = qrOnly.filter((q) => q.isDuplicateRejection).length;
+      const qrFailedCount = qrOnly.filter((q) => !q.success && !q.isDuplicateRejection).length;
+      const qrTimeoutCount = qrOnly.filter((q) => q.timedOut).length;
+      const stageStats = {
+        qrDetect: computeLatencyStats(qrOnly.map((q) => q.qrDetectMs).filter((v) => typeof v === "number")),
+        qrParse: computeLatencyStats(qrOnly.map((q) => q.qrParseMs).filter((v) => typeof v === "number")),
+        apiRequest: computeLatencyStats(qrOnly.map((q) => q.apiRequestMs).filter((v) => typeof v === "number")),
+        authTokenVerify: computeLatencyStats(qrOnly.map((q) => q.authMs).filter((v) => typeof v === "number")),
+        tokenValidation: computeLatencyStats(qrOnly.map((q) => q.tokenValidationMs).filter((v) => typeof v === "number")),
+        firestoreTx: computeLatencyStats(qrOnly.map((q) => q.txMs).filter((v) => typeof v === "number")),
+        totalPunchIn: computeLatencyStats(qrInList.map((q) => q.totalE2eMs ?? q.totalServerMs).filter((v) => typeof v === "number")),
+        totalPunchOut: computeLatencyStats(qrOutList.map((q) => q.totalE2eMs ?? q.totalServerMs).filter((v) => typeof v === "number")),
+        manualPunch: computeLatencyStats(manualList.map((q) => q.totalE2eMs ?? q.totalServerMs).filter((v) => typeof v === "number"))
+      };
+      const dbStats = computeLatencyStats(dbOps.map((d) => d.durationMs));
+      const dbReads = dbOps.filter((d) => d.operation === "READ" || d.operation === "QUERY").length;
+      const dbWrites = dbOps.filter((d) => d.operation === "WRITE" || d.operation === "BATCH").length;
+      const dbTxList = dbOps.filter((d) => d.operation === "TRANSACTION");
+      const dbTxFailed = dbTxList.filter((d) => !d.success).length;
+      const dbPermDenied = dbOps.filter((d) => d.isPermissionDenied).length;
+      const dbNetErrors = dbOps.filter((d) => d.isNetworkError).length;
+      const slowDbOps = dbOps.filter((d) => d.durationMs >= 500).slice(-30).reverse();
+      const groupClientMetric = (metricKey) => computeLatencyStats(cPerf.filter((c) => c.metric === metricKey).map((c) => c.durationMs));
+      const websitePerf = {
+        initialLoad: groupClientMetric("app_initial_load_ms"),
+        navigation: groupClientMetric("navigation_ms"),
+        skeletonDuration: groupClientMetric("skeleton_visible_ms"),
+        routePrefetch: groupClientMetric("route_prefetch_ms"),
+        backgroundRefresh: groupClientMetric("background_refresh_ms"),
+        slowRender: groupClientMetric("slow_render_ms"),
+        jsErrorsCount: errList.filter((e) => e.source === "FRONTEND" && e.category === "JS_ERROR").length,
+        promiseRejectionsCount: errList.filter((e) => e.source === "FRONTEND" && e.category === "UNHANDLED_REJECTION").length,
+        networkFailuresCount: errList.filter((e) => e.source === "FRONTEND" && (e.category === "NETWORK_FAILURE" || e.category === "CLIENT_TIMEOUT")).length
+      };
+      const totalSpanMs = Math.max(6e4, windowEndMs - windowStartMs);
+      const bucketCount = rangeParam === "7d" ? 7 : rangeParam === "30d" ? 15 : 12;
+      const bucketStepMs = totalSpanMs / bucketCount;
+      const timeSeries = Array.from({ length: bucketCount }, (_, idx) => {
+        const bStart = windowStartMs + idx * bucketStepMs;
+        const bEnd = bStart + bucketStepMs;
+        const label = rangeParam === "7d" || rangeParam === "30d" ? new Date(bStart).toLocaleDateString("en-IN", { day: "2-digit", month: "short" }) : new Date(bStart).toLocaleTimeString("en-IN", {
+          timeZone: "Asia/Kolkata",
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false
+        });
+        const bApis = apis.filter((a) => a.timestampMs >= bStart && a.timestampMs < bEnd);
+        const bQr = qrOnly.filter((q) => q.timestampMs >= bStart && q.timestampMs < bEnd);
+        const bDb = dbOps.filter((d) => d.timestampMs >= bStart && d.timestampMs < bEnd);
+        const bErr = errList.filter((e) => e.timestampMs >= bStart && e.timestampMs < bEnd);
+        const bAct = actList.filter((a) => a.timestampMs >= bStart && a.timestampMs < bEnd);
+        const bIo = ioList.filter((io) => io.timestampMs >= bStart && io.timestampMs < bEnd);
+        const apiAvg = computeLatencyStats(bApis.map((x) => x.durationMs)).avgMs;
+        const qrAvg = computeLatencyStats(
+          bQr.map((x) => x.totalE2eMs ?? x.totalServerMs ?? 0).filter((v) => v > 0)
+        ).avgMs;
+        const dbAvg = computeLatencyStats(bDb.map((x) => x.durationMs)).avgMs;
+        const ioAvg = computeLatencyStats(bIo.map((x) => x.durationMs)).avgMs;
+        return {
+          label,
+          bucketStartIso: new Date(bStart).toISOString(),
+          apiAvgMs: apiAvg,
+          apiCalls: bApis.length,
+          qrAvgMs: qrAvg,
+          qrPunches: bQr.length,
+          dbAvgMs: dbAvg,
+          errorCount: bErr.length,
+          activityCount: bAct.length,
+          importExportAvgMs: ioAvg,
+          availabilityPct: bApis.length > 0 ? roundMs2((bApis.length - bApis.filter((x) => !x.success && x.status >= 500).length) / bApis.length * 100) : null
+        };
+      });
+      const moduleHealth = computeModuleHealthMatrix(db, nowMs);
+      const alertsList = Array.from(store.alerts.values()).sort(
+        (a, b) => b.lastTriggeredMs - a.lastTriggeredMs
+      );
+      const activeAlertsCount = alertsList.filter((a) => a.status === "ACTIVE").length;
+      let overallHealth = "Healthy";
+      if (!dbConnected) {
+        overallHealth = "Critical";
+      } else if (activeAlertsCount > 0 && alertsList.some((a) => a.status === "ACTIVE" && a.severity === "CRITICAL")) {
+        overallHealth = "Critical";
+      } else if (activeAlertsCount > 0 || moduleHealth.some((m) => m.status === "Degraded" || m.status === "Warning")) {
+        overallHealth = "Warning";
+      }
+      let historicalRollups = [];
+      try {
+        const rollupSnap = await db.collection("monitoring_rollups").get();
+        historicalRollups = rollupSnap.docs.map((d) => d.data()).filter(Boolean).sort((a, b) => String(b.dateKey || "").localeCompare(String(a.dateKey || ""))).slice(0, 30);
+      } catch {
+      }
+      const netSamples = store.networkSamples.filter((n) => inWindow(n.timestampMs));
+      const speedTestsWindow = store.speedTests.filter((s) => inWindow(s.timestampMs));
+      const latestSpeedAny = speedTestsWindow[speedTestsWindow.length - 1] ?? store.speedTests[store.speedTests.length - 1] ?? null;
+      const successfulProbes = netSamples.filter((n) => n.probeSucceeded && n.rttMs !== null);
+      const rttValues = successfulProbes.map((n) => n.rttMs);
+      const rttNumStats = computeNumericStats(rttValues);
+      const serverProcStats = computeNumericStats(
+        successfulProbes.map((n) => n.serverProcessMs).filter((v) => typeof v === "number")
+      );
+      const dnsStats = computeNumericStats(
+        netSamples.map((n) => n.dnsMs).filter((v) => typeof v === "number" && v > 0)
+      );
+      const tcpStats = computeNumericStats(
+        netSamples.map((n) => n.tcpConnectMs).filter((v) => typeof v === "number" && v > 0)
+      );
+      const tlsStats = computeNumericStats(
+        netSamples.map((n) => n.tlsHandshakeMs).filter((v) => typeof v === "number" && v > 0)
+      );
+      const jitterValueMs = computeJitterFromRttSeries(rttValues);
+      const jitterRating = classifyJitterRating(jitterValueMs, store.thresholds);
+      const packetLossEval = evaluatePacketLoss(
+        netSamples.map((n) => ({ success: n.probeSucceeded })),
+        store.thresholds
+      );
+      const latestSample = netSamples[netSamples.length - 1] ?? store.networkSamples[store.networkSamples.length - 1] ?? null;
+      const netOnline = latestSample ? latestSample.online : true;
+      const lastSuccessfulNet = [...netSamples].reverse().find((n) => n.probeSucceeded) ?? null;
+      const clientNetFailures = errList.filter(
+        (e) => e.source === "FRONTEND" && (e.category === "NETWORK_FAILURE" || e.category === "CLIENT_TIMEOUT")
+      ).length;
+      const totalClientPlusProbeRequests = netSamples.length + apis.length;
+      const networkRequestFailureRatePct = totalClientPlusProbeRequests > 0 ? roundMs2(clientNetFailures / totalClientPlusProbeRequests * 100) : netSamples.length > 0 ? 0 : null;
+      const dlMbps = latestSpeedAny?.downloadMbps ?? null;
+      const ulMbps = latestSpeedAny?.uploadMbps ?? null;
+      const dlRating = classifyDownloadRating(dlMbps, store.thresholds);
+      const ulRating = classifyUploadRating(ulMbps, store.thresholds);
+      const healthScore = computeInternetHealthScore({
+        online: netOnline,
+        probeCount: netSamples.length,
+        successfulProbeCount: successfulProbes.length,
+        avgRttMs: rttNumStats.avg,
+        jitterMs: jitterValueMs,
+        packetLossPct: packetLossEval.reportablePacketLossPct,
+        downloadMbps: dlMbps,
+        uploadMbps: ulMbps,
+        thresholds: store.thresholds
+      });
+      const apiServerErrorCount = apis.filter((a) => !a.success && a.status >= 500).length;
+      const diagnostics = diagnoseNetworkVsServer({
+        online: netOnline,
+        probeCount: netSamples.length,
+        successfulProbeCount: successfulProbes.length,
+        avgRttMs: rttNumStats.avg,
+        p95RttMs: rttNumStats.p95,
+        avgServerProbeProcessMs: serverProcStats.avg,
+        jitterMs: jitterValueMs,
+        packetLossPct: packetLossEval.reportablePacketLossPct,
+        downloadMbps: dlMbps,
+        uploadMbps: ulMbps,
+        networkRequestFailureRatePct,
+        apiSampleCount: apis.length,
+        apiAvgMs: apiStats.avgMs,
+        apiP95Ms: apiStats.p95Ms,
+        apiServerErrorCount,
+        apiTimeoutCount: timeoutApiCount,
+        dbOpCount: dbOps.length,
+        dbAvgOpMs: dbStats.avgMs,
+        dbP95OpMs: dbStats.p95Ms,
+        dbErrorCount: dbOps.filter((d) => !d.success).length,
+        dbTxFailureCount: dbTxFailed,
+        frontendPerfCount: cPerf.length,
+        frontendSlowRenderAvgMs: websitePerf.slowRender.avgMs,
+        frontendSlowRenderCount: websitePerf.slowRender.count,
+        frontendNavAvgMs: websitePerf.navigation.avgMs,
+        thresholds: store.thresholds
+      });
+      const sessionMap = /* @__PURE__ */ new Map();
+      for (const n of netSamples) {
+        let rec = sessionMap.get(n.sessionId);
+        if (!rec) {
+          rec = {
+            sessionId: n.sessionId,
+            actorLoginId: n.actorLoginId,
+            actorRole: n.actorRole,
+            userAgentShort: n.userAgentShort,
+            connectionType: n.connectionType,
+            effectiveType: n.effectiveType,
+            browserEstimatedDownlinkMbps: n.downlinkEstimateMbps,
+            browserEstimatedRttMs: n.browserRttEstimateMs,
+            rtts: [],
+            online: n.online,
+            lastSampleAt: n.timestamp,
+            lastSampleMs: n.timestampMs,
+            failedCount: 0
+          };
+          sessionMap.set(n.sessionId, rec);
+        }
+        if (n.probeSucceeded && n.rttMs !== null) rec.rtts.push(n.rttMs);
+        if (!n.probeSucceeded) rec.failedCount += 1;
+        if (n.timestampMs >= rec.lastSampleMs) {
+          rec.online = n.online;
+          rec.connectionType = n.connectionType;
+          rec.effectiveType = n.effectiveType;
+          rec.browserEstimatedDownlinkMbps = n.downlinkEstimateMbps;
+          rec.browserEstimatedRttMs = n.browserRttEstimateMs;
+          rec.lastSampleAt = n.timestamp;
+          rec.lastSampleMs = n.timestampMs;
+          rec.userAgentShort = n.userAgentShort;
+        }
+      }
+      const activeDeviceSessions = Array.from(sessionMap.values()).sort((a, b) => b.lastSampleMs - a.lastSampleMs).slice(0, 50).map((s) => {
+        const st = computeNumericStats(s.rtts);
+        const rating = classifyLatencyRating(st.last, store.thresholds);
+        const status = !s.online ? "CRITICAL" : rating === "CRITICAL" || rating === "POOR" ? "CRITICAL" : rating === "WARNING" ? "WARNING" : rating === "UNKNOWN" ? "UNKNOWN" : "GOOD";
+        return {
+          sessionId: s.sessionId,
+          actorLoginId: s.actorLoginId,
+          actorRole: s.actorRole,
+          userAgentShort: s.userAgentShort,
+          connectionType: s.connectionType,
+          effectiveType: s.effectiveType,
+          browserEstimatedDownlinkMbps: s.browserEstimatedDownlinkMbps,
+          browserEstimatedRttMs: s.browserEstimatedRttMs,
+          measuredRttAvgMs: st.avg,
+          measuredRttLastMs: st.last,
+          probeCount: s.rtts.length + s.failedCount,
+          lastSampleAt: s.lastSampleAt,
+          networkStatus: status
+        };
+      });
+      const networkHistoryBuckets = Array.from({ length: bucketCount }, (_, idx) => {
+        const bStart = windowStartMs + idx * bucketStepMs;
+        const bEnd = bStart + bucketStepMs;
+        const label = rangeParam === "7d" || rangeParam === "30d" ? new Date(bStart).toLocaleDateString("en-IN", { day: "2-digit", month: "short" }) : new Date(bStart).toLocaleTimeString("en-IN", {
+          timeZone: "Asia/Kolkata",
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false
+        });
+        const bNet = netSamples.filter((n) => n.timestampMs >= bStart && n.timestampMs < bEnd);
+        const bOkRtts = bNet.filter((n) => n.probeSucceeded && n.rttMs !== null).map((n) => n.rttMs);
+        const bRttStats = computeNumericStats(bOkRtts);
+        const bJitter = computeJitterFromRttSeries(bOkRtts);
+        const bFail = bNet.filter((n) => !n.probeSucceeded).length;
+        const bLossPct = bNet.length >= 5 ? bFail === 1 ? 0 : roundMs2(bFail / bNet.length * 100) : null;
+        const bSp = speedTestsWindow.filter((s) => s.timestampMs >= bStart && s.timestampMs < bEnd);
+        const bApis = apis.filter((a) => a.timestampMs >= bStart && a.timestampMs < bEnd);
+        const bApiStats = computeNumericStats(bApis.map((a) => a.durationMs));
+        const bDlStats = computeNumericStats(
+          bSp.map((s) => s.downloadMbps).filter((v) => typeof v === "number")
+        );
+        const bUlStats = computeNumericStats(
+          bSp.map((s) => s.uploadMbps).filter((v) => typeof v === "number")
+        );
+        return {
+          label,
+          bucketStartIso: new Date(bStart).toISOString(),
+          probeCount: bNet.length,
+          rttAvgMs: bRttStats.avg,
+          jitterMs: bJitter,
+          packetLossPct: bLossPct,
+          downloadMbps: bDlStats.avg,
+          uploadMbps: bUlStats.avg,
+          apiAvgMs: bApiStats.avg,
+          disconnections: bNet.filter((n) => n.disconnectionEvent).length
+        };
+      });
+      const latencyRating = classifyLatencyRating(rttNumStats.avg, store.thresholds);
+      const throughputStatus = dlRating === "UNKNOWN" && ulRating === "UNKNOWN" ? "UNKNOWN" : dlRating === "CRITICAL" || ulRating === "CRITICAL" ? "CRITICAL" : dlRating === "WARNING" || ulRating === "WARNING" ? "WARNING" : "GOOD";
+      const backendVsNetStatus = diagnostics.primaryCause === "Cause Unknown" ? "UNKNOWN" : diagnostics.primaryCause === "All Systems Nominal" ? "GOOD" : diagnostics.confidence === "High" ? "CRITICAL" : "WARNING";
+      const networkMonitoring = {
+        online: netOnline,
+        connectionStatusLabel: !netOnline ? "Disconnected (Offline)" : netSamples.length === 0 ? "Connected (Awaiting HTTP Probes)" : successfulProbes.length === 0 ? "Unreachable (Probes Failing)" : "Connected",
+        lastSuccessfulMeasurementAt: lastSuccessfulNet?.timestamp ?? null,
+        lastDisconnectionAt: store.lastDisconnectionAt,
+        disconnectionCount: store.disconnectionCount,
+        rttStats: {
+          currentMs: rttNumStats.last,
+          avgMs: rttNumStats.avg,
+          p50Ms: rttNumStats.p50,
+          p95Ms: rttNumStats.p95,
+          maxMs: rttNumStats.max,
+          rating: latencyRating,
+          sampleCount: rttNumStats.count
+        },
+        avgServerProbeProcessMs: serverProcStats.avg,
+        dnsMs: dnsStats.avg,
+        tcpConnectMs: tcpStats.avg,
+        tlsHandshakeMs: tlsStats.avg,
+        timingMeasurementNote: "DNS, TCP, and TLS timings are extracted from Browser PerformanceResourceTiming only on fresh uncached connections where Timing-Allow-Origin permits; reused keep-alive sockets report null (Not Measurable).",
+        jitter: {
+          valueMs: jitterValueMs,
+          rating: jitterRating,
+          sampleCount: rttValues.length
+        },
+        packetLoss: packetLossEval,
+        speedTest: {
+          latestDownloadMbps: dlMbps,
+          latestUploadMbps: ulMbps,
+          downloadRating: dlRating,
+          uploadRating: ulRating,
+          lastTestedAt: latestSpeedAny?.timestamp ?? null,
+          isEstimate: true,
+          disclosure: "Measured on manual trigger using bounded 256 KB HTTP payloads (not a multi-stream ISP throughput saturation benchmark).",
+          recentTests: [...store.speedTests].reverse().slice(0, 20)
+        },
+        networkRequestFailureRatePct,
+        backendApiAvgMs: apiStats.avgMs,
+        backendApiP95Ms: apiStats.p95Ms,
+        healthScore,
+        diagnostics,
+        indicatorStatuses: {
+          connectivity: !netOnline ? "CRITICAL" : netSamples.length === 0 ? "UNKNOWN" : successfulProbes.length === 0 ? "CRITICAL" : "GOOD",
+          latency: latencyRating === "UNKNOWN" ? "UNKNOWN" : latencyRating === "CRITICAL" || latencyRating === "POOR" ? "CRITICAL" : latencyRating === "WARNING" ? "WARNING" : "GOOD",
+          jitter: jitterRating,
+          packetLoss: packetLossEval.rating,
+          throughput: throughputStatus,
+          backendVsNetwork: backendVsNetStatus
+        },
+        historyBuckets: networkHistoryBuckets,
+        activeDeviceSessions,
+        totalProbeSamplesInWindow: netSamples.length
+      };
+      return res.json({
+        success: true,
+        generatedAt: new Date(nowMs).toISOString(),
+        window: {
+          range: rangeParam,
+          fromIso: new Date(windowStartMs).toISOString(),
+          toIso: new Date(windowEndMs).toISOString()
+        },
+        overview: {
+          overallHealth,
+          backendStatus: dbConnected ? "Healthy" : "Degraded",
+          frontendStatus: cPerf.length > 0 ? websitePerf.jsErrorsCount >= store.thresholds.frontendErrorSpikeCount ? "Warning" : "Healthy" : "Unknown / Not Instrumented",
+          firebaseConnectivity: dbConnected ? "Connected" : "Error",
+          firebasePingMs: dbPingMs,
+          projectId,
+          databaseId,
+          credentialMode,
+          apiAvgMs: apiStats.avgMs,
+          apiP50Ms: apiStats.p50Ms,
+          apiP95Ms: apiStats.p95Ms,
+          totalApiRequests: apis.length,
+          failedApiRequests: failedApiCount,
+          timeoutApiRequests: timeoutApiCount,
+          applicationErrorCount: errList.length,
+          activeUserSessions: activeUserSessionsCount,
+          totalActiveUserAccounts: totalRegisteredAccounts,
+          recentAuditCount,
+          qrPunchAvgMs: qrStats.avgMs,
+          qrPunchP50Ms: qrStats.p50Ms,
+          qrPunchP95Ms: qrStats.p95Ms,
+          qrPunchMaxMs: qrStats.maxMs,
+          qrPunchTotal: qrOnly.length,
+          qrPunchSuccessRatePct: qrOnly.length > 0 ? roundMs2(qrSuccessCount / qrOnly.length * 100) : null,
+          qrPunchFailureRatePct: qrOnly.length > 0 ? roundMs2(qrFailedCount / qrOnly.length * 100) : null,
+          qrDuplicateRejections: qrDuplicateRejects,
+          qrTimeouts: qrTimeoutCount,
+          backgroundRefreshAvgMs: websitePerf.backgroundRefresh.avgMs,
+          backgroundRefreshStatus: websitePerf.backgroundRefresh.count > 0 ? "Active" : "Unknown / Not Instrumented",
+          lastSuccessfulHealthCheck: store.lastHealthCheckAt,
+          lastMonitoringUpdate: store.lastTelemetryUpdateAt,
+          activeAlertsCount
+        },
+        websitePerf,
+        apiMonitoring: {
+          summary: apiStats,
+          totalRequests: apis.length,
+          failedRequests: failedApiCount,
+          timeoutCount: timeoutApiCount,
+          endpoints: apiEndpointSummary,
+          recentTraces: [...apis].reverse().slice(0, 120)
+        },
+        databaseMonitoring: {
+          connectivity: dbConnected ? "Connected" : "Unavailable",
+          probeLatencyMs: dbPingMs,
+          measuredTotalOps: dbOps.length,
+          measuredReads: dbReads,
+          measuredWrites: dbWrites,
+          transactionCount: dbTxList.length,
+          failedTransactionCount: dbTxFailed,
+          avgOpDurationMs: dbStats.avgMs,
+          p95OpDurationMs: dbStats.p95Ms,
+          permissionDeniedCount: dbPermDenied,
+          networkErrorCount: dbNetErrors,
+          slowOperations: slowDbOps,
+          bulkAndImportBatches: [...ioList].reverse().slice(0, 50),
+          cloudBillingUsageStatus: "Not Available",
+          cloudBillingRequirement: "Requires server-side Google Cloud Monitoring API (@google-cloud/monitoring) and IAM role roles/monitoring.viewer on the backend service account for project-wide Firestore read/write billing & quota counters."
+        },
+        qrPerformance: {
+          summary: qrStats,
+          successCount: qrSuccessCount,
+          failedCount: qrFailedCount,
+          duplicateRejections: qrDuplicateRejects,
+          timeoutCount: qrTimeoutCount,
+          stages: stageStats,
+          recentPunches: [...qrList].reverse().slice(0, 100)
+        },
+        userActivity: [...actList].reverse().slice(0, 200),
+        moduleHealth,
+        errorLogs: [...errList].reverse().slice(0, 200),
+        alerts: alertsList,
+        thresholds: store.thresholds,
+        timeSeries,
+        historicalRollups,
+        networkMonitoring
+      });
+    } catch (err) {
+      console.error("[Monitoring Overview] Error:", err);
+      return res.status(500).json({
+        success: false,
+        error: err?.message || "Failed to compute monitoring overview."
+      });
+    }
+  });
+  app.post("/api/monitoring/health-probe", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        ["super_admin"],
+        "System Health Probe"
+      );
+      if (!caller) return;
+      const start = performance.now();
+      await db.collection("system_settings").doc("global").get();
+      const probeMs = roundMs2(performance.now() - start);
+      noteServerHealthCheck(db, "ok", probeMs);
+      recordDbOpMetric(db, {
+        operation: "READ",
+        collection: "system_settings",
+        durationMs: probeMs,
+        success: true,
+        correlationId: req.correlationId
+      });
+      return res.json({
+        success: true,
+        status: "ok",
+        firestoreProbeMs: probeMs,
+        checkedAt: (/* @__PURE__ */ new Date()).toISOString()
+      });
+    } catch (err) {
+      noteServerHealthCheck(db, "degraded");
+      recordDbOpMetric(db, {
+        operation: "READ",
+        collection: "system_settings",
+        durationMs: 0,
+        success: false,
+        errorMessage: err?.message,
+        correlationId: req.correlationId
+      });
+      return res.status(503).json({
+        success: false,
+        status: "degraded",
+        error: err?.message || "Health probe failed."
+      });
+    }
+  });
+  app.post("/api/monitoring/alerts/action", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        ["super_admin"],
+        "Update Monitoring Alert"
+      );
+      if (!caller) return;
+      const parsed = AlertActionSchema.safeParse(req.body || {});
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || "Invalid alert action payload."
+        });
+      }
+      const { groupKey, action } = parsed.data;
+      const store = getStore2(db);
+      const alert = store.alerts.get(groupKey);
+      if (!alert) {
+        return res.status(404).json({
+          success: false,
+          error: "Alert group not found."
+        });
+      }
+      const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+      if (action === "ACKNOWLEDGE") {
+        alert.status = "ACKNOWLEDGED";
+        alert.acknowledgedAt = nowIso;
+        alert.acknowledgedBy = caller.loginId;
+      } else if (action === "RESOLVE") {
+        alert.status = "RESOLVED";
+        alert.resolvedAt = nowIso;
+        alert.resolvedBy = caller.loginId;
+      } else if (action === "REOPEN") {
+        alert.status = "ACTIVE";
+        alert.resolvedAt = null;
+        alert.resolvedBy = null;
+      }
+      await db.collection("monitoring_alerts").doc(groupKey).set(alert, { merge: true }).catch(() => {
+      });
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: `MONITORING_ALERT_${action}`,
+        category: "SYSTEM",
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        targetType: "MONITORING_ALERT",
+        targetId: groupKey,
+        newValue: { status: alert.status },
+        actionSource: "SYSTEM_PERFORMANCE_CENTER",
+        description: `Alert "${alert.title}" (${groupKey}) marked ${alert.status} by ${caller.loginId}.`,
+        success: true
+      }).catch(() => {
+      });
+      return res.json({ success: true, alert });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: err?.message || "Failed to update monitoring alert."
+      });
+    }
+  });
+  app.get("/api/monitoring/thresholds", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        ["super_admin"],
+        "View Monitoring Thresholds"
+      );
+      if (!caller) return;
+      await ensureHydrated();
+      return res.json({
+        success: true,
+        thresholds: getStore2(db).thresholds
+      });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err?.message || "Failed to load thresholds." });
+    }
+  });
+  app.post("/api/monitoring/thresholds", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        ["super_admin"],
+        "Update Monitoring Thresholds"
+      );
+      if (!caller) return;
+      const parsed = ThresholdUpdateSchema.safeParse(req.body || {});
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || "Invalid threshold parameters."
+        });
+      }
+      const store = getStore2(db);
+      const previous = { ...store.thresholds };
+      store.thresholds = {
+        ...store.thresholds,
+        ...parsed.data
+      };
+      await db.collection("monitoring_config").doc("thresholds").set(
+        {
+          ...store.thresholds,
+          updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+          updatedBy: caller.loginId
+        },
+        { merge: true }
+      );
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: "MONITORING_THRESHOLDS_UPDATED",
+        category: "SETTINGS",
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        targetType: "MONITORING_CONFIG",
+        targetId: "thresholds",
+        oldValue: previous,
+        newValue: store.thresholds,
+        actionSource: "SYSTEM_PERFORMANCE_CENTER",
+        description: `Updated live monitoring thresholds & alert configuration.`,
+        success: true
+      }).catch(() => {
+      });
+      evaluateAlertThresholds(db);
+      return res.json({
+        success: true,
+        thresholds: store.thresholds
+      });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: err?.message || "Failed to update monitoring thresholds."
+      });
+    }
+  });
+  const SPEEDTEST_PAYLOAD_BUFFER = crypto2.randomBytes(524288);
+  app.get("/api/network/ping", async (req, res) => {
+    const startNs = performance.now();
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "Network RTT Probe");
+      if (!caller) return;
+      const serverProcessMs = roundMs2(performance.now() - startNs);
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+      res.setHeader("Timing-Allow-Origin", "*");
+      res.setHeader("X-Server-Process-Ms", String(serverProcessMs));
+      res.setHeader("Server-Timing", `app;dur=${serverProcessMs}`);
+      return res.json({
+        ok: true,
+        probeKind: "HTTP_APP_RTT",
+        serverTimeIso: (/* @__PURE__ */ new Date()).toISOString(),
+        serverProcessMs
+      });
+    } catch (err) {
+      return res.status(500).json({
+        ok: false,
+        error: err?.message || "Network ping probe failed."
+      });
+    }
+  });
+  app.get("/api/network/speedtest/download", async (req, res) => {
+    const startNs = performance.now();
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "Network Download Speed Test");
+      if (!caller) return;
+      const requested = Number(req.query.bytes ?? 262144);
+      const boundedBytes = Number.isFinite(requested) ? Math.max(32768, Math.min(524288, Math.floor(requested))) : 262144;
+      const chunk = SPEEDTEST_PAYLOAD_BUFFER.subarray(0, boundedBytes);
+      const serverProcessMs = roundMs2(performance.now() - startNs);
+      res.setHeader("Content-Type", "application/octet-stream");
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+      res.setHeader("Timing-Allow-Origin", "*");
+      res.setHeader("X-Payload-Bytes", String(boundedBytes));
+      res.setHeader("X-Server-Process-Ms", String(serverProcessMs));
+      res.setHeader("Server-Timing", `app;dur=${serverProcessMs}`);
+      return res.status(200).send(chunk);
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: err?.message || "Download speed test failed."
+      });
+    }
+  });
+  app.post("/api/network/speedtest/upload", async (req, res) => {
+    const startNs = performance.now();
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "Network Upload Speed Test");
+      if (!caller) return;
+      let receivedBytes = 0;
+      const bodyVal = req.body;
+      if (Buffer.isBuffer(bodyVal)) {
+        receivedBytes = bodyVal.byteLength;
+      } else if (typeof bodyVal === "string") {
+        receivedBytes = Buffer.byteLength(bodyVal, "utf8");
+      } else if (bodyVal && typeof bodyVal === "object") {
+        receivedBytes = Buffer.byteLength(JSON.stringify(bodyVal), "utf8");
+      } else {
+        const cl = Number(req.headers["content-length"] || 0);
+        if (Number.isFinite(cl) && cl > 0) receivedBytes = cl;
+      }
+      if (receivedBytes > 6e5) {
+        return res.status(413).json({
+          success: false,
+          error: "Upload speed test payload exceeds 512 KB cap."
+        });
+      }
+      const serverReceiveMs = roundMs2(performance.now() - startNs);
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+      res.setHeader("Timing-Allow-Origin", "*");
+      res.setHeader("X-Server-Process-Ms", String(serverReceiveMs));
+      return res.json({
+        success: true,
+        receivedBytes,
+        serverReceiveMs,
+        checkedAt: (/* @__PURE__ */ new Date()).toISOString()
+      });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: err?.message || "Upload speed test failed."
+      });
+    }
+  });
+}
+
+// serverLoginSecurity.ts
 var MAX_CONSECUTIVE_FAILED_ATTEMPTS = 3;
 var LOCKED_ACCOUNT_MESSAGE = "Your account has been temporarily blocked. Please contact Super Admin.";
+var SUPER_ADMIN_PROGRESSIVE_LOCK_MINUTES = [10, 20, 30, 60];
+var DEFAULT_SUPER_ADMIN_LOCKOUT_RESET_HOURS = 24;
+var MIN_SUPER_ADMIN_LOCKOUT_RESET_HOURS = 6;
+var MAX_SUPER_ADMIN_LOCKOUT_RESET_HOURS = 720;
+function computeSuperAdminLockDurationMinutes(progressiveLockLevel) {
+  const safeLevel = Math.max(1, Math.floor(Number(progressiveLockLevel) || 1));
+  const idx = Math.min(safeLevel - 1, SUPER_ADMIN_PROGRESSIVE_LOCK_MINUTES.length - 1);
+  return SUPER_ADMIN_PROGRESSIVE_LOCK_MINUTES[idx];
+}
+function formatLockoutDurationText(remainingSeconds) {
+  const safeSec = Math.max(1, Math.ceil(Number(remainingSeconds) || 0));
+  const mins = Math.floor(safeSec / 60);
+  const secs = safeSec % 60;
+  if (mins <= 0) {
+    return `${secs} second${secs === 1 ? "" : "s"}`;
+  }
+  if (secs === 0) {
+    return `${mins} minute${mins === 1 ? "" : "s"}`;
+  }
+  return `${mins}m ${String(secs).padStart(2, "0")}s`;
+}
+async function resolveSuperAdminLockoutResetHours(db) {
+  let candidate = null;
+  try {
+    const snap = await db.collection("system_settings").doc("global").get();
+    if (snap.exists) {
+      const val = Number(snap.data()?.superAdminLockoutResetHours);
+      if (Number.isFinite(val) && val > 0) {
+        candidate = val;
+      }
+    }
+  } catch {
+  }
+  if (candidate === null && process.env.SUPER_ADMIN_LOCKOUT_RESET_HOURS) {
+    const envVal = Number(process.env.SUPER_ADMIN_LOCKOUT_RESET_HOURS);
+    if (Number.isFinite(envVal) && envVal > 0) {
+      candidate = envVal;
+    }
+  }
+  if (candidate === null) {
+    candidate = DEFAULT_SUPER_ADMIN_LOCKOUT_RESET_HOURS;
+  }
+  return Math.min(
+    MAX_SUPER_ADMIN_LOCKOUT_RESET_HOURS,
+    Math.max(MIN_SUPER_ADMIN_LOCKOUT_RESET_HOURS, Math.round(candidate))
+  );
+}
+function resolveAuthoritativeLockedUntilMs(secData, userData) {
+  const candidates = [
+    secData?.lockedUntilMs,
+    userData?.lockedUntilMs,
+    secData?.lockoutUntil,
+    secData?.lockedUntil,
+    userData?.lockoutUntil,
+    userData?.lockedUntil
+  ];
+  for (const val of candidates) {
+    if (typeof val === "number" && Number.isFinite(val) && val > 0) {
+      return val;
+    }
+    if (typeof val === "string" && val.trim()) {
+      const parsed = Date.parse(val.trim());
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return parsed;
+      }
+    }
+  }
+  return null;
+}
+function resolveAuthoritativeLockedUntilIso(lockedUntilMs, secData, userData) {
+  if (lockedUntilMs === null) return null;
+  const rawIso = secData?.lockoutUntil || secData?.lockedUntil || userData?.lockoutUntil || userData?.lockedUntil;
+  if (typeof rawIso === "string" && rawIso.trim() && Number.isFinite(Date.parse(rawIso.trim()))) {
+    return rawIso.trim();
+  }
+  return new Date(lockedUntilMs).toISOString();
+}
+function resolveCanonicalSuperAdminLockWindow(secData, userData) {
+  const explicitMs = resolveAuthoritativeLockedUntilMs(secData, userData);
+  const explicitDuration = typeof secData?.lockDurationMinutes === "number" && Number.isFinite(secData.lockDurationMinutes) ? secData.lockDurationMinutes : typeof userData?.lockDurationMinutes === "number" && Number.isFinite(userData.lockDurationMinutes) ? userData.lockDurationMinutes : null;
+  if (explicitMs !== null) {
+    const level = Math.max(
+      1,
+      Number(secData?.progressiveLockLevel ?? userData?.progressiveLockLevel ?? 1)
+    );
+    return {
+      lockedUntilMs: explicitMs,
+      lockoutUntil: resolveAuthoritativeLockedUntilIso(explicitMs, secData, userData),
+      lockDurationMinutes: explicitDuration ?? computeSuperAdminLockDurationMinutes(level)
+    };
+  }
+  const anchorCandidates = [
+    secData?.lockedAt,
+    userData?.lockedAt,
+    secData?.lastFailedAt,
+    secData?.updatedAt,
+    userData?.updatedAt
+  ];
+  let anchorMs = null;
+  for (const raw of anchorCandidates) {
+    if (typeof raw === "string" && raw.trim()) {
+      const parsed = Date.parse(raw.trim());
+      if (Number.isFinite(parsed) && parsed > 0) {
+        anchorMs = parsed;
+        break;
+      }
+    }
+  }
+  if (anchorMs === null) {
+    return { lockedUntilMs: null, lockoutUntil: null, lockDurationMinutes: explicitDuration };
+  }
+  const effectiveLevel = Math.max(
+    1,
+    Number(secData?.progressiveLockLevel ?? userData?.progressiveLockLevel ?? 1)
+  );
+  const derivedDuration = explicitDuration ?? computeSuperAdminLockDurationMinutes(effectiveLevel);
+  const derivedUntilMs = anchorMs + derivedDuration * 60 * 1e3;
+  return {
+    lockedUntilMs: derivedUntilMs,
+    lockoutUntil: new Date(derivedUntilMs).toISOString(),
+    lockDurationMinutes: derivedDuration
+  };
+}
 var loginMutexQueues = /* @__PURE__ */ new Map();
 async function withLoginIdLock(loginId, task) {
   const key = loginId.trim().toLowerCase() || "__anonymous__";
@@ -1938,10 +4600,10 @@ function getIpScopeKey(ip, loginId) {
   return `${cleanIp}::${cleanLogin}`;
 }
 function getIpRateDocId(scopeKey) {
-  return `ip_${crypto2.createHash("sha256").update(scopeKey).digest("hex").slice(0, 32)}`;
+  return `ip_${crypto3.createHash("sha256").update(scopeKey).digest("hex").slice(0, 32)}`;
 }
-async function checkIpProgressiveRateLimitPersistent(db, ip, loginId) {
-  const now = Date.now();
+async function checkIpProgressiveRateLimitPersistent(db, ip, loginId, nowMs) {
+  const now = typeof nowMs === "number" ? nowMs : Date.now();
   const keysToCheck = [
     ...loginId ? [getIpScopeKey(ip, loginId)] : [],
     getIpScopeKey(ip, "__unknown_probe__")
@@ -1963,8 +4625,8 @@ async function checkIpProgressiveRateLimitPersistent(db, ip, loginId) {
   }
   return { allowed: true };
 }
-async function recordIpFailurePersistent(db, ip, kind, loginId) {
-  const now = Date.now();
+async function recordIpFailurePersistent(db, ip, kind, loginId, nowMs) {
+  const now = typeof nowMs === "number" ? nowMs : Date.now();
   const nowIso = new Date(now).toISOString();
   const cleanLogin = kind === "unknown_id" ? "__unknown_probe__" : (loginId || "__global__").trim().toLowerCase();
   const scopeKey = getIpScopeKey(ip, cleanLogin);
@@ -2064,16 +4726,16 @@ function generateStrongTemporaryPassword(length = 14) {
   const special = "@#$%&*!?";
   const all = upper + lower + digits + special;
   const chars = [
-    upper[crypto2.randomInt(0, upper.length)],
-    lower[crypto2.randomInt(0, lower.length)],
-    digits[crypto2.randomInt(0, digits.length)],
-    special[crypto2.randomInt(0, special.length)]
+    upper[crypto3.randomInt(0, upper.length)],
+    lower[crypto3.randomInt(0, lower.length)],
+    digits[crypto3.randomInt(0, digits.length)],
+    special[crypto3.randomInt(0, special.length)]
   ];
   while (chars.length < length) {
-    chars.push(all[crypto2.randomInt(0, all.length)]);
+    chars.push(all[crypto3.randomInt(0, all.length)]);
   }
   for (let i = chars.length - 1; i > 0; i--) {
-    const j = crypto2.randomInt(0, i + 1);
+    const j = crypto3.randomInt(0, i + 1);
     const tmp = chars[i];
     chars[i] = chars[j];
     chars[j] = tmp;
@@ -2225,16 +4887,16 @@ async function captureTelemetryContext(db, req) {
   return { ipAddress, geoLocation, uaMeta };
 }
 async function recordLoginAttemptDoc(db, params) {
-  const nowDate = /* @__PURE__ */ new Date();
-  const now = nowDate.toISOString();
-  const attemptId = `att_${nowDate.getTime()}_${crypto2.randomBytes(4).toString("hex")}`;
+  const effectiveNowMs = typeof params.nowMs === "number" ? params.nowMs : Date.now();
+  const now = new Date(effectiveNowMs).toISOString();
+  const attemptId = `att_${effectiveNowMs}_${crypto3.randomBytes(4).toString("hex")}`;
   await db.collection("login_attempts").doc(attemptId).set({
     id: attemptId,
     loginId: params.loginId.trim().toLowerCase(),
     role: String(params.role || "UNKNOWN").toUpperCase(),
     firebaseUid: params.firebaseUid || null,
     timestamp: now,
-    timestampMs: nowDate.getTime(),
+    timestampMs: effectiveNowMs,
     success: params.success,
     outcome: params.outcome,
     failureReasonCategory: params.failureReasonCategory,
@@ -2242,6 +4904,9 @@ async function recordLoginAttemptDoc(db, params) {
     attemptNumber: params.attemptNumber ?? null,
     consecutiveFailedAfter: params.consecutiveFailedAfter ?? null,
     triggeredLock: Boolean(params.triggeredLock),
+    lockDurationMinutes: params.lockDurationMinutes ?? null,
+    lockoutUntil: params.lockedUntil ?? null,
+    lockedUntil: params.lockedUntil ?? null,
     ipAddress: params.telemetry.ipAddress,
     geoLocation: params.telemetry.geoLocation,
     browser: params.telemetry.uaMeta.browser,
@@ -2253,9 +4918,9 @@ async function recordLoginAttemptDoc(db, params) {
   return attemptId;
 }
 async function recordSecurityAuditLogDoc(db, params) {
-  const nowDate = /* @__PURE__ */ new Date();
-  const now = nowDate.toISOString();
-  const logId = `saud_${nowDate.getTime()}_${crypto2.randomBytes(4).toString("hex")}`;
+  const effectiveNowMs = typeof params.nowMs === "number" ? params.nowMs : Date.now();
+  const now = new Date(effectiveNowMs).toISOString();
+  const logId = `saud_${effectiveNowMs}_${crypto3.randomBytes(4).toString("hex")}`;
   const safeMeta = {};
   if (params.metadata) {
     for (const [k, v] of Object.entries(params.metadata)) {
@@ -2274,7 +4939,7 @@ async function recordSecurityAuditLogDoc(db, params) {
     actorLoginId: (params.actorLoginId || params.targetLoginId || "system").trim().toLowerCase(),
     actorRole: String(params.actorRole || "SYSTEM").toUpperCase(),
     timestamp: now,
-    timestampMs: nowDate.getTime(),
+    timestampMs: effectiveNowMs,
     ipAddress: params.telemetry.ipAddress,
     geoLocation: params.telemetry.geoLocation,
     deviceInfo: {
@@ -2303,12 +4968,14 @@ async function seedAccountSecurityRecords(db) {
           role: String(uData.role || "user"),
           status: String(uData.status || "Active"),
           lockStatus: uData.isLocked || uData.lockStatus === "LOCKED" ? "LOCKED" : "ACTIVE",
+          lockedUntilMs: typeof uData.lockedUntilMs === "number" ? uData.lockedUntilMs : null,
           loginId
         });
       }
       const secId = `sec_${loginId}`;
       const secRef = db.collection("account_security").doc(secId);
       const secSnap = await secRef.get();
+      const isCanonicalSA = isCanonicalSuperAdminAccount(uDoc.id, uData);
       if (!secSnap.exists) {
         await secRef.set({
           id: secId,
@@ -2317,6 +4984,7 @@ async function seedAccountSecurityRecords(db) {
           firebaseUid: uData.authUid || uDoc.id,
           email: uData.email || `${loginId}@narid.com`,
           lockStatus: uData.isLocked || uData.lockStatus === "LOCKED" ? "LOCKED" : "ACTIVE",
+          lockPolicyType: isCanonicalSA ? "PROGRESSIVE_TEMPORARY" : "PERMANENT_MANUAL",
           consecutiveFailedAttempts: Number(uData.consecutiveFailedAttempts || 0),
           maxAttemptsAllowed: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
           totalLoginAttempts: 0,
@@ -2324,7 +4992,21 @@ async function seedAccountSecurityRecords(db) {
           totalFailedLogins: 0,
           forcePasswordChange: uData.mustChangePassword === true || uData.forcePasswordChange === true,
           lockedAt: uData.lockedAt || null,
+          lockoutUntil: uData.lockoutUntil || uData.lockedUntil || null,
+          lockedUntil: uData.lockedUntil || uData.lockoutUntil || null,
+          lockedUntilMs: typeof uData.lockedUntilMs === "number" ? uData.lockedUntilMs : null,
+          lockDurationMinutes: typeof uData.lockDurationMinutes === "number" ? uData.lockDurationMinutes : null,
           lockReason: uData.lockReason || null,
+          progressiveLockLevel: Number(uData.progressiveLockLevel || 0),
+          totalLockoutEvents: Number(uData.totalLockoutEvents || 0),
+          lastLockoutAt: uData.lastLockoutAt || null,
+          lastLockExpiredAt: uData.lastLockExpiredAt || null,
+          cleanWindowStartAt: uData.cleanWindowStartAt || null,
+          cleanWindowStartMs: typeof uData.cleanWindowStartMs === "number" ? uData.cleanWindowStartMs : null,
+          cleanLoginsSinceLastLockout: Number(uData.cleanLoginsSinceLastLockout || 0),
+          pendingPostLockoutLoginAudit: Boolean(uData.pendingPostLockoutLoginAudit),
+          lockoutLevelResetAt: uData.lockoutLevelResetAt || null,
+          lockoutLevelResetReason: uData.lockoutLevelResetReason || null,
           lastFailedAt: null,
           lastFailedIp: null,
           lastFailedGeo: null,
@@ -2352,6 +5034,10 @@ async function seedAccountSecurityRecords(db) {
         if (uData.authUid && sData.firebaseUid !== uData.authUid) {
           updates.firebaseUid = uData.authUid;
         }
+        const expectedPolicy = isCanonicalSA ? "PROGRESSIVE_TEMPORARY" : "PERMANENT_MANUAL";
+        if (sData.lockPolicyType !== expectedPolicy) {
+          updates.lockPolicyType = expectedPolicy;
+        }
         if (Object.keys(updates).length > 0) {
           updates.updatedAt = now;
           await secRef.update(updates);
@@ -2362,15 +5048,22 @@ async function seedAccountSecurityRecords(db) {
     console.warn("[Security Boot] account_security seed notice:", err?.message || err);
   }
 }
-var UnblockAccountSchema = z.object({
-  targetLoginId: z.string().trim().min(1, "Target Login ID is required.").max(64),
-  reason: z.string().trim().min(5, "An explicit unblock reason (at least 5 characters) is mandatory.").max(500),
-  confirmed: z.literal(true, { message: "Explicit confirmation is required to unblock an account." })
+var UnblockAccountSchema = z2.object({
+  targetLoginId: z2.string().trim().min(1, "Target Login ID is required.").max(64),
+  reason: z2.string().trim().min(5, "An explicit unblock reason (at least 5 characters) is mandatory.").max(500),
+  confirmed: z2.literal(true, { message: "Explicit confirmation is required to unblock an account." })
 });
-var GenerateTempPasswordSchema = z.object({
-  targetLoginId: z.string().trim().min(1, "Target Login ID is required.").max(64),
-  reason: z.string().trim().min(5, "A governance reason (at least 5 characters) is mandatory.").max(500),
-  freshSuperAdminPassword: z.string().optional()
+var GenerateTempPasswordSchema = z2.object({
+  targetLoginId: z2.string().trim().min(1, "Target Login ID is required.").max(64),
+  reason: z2.string().trim().min(5, "A governance reason (at least 5 characters) is mandatory.").max(500),
+  freshSuperAdminPassword: z2.string().optional()
+});
+var ResetSuperAdminLockoutLevelSchema = z2.object({
+  reason: z2.string().trim().min(5, "An explicit governance reason (at least 5 characters) is mandatory.").max(500),
+  confirmed: z2.literal(true, {
+    message: "Explicit confirmation is required to reset the Super Admin progressive lockout level."
+  }),
+  freshSuperAdminPassword: z2.string().optional()
 });
 function registerLoginSecurityRoutes(app, deps) {
   const {
@@ -2380,8 +5073,10 @@ function registerLoginSecurityRoutes(app, deps) {
     verifyPassword: verifyPassword2,
     hashPassword: hashPassword2,
     syncExistingFirebaseAuthPassword: syncExistingFirebaseAuthPassword2,
-    requireVerifiedCaller
+    requireVerifiedCaller,
+    nowProvider
   } = deps;
+  const getNowMs = nowProvider || (() => Date.now());
   app.post("/api/auth/login", async (req, res) => {
     try {
       const loginIdRaw = typeof req.body?.loginId === "string" ? req.body.loginId.trim() : "";
@@ -2394,7 +5089,13 @@ function registerLoginSecurityRoutes(app, deps) {
       }
       const cleanId = loginIdRaw.toLowerCase();
       const telemetry = await captureTelemetryContext(db, req);
-      const ipCheck = await checkIpProgressiveRateLimitPersistent(db, telemetry.ipAddress, cleanId);
+      const requestNowMs = getNowMs();
+      const ipCheck = await checkIpProgressiveRateLimitPersistent(
+        db,
+        telemetry.ipAddress,
+        cleanId,
+        requestNowMs
+      );
       if (!ipCheck.allowed) {
         await recordLoginAttemptDoc(db, {
           loginId: cleanId,
@@ -2403,6 +5104,7 @@ function registerLoginSecurityRoutes(app, deps) {
           outcome: "BLOCKED_RATE_LIMIT",
           failureReasonCategory: "RATE_LIMITED",
           failureReason: ipCheck.reason || "Rate limit cooldown active",
+          nowMs: requestNowMs,
           telemetry
         });
         await recordSecurityAuditLogDoc(db, {
@@ -2412,6 +5114,7 @@ function registerLoginSecurityRoutes(app, deps) {
           reason: "IP progressive rate limit cooldown blocked login attempt",
           details: `Blocked login attempt for "${cleanId}" from IP ${telemetry.ipAddress} (${ipCheck.cooldownSeconds}s remaining).`,
           metadata: { cooldownSeconds: ipCheck.cooldownSeconds },
+          nowMs: requestNowMs,
           telemetry
         });
         return res.status(429).json({
@@ -2521,32 +5224,88 @@ function registerLoginSecurityRoutes(app, deps) {
             }
           };
         }
-        const now = (/* @__PURE__ */ new Date()).toISOString();
+        const nowMs = getNowMs();
+        const now = new Date(nowMs).toISOString();
         const deviceSummary = {
           browser: telemetry.uaMeta.browser,
           os: telemetry.uaMeta.os,
           deviceType: telemetry.uaMeta.deviceType
         };
+        const isPreCheckedCanonicalSuperAdmin = isCanonicalSuperAdminAccount(userDoc.id, userData);
+        const superAdminResetHours = isPreCheckedCanonicalSuperAdmin ? await resolveSuperAdminLockoutResetHours(db) : DEFAULT_SUPER_ADMIN_LOCKOUT_RESET_HOURS;
         const txOutcome = await db.runTransaction(async (tx) => {
-          const secSnap = await tx.get(secRef);
-          const curSec = secSnap.exists ? secSnap.data() || {} : {
+          const [secSnap, freshUserSnap] = await Promise.all([tx.get(secRef), tx.get(userRef)]);
+          const freshUserData = freshUserSnap.exists ? freshUserSnap.data() || {} : userData;
+          const isCanonicalSA = isCanonicalSuperAdminAccount(userDoc.id, freshUserData);
+          let curSec = secSnap.exists ? { ...secSnap.data() || {} } : {
             id: `sec_${cleanId}`,
             loginId: cleanId,
             role: roleUpper,
             firebaseUid,
-            email: userData.email || `${cleanId}@narid.com`,
-            lockStatus: userData.isLocked || userData.lockStatus === "LOCKED" ? "LOCKED" : "ACTIVE",
-            consecutiveFailedAttempts: Number(userData.consecutiveFailedAttempts || 0),
+            email: freshUserData.email || `${cleanId}@narid.com`,
+            lockStatus: freshUserData.isLocked || freshUserData.lockStatus === "LOCKED" ? "LOCKED" : "ACTIVE",
+            lockPolicyType: isCanonicalSA ? "PROGRESSIVE_TEMPORARY" : "PERMANENT_MANUAL",
+            consecutiveFailedAttempts: Number(freshUserData.consecutiveFailedAttempts || 0),
             maxAttemptsAllowed: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
             totalLoginAttempts: 0,
             totalSuccessfulLogins: 0,
             totalFailedLogins: 0,
-            forcePasswordChange: userData.mustChangePassword === true || userData.forcePasswordChange === true,
-            lockedAt: userData.lockedAt || null,
-            lockReason: userData.lockReason || null
+            forcePasswordChange: freshUserData.mustChangePassword === true || freshUserData.forcePasswordChange === true,
+            lockedAt: freshUserData.lockedAt || null,
+            lockoutUntil: freshUserData.lockoutUntil || freshUserData.lockedUntil || null,
+            lockedUntil: freshUserData.lockedUntil || freshUserData.lockoutUntil || null,
+            lockedUntilMs: typeof freshUserData.lockedUntilMs === "number" ? freshUserData.lockedUntilMs : null,
+            lockDurationMinutes: typeof freshUserData.lockDurationMinutes === "number" ? freshUserData.lockDurationMinutes : null,
+            lockReason: freshUserData.lockReason || null,
+            progressiveLockLevel: Number(freshUserData.progressiveLockLevel || 0),
+            totalLockoutEvents: Number(freshUserData.totalLockoutEvents || 0),
+            lastLockoutAt: freshUserData.lastLockoutAt || null,
+            lastLockExpiredAt: freshUserData.lastLockExpiredAt || null,
+            cleanWindowStartAt: freshUserData.cleanWindowStartAt || null,
+            cleanWindowStartMs: typeof freshUserData.cleanWindowStartMs === "number" ? freshUserData.cleanWindowStartMs : null,
+            cleanLoginsSinceLastLockout: Number(freshUserData.cleanLoginsSinceLastLockout || 0),
+            pendingPostLockoutLoginAudit: Boolean(freshUserData.pendingPostLockoutLoginAudit)
           };
-          const isCurrentlyLocked = curSec.lockStatus === "LOCKED" || userData.lockStatus === "LOCKED" || userData.isLocked === true;
+          const saLockWindow = isCanonicalSA ? resolveCanonicalSuperAdminLockWindow(curSec, freshUserData) : {
+            lockedUntilMs: resolveAuthoritativeLockedUntilMs(curSec, freshUserData),
+            lockoutUntil: null,
+            lockDurationMinutes: null
+          };
+          const existingLockedUntilMs = saLockWindow.lockedUntilMs;
+          let isCurrentlyLocked = curSec.lockStatus === "LOCKED" || freshUserData.lockStatus === "LOCKED" || freshUserData.isLocked === true;
+          let expiredLockInfo = null;
+          if (isCurrentlyLocked && isCanonicalSA && existingLockedUntilMs !== null && nowMs >= existingLockedUntilMs) {
+            const retainedLevel = Number(
+              curSec.progressiveLockLevel ?? freshUserData.progressiveLockLevel ?? 0
+            );
+            expiredLockInfo = {
+              previousLockedAt: curSec.lockedAt || freshUserData.lockedAt || null,
+              previousLockedUntil: saLockWindow.lockoutUntil || resolveAuthoritativeLockedUntilIso(existingLockedUntilMs, curSec, freshUserData),
+              previousDurationMinutes: saLockWindow.lockDurationMinutes ?? curSec.lockDurationMinutes ?? freshUserData.lockDurationMinutes ?? null,
+              retainedProgressiveLevel: retainedLevel
+            };
+            isCurrentlyLocked = false;
+            curSec = {
+              ...curSec,
+              lockStatus: "ACTIVE",
+              lockPolicyType: "PROGRESSIVE_TEMPORARY",
+              consecutiveFailedAttempts: 0,
+              lockedAt: null,
+              lockoutUntil: null,
+              lockedUntil: null,
+              lockedUntilMs: null,
+              lockDurationMinutes: null,
+              lockReason: null,
+              lastLockExpiredAt: now,
+              progressiveLockLevel: retainedLevel,
+              pendingPostLockoutLoginAudit: true
+            };
+          }
           if (isCurrentlyLocked) {
+            const activeLockedUntilMs = isCanonicalSA ? existingLockedUntilMs : null;
+            const remainingSeconds = isCanonicalSA && activeLockedUntilMs !== null ? Math.max(1, Math.ceil((activeLockedUntilMs - nowMs) / 1e3)) : null;
+            const lockedUntilIso = isCanonicalSA && activeLockedUntilMs !== null ? saLockWindow.lockoutUntil || resolveAuthoritativeLockedUntilIso(activeLockedUntilMs, curSec, freshUserData) : null;
+            const activeDurationMinutes = isCanonicalSA ? saLockWindow.lockDurationMinutes ?? curSec.lockDurationMinutes ?? freshUserData.lockDurationMinutes ?? null : null;
             tx.set(
               secRef,
               {
@@ -2554,33 +5313,135 @@ function registerLoginSecurityRoutes(app, deps) {
                 role: roleUpper,
                 firebaseUid,
                 lockStatus: "LOCKED",
+                lockPolicyType: isCanonicalSA ? "PROGRESSIVE_TEMPORARY" : "PERMANENT_MANUAL",
                 totalLoginAttempts: Number(curSec.totalLoginAttempts || 0) + 1,
                 lastFailedAt: now,
                 lastFailedIp: telemetry.ipAddress,
                 lastFailedGeo: telemetry.geoLocation,
                 lastFailedDevice: deviceSummary,
-                lastFailedReason: "Attempted login while account LOCKED",
+                lastFailedReason: isCanonicalSA && remainingSeconds !== null ? `Attempted login during active temporary lockout (${formatLockoutDurationText(remainingSeconds)} remaining)` : "Attempted login while account LOCKED",
                 updatedAt: now
               },
               { merge: true }
             );
             return {
               kind: "LOCKED_REJECT",
-              consecutiveFailed: Number(curSec.consecutiveFailedAttempts || MAX_CONSECUTIVE_FAILED_ATTEMPTS)
+              isCanonicalSA,
+              temporaryLock: Boolean(isCanonicalSA && activeLockedUntilMs !== null),
+              lockedUntil: lockedUntilIso,
+              lockedUntilMs: activeLockedUntilMs,
+              serverNowMs: nowMs,
+              remainingSeconds,
+              lockDurationMinutes: activeDurationMinutes,
+              progressiveLockLevel: Number(
+                curSec.progressiveLockLevel ?? freshUserData.progressiveLockLevel ?? 0
+              ),
+              consecutiveFailed: Number(curSec.consecutiveFailedAttempts || MAX_CONSECUTIVE_FAILED_ATTEMPTS),
+              expiredLockInfo: null,
+              freshUserData
             };
           }
-          const isPasswordValid = userData.passwordHash ? verifyPassword2(password, String(userData.passwordHash)) : false;
+          const isPasswordValid = freshUserData.passwordHash ? verifyPassword2(password, String(freshUserData.passwordHash)) : false;
           if (!isPasswordValid) {
             const nextConsecutive = Number(curSec.consecutiveFailedAttempts || 0) + 1;
             const reachedLock = nextConsecutive >= MAX_CONSECUTIVE_FAILED_ATTEMPTS;
+            if (isCanonicalSA) {
+              const currentLevel = Number(
+                curSec.progressiveLockLevel ?? freshUserData.progressiveLockLevel ?? 0
+              );
+              const nextLevel = reachedLock ? currentLevel + 1 : currentLevel;
+              const durationMinutes = reachedLock ? computeSuperAdminLockDurationMinutes(nextLevel) : null;
+              const lockedUntilMs = reachedLock && durationMinutes !== null ? nowMs + durationMinutes * 60 * 1e3 : null;
+              const lockedUntilIso = lockedUntilMs !== null ? new Date(lockedUntilMs).toISOString() : null;
+              const totalLockoutEvents = Number(curSec.totalLockoutEvents ?? freshUserData.totalLockoutEvents ?? 0) + (reachedLock ? 1 : 0);
+              const lockReasonText = reachedLock && durationMinutes !== null ? `Progressive temporary lockout (${durationMinutes} minutes) after ${nextConsecutive} consecutive failed password attempts` : null;
+              const secUpdate2 = {
+                ...curSec,
+                id: `sec_${cleanId}`,
+                loginId: cleanId,
+                role: roleUpper,
+                firebaseUid,
+                email: freshUserData.email || `${cleanId}@narid.com`,
+                lockStatus: reachedLock ? "LOCKED" : "ACTIVE",
+                lockPolicyType: "PROGRESSIVE_TEMPORARY",
+                consecutiveFailedAttempts: nextConsecutive,
+                maxAttemptsAllowed: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
+                totalLoginAttempts: Number(curSec.totalLoginAttempts || 0) + 1,
+                totalFailedLogins: Number(curSec.totalFailedLogins || 0) + 1,
+                lastFailedAt: now,
+                lastFailedIp: telemetry.ipAddress,
+                lastFailedGeo: telemetry.geoLocation,
+                lastFailedDevice: deviceSummary,
+                lastFailedReason: reachedLock ? `Super Admin temporarily locked for ${durationMinutes} minutes after ${nextConsecutive} consecutive failed password attempts` : `Invalid password (Attempt ${nextConsecutive} of ${MAX_CONSECUTIVE_FAILED_ATTEMPTS})`,
+                lockedAt: reachedLock ? now : null,
+                lockoutUntil: lockedUntilIso,
+                lockedUntil: lockedUntilIso,
+                lockedUntilMs,
+                lockDurationMinutes: durationMinutes,
+                lockReason: lockReasonText,
+                progressiveLockLevel: nextLevel,
+                totalLockoutEvents,
+                lastLockoutAt: reachedLock ? now : curSec.lastLockoutAt || freshUserData.lastLockoutAt || null,
+                lastLockExpiredAt: expiredLockInfo ? now : curSec.lastLockExpiredAt || freshUserData.lastLockExpiredAt || null,
+                // Any failed password attempt clears the sustained clean usage window
+                cleanWindowStartAt: null,
+                cleanWindowStartMs: null,
+                cleanLoginsSinceLastLockout: 0,
+                pendingPostLockoutLoginAudit: reachedLock ? true : Boolean(expiredLockInfo || curSec.pendingPostLockoutLoginAudit),
+                updatedAt: now
+              };
+              tx.set(secRef, secUpdate2, { merge: true });
+              const userUpdates = {
+                consecutiveFailedAttempts: nextConsecutive,
+                isLocked: reachedLock,
+                lockStatus: reachedLock ? "LOCKED" : "ACTIVE",
+                lockPolicyType: "PROGRESSIVE_TEMPORARY",
+                lockedAt: reachedLock ? now : null,
+                lockoutUntil: lockedUntilIso,
+                lockedUntil: lockedUntilIso,
+                lockedUntilMs,
+                lockDurationMinutes: durationMinutes,
+                lockReason: lockReasonText,
+                progressiveLockLevel: nextLevel,
+                totalLockoutEvents,
+                lastLockoutAt: secUpdate2.lastLockoutAt,
+                lastLockExpiredAt: secUpdate2.lastLockExpiredAt,
+                cleanWindowStartAt: null,
+                cleanWindowStartMs: null,
+                cleanLoginsSinceLastLockout: 0,
+                pendingPostLockoutLoginAudit: secUpdate2.pendingPostLockoutLoginAudit,
+                updatedAt: now
+              };
+              if (reachedLock) {
+                userUpdates.sessionRevokedAt = now;
+              }
+              tx.update(userRef, userUpdates);
+              return {
+                kind: reachedLock ? "NOW_LOCKED" : "FAILED_PASSWORD",
+                isCanonicalSA: true,
+                temporaryLock: reachedLock,
+                attemptNumber: nextConsecutive,
+                remainingAttempts: Math.max(0, MAX_CONSECUTIVE_FAILED_ATTEMPTS - nextConsecutive),
+                lockedUntil: lockedUntilIso,
+                lockedUntilMs,
+                serverNowMs: nowMs,
+                remainingSeconds: durationMinutes !== null ? durationMinutes * 60 : null,
+                lockDurationMinutes: durationMinutes,
+                progressiveLockLevel: nextLevel,
+                totalLockoutEvents,
+                expiredLockInfo,
+                freshUserData
+              };
+            }
             const secUpdate = {
               ...curSec,
               id: `sec_${cleanId}`,
               loginId: cleanId,
               role: roleUpper,
               firebaseUid,
-              email: userData.email || `${cleanId}@narid.com`,
+              email: freshUserData.email || `${cleanId}@narid.com`,
               lockStatus: reachedLock ? "LOCKED" : "ACTIVE",
+              lockPolicyType: "PERMANENT_MANUAL",
               consecutiveFailedAttempts: nextConsecutive,
               maxAttemptsAllowed: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
               totalLoginAttempts: Number(curSec.totalLoginAttempts || 0) + 1,
@@ -2599,17 +5460,143 @@ function registerLoginSecurityRoutes(app, deps) {
               consecutiveFailedAttempts: nextConsecutive,
               isLocked: reachedLock,
               lockStatus: reachedLock ? "LOCKED" : "ACTIVE",
-              lockedAt: reachedLock ? now : userData.lockedAt || null,
-              lockReason: reachedLock ? secUpdate.lockReason : userData.lockReason || null,
+              lockedAt: reachedLock ? now : freshUserData.lockedAt || null,
+              lockReason: reachedLock ? secUpdate.lockReason : freshUserData.lockReason || null,
               updatedAt: now
             });
             return {
               kind: reachedLock ? "NOW_LOCKED" : "FAILED_PASSWORD",
+              isCanonicalSA: false,
+              temporaryLock: false,
               attemptNumber: nextConsecutive,
-              remainingAttempts: Math.max(0, MAX_CONSECUTIVE_FAILED_ATTEMPTS - nextConsecutive)
+              remainingAttempts: Math.max(0, MAX_CONSECUTIVE_FAILED_ATTEMPTS - nextConsecutive),
+              lockedUntil: null,
+              lockedUntilMs: null,
+              serverNowMs: nowMs,
+              remainingSeconds: null,
+              lockDurationMinutes: null,
+              progressiveLockLevel: 0,
+              totalLockoutEvents: 0,
+              expiredLockInfo: null,
+              freshUserData
             };
           }
-          const mustChange = userData.mustChangePassword === true || curSec.forcePasswordChange === true;
+          const mustChange = freshUserData.mustChangePassword === true || curSec.forcePasswordChange === true;
+          if (isCanonicalSA) {
+            const wasPostLockoutLogin = Boolean(
+              expiredLockInfo || curSec.pendingPostLockoutLoginAudit || freshUserData.pendingPostLockoutLoginAudit
+            );
+            const currentLevel = Number(
+              curSec.progressiveLockLevel ?? freshUserData.progressiveLockLevel ?? 0
+            );
+            let nextLevel = currentLevel;
+            let nextCleanStartAt = curSec.cleanWindowStartAt || freshUserData.cleanWindowStartAt || null;
+            let nextCleanStartMs = typeof curSec.cleanWindowStartMs === "number" ? curSec.cleanWindowStartMs : typeof freshUserData.cleanWindowStartMs === "number" ? freshUserData.cleanWindowStartMs : null;
+            let nextCleanLogins = Number(
+              curSec.cleanLoginsSinceLastLockout ?? freshUserData.cleanLoginsSinceLastLockout ?? 0
+            );
+            let autoResetLevelInfo = null;
+            if (currentLevel > 0) {
+              const requiredWindowMs = superAdminResetHours * 60 * 60 * 1e3;
+              if (nextCleanStartMs !== null && nowMs - nextCleanStartMs >= requiredWindowMs) {
+                autoResetLevelInfo = {
+                  previousLevel: currentLevel,
+                  cleanWindowHours: superAdminResetHours,
+                  cleanLogins: nextCleanLogins + 1
+                };
+                nextLevel = 0;
+                nextCleanStartAt = null;
+                nextCleanStartMs = null;
+                nextCleanLogins = 0;
+              } else {
+                if (nextCleanStartMs === null) {
+                  nextCleanStartMs = nowMs;
+                  nextCleanStartAt = now;
+                }
+                nextCleanLogins += 1;
+              }
+            } else {
+              nextCleanStartAt = null;
+              nextCleanStartMs = null;
+              nextCleanLogins = 0;
+            }
+            const resetReasonText = autoResetLevelInfo ? `Automatic reset after ${superAdminResetHours}h of sustained clean Super Admin usage with zero failed password attempts` : curSec.lockoutLevelResetReason || freshUserData.lockoutLevelResetReason || null;
+            const resetAtText = autoResetLevelInfo ? now : curSec.lockoutLevelResetAt || freshUserData.lockoutLevelResetAt || null;
+            tx.set(
+              secRef,
+              {
+                ...curSec,
+                id: `sec_${cleanId}`,
+                loginId: cleanId,
+                role: roleUpper,
+                firebaseUid,
+                email: freshUserData.email || `${cleanId}@narid.com`,
+                lockStatus: "ACTIVE",
+                lockPolicyType: "PROGRESSIVE_TEMPORARY",
+                consecutiveFailedAttempts: 0,
+                maxAttemptsAllowed: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
+                totalLoginAttempts: Number(curSec.totalLoginAttempts || 0) + 1,
+                totalSuccessfulLogins: Number(curSec.totalSuccessfulLogins || 0) + 1,
+                forcePasswordChange: mustChange,
+                lockedAt: null,
+                lockoutUntil: null,
+                lockedUntil: null,
+                lockedUntilMs: null,
+                lockDurationMinutes: null,
+                lockReason: null,
+                progressiveLockLevel: nextLevel,
+                totalLockoutEvents: Number(
+                  curSec.totalLockoutEvents ?? freshUserData.totalLockoutEvents ?? 0
+                ),
+                lastLockoutAt: curSec.lastLockoutAt || freshUserData.lastLockoutAt || null,
+                lastLockExpiredAt: expiredLockInfo ? now : curSec.lastLockExpiredAt || freshUserData.lastLockExpiredAt || null,
+                cleanWindowStartAt: nextCleanStartAt,
+                cleanWindowStartMs: nextCleanStartMs,
+                cleanLoginsSinceLastLockout: nextCleanLogins,
+                pendingPostLockoutLoginAudit: false,
+                lockoutLevelResetAt: resetAtText,
+                lockoutLevelResetReason: resetReasonText,
+                lastSuccessAt: now,
+                lastSuccessIp: telemetry.ipAddress,
+                lastSuccessGeo: telemetry.geoLocation,
+                lastSuccessDevice: deviceSummary,
+                updatedAt: now
+              },
+              { merge: true }
+            );
+            tx.update(userRef, {
+              consecutiveFailedAttempts: 0,
+              isLocked: false,
+              lockStatus: "ACTIVE",
+              lockPolicyType: "PROGRESSIVE_TEMPORARY",
+              lockedAt: null,
+              lockoutUntil: null,
+              lockedUntil: null,
+              lockedUntilMs: null,
+              lockDurationMinutes: null,
+              lockReason: null,
+              progressiveLockLevel: nextLevel,
+              lastLockExpiredAt: expiredLockInfo ? now : freshUserData.lastLockExpiredAt || null,
+              cleanWindowStartAt: nextCleanStartAt,
+              cleanWindowStartMs: nextCleanStartMs,
+              cleanLoginsSinceLastLockout: nextCleanLogins,
+              pendingPostLockoutLoginAudit: false,
+              lockoutLevelResetAt: resetAtText,
+              lockoutLevelResetReason: resetReasonText,
+              lastSuccessLoginAt: now,
+              updatedAt: now
+            });
+            return {
+              kind: "SUCCESS",
+              isCanonicalSA: true,
+              mustChange,
+              expiredLockInfo,
+              wasPostLockoutLogin,
+              autoResetLevelInfo,
+              progressiveLockLevel: nextLevel,
+              freshUserData
+            };
+          }
           tx.set(
             secRef,
             {
@@ -2618,7 +5605,7 @@ function registerLoginSecurityRoutes(app, deps) {
               loginId: cleanId,
               role: roleUpper,
               firebaseUid,
-              email: userData.email || `${cleanId}@narid.com`,
+              email: freshUserData.email || `${cleanId}@narid.com`,
               lockStatus: "ACTIVE",
               consecutiveFailedAttempts: 0,
               maxAttemptsAllowed: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
@@ -2642,19 +5629,79 @@ function registerLoginSecurityRoutes(app, deps) {
           });
           return {
             kind: "SUCCESS",
-            mustChange
+            isCanonicalSA: false,
+            mustChange,
+            expiredLockInfo: null,
+            wasPostLockoutLogin: false,
+            autoResetLevelInfo: null,
+            progressiveLockLevel: 0,
+            freshUserData
           };
         });
+        const resolvedUserData = txOutcome.freshUserData || userData;
+        if (txOutcome.expiredLockInfo) {
+          await Promise.all([
+            recordSecurityAuditLogDoc(db, {
+              action: "LOCKOUT_EXPIRED_REACTIVATED",
+              severity: "INFO",
+              targetLoginId: cleanId,
+              targetRole: roleUpper,
+              targetUid: firebaseUid,
+              reason: "Super Admin temporary lockout duration expired; account automatically reactivated",
+              details: `Temporary lockout for canonical Super Admin "${cleanId}" expired at ${txOutcome.expiredLockInfo.previousLockedUntil || now}. Consecutive failed counter reset to 0 while retaining progressive level ${txOutcome.expiredLockInfo.retainedProgressiveLevel}.`,
+              metadata: {
+                previousLockedAt: txOutcome.expiredLockInfo.previousLockedAt,
+                previousLockedUntil: txOutcome.expiredLockInfo.previousLockedUntil,
+                previousDurationMinutes: txOutcome.expiredLockInfo.previousDurationMinutes,
+                retainedProgressiveLevel: txOutcome.expiredLockInfo.retainedProgressiveLevel
+              },
+              nowMs,
+              telemetry
+            }),
+            recordEnterpriseAuditEvent(db, {
+              req,
+              action: "super_admin_lockout_expired",
+              category: "SECURITY",
+              severity: "INFO",
+              actorUid: firebaseUid,
+              actorLoginId: cleanId,
+              actorRole: roleUpper,
+              targetType: "ACCOUNT",
+              targetId: userDoc.id,
+              oldValue: {
+                lockStatus: "LOCKED",
+                lockedUntil: txOutcome.expiredLockInfo.previousLockedUntil,
+                lockDurationMinutes: txOutcome.expiredLockInfo.previousDurationMinutes
+              },
+              newValue: {
+                lockStatus: "ACTIVE",
+                consecutiveFailedAttempts: 0,
+                progressiveLockLevel: txOutcome.expiredLockInfo.retainedProgressiveLevel
+              },
+              actionSource: "PROGRESSIVE_LOCKOUT_ENGINE",
+              description: `Canonical Super Admin temporary lockout expired; account automatically reactivated with progressive level ${txOutcome.expiredLockInfo.retainedProgressiveLevel} retained.`,
+              success: true
+            })
+          ]);
+        }
         if (txOutcome.kind === "LOCKED_REJECT") {
           await syncUserUidIndex(db, {
-            uid: userData.authUid || null,
+            uid: resolvedUserData.authUid || null,
             roleDocId: userDoc.id,
-            role: String(userData.role || "user"),
-            status: String(userData.status || "Active"),
+            role: String(resolvedUserData.role || "user"),
+            status: String(resolvedUserData.status || "Active"),
             lockStatus: "LOCKED",
+            lockedUntilMs: txOutcome.lockedUntilMs ?? null,
             loginId: cleanId
           });
-          const ipRes = await recordIpFailurePersistent(db, telemetry.ipAddress, "locked_hit", cleanId);
+          const ipRes = await recordIpFailurePersistent(
+            db,
+            telemetry.ipAddress,
+            "locked_hit",
+            cleanId,
+            nowMs
+          );
+          const lockedErrorMessage = txOutcome.temporaryLock && txOutcome.remainingSeconds !== null ? `Super Admin account is temporarily locked due to repeated failed password attempts. Try again in ${formatLockoutDurationText(txOutcome.remainingSeconds)}.` : LOCKED_ACCOUNT_MESSAGE;
           await Promise.all([
             recordLoginAttemptDoc(db, {
               loginId: cleanId,
@@ -2663,8 +5710,11 @@ function registerLoginSecurityRoutes(app, deps) {
               success: false,
               outcome: "BLOCKED_LOCKED",
               failureReasonCategory: "ACCOUNT_LOCKED",
-              failureReason: "Login rejected because account status is LOCKED",
+              failureReason: txOutcome.temporaryLock ? `Login rejected during active temporary lockout (${txOutcome.remainingSeconds}s remaining)` : "Login rejected because account status is LOCKED",
               consecutiveFailedAfter: txOutcome.consecutiveFailed,
+              lockDurationMinutes: txOutcome.lockDurationMinutes,
+              lockedUntil: txOutcome.lockedUntil,
+              nowMs,
               telemetry
             }),
             recordSecurityAuditLogDoc(db, {
@@ -2673,8 +5723,15 @@ function registerLoginSecurityRoutes(app, deps) {
               targetLoginId: cleanId,
               targetRole: roleUpper,
               targetUid: firebaseUid,
-              reason: "Attempted login on locked account",
-              details: `Rejected login attempt for locked account "${cleanId}" (${roleUpper}) from IP ${telemetry.ipAddress}.`,
+              reason: txOutcome.temporaryLock ? "Attempted login during active Super Admin temporary lockout" : "Attempted login on locked account",
+              details: txOutcome.temporaryLock ? `Rejected login attempt for temporarily locked Super Admin "${cleanId}" from IP ${telemetry.ipAddress} (${txOutcome.remainingSeconds}s remaining until ${txOutcome.lockedUntil}).` : `Rejected login attempt for locked account "${cleanId}" (${roleUpper}) from IP ${telemetry.ipAddress}.`,
+              metadata: txOutcome.temporaryLock ? {
+                temporaryLock: true,
+                lockedUntil: txOutcome.lockedUntil,
+                remainingSeconds: txOutcome.remainingSeconds,
+                lockDurationMinutes: txOutcome.lockDurationMinutes
+              } : void 0,
+              nowMs,
               telemetry
             }),
             recordLoginHistoryEntry(db, {
@@ -2684,7 +5741,7 @@ function registerLoginSecurityRoutes(app, deps) {
               authUid: firebaseUid,
               role: roleUpper,
               success: false,
-              failureReason: LOCKED_ACCOUNT_MESSAGE
+              failureReason: lockedErrorMessage
             }),
             recordEnterpriseAuditEvent(db, {
               req,
@@ -2696,7 +5753,7 @@ function registerLoginSecurityRoutes(app, deps) {
               actorRole: roleUpper,
               targetId: userDoc.id,
               actionSource: "ACCOUNT_LOCKOUT_GUARD",
-              description: `Blocked login attempt on already locked account "${cleanId}".`,
+              description: txOutcome.temporaryLock ? `Blocked login attempt on temporarily locked Super Admin "${cleanId}" (${txOutcome.remainingSeconds}s remaining).` : `Blocked login attempt on already locked account "${cleanId}".`,
               success: false
             })
           ]);
@@ -2710,8 +5767,37 @@ function registerLoginSecurityRoutes(app, deps) {
               reason: "Repeated attempts against locked account triggered progressive IP cooldown",
               details: `IP ${telemetry.ipAddress} triggered ${ipRes.cooldownSeconds}s progressive cooldown after hammering locked account "${cleanId}".`,
               metadata: { cooldownSeconds: ipRes.cooldownSeconds },
+              nowMs,
               telemetry
             });
+          }
+          recordActivityTelemetry(db, {
+            actorUid: firebaseUid,
+            actorLoginId: cleanId,
+            actorRole: roleUpper,
+            action: "LOGIN_BLOCKED_LOCKED",
+            module: "Authentication",
+            result: "Failed",
+            correlationId: req.correlationId,
+            detail: txOutcome.temporaryLock ? `Blocked during temporary lockout (${txOutcome.remainingSeconds}s remaining)` : "Attempted login on locked account"
+          });
+          if (txOutcome.temporaryLock) {
+            return {
+              status: 423,
+              body: {
+                success: false,
+                code: "ACCOUNT_LOCKED",
+                locked: true,
+                temporaryLock: true,
+                lockoutUntil: txOutcome.lockedUntil,
+                lockedUntil: txOutcome.lockedUntil,
+                lockedUntilMs: txOutcome.lockedUntilMs,
+                serverNowMs: txOutcome.serverNowMs,
+                remainingSeconds: txOutcome.remainingSeconds,
+                lockDurationMinutes: txOutcome.lockDurationMinutes,
+                error: lockedErrorMessage
+              }
+            };
           }
           return {
             status: 423,
@@ -2719,20 +5805,34 @@ function registerLoginSecurityRoutes(app, deps) {
               success: false,
               code: "ACCOUNT_LOCKED",
               locked: true,
+              temporaryLock: false,
               error: LOCKED_ACCOUNT_MESSAGE
             }
           };
         }
         if (txOutcome.kind === "NOW_LOCKED") {
           await syncUserUidIndex(db, {
-            uid: userData.authUid || null,
+            uid: resolvedUserData.authUid || null,
             roleDocId: userDoc.id,
-            role: String(userData.role || "user"),
-            status: String(userData.status || "Active"),
+            role: String(resolvedUserData.role || "user"),
+            status: String(resolvedUserData.status || "Active"),
             lockStatus: "LOCKED",
+            lockedUntilMs: txOutcome.lockedUntilMs ?? null,
             loginId: cleanId
           });
-          await recordIpFailurePersistent(db, telemetry.ipAddress, "password", cleanId);
+          if (txOutcome.isCanonicalSA && auth && resolvedUserData.authUid && !String(resolvedUserData.authUid).startsWith("role_")) {
+            try {
+              await auth.revokeRefreshTokens(String(resolvedUserData.authUid));
+            } catch (revokeErr) {
+              console.warn(
+                "[Super Admin Progressive Lockout] revokeRefreshTokens notice:",
+                revokeErr?.message || revokeErr
+              );
+            }
+          }
+          await recordIpFailurePersistent(db, telemetry.ipAddress, "password", cleanId, nowMs);
+          const isTempSA = txOutcome.isCanonicalSA && txOutcome.temporaryLock;
+          const lockedReasonMsg = isTempSA ? `Super Admin account temporarily locked for ${txOutcome.lockDurationMinutes} minutes after ${txOutcome.attemptNumber} consecutive failed password attempts. Please wait before trying again.` : LOCKED_ACCOUNT_MESSAGE;
           await Promise.all([
             recordLoginAttemptDoc(db, {
               loginId: cleanId,
@@ -2741,10 +5841,13 @@ function registerLoginSecurityRoutes(app, deps) {
               success: false,
               outcome: "FAILED_PASSWORD",
               failureReasonCategory: "ACCOUNT_LOCKED",
-              failureReason: "3rd consecutive failed password attempt triggered automatic account lock",
+              failureReason: isTempSA ? `3rd consecutive failed password triggered progressive temporary lockout (${txOutcome.lockDurationMinutes} minutes)` : "3rd consecutive failed password attempt triggered automatic account lock",
               attemptNumber: txOutcome.attemptNumber,
               consecutiveFailedAfter: txOutcome.attemptNumber,
               triggeredLock: true,
+              lockDurationMinutes: txOutcome.lockDurationMinutes,
+              lockedUntil: txOutcome.lockedUntil,
+              nowMs,
               telemetry
             }),
             recordSecurityAuditLogDoc(db, {
@@ -2753,9 +5856,19 @@ function registerLoginSecurityRoutes(app, deps) {
               targetLoginId: cleanId,
               targetRole: roleUpper,
               targetUid: firebaseUid,
-              reason: "Exceeded 3 consecutive failed password attempts",
-              details: `SECURITY ALERT: Account "${cleanId}" (${roleUpper}, UID: ${firebaseUid}) automatically LOCKED on failed attempt #${txOutcome.attemptNumber}.`,
-              metadata: { attemptNumber: txOutcome.attemptNumber, maxAttempts: MAX_CONSECUTIVE_FAILED_ATTEMPTS },
+              reason: isTempSA ? `Super Admin progressive temporary lockout triggered (${txOutcome.lockDurationMinutes} minutes, level ${txOutcome.progressiveLockLevel})` : "Exceeded 3 consecutive failed password attempts",
+              details: isTempSA ? `SECURITY ALERT: Canonical Super Admin "${cleanId}" (UID: ${firebaseUid}) temporarily LOCKED for ${txOutcome.lockDurationMinutes} minutes (progressive level ${txOutcome.progressiveLockLevel}, event #${txOutcome.totalLockoutEvents}) until ${txOutcome.lockedUntil}. Active sessions revoked.` : `SECURITY ALERT: Account "${cleanId}" (${roleUpper}, UID: ${firebaseUid}) automatically LOCKED on failed attempt #${txOutcome.attemptNumber}.`,
+              metadata: isTempSA ? {
+                attemptNumber: txOutcome.attemptNumber,
+                maxAttempts: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
+                lockPolicyType: "PROGRESSIVE_TEMPORARY",
+                progressiveLockLevel: txOutcome.progressiveLockLevel,
+                totalLockoutEvents: txOutcome.totalLockoutEvents,
+                lockDurationMinutes: txOutcome.lockDurationMinutes,
+                lockedUntil: txOutcome.lockedUntil,
+                sessionsRevoked: true
+              } : { attemptNumber: txOutcome.attemptNumber, maxAttempts: MAX_CONSECUTIVE_FAILED_ATTEMPTS },
+              nowMs,
               telemetry
             }),
             recordLoginHistoryEntry(db, {
@@ -2765,28 +5878,78 @@ function registerLoginSecurityRoutes(app, deps) {
               authUid: firebaseUid,
               role: roleUpper,
               success: false,
-              failureReason: `Locked after ${txOutcome.attemptNumber} consecutive failed attempts`
+              failureReason: isTempSA ? `Progressive temporary lockout (${txOutcome.lockDurationMinutes}m) after ${txOutcome.attemptNumber} failed attempts` : `Locked after ${txOutcome.attemptNumber} consecutive failed attempts`
             }),
             recordEnterpriseAuditEvent(db, {
               req,
-              action: "failed_login_threshold_exceeded",
+              action: isTempSA ? "super_admin_progressive_lockout" : "failed_login_threshold_exceeded",
               category: "SECURITY",
               severity: "CRITICAL",
               actorUid: firebaseUid,
               actorLoginId: cleanId,
               actorRole: roleUpper,
+              targetType: "ACCOUNT",
               targetId: userDoc.id,
-              actionSource: "ACCOUNT_LOCKOUT_ENGINE",
-              description: `Account "${cleanId}" (${roleUpper}) automatically LOCKED after ${txOutcome.attemptNumber} consecutive failed password attempts.`,
+              newValue: isTempSA ? {
+                lockStatus: "LOCKED",
+                lockPolicyType: "PROGRESSIVE_TEMPORARY",
+                progressiveLockLevel: txOutcome.progressiveLockLevel,
+                totalLockoutEvents: txOutcome.totalLockoutEvents,
+                lockDurationMinutes: txOutcome.lockDurationMinutes,
+                lockedUntil: txOutcome.lockedUntil
+              } : void 0,
+              actionSource: isTempSA ? "PROGRESSIVE_LOCKOUT_ENGINE" : "ACCOUNT_LOCKOUT_ENGINE",
+              description: isTempSA ? `Canonical Super Admin "${cleanId}" temporarily locked for ${txOutcome.lockDurationMinutes} minutes (level ${txOutcome.progressiveLockLevel}) after ${txOutcome.attemptNumber} consecutive failed attempts.` : `Account "${cleanId}" (${roleUpper}) automatically LOCKED after ${txOutcome.attemptNumber} consecutive failed password attempts.`,
               success: false
             })
           ]);
+          recordActivityTelemetry(db, {
+            actorUid: firebaseUid,
+            actorLoginId: cleanId,
+            actorRole: roleUpper,
+            action: "ACCOUNT_LOCKED",
+            module: "Authentication",
+            result: "Failed",
+            correlationId: req.correlationId,
+            detail: isTempSA ? `Progressive temporary lock (${txOutcome.lockDurationMinutes}m) on attempt #${txOutcome.attemptNumber}` : `Auto-locked on attempt #${txOutcome.attemptNumber}`
+          });
+          recordErrorTelemetry(db, {
+            source: "AUTH",
+            module: "Authentication",
+            category: "AUTH",
+            severity: "CRITICAL",
+            message: isTempSA ? `Super Admin temporarily locked (${txOutcome.lockDurationMinutes}m) after ${txOutcome.attemptNumber} failed attempts` : `Account locked after ${txOutcome.attemptNumber} failed attempts`,
+            statusCode: 423,
+            correlationId: req.correlationId
+          });
+          if (isTempSA) {
+            return {
+              status: 423,
+              body: {
+                success: false,
+                code: "ACCOUNT_LOCKED",
+                locked: true,
+                temporaryLock: true,
+                lockoutUntil: txOutcome.lockedUntil,
+                lockedUntil: txOutcome.lockedUntil,
+                lockedUntilMs: txOutcome.lockedUntilMs,
+                serverNowMs: txOutcome.serverNowMs,
+                remainingSeconds: txOutcome.remainingSeconds,
+                lockDurationMinutes: txOutcome.lockDurationMinutes,
+                attemptNumber: txOutcome.attemptNumber,
+                maxAttempts: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
+                remainingAttempts: 0,
+                error: lockedReasonMsg
+              }
+            };
+          }
           return {
             status: 423,
             body: {
               success: false,
               code: "ACCOUNT_LOCKED",
               locked: true,
+              temporaryLock: false,
               attemptNumber: txOutcome.attemptNumber,
               maxAttempts: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
               remainingAttempts: 0,
@@ -2795,7 +5958,18 @@ function registerLoginSecurityRoutes(app, deps) {
           };
         }
         if (txOutcome.kind === "FAILED_PASSWORD") {
-          await recordIpFailurePersistent(db, telemetry.ipAddress, "password", cleanId);
+          if (txOutcome.expiredLockInfo) {
+            await syncUserUidIndex(db, {
+              uid: resolvedUserData.authUid || null,
+              roleDocId: userDoc.id,
+              role: String(resolvedUserData.role || "user"),
+              status: String(resolvedUserData.status || "Active"),
+              lockStatus: "ACTIVE",
+              lockedUntilMs: null,
+              loginId: cleanId
+            });
+          }
+          await recordIpFailurePersistent(db, telemetry.ipAddress, "password", cleanId, nowMs);
           const isSecondWarning = txOutcome.attemptNumber === 2;
           await Promise.all([
             recordLoginAttemptDoc(db, {
@@ -2809,6 +5983,7 @@ function registerLoginSecurityRoutes(app, deps) {
               attemptNumber: txOutcome.attemptNumber,
               consecutiveFailedAfter: txOutcome.attemptNumber,
               triggeredLock: false,
+              nowMs,
               telemetry
             }),
             recordSecurityAuditLogDoc(db, {
@@ -2823,6 +5998,7 @@ function registerLoginSecurityRoutes(app, deps) {
                 attemptNumber: txOutcome.attemptNumber,
                 remainingAttempts: txOutcome.remainingAttempts
               },
+              nowMs,
               telemetry
             }),
             recordLoginHistoryEntry(db, {
@@ -2848,6 +6024,16 @@ function registerLoginSecurityRoutes(app, deps) {
               success: false
             })
           ]);
+          recordActivityTelemetry(db, {
+            actorUid: firebaseUid,
+            actorLoginId: cleanId,
+            actorRole: roleUpper,
+            action: "LOGIN_FAILED",
+            module: "Authentication",
+            result: "Failed",
+            correlationId: req.correlationId,
+            detail: `Invalid password attempt ${txOutcome.attemptNumber}/${MAX_CONSECUTIVE_FAILED_ATTEMPTS}`
+          });
           return {
             status: 401,
             body: isSecondWarning ? {
@@ -2871,22 +6057,23 @@ function registerLoginSecurityRoutes(app, deps) {
         }
         await clearIpCooldownPersistent(db, telemetry.ipAddress, cleanId);
         await syncUserUidIndex(db, {
-          uid: userData.authUid || null,
+          uid: resolvedUserData.authUid || null,
           roleDocId: userDoc.id,
-          role: String(userData.role || "user"),
-          status: String(userData.status || "Active"),
+          role: String(resolvedUserData.role || "user"),
+          status: String(resolvedUserData.status || "Active"),
           lockStatus: "ACTIVE",
+          lockedUntilMs: null,
           loginId: cleanId
         });
-        const sessionId = `sess_${crypto2.randomBytes(10).toString("hex")}`;
-        const sessionToken = crypto2.randomBytes(32).toString("hex");
-        let effectiveModules = Array.isArray(userData.modulesAllowed) ? [...userData.modulesAllowed] : [];
-        if (String(userData.role || "").toLowerCase() === "user" && !userData.dashboardAccessMigratedV1) {
+        const sessionId = `sess_${crypto3.randomBytes(10).toString("hex")}`;
+        const sessionToken = crypto3.randomBytes(32).toString("hex");
+        let effectiveModules = Array.isArray(resolvedUserData.modulesAllowed) ? [...resolvedUserData.modulesAllowed] : [];
+        if (String(resolvedUserData.role || "").toLowerCase() === "user" && !resolvedUserData.dashboardAccessMigratedV1) {
           if (!effectiveModules.includes("dashboard")) {
             effectiveModules = ["dashboard", ...effectiveModules];
           }
         }
-        await Promise.all([
+        const successAuditTasks = [
           recordLoginAttemptDoc(db, {
             loginId: cleanId,
             role: roleUpper,
@@ -2896,6 +6083,7 @@ function registerLoginSecurityRoutes(app, deps) {
             failureReasonCategory: "NONE",
             consecutiveFailedAfter: 0,
             sessionId,
+            nowMs,
             telemetry
           }),
           recordSecurityAuditLogDoc(db, {
@@ -2910,6 +6098,7 @@ function registerLoginSecurityRoutes(app, deps) {
             reason: "Successful credential verification",
             details: `User "${cleanId}" (${roleUpper}) authenticated successfully. Consecutive failed counter reset to 0.`,
             metadata: { sessionId, forcePasswordChange: txOutcome.mustChange },
+            nowMs,
             telemetry
           }),
           recordLoginHistoryEntry(db, {
@@ -2935,8 +6124,102 @@ function registerLoginSecurityRoutes(app, deps) {
             description: `User "${cleanId}" (${roleUpper}) successfully authenticated.`,
             success: true
           })
-        ]);
-        const { passwordHash: _ph, ...sanitizedProfile } = userData;
+        ];
+        if (txOutcome.isCanonicalSA && txOutcome.wasPostLockoutLogin) {
+          successAuditTasks.push(
+            recordSecurityAuditLogDoc(db, {
+              action: "LOGIN_SUCCESS_AFTER_LOCKOUT",
+              severity: "INFO",
+              targetLoginId: cleanId,
+              targetRole: roleUpper,
+              targetUid: firebaseUid,
+              actorUid: firebaseUid,
+              actorLoginId: cleanId,
+              actorRole: roleUpper,
+              reason: "First successful Super Admin login following temporary lockout expiry",
+              details: `Canonical Super Admin "${cleanId}" signed in successfully after temporary lockout expiry (session ${sessionId}). Progressive lockout level is ${txOutcome.progressiveLockLevel}.`,
+              metadata: {
+                sessionId,
+                progressiveLockLevel: txOutcome.progressiveLockLevel
+              },
+              nowMs,
+              telemetry
+            }),
+            recordEnterpriseAuditEvent(db, {
+              req,
+              action: "login_success_after_lockout",
+              category: "SECURITY",
+              severity: "INFO",
+              actorUid: firebaseUid,
+              actorLoginId: cleanId,
+              actorRole: roleUpper,
+              targetType: "ACCOUNT",
+              targetId: userDoc.id,
+              actionSource: "PROGRESSIVE_LOCKOUT_ENGINE",
+              sessionId,
+              newValue: { progressiveLockLevel: txOutcome.progressiveLockLevel },
+              description: `Canonical Super Admin "${cleanId}" completed first successful login after temporary lockout expiry.`,
+              success: true
+            })
+          );
+        }
+        if (txOutcome.isCanonicalSA && txOutcome.autoResetLevelInfo) {
+          successAuditTasks.push(
+            recordSecurityAuditLogDoc(db, {
+              action: "LOCKOUT_LEVEL_RESET",
+              severity: "INFO",
+              targetLoginId: cleanId,
+              targetRole: roleUpper,
+              targetUid: firebaseUid,
+              actorUid: firebaseUid,
+              actorLoginId: cleanId,
+              actorRole: roleUpper,
+              reason: `Automatic progressive lockout level reset after ${txOutcome.autoResetLevelInfo.cleanWindowHours}h sustained clean usage`,
+              details: `Canonical Super Admin "${cleanId}" progressive lockout level automatically reset from ${txOutcome.autoResetLevelInfo.previousLevel} to 0 after ${txOutcome.autoResetLevelInfo.cleanWindowHours} hours of clean usage with zero failed password attempts.`,
+              metadata: {
+                resetType: "AUTOMATIC_SUSTAINED_CLEAN_USAGE",
+                previousLevel: txOutcome.autoResetLevelInfo.previousLevel,
+                newLevel: 0,
+                cleanWindowHours: txOutcome.autoResetLevelInfo.cleanWindowHours,
+                cleanLogins: txOutcome.autoResetLevelInfo.cleanLogins
+              },
+              nowMs,
+              telemetry
+            }),
+            recordEnterpriseAuditEvent(db, {
+              req,
+              action: "super_admin_lockout_level_reset",
+              category: "SECURITY",
+              severity: "INFO",
+              actorUid: firebaseUid,
+              actorLoginId: cleanId,
+              actorRole: roleUpper,
+              targetType: "ACCOUNT",
+              targetId: userDoc.id,
+              oldValue: { progressiveLockLevel: txOutcome.autoResetLevelInfo.previousLevel },
+              newValue: {
+                progressiveLockLevel: 0,
+                resetType: "AUTOMATIC_SUSTAINED_CLEAN_USAGE",
+                cleanWindowHours: txOutcome.autoResetLevelInfo.cleanWindowHours
+              },
+              actionSource: "PROGRESSIVE_LOCKOUT_ENGINE",
+              description: `Canonical Super Admin progressive lockout level automatically reset from ${txOutcome.autoResetLevelInfo.previousLevel} to 0 after ${txOutcome.autoResetLevelInfo.cleanWindowHours}h of sustained clean usage.`,
+              success: true
+            })
+          );
+        }
+        await Promise.all(successAuditTasks);
+        recordActivityTelemetry(db, {
+          actorUid: firebaseUid,
+          actorLoginId: cleanId,
+          actorRole: roleUpper,
+          action: "LOGIN_SUCCESS",
+          module: "Authentication",
+          result: "Success",
+          correlationId: req.correlationId,
+          detail: `Authenticated session ${sessionId}`
+        });
+        const { passwordHash: _ph, ...sanitizedProfile } = resolvedUserData;
         return {
           status: 200,
           body: {
@@ -2948,6 +6231,11 @@ function registerLoginSecurityRoutes(app, deps) {
               mustChangePassword: txOutcome.mustChange,
               forcePasswordChange: txOutcome.mustChange,
               lockStatus: "ACTIVE",
+              lockedAt: null,
+              lockoutUntil: null,
+              lockedUntil: null,
+              lockedUntilMs: null,
+              lockDurationMinutes: null,
               consecutiveFailedAttempts: 0
             },
             sessionToken,
@@ -2970,6 +6258,261 @@ function registerLoginSecurityRoutes(app, deps) {
       return res.status(500).json({
         success: false,
         error: "Authentication security service error. Please try again."
+      });
+    }
+  });
+  app.get("/api/auth/lockout-status", async (req, res) => {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    try {
+      const nowMs = getNowMs();
+      const rawLoginId = typeof req.query?.loginId === "string" ? req.query.loginId.trim().toLowerCase() : "";
+      if (rawLoginId && rawLoginId !== "superadmin") {
+        return res.json({
+          success: true,
+          locked: false,
+          temporaryLock: false,
+          serverNowMs: nowMs
+        });
+      }
+      let userDoc = await db.collection("user_roles").doc("role_superadmin").get();
+      if (!userDoc.exists) {
+        const snap = await db.collection("user_roles").where("loginId", "==", "superadmin").limit(1).get();
+        if (!snap.empty) {
+          userDoc = snap.docs[0];
+        }
+      }
+      if (!userDoc || !userDoc.exists) {
+        return res.json({
+          success: true,
+          locked: false,
+          temporaryLock: false,
+          serverNowMs: nowMs
+        });
+      }
+      const userData = userDoc.data() || {};
+      if (!isCanonicalSuperAdminAccount(userDoc.id, userData)) {
+        return res.json({
+          success: true,
+          locked: false,
+          temporaryLock: false,
+          serverNowMs: nowMs
+        });
+      }
+      const secRef = db.collection("account_security").doc("sec_superadmin");
+      const userRef = db.collection("user_roles").doc(userDoc.id);
+      const secSnap = await secRef.get();
+      const secData = secSnap.exists ? secSnap.data() || {} : {};
+      const isCurrentlyLocked = secData.lockStatus === "LOCKED" || userData.lockStatus === "LOCKED" || userData.isLocked === true;
+      const saLockWindow = resolveCanonicalSuperAdminLockWindow(secData, userData);
+      const existingLockedUntilMs = saLockWindow.lockedUntilMs;
+      if (!isCurrentlyLocked || existingLockedUntilMs === null) {
+        return res.json({
+          success: true,
+          locked: false,
+          temporaryLock: false,
+          serverNowMs: nowMs
+        });
+      }
+      if (nowMs < existingLockedUntilMs) {
+        const remainingSeconds = Math.max(1, Math.ceil((existingLockedUntilMs - nowMs) / 1e3));
+        const lockoutUntilIso = saLockWindow.lockoutUntil || resolveAuthoritativeLockedUntilIso(existingLockedUntilMs, secData, userData);
+        const lockDurationMinutes = saLockWindow.lockDurationMinutes;
+        return res.json({
+          success: true,
+          locked: true,
+          temporaryLock: true,
+          loginId: "superadmin",
+          lockoutUntil: lockoutUntilIso,
+          lockedUntil: lockoutUntilIso,
+          lockedUntilMs: existingLockedUntilMs,
+          serverNowMs: nowMs,
+          remainingSeconds,
+          lockDurationMinutes
+        });
+      }
+      const reactivationOutcome = await withLoginIdLock("superadmin", async () => {
+        const txNowMs = getNowMs();
+        const txNowIso = new Date(txNowMs).toISOString();
+        const txResult = await db.runTransaction(async (tx) => {
+          const [freshSecSnap, freshUserSnap] = await Promise.all([tx.get(secRef), tx.get(userRef)]);
+          const freshSec = freshSecSnap.exists ? freshSecSnap.data() || {} : {};
+          const freshUser = freshUserSnap.exists ? freshUserSnap.data() || {} : userData;
+          const txIsLocked = freshSec.lockStatus === "LOCKED" || freshUser.lockStatus === "LOCKED" || freshUser.isLocked === true;
+          const txLockWindow = resolveCanonicalSuperAdminLockWindow(freshSec, freshUser);
+          const txLockedUntilMs = txLockWindow.lockedUntilMs;
+          if (!txIsLocked || txLockedUntilMs === null) {
+            return { kind: "ALREADY_ACTIVE", serverNowMs: txNowMs };
+          }
+          if (txNowMs < txLockedUntilMs) {
+            const remSec = Math.max(1, Math.ceil((txLockedUntilMs - txNowMs) / 1e3));
+            const iso = txLockWindow.lockoutUntil || resolveAuthoritativeLockedUntilIso(txLockedUntilMs, freshSec, freshUser);
+            return {
+              kind: "STILL_LOCKED",
+              serverNowMs: txNowMs,
+              lockoutUntil: iso,
+              lockedUntilMs: txLockedUntilMs,
+              remainingSeconds: remSec,
+              lockDurationMinutes: txLockWindow.lockDurationMinutes
+            };
+          }
+          const retainedLevel = Number(
+            freshSec.progressiveLockLevel ?? freshUser.progressiveLockLevel ?? 0
+          );
+          const previousLockedAt = freshSec.lockedAt || freshUser.lockedAt || null;
+          const previousLockedUntil = resolveAuthoritativeLockedUntilIso(
+            txLockedUntilMs,
+            freshSec,
+            freshUser
+          );
+          const previousDurationMinutes = freshSec.lockDurationMinutes ?? freshUser.lockDurationMinutes ?? null;
+          tx.set(
+            secRef,
+            {
+              ...freshSec,
+              id: "sec_superadmin",
+              loginId: "superadmin",
+              role: "SUPER_ADMIN",
+              firebaseUid: String(freshUser.authUid || userDoc.id),
+              email: freshUser.email || "superadmin@narid.com",
+              lockStatus: "ACTIVE",
+              lockPolicyType: "PROGRESSIVE_TEMPORARY",
+              consecutiveFailedAttempts: 0,
+              lockedAt: null,
+              lockoutUntil: null,
+              lockedUntil: null,
+              lockedUntilMs: null,
+              lockDurationMinutes: null,
+              lockReason: null,
+              lastLockExpiredAt: txNowIso,
+              progressiveLockLevel: retainedLevel,
+              pendingPostLockoutLoginAudit: true,
+              updatedAt: txNowIso
+            },
+            { merge: true }
+          );
+          tx.update(userRef, {
+            isLocked: false,
+            lockStatus: "ACTIVE",
+            lockPolicyType: "PROGRESSIVE_TEMPORARY",
+            consecutiveFailedAttempts: 0,
+            lockedAt: null,
+            lockoutUntil: null,
+            lockedUntil: null,
+            lockedUntilMs: null,
+            lockDurationMinutes: null,
+            lockReason: null,
+            lastLockExpiredAt: txNowIso,
+            progressiveLockLevel: retainedLevel,
+            pendingPostLockoutLoginAudit: true,
+            updatedAt: txNowIso
+          });
+          return {
+            kind: "REACTIVATED",
+            serverNowMs: txNowMs,
+            nowIso: txNowIso,
+            firebaseUid: String(freshUser.authUid || userDoc.id),
+            authUid: freshUser.authUid || null,
+            role: String(freshUser.role || "super_admin"),
+            status: String(freshUser.status || "Active"),
+            previousLockedAt,
+            previousLockedUntil,
+            previousDurationMinutes,
+            retainedLevel
+          };
+        });
+        if (txResult.kind === "REACTIVATED") {
+          await syncUserUidIndex(db, {
+            uid: txResult.authUid,
+            roleDocId: userDoc.id,
+            role: txResult.role,
+            status: txResult.status,
+            lockStatus: "ACTIVE",
+            lockedUntilMs: null,
+            loginId: "superadmin"
+          });
+          const telemetry = await captureTelemetryContext(db, req);
+          await Promise.all([
+            recordSecurityAuditLogDoc(db, {
+              action: "LOCKOUT_EXPIRED_REACTIVATED",
+              severity: "INFO",
+              targetLoginId: "superadmin",
+              targetRole: "SUPER_ADMIN",
+              targetUid: txResult.firebaseUid,
+              reason: "Super Admin temporary lockout duration expired; account automatically reactivated",
+              details: `Temporary lockout for canonical Super Admin "superadmin" expired at ${txResult.previousLockedUntil || txResult.nowIso}. Verified server-side and reactivated with progressive level ${txResult.retainedLevel} retained.`,
+              metadata: {
+                previousLockedAt: txResult.previousLockedAt,
+                previousLockedUntil: txResult.previousLockedUntil,
+                previousDurationMinutes: txResult.previousDurationMinutes,
+                retainedProgressiveLevel: txResult.retainedLevel,
+                verifiedVia: "LOCKOUT_STATUS_CHECK"
+              },
+              nowMs: txResult.serverNowMs,
+              telemetry
+            }),
+            recordEnterpriseAuditEvent(db, {
+              req,
+              action: "super_admin_lockout_expired",
+              category: "SECURITY",
+              severity: "INFO",
+              actorUid: txResult.firebaseUid,
+              actorLoginId: "superadmin",
+              actorRole: "SUPER_ADMIN",
+              targetType: "ACCOUNT",
+              targetId: userDoc.id,
+              oldValue: {
+                lockStatus: "LOCKED",
+                lockoutUntil: txResult.previousLockedUntil,
+                lockDurationMinutes: txResult.previousDurationMinutes
+              },
+              newValue: {
+                lockStatus: "ACTIVE",
+                consecutiveFailedAttempts: 0,
+                progressiveLockLevel: txResult.retainedLevel
+              },
+              actionSource: "PROGRESSIVE_LOCKOUT_ENGINE",
+              description: `Canonical Super Admin "superadmin" temporary lockout expired and was automatically reactivated upon server verification (progressive level ${txResult.retainedLevel} retained).`,
+              success: true
+            })
+          ]);
+        }
+        return txResult;
+      });
+      if (reactivationOutcome.kind === "STILL_LOCKED") {
+        return res.json({
+          success: true,
+          locked: true,
+          temporaryLock: true,
+          loginId: "superadmin",
+          lockoutUntil: reactivationOutcome.lockoutUntil,
+          lockedUntil: reactivationOutcome.lockoutUntil,
+          lockedUntilMs: reactivationOutcome.lockedUntilMs,
+          serverNowMs: reactivationOutcome.serverNowMs,
+          remainingSeconds: reactivationOutcome.remainingSeconds,
+          lockDurationMinutes: reactivationOutcome.lockDurationMinutes
+        });
+      }
+      return res.json({
+        success: true,
+        locked: false,
+        temporaryLock: false,
+        expiredReactivated: reactivationOutcome.kind === "REACTIVATED",
+        serverNowMs: reactivationOutcome.serverNowMs
+      });
+    } catch (err) {
+      if (isFirestorePermissionDeniedError(err)) {
+        const msg = formatAdminPermissionDeniedError(projectId, TARGET_DATABASE_ID);
+        return res.status(503).json({
+          success: false,
+          code: "FIREBASE_ADMIN_PERMISSION_DENIED",
+          error: msg
+        });
+      }
+      console.error("[Lockout Status API] Error:", err);
+      return res.status(500).json({
+        success: false,
+        error: "Failed to check lockout status."
       });
     }
   });
@@ -3012,12 +6555,14 @@ function registerLoginSecurityRoutes(app, deps) {
         "Security & Login Attempt Management Overview"
       );
       if (!caller) return;
-      const [usersSnap, secSnap, attemptsSnap, secLogsSnap] = await Promise.all([
+      const [usersSnap, secSnap, attemptsSnap, secLogsSnap, superAdminLockoutResetHours] = await Promise.all([
         db.collection("user_roles").get(),
         db.collection("account_security").get(),
         db.collection("login_attempts").get(),
-        db.collection("security_audit_logs").get()
+        db.collection("security_audit_logs").get(),
+        resolveSuperAdminLockoutResetHours(db)
       ]);
+      const nowMs = getNowMs();
       const secByLoginId = /* @__PURE__ */ new Map();
       secSnap.docs.forEach((d) => {
         const data = d.data() || {};
@@ -3036,7 +6581,20 @@ function registerLoginSecurityRoutes(app, deps) {
         }
         const sec = secByLoginId.get(loginId) || {};
         const accAttempts = attempts.filter((a) => String(a.loginId || "").toLowerCase() === loginId);
-        const lockStatus = sec.lockStatus === "LOCKED" || uData.lockStatus === "LOCKED" || uData.isLocked === true ? "LOCKED" : "ACTIVE";
+        const isCanonicalSA = isCanonicalSuperAdminAccount(uDoc.id, uData);
+        const saLockWindow = isCanonicalSA ? resolveCanonicalSuperAdminLockWindow(sec, uData) : {
+          lockedUntilMs: resolveAuthoritativeLockedUntilMs(sec, uData),
+          lockoutUntil: null,
+          lockDurationMinutes: null
+        };
+        const lockedUntilMs = saLockWindow.lockedUntilMs;
+        const rawIsLocked = sec.lockStatus === "LOCKED" || uData.lockStatus === "LOCKED" || uData.isLocked === true;
+        const lockoutExpiredPendingLogin = Boolean(
+          isCanonicalSA && rawIsLocked && lockedUntilMs !== null && nowMs >= lockedUntilMs
+        );
+        const effectiveLockStatus = rawIsLocked && !lockoutExpiredPendingLogin ? "LOCKED" : "ACTIVE";
+        const remainingLockSeconds = isCanonicalSA && effectiveLockStatus === "LOCKED" && lockedUntilMs !== null ? Math.max(0, Math.ceil((lockedUntilMs - nowMs) / 1e3)) : 0;
+        const effectiveLockedUntilIso = effectiveLockStatus === "LOCKED" ? saLockWindow.lockoutUntil || resolveAuthoritativeLockedUntilIso(lockedUntilMs, sec, uData) : null;
         accountMap.set(loginId, {
           id: sec.id || `sec_${loginId}`,
           roleDocId: uDoc.id,
@@ -3046,10 +6604,9 @@ function registerLoginSecurityRoutes(app, deps) {
           role: String(uData.role || "USER").toUpperCase(),
           firebaseUid: sec.firebaseUid || uData.authUid || uDoc.id,
           accountStatus: uData.status || "Active",
-          lockStatus,
-          consecutiveFailedAttempts: Number(
-            sec.consecutiveFailedAttempts ?? uData.consecutiveFailedAttempts ?? 0
-          ),
+          lockStatus: effectiveLockStatus,
+          lockPolicyType: isCanonicalSA ? "PROGRESSIVE_TEMPORARY" : "PERMANENT_MANUAL",
+          consecutiveFailedAttempts: lockoutExpiredPendingLogin ? 0 : Number(sec.consecutiveFailedAttempts ?? uData.consecutiveFailedAttempts ?? 0),
           maxAttemptsAllowed: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
           totalLoginAttempts: Number(sec.totalLoginAttempts ?? accAttempts.length),
           totalSuccessfulLogins: Number(
@@ -3060,8 +6617,23 @@ function registerLoginSecurityRoutes(app, deps) {
           ),
           forcePasswordChange: Boolean(uData.mustChangePassword === true || sec.forcePasswordChange === true),
           mustChangePassword: Boolean(uData.mustChangePassword === true),
-          lockedAt: sec.lockedAt || uData.lockedAt || null,
-          lockReason: sec.lockReason || uData.lockReason || null,
+          lockedAt: effectiveLockStatus === "LOCKED" ? sec.lockedAt || uData.lockedAt || null : null,
+          lockoutUntil: effectiveLockedUntilIso,
+          lockedUntil: effectiveLockedUntilIso,
+          lockedUntilMs: effectiveLockStatus === "LOCKED" ? lockedUntilMs : null,
+          lockDurationMinutes: effectiveLockStatus === "LOCKED" ? saLockWindow.lockDurationMinutes ?? sec.lockDurationMinutes ?? uData.lockDurationMinutes ?? null : null,
+          remainingLockSeconds,
+          lockoutExpiredPendingLogin,
+          lockReason: effectiveLockStatus === "LOCKED" ? sec.lockReason || uData.lockReason || null : null,
+          progressiveLockLevel: isCanonicalSA ? Number(sec.progressiveLockLevel ?? uData.progressiveLockLevel ?? 0) : 0,
+          totalLockoutEvents: isCanonicalSA ? Number(sec.totalLockoutEvents ?? uData.totalLockoutEvents ?? 0) : 0,
+          lastLockoutAt: isCanonicalSA ? sec.lastLockoutAt || uData.lastLockoutAt || null : null,
+          lastLockExpiredAt: isCanonicalSA ? sec.lastLockExpiredAt || uData.lastLockExpiredAt || null : null,
+          cleanWindowStartAt: isCanonicalSA ? sec.cleanWindowStartAt || uData.cleanWindowStartAt || null : null,
+          cleanWindowStartMs: isCanonicalSA ? typeof sec.cleanWindowStartMs === "number" ? sec.cleanWindowStartMs : typeof uData.cleanWindowStartMs === "number" ? uData.cleanWindowStartMs : null : null,
+          cleanLoginsSinceLastLockout: isCanonicalSA ? Number(sec.cleanLoginsSinceLastLockout ?? uData.cleanLoginsSinceLastLockout ?? 0) : 0,
+          lockoutLevelResetAt: isCanonicalSA ? sec.lockoutLevelResetAt || uData.lockoutLevelResetAt || null : null,
+          lockoutLevelResetReason: isCanonicalSA ? sec.lockoutLevelResetReason || uData.lockoutLevelResetReason || null : null,
           lastSuccessAt: sec.lastSuccessAt || uData.lastSuccessLoginAt || null,
           lastSuccessIp: sec.lastSuccessIp || null,
           lastSuccessGeo: sec.lastSuccessGeo || null,
@@ -3104,7 +6676,9 @@ function registerLoginSecurityRoutes(app, deps) {
         kpis,
         accounts,
         recentAttempts: attempts.slice(0, 150),
-        recentSecurityLogs: securityLogs.slice(0, 150)
+        recentSecurityLogs: securityLogs.slice(0, 150),
+        superAdminLockoutResetHours,
+        serverNowMs: nowMs
       });
     } catch (err) {
       if (isFirestorePermissionDeniedError(err)) {
@@ -3260,6 +6834,10 @@ function registerLoginSecurityRoutes(app, deps) {
               consecutiveFailedAttempts: 0,
               maxAttemptsAllowed: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
               lockedAt: null,
+              lockoutUntil: null,
+              lockedUntil: null,
+              lockedUntilMs: null,
+              lockDurationMinutes: null,
               lockReason: null,
               unblockedByUid: caller.uid,
               unblockedByLoginId: caller.loginId,
@@ -3274,6 +6852,10 @@ function registerLoginSecurityRoutes(app, deps) {
             lockStatus: "ACTIVE",
             consecutiveFailedAttempts: 0,
             lockedAt: null,
+            lockoutUntil: null,
+            lockedUntil: null,
+            lockedUntilMs: null,
+            lockDurationMinutes: null,
             lockReason: null,
             unblockedBy: caller.loginId,
             unblockedAt: now,
@@ -3540,7 +7122,7 @@ function registerLoginSecurityRoutes(app, deps) {
             await db.collection("user_roles").doc(mDoc.id).update(tempPassUpdates);
           }
         }
-        const resetLogId = `reset_${Date.now()}_${crypto2.randomBytes(3).toString("hex")}`;
+        const resetLogId = `reset_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
         await Promise.all([
           db.collection("password_reset_logs").doc(resetLogId).set({
             id: resetLogId,
@@ -3644,15 +7226,207 @@ function registerLoginSecurityRoutes(app, deps) {
       });
     }
   });
+  app.post("/api/security/reset-superadmin-lockout-level", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        ["super_admin"],
+        "Reset Super Admin Progressive Lockout Level"
+      );
+      if (!caller) return;
+      const parsed = ResetSuperAdminLockoutLevelSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || "Invalid lockout level reset request."
+        });
+      }
+      const reason = parsed.data.reason.trim();
+      const freshPassword = parsed.data.freshSuperAdminPassword;
+      const telemetry = await captureTelemetryContext(db, req);
+      const nowMs = getNowMs();
+      const now = new Date(nowMs).toISOString();
+      const nowSec = Math.floor(nowMs / 1e3);
+      const isRecentTokenAuth = typeof caller.authTime === "number" && nowSec - caller.authTime <= 300;
+      let freshAuthVerified = false;
+      if (freshPassword && freshPassword.length > 0) {
+        const callerDoc = await db.collection("user_roles").doc(caller.profileDocId).get();
+        const callerHash = callerDoc.exists ? callerDoc.data()?.passwordHash : null;
+        if (callerHash && verifyPassword2(freshPassword, String(callerHash))) {
+          freshAuthVerified = true;
+        } else {
+          await recordSecurityAuditLogDoc(db, {
+            action: "UNAUTHORIZED_SECURITY_ACCESS",
+            severity: "CRITICAL",
+            targetLoginId: "superadmin",
+            targetRole: "SUPER_ADMIN",
+            actorUid: caller.uid,
+            actorLoginId: caller.loginId,
+            actorRole: "SUPER_ADMIN",
+            reason: "Failed fresh Super Admin password verification for progressive lockout level reset",
+            details: `Super Admin "${caller.loginId}" entered an incorrect password during fresh re-authentication check for progressive lockout level reset.`,
+            nowMs,
+            telemetry
+          });
+          return res.status(401).json({
+            success: false,
+            requiresFreshAuth: true,
+            error: "Fresh Super Admin authentication failed: Incorrect Super Admin password."
+          });
+        }
+      } else if (isRecentTokenAuth) {
+        freshAuthVerified = true;
+      }
+      if (!freshAuthVerified) {
+        return res.status(401).json({
+          success: false,
+          requiresFreshAuth: true,
+          error: "Fresh Super Admin authentication is required before resetting the progressive lockout level. Please enter your current Super Admin password."
+        });
+      }
+      const resetResult = await withLoginIdLock("superadmin", async () => {
+        let userDoc = await db.collection("user_roles").doc("role_superadmin").get();
+        if (!userDoc.exists) {
+          const snap = await db.collection("user_roles").where("loginId", "==", "superadmin").limit(1).get();
+          if (!snap.empty) userDoc = snap.docs[0];
+        }
+        if (!userDoc || !userDoc.exists) {
+          return { notFound: true };
+        }
+        const userData = userDoc.data() || {};
+        if (!isCanonicalSuperAdminAccount(userDoc.id, userData)) {
+          return { notFound: true };
+        }
+        const firebaseUid = String(userData.authUid || userDoc.id);
+        const secRef = db.collection("account_security").doc("sec_superadmin");
+        const userRef = db.collection("user_roles").doc(userDoc.id);
+        let previousLevel = 0;
+        let totalLockoutEvents = 0;
+        await db.runTransaction(async (tx) => {
+          const [secSnap, freshUserSnap] = await Promise.all([tx.get(secRef), tx.get(userRef)]);
+          const curSec = secSnap.exists ? secSnap.data() || {} : {};
+          const freshUser = freshUserSnap.exists ? freshUserSnap.data() || {} : userData;
+          previousLevel = Number(curSec.progressiveLockLevel ?? freshUser.progressiveLockLevel ?? 0);
+          totalLockoutEvents = Number(curSec.totalLockoutEvents ?? freshUser.totalLockoutEvents ?? 0);
+          tx.set(
+            secRef,
+            {
+              ...curSec,
+              id: "sec_superadmin",
+              loginId: "superadmin",
+              role: "SUPER_ADMIN",
+              firebaseUid,
+              email: freshUser.email || "superadmin@narid.com",
+              lockPolicyType: "PROGRESSIVE_TEMPORARY",
+              progressiveLockLevel: 0,
+              consecutiveFailedAttempts: 0,
+              cleanWindowStartAt: null,
+              cleanWindowStartMs: null,
+              cleanLoginsSinceLastLockout: 0,
+              lockoutLevelResetAt: now,
+              lockoutLevelResetReason: reason,
+              updatedAt: now
+            },
+            { merge: true }
+          );
+          tx.update(userRef, {
+            progressiveLockLevel: 0,
+            consecutiveFailedAttempts: 0,
+            cleanWindowStartAt: null,
+            cleanWindowStartMs: null,
+            cleanLoginsSinceLastLockout: 0,
+            lockoutLevelResetAt: now,
+            lockoutLevelResetReason: reason,
+            updatedAt: now
+          });
+        });
+        await Promise.all([
+          recordSecurityAuditLogDoc(db, {
+            action: "LOCKOUT_LEVEL_RESET",
+            severity: "CRITICAL",
+            targetLoginId: "superadmin",
+            targetRole: "SUPER_ADMIN",
+            targetUid: firebaseUid,
+            actorUid: caller.uid,
+            actorLoginId: caller.loginId,
+            actorRole: "SUPER_ADMIN",
+            reason,
+            details: `Super Admin "${caller.loginId}" explicitly reset canonical Super Admin progressive lockout level from ${previousLevel} to 0. Historical lockout count (${totalLockoutEvents}) preserved. Reason: ${reason}`,
+            metadata: {
+              resetType: "MANUAL_APPROVED_RESET",
+              previousLevel,
+              newLevel: 0,
+              totalLockoutEventsPreserved: totalLockoutEvents
+            },
+            nowMs,
+            telemetry
+          }),
+          recordEnterpriseAuditEvent(db, {
+            req,
+            action: "super_admin_lockout_level_reset",
+            category: "SECURITY",
+            severity: "CRITICAL",
+            actorUid: caller.uid,
+            actorLoginId: caller.loginId,
+            actorRole: "SUPER_ADMIN",
+            targetType: "ACCOUNT",
+            targetId: userDoc.id,
+            oldValue: { progressiveLockLevel: previousLevel },
+            newValue: {
+              progressiveLockLevel: 0,
+              resetType: "MANUAL_APPROVED_RESET",
+              totalLockoutEventsPreserved: totalLockoutEvents,
+              reason
+            },
+            actionSource: "SECURITY_CONTROL_LOCKOUT_RESET",
+            reason,
+            description: `Super Admin "${caller.loginId}" reset canonical Super Admin progressive lockout level from ${previousLevel} to 0.`,
+            success: true
+          })
+        ]);
+        return {
+          notFound: false,
+          previousLevel,
+          newLevel: 0,
+          totalLockoutEvents,
+          resetAt: now
+        };
+      });
+      if (resetResult.notFound) {
+        return res.status(404).json({
+          success: false,
+          error: "Canonical Super Admin account not found."
+        });
+      }
+      return res.json({
+        success: true,
+        message: `Super Admin progressive lockout level reset from ${resetResult.previousLevel} to 0. Full lockout history (${resetResult.totalLockoutEvents} events) preserved.`,
+        ...resetResult
+      });
+    } catch (err) {
+      if (isFirestorePermissionDeniedError(err)) {
+        const msg = formatAdminPermissionDeniedError(projectId, TARGET_DATABASE_ID);
+        return res.status(503).json({ success: false, code: "FIREBASE_ADMIN_PERMISSION_DENIED", error: msg });
+      }
+      console.error("[Security Reset Super Admin Lockout Level API] Error:", err);
+      return res.status(500).json({
+        success: false,
+        error: err?.message || "Failed to reset Super Admin progressive lockout level."
+      });
+    }
+  });
 }
 
 // serverAttendance.ts
-import crypto3 from "crypto";
-import { z as z2 } from "zod";
+import crypto4 from "crypto";
+import { z as z3 } from "zod";
 
 // src/utils/attendanceStatus.ts
 var STANDARD_DUTY_MINUTES = 510;
 var HALF_DAY_MIN_MINUTES = 270;
+var EARLY_OT_THRESHOLD_MINUTES = 60;
+var EARLY_PUNCH_POLICY_ID = "OPTION_A_60M";
 var NON_WORKING_STATUSES = /* @__PURE__ */ new Set([
   "ABSENT",
   "LEAVE",
@@ -3686,6 +7460,135 @@ function formatOtBadge(overtimeMinutes) {
   if (safe <= 0) return "00:00";
   return `${formatDurationClock(safe)} OT`;
 }
+function formatShiftTimeClock12h(timeStr) {
+  const clean = String(timeStr || "").trim();
+  if (!clean || !clean.includes(":")) return "--:--";
+  const [rawH, rawM] = clean.split(":").map((n) => parseInt(n, 10));
+  if (!Number.isFinite(rawH) || !Number.isFinite(rawM)) return "--:--";
+  const h24 = (rawH % 24 + 24) % 24;
+  const h12 = h24 % 12 || 12;
+  const ampm = h24 >= 12 ? "PM" : "AM";
+  return `${String(h12).padStart(2, "0")}:${String(rawM).padStart(2, "0")} ${ampm}`;
+}
+function getNextCalendarDateKey(dateKey) {
+  const [y, m, d] = String(dateKey || "1970-01-01").split("-").map(Number);
+  const dt = new Date(Date.UTC(y || 1970, (m || 1) - 1, d || 1));
+  dt.setUTCDate(dt.getUTCDate() + 1);
+  const nextY = dt.getUTCFullYear();
+  const nextM = String(dt.getUTCMonth() + 1).padStart(2, "0");
+  const nextD = String(dt.getUTCDate()).padStart(2, "0");
+  return `${nextY}-${nextM}-${nextD}`;
+}
+function resolveScheduledShiftDefaults(recordOrShift) {
+  const shiftIdUpper = String(recordOrShift?.shiftId || recordOrShift?.id || "").toUpperCase();
+  const shiftNameUpper = String(recordOrShift?.shiftNameSnapshot || recordOrShift?.name || "").toUpperCase();
+  const inferredNight = recordOrShift?.isOvernight === true || shiftIdUpper === "NIGHT" || shiftNameUpper.includes("NIGHT");
+  const defaultStart = inferredNight ? "20:00" : "09:00";
+  const defaultEnd = inferredNight ? "04:30" : "17:30";
+  const startTime = String(recordOrShift?.scheduledPunchIn || recordOrShift?.startTime || defaultStart).trim() || defaultStart;
+  const endTime = String(recordOrShift?.scheduledPunchOut || recordOrShift?.endTime || defaultEnd).trim() || defaultEnd;
+  return {
+    startTime,
+    endTime,
+    isOvernight: inferredNight
+  };
+}
+function resolveShiftScheduleBounds(shiftDate, shiftOrRecord) {
+  const { startTime, endTime, isOvernight } = resolveScheduledShiftDefaults(shiftOrRecord);
+  const [sh, sm] = startTime.split(":").map((n) => parseInt(n, 10) || 0);
+  const [eh, em] = endTime.split(":").map((n) => parseInt(n, 10) || 0);
+  const endDateKey = isOvernight ? getNextCalendarDateKey(shiftDate) : shiftDate;
+  const scheduledStartIso = `${shiftDate}T${String(sh).padStart(2, "0")}:${String(sm).padStart(2, "0")}:00+05:30`;
+  const scheduledEndIso = `${endDateKey}T${String(eh).padStart(2, "0")}:${String(em).padStart(2, "0")}:00+05:30`;
+  return {
+    startTime: `${String(sh).padStart(2, "0")}:${String(sm).padStart(2, "0")}`,
+    endTime: `${String(eh).padStart(2, "0")}:${String(em).padStart(2, "0")}`,
+    isOvernight,
+    scheduledStartIso,
+    scheduledEndIso,
+    scheduledStartMs: new Date(scheduledStartIso).getTime(),
+    scheduledEndMs: new Date(scheduledEndIso).getTime()
+  };
+}
+function evaluateEarlyPunchOnPunchIn(params) {
+  const firstInMs = new Date(params.firstInIso).getTime();
+  const scheduledStartMs = new Date(params.scheduledStartIso).getTime();
+  const earlyArrivalMinutes = Number.isFinite(firstInMs) && Number.isFinite(scheduledStartMs) && firstInMs < scheduledStartMs ? Math.max(0, Math.floor((scheduledStartMs - firstInMs) / 6e4)) : 0;
+  const provisionalEarlyOtMinutes = earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES ? earlyArrivalMinutes : 0;
+  return {
+    earlyArrivalMinutes,
+    provisionalEarlyOtMinutes,
+    earlyOtFinalized: false,
+    earlyPunchPolicy: EARLY_PUNCH_POLICY_ID
+  };
+}
+function evaluateOptionAPunchOut(params) {
+  const standardDutyMinutes = Math.max(
+    1,
+    Math.floor(Number.isFinite(params.standardDutyMinutes) ? Number(params.standardDutyMinutes) : STANDARD_DUTY_MINUTES)
+  );
+  const firstInMs = new Date(params.firstInIso).getTime();
+  const lastOutMs = new Date(params.lastOutIso).getTime();
+  const scheduledStartMs = new Date(params.scheduledStartIso).getTime();
+  if (!Number.isFinite(firstInMs) || !Number.isFinite(lastOutMs) || lastOutMs < firstInMs) {
+    return {
+      actualPresenceMinutes: 0,
+      earlyArrivalMinutes: 0,
+      provisionalEarlyOtMinutes: 0,
+      earlyOtMinutes: 0,
+      postShiftOtMinutes: 0,
+      overtimeMinutes: 0,
+      totalOtMinutes: 0,
+      regularDutyMinutes: 0,
+      totalDutyMinutes: 0,
+      attendanceStatus: "SHORT LEAVE",
+      earlyOtFinalized: true,
+      earlyPunchPolicy: EARLY_PUNCH_POLICY_ID
+    };
+  }
+  const actualPresenceMinutes = Math.max(0, Math.floor((lastOutMs - firstInMs) / 6e4));
+  const earlyArrivalMinutes = Number.isFinite(scheduledStartMs) && firstInMs < scheduledStartMs ? Math.max(0, Math.floor((scheduledStartMs - firstInMs) / 6e4)) : 0;
+  const provisionalEarlyOtMinutes = earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES ? earlyArrivalMinutes : 0;
+  const shiftAnchorMs = Number.isFinite(scheduledStartMs) && firstInMs < scheduledStartMs ? scheduledStartMs : firstInMs;
+  const fromShiftStartMinutes = Math.max(0, Math.floor((lastOutMs - shiftAnchorMs) / 6e4));
+  if (fromShiftStartMinutes >= standardDutyMinutes) {
+    const regularDutyMinutes = standardDutyMinutes;
+    const postShiftOtMinutes = fromShiftStartMinutes - standardDutyMinutes;
+    const earlyOtMinutes = provisionalEarlyOtMinutes;
+    const overtimeMinutes = earlyOtMinutes + postShiftOtMinutes;
+    const totalDutyMinutes = regularDutyMinutes + overtimeMinutes;
+    return {
+      actualPresenceMinutes,
+      earlyArrivalMinutes,
+      provisionalEarlyOtMinutes,
+      earlyOtMinutes,
+      postShiftOtMinutes,
+      overtimeMinutes,
+      totalOtMinutes: overtimeMinutes,
+      regularDutyMinutes,
+      totalDutyMinutes,
+      attendanceStatus: overtimeMinutes > 0 ? "COMPLETED + OT" : "COMPLETED",
+      earlyOtFinalized: true,
+      earlyPunchPolicy: EARLY_PUNCH_POLICY_ID
+    };
+  }
+  const countedDuty = earlyArrivalMinutes > 0 ? fromShiftStartMinutes : actualPresenceMinutes;
+  const attendanceStatus = classifyCompletedDutyStatus(countedDuty, standardDutyMinutes);
+  return {
+    actualPresenceMinutes,
+    earlyArrivalMinutes,
+    provisionalEarlyOtMinutes,
+    earlyOtMinutes: 0,
+    postShiftOtMinutes: 0,
+    overtimeMinutes: 0,
+    totalOtMinutes: 0,
+    regularDutyMinutes: countedDuty,
+    totalDutyMinutes: countedDuty,
+    attendanceStatus,
+    earlyOtFinalized: true,
+    earlyPunchPolicy: EARLY_PUNCH_POLICY_ID
+  };
+}
 function isAttendanceLate(record) {
   if (!record) return false;
   if (record.isLate === true) return true;
@@ -3713,6 +7616,8 @@ function isAttendanceRecordOpen(record) {
   return Boolean(record.firstPunchIn || record.punchIn);
 }
 function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinutes = STANDARD_DUTY_MINUTES) {
+  const { startTime: defaultStart } = resolveScheduledShiftDefaults(record);
+  const scheduledStartDisplay = formatShiftTimeClock12h(defaultStart);
   if (!record) {
     return {
       status: "ABSENT",
@@ -3723,7 +7628,16 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       regularDutyMinutes: 0,
       overtimeMinutes: 0,
       accumulatedDutyMinutes: 0,
-      otLabel: "00:00"
+      otLabel: "00:00",
+      scheduledPunchIn: defaultStart,
+      scheduledStartDisplay,
+      earlyArrivalMinutes: 0,
+      provisionalEarlyOtMinutes: 0,
+      earlyOtMinutes: 0,
+      postShiftOtMinutes: 0,
+      totalOtMinutes: 0,
+      earlyOtFinalized: false,
+      isEarlyPunch: false
     };
   }
   const rawStatus = String(record.attendanceStatus || "").trim().toUpperCase();
@@ -3738,9 +7652,20 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       regularDutyMinutes: 0,
       overtimeMinutes: 0,
       accumulatedDutyMinutes: 0,
-      otLabel: "00:00"
+      otLabel: "00:00",
+      scheduledPunchIn: defaultStart,
+      scheduledStartDisplay,
+      earlyArrivalMinutes: 0,
+      provisionalEarlyOtMinutes: 0,
+      earlyOtMinutes: 0,
+      postShiftOtMinutes: 0,
+      totalOtMinutes: 0,
+      earlyOtFinalized: false,
+      isEarlyPunch: false
     };
   }
+  const storedEarlyArrival = Math.max(0, Math.floor(Number(record.earlyArrivalMinutes || 0) || 0));
+  const computedProvisionalEarlyOt = typeof record.provisionalEarlyOtMinutes === "number" && Number.isFinite(record.provisionalEarlyOtMinutes) ? Math.max(0, Math.floor(record.provisionalEarlyOtMinutes)) : storedEarlyArrival >= EARLY_OT_THRESHOLD_MINUTES ? storedEarlyArrival : 0;
   const reenteredInside = String(record.currentState || "").toUpperCase() === "INSIDE" && String(record.punchOutType || "").toUpperCase() === "NONE";
   if (!reenteredInside && (record.autoClosed === true || String(record.punchOutType || "").toUpperCase() === "AUTO" || rawStatus === "AUTO CLOSED" || rawStatus === "MISSED PUNCH OUT" || record.missedPunchOut === true)) {
     const completedDutyMinutes2 = Math.max(
@@ -3758,7 +7683,16 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       overtimeMinutes: 0,
       // Strictly zero OT on auto-closed / missed punch out
       accumulatedDutyMinutes: 0,
-      otLabel: "00:00"
+      otLabel: "00:00",
+      scheduledPunchIn: defaultStart,
+      scheduledStartDisplay,
+      earlyArrivalMinutes: storedEarlyArrival,
+      provisionalEarlyOtMinutes: 0,
+      earlyOtMinutes: 0,
+      postShiftOtMinutes: 0,
+      totalOtMinutes: 0,
+      earlyOtFinalized: false,
+      isEarlyPunch: storedEarlyArrival > 0
     };
   }
   if (isAttendanceRecordOpen(record)) {
@@ -3774,15 +7708,71 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       // Never count open shift as finalized completed duty
       regularDutyMinutes: 0,
       overtimeMinutes: 0,
-      // Never calculate OT on open shift
+      // Never finalize OT on open shift
       accumulatedDutyMinutes,
-      otLabel: "00:00"
+      otLabel: "00:00",
+      scheduledPunchIn: defaultStart,
+      scheduledStartDisplay,
+      earlyArrivalMinutes: storedEarlyArrival,
+      provisionalEarlyOtMinutes: computedProvisionalEarlyOt,
+      earlyOtMinutes: 0,
+      postShiftOtMinutes: 0,
+      totalOtMinutes: 0,
+      earlyOtFinalized: false,
+      isEarlyPunch: storedEarlyArrival > 0
     };
   }
   const firstInIso = record.firstPunchIn || record.punchIn;
   const lastOutIso = record.lastPunchOut || record.actualPunchOut || record.effectivePunchOut;
   const firstInMs = firstInIso ? new Date(firstInIso).getTime() : NaN;
   const lastOutMs = lastOutIso ? new Date(lastOutIso).getTime() : NaN;
+  const isOptionARecord = record.earlyPunchPolicy === EARLY_PUNCH_POLICY_ID || typeof record.earlyOtMinutes === "number" || typeof record.postShiftOtMinutes === "number";
+  if (isOptionARecord) {
+    let earlyArrivalMinutes = storedEarlyArrival;
+    let earlyOtMinutes = Math.max(0, Math.floor(Number(record.earlyOtMinutes || 0) || 0));
+    let postShiftOtMinutes = Math.max(0, Math.floor(Number(record.postShiftOtMinutes || 0) || 0));
+    let completedDutyMinutes2 = Math.max(0, Math.floor(Number(record.totalDutyMinutes || 0) || 0));
+    let regularDutyMinutes2 = Math.max(0, Math.floor(Number(record.regularDutyMinutes || 0) || 0));
+    let overtimeMinutes2 = earlyOtMinutes + postShiftOtMinutes;
+    const scheduledStartIso = record.scheduledPunchInIso || (record.shiftDate ? resolveShiftScheduleBounds(record.shiftDate, record).scheduledStartIso : void 0);
+    if (scheduledStartIso && firstInIso && lastOutIso && Number.isFinite(firstInMs) && Number.isFinite(lastOutMs)) {
+      const evaluated = evaluateOptionAPunchOut({
+        firstInIso,
+        lastOutIso,
+        scheduledStartIso,
+        standardDutyMinutes
+      });
+      earlyArrivalMinutes = evaluated.earlyArrivalMinutes;
+      earlyOtMinutes = evaluated.earlyOtMinutes;
+      postShiftOtMinutes = evaluated.postShiftOtMinutes;
+      overtimeMinutes2 = evaluated.overtimeMinutes;
+      regularDutyMinutes2 = evaluated.regularDutyMinutes;
+      completedDutyMinutes2 = evaluated.totalDutyMinutes;
+    } else if (overtimeMinutes2 === 0 && typeof record.overtimeMinutes === "number") {
+      overtimeMinutes2 = Math.max(0, Math.floor(record.overtimeMinutes));
+    }
+    const status2 = classifyCompletedDutyStatus(completedDutyMinutes2, standardDutyMinutes);
+    return {
+      status: status2,
+      state: "OUTSIDE",
+      isOpen: false,
+      isLate,
+      completedDutyMinutes: completedDutyMinutes2,
+      regularDutyMinutes: regularDutyMinutes2,
+      overtimeMinutes: overtimeMinutes2,
+      accumulatedDutyMinutes: 0,
+      otLabel: formatOtBadge(overtimeMinutes2),
+      scheduledPunchIn: defaultStart,
+      scheduledStartDisplay,
+      earlyArrivalMinutes,
+      provisionalEarlyOtMinutes: earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES ? earlyArrivalMinutes : 0,
+      earlyOtMinutes,
+      postShiftOtMinutes,
+      totalOtMinutes: overtimeMinutes2,
+      earlyOtFinalized: true,
+      isEarlyPunch: earlyArrivalMinutes > 0
+    };
+  }
   let completedDutyMinutes = 0;
   if (typeof record.totalDutyMinutes === "number" && Number.isFinite(record.totalDutyMinutes) && record.totalDutyMinutes > 0) {
     completedDutyMinutes = Math.floor(record.totalDutyMinutes);
@@ -3806,7 +7796,16 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
     regularDutyMinutes,
     overtimeMinutes,
     accumulatedDutyMinutes: 0,
-    otLabel: formatOtBadge(overtimeMinutes)
+    otLabel: formatOtBadge(overtimeMinutes),
+    scheduledPunchIn: defaultStart,
+    scheduledStartDisplay,
+    earlyArrivalMinutes: 0,
+    provisionalEarlyOtMinutes: 0,
+    earlyOtMinutes: 0,
+    postShiftOtMinutes: overtimeMinutes,
+    totalOtMinutes: overtimeMinutes,
+    earlyOtFinalized: true,
+    isEarlyPunch: false
   };
 }
 
@@ -3834,8 +7833,8 @@ var DEFAULT_SHIFTS = [
     startTime: "09:00",
     endTime: "17:30",
     scheduledDurationMinutes: 510,
-    punchInWindowStart: "09:00",
-    punchInWindowEnd: "20:00",
+    punchInWindowStart: "06:00",
+    punchInWindowEnd: "18:00",
     isOvernight: false,
     gracePeriodMinutes: 15,
     status: "Active"
@@ -3846,8 +7845,8 @@ var DEFAULT_SHIFTS = [
     startTime: "20:00",
     endTime: "04:30",
     scheduledDurationMinutes: 510,
-    punchInWindowStart: "20:00",
-    punchInWindowEnd: "09:00",
+    punchInWindowStart: "18:00",
+    punchInWindowEnd: "06:00",
     isOvernight: true,
     gracePeriodMinutes: 15,
     status: "Active"
@@ -3863,7 +7862,9 @@ var DEFAULT_SETTINGS = {
 var employeeScanLocks = /* @__PURE__ */ new Map();
 async function withEmployeeScanLock(employeeId, task) {
   const key = employeeId.trim().toUpperCase() || "__UNKNOWN__";
-  const prev = employeeScanLocks.get(key) || Promise.resolve();
+  const existing = employeeScanLocks.get(key);
+  const waitedForLock = Boolean(existing);
+  const prev = existing || Promise.resolve();
   let release;
   const gate = new Promise((resolve) => {
     release = resolve;
@@ -3872,7 +7873,7 @@ async function withEmployeeScanLock(employeeId, task) {
   employeeScanLocks.set(key, chained);
   try {
     await prev;
-    return await task();
+    return await task({ waitedForLock });
   } finally {
     release();
     if (employeeScanLocks.get(key) === chained) {
@@ -3996,13 +7997,26 @@ function parseQrPayload(raw) {
   }
   return { employeeId: cleanLegacyId, format: "LEGACY_EMPLOYEE_ID" };
 }
+function resolveEffectivePunchInWindow(shift) {
+  const rawStart = String(shift?.punchInWindowStart || "").trim();
+  const rawEnd = String(shift?.punchInWindowEnd || "").trim();
+  const shiftIdUpper = String(shift?.id || "").toUpperCase();
+  if (!shift?.isOvernight && (shiftIdUpper === "DAY" || shift?.startTime === "09:00") && rawStart === "09:00" && rawEnd === "20:00") {
+    return { winStartStr: "06:00", winEndStr: "18:00" };
+  }
+  if ((shift?.isOvernight || shiftIdUpper === "NIGHT") && shift?.startTime === "20:00" && rawStart === "20:00" && rawEnd === "09:00") {
+    return { winStartStr: "18:00", winEndStr: "06:00" };
+  }
+  return { winStartStr: rawStart, winEndStr: rawEnd };
+}
 function identifyShiftForPunchIn(shifts, now = /* @__PURE__ */ new Date()) {
   const kolkata = getKolkataTimeParts(now);
   const currentMins = kolkata.totalMinutes;
   const activeShifts = shifts.filter((s) => s.status === "Active");
   for (const shift of activeShifts) {
-    const winStart = timeStringToMinutes(shift.punchInWindowStart);
-    const winEnd = timeStringToMinutes(shift.punchInWindowEnd);
+    const { winStartStr, winEndStr } = resolveEffectivePunchInWindow(shift);
+    const winStart = timeStringToMinutes(winStartStr);
+    const winEnd = timeStringToMinutes(winEndStr);
     if (winStart < winEnd) {
       if (currentMins >= winStart && currentMins < winEnd) {
         return { shift, shiftDate: kolkata.dateKey };
@@ -4017,35 +8031,35 @@ function identifyShiftForPunchIn(shifts, now = /* @__PURE__ */ new Date()) {
   }
   const dayShift = activeShifts.find((s) => !s.isOvernight) || activeShifts[0];
   const nightShift = activeShifts.find((s) => s.isOvernight) || activeShifts[activeShifts.length - 1];
-  if (currentMins >= 540 && currentMins < 1200) {
+  if (currentMins >= 360 && currentMins < 1080) {
     return dayShift ? { shift: dayShift, shiftDate: kolkata.dateKey } : null;
-  } else if (currentMins >= 1200) {
+  } else if (currentMins >= 1080) {
     return nightShift ? { shift: nightShift, shiftDate: kolkata.dateKey } : null;
   } else {
     return nightShift ? { shift: nightShift, shiftDate: getYesterdayKolkataDateKey(now) } : null;
   }
 }
-var AttendanceScanSchema = z2.object({
-  rawPayload: z2.string().trim().min(1, "Scan payload cannot be empty.").max(256),
-  scannerType: z2.enum(["IN", "OUT"]).optional(),
-  scannerDevice: z2.enum(["USB_SCANNER", "WEBCAM", "MANUAL", "SYSTEM_AUTO"]).optional(),
-  customScanTime: z2.string().datetime({ offset: true }).or(z2.string().datetime()).optional(),
-  clientRequestId: z2.string().trim().min(4).max(64).optional()
+var AttendanceScanSchema = z3.object({
+  rawPayload: z3.string().trim().min(1, "Scan payload cannot be empty.").max(256),
+  scannerType: z3.enum(["IN", "OUT"]).optional(),
+  scannerDevice: z3.enum(["USB_SCANNER", "WEBCAM", "MANUAL", "SYSTEM_AUTO"]).optional(),
+  customScanTime: z3.string().datetime({ offset: true }).or(z3.string().datetime()).optional(),
+  clientRequestId: z3.string().trim().min(4).max(64).optional()
 });
-var ManualPunchSchema = z2.object({
-  employeeId: z2.string().trim().min(2, "Please enter a valid Employee ID.").max(32, "Employee ID cannot exceed 32 characters.").transform((v) => v.toUpperCase()).refine((v) => EMPLOYEE_ID_PATTERN.test(v), {
+var ManualPunchSchema = z3.object({
+  employeeId: z3.string().trim().min(2, "Please enter a valid Employee ID.").max(32, "Employee ID cannot exceed 32 characters.").transform((v) => v.toUpperCase()).refine((v) => EMPLOYEE_ID_PATTERN.test(v), {
     message: "Invalid Employee ID format. Use letters, numbers, hyphens, or underscores only."
   }),
-  scannerType: z2.enum(["IN", "OUT"]).optional(),
-  reason: z2.string().trim().max(250).optional(),
-  customScanTime: z2.string().datetime({ offset: true }).or(z2.string().datetime()).optional(),
-  clientRequestId: z2.string().trim().min(4).max(64).optional()
+  scannerType: z3.enum(["IN", "OUT"]).optional(),
+  reason: z3.string().trim().max(250).optional(),
+  customScanTime: z3.string().datetime({ offset: true }).or(z3.string().datetime()).optional(),
+  clientRequestId: z3.string().trim().min(4).max(64).optional()
 });
-var AttendanceCorrectSchema = z2.object({
-  attendanceId: z2.string().trim().min(1, "Attendance ID is required.").max(128),
-  actualPunchOut: z2.string().optional(),
-  punchOutType: z2.enum(["ACTUAL", "AUTO"]),
-  attendanceStatus: z2.enum([
+var AttendanceCorrectSchema = z3.object({
+  attendanceId: z3.string().trim().min(1, "Attendance ID is required.").max(128),
+  actualPunchOut: z3.string().optional(),
+  punchOutType: z3.enum(["ACTUAL", "AUTO"]),
+  attendanceStatus: z3.enum([
     "IN PROGRESS",
     "SHORT LEAVE",
     "HALF DAY",
@@ -4058,18 +8072,18 @@ var AttendanceCorrectSchema = z2.object({
     "ABSENT",
     "ON LEAVE"
   ]),
-  reason: z2.string().trim().min(3, "A clear correction reason (at least 3 characters) is mandatory.").max(500)
+  reason: z3.string().trim().min(3, "A clear correction reason (at least 3 characters) is mandatory.").max(500)
 });
-var GenerateRosterSchema = z2.object({
-  shiftDate: z2.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Invalid shiftDate (expected YYYY-MM-DD)."),
-  shiftId: z2.string().trim().min(1).max(64)
+var GenerateRosterSchema = z3.object({
+  shiftDate: z3.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Invalid shiftDate (expected YYYY-MM-DD)."),
+  shiftId: z3.string().trim().min(1).max(64)
 });
-var ClearAttendanceSchema = z2.object({
-  confirmed: z2.literal(true, { message: "Explicit confirmation is required to clear attendance records." }),
-  confirmPhrase: z2.literal("CLEAR_ALL_ATTENDANCE", {
+var ClearAttendanceSchema = z3.object({
+  confirmed: z3.literal(true, { message: "Explicit confirmation is required to clear attendance records." }),
+  confirmPhrase: z3.literal("CLEAR_ALL_ATTENDANCE", {
     message: 'Confirmation phrase "CLEAR_ALL_ATTENDANCE" is required to clear attendance records.'
   }),
-  reason: z2.string().trim().min(5, "Reason is required for audit trail.").max(500).optional()
+  reason: z3.string().trim().min(5, "Reason is required for audit trail.").max(500).optional()
 });
 var ADMIN_FALLBACK_ACTIONS = {
   dashboard: { view: true },
@@ -4159,18 +8173,29 @@ async function resolveCallerAttendancePermissions(db, caller) {
       canQrScan: true,
       canManualEntry: true,
       canCustomTime: true,
-      cacheHitRolePerms: true
+      cacheHitRolePerms: true,
+      extraReads: 0
     };
   }
+  let extraReads = 0;
   try {
+    const hasPrefetchedRolePerm = Boolean(caller.prefetchedRolePerm) && caller.prefetchedRolePerm.role === caller.role;
     const [userPermSnap, rolePermSnap] = await Promise.all([
-      caller.prefetchedUserPermSnap ? Promise.resolve(caller.prefetchedUserPermSnap) : db.collection("user_permissions").doc(caller.profileDocId).get(),
-      getCachedRolePermissionsDoc(db, caller.role)
+      caller.prefetchedUserPermSnap ? Promise.resolve(caller.prefetchedUserPermSnap) : (extraReads += 1, db.collection("user_permissions").doc(caller.profileDocId).get()),
+      hasPrefetchedRolePerm ? Promise.resolve({
+        exists: caller.prefetchedRolePerm.exists,
+        data: caller.prefetchedRolePerm.data,
+        cacheHit: caller.prefetchedRolePerm.cacheHit
+      }) : getCachedRolePermissionsDoc(db, caller.role).then((res) => {
+        if (!res.cacheHit) extraReads += 1;
+        return res;
+      })
     ]);
     const userPermData = userPermSnap.exists ? userPermSnap.data() : void 0;
     const rolePermData = rolePermSnap.exists ? rolePermSnap.data : void 0;
     let fallbackModules = caller.modulesAllowed;
     if (fallbackModules === void 0 && caller.role !== "admin") {
+      extraReads += 1;
       const userSnap = await db.collection("user_roles").doc(caller.profileDocId).get();
       if (userSnap.exists && Array.isArray(userSnap.data()?.modulesAllowed)) {
         fallbackModules = userSnap.data().modulesAllowed;
@@ -4223,7 +8248,8 @@ async function resolveCallerAttendancePermissions(db, caller) {
       canQrScan,
       canManualEntry,
       canCustomTime,
-      cacheHitRolePerms: rolePermSnap.cacheHit
+      cacheHitRolePerms: rolePermSnap.cacheHit,
+      extraReads
     };
   } catch (err) {
     console.warn("[Attendance Permission Context] Lookup failed; failing closed:", err?.message || err);
@@ -4231,29 +8257,75 @@ async function resolveCallerAttendancePermissions(db, caller) {
       canQrScan: false,
       canManualEntry: false,
       canCustomTime: false,
-      cacheHitRolePerms: false
+      cacheHitRolePerms: false,
+      extraReads
     };
   }
 }
 function registerAttendanceRoutes(app, deps) {
   const { db, requireVerifiedCaller } = deps;
   async function writePunchLog(entry) {
-    const id = `log_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
+    const id = `log_${Date.now()}_${crypto4.randomBytes(3).toString("hex")}`;
     await db.collection("punch_logs").doc(id).set({ ...entry, id });
   }
   app.post("/api/attendance/scan", async (req, res) => {
     const reqStartMs = performance.now();
     try {
+      const parsed = AttendanceScanSchema.safeParse(req.body);
+      let preQrParseMs = 0;
+      let preQr = null;
+      let preNow = null;
+      let preYesterdayKey = null;
+      if (parsed.success) {
+        const qrParseStart = performance.now();
+        preQr = parseQrPayload(parsed.data.rawPayload);
+        preQrParseMs = roundMs(performance.now() - qrParseStart);
+        const candidateNow = parsed.data.customScanTime ? new Date(parsed.data.customScanTime) : /* @__PURE__ */ new Date();
+        if (!Number.isNaN(candidateNow.getTime())) {
+          preNow = candidateNow;
+          preYesterdayKey = getYesterdayKolkataDateKey(candidateNow);
+        }
+      }
+      let prefetchedEmployee = null;
+      let prefetchedAttendance = null;
+      let prefetchedConfig = null;
       const caller = await requireVerifiedCaller(
         req,
         res,
         "*",
         "Attendance Scan Processing",
-        { prefetchUserPermission: true }
+        {
+          prefetchUserPermission: true,
+          onTokenVerified: () => {
+            if (!preQr || preQr.format === "INVALID" || !preQr.employeeId) return;
+            const empId = preQr.employeeId;
+            const empStart = performance.now();
+            prefetchedEmployee = db.collection("employees").doc(empId).get().then((snap) => ({ snap, ms: roundMs(performance.now() - empStart) }));
+            prefetchedEmployee.catch(() => {
+            });
+            if (preYesterdayKey && !employeeScanLocks.has(empId)) {
+              const attStart = performance.now();
+              const yKey = preYesterdayKey;
+              prefetchedAttendance = db.collection("attendance").where("employeeId", "==", empId).where("shiftDate", ">=", yKey).get().then((snap) => ({ snap, ms: roundMs(performance.now() - attStart), yesterdayKey: yKey }));
+              prefetchedAttendance.catch(() => {
+              });
+            }
+            const cfgStart = performance.now();
+            prefetchedConfig = Promise.all([
+              getCachedShifts(db, DEFAULT_SHIFTS),
+              getCachedSystemSettings(db, DEFAULT_SETTINGS)
+            ]).then(([shiftsRes, settingsRes]) => ({
+              shiftsRes,
+              settingsRes,
+              ms: roundMs(performance.now() - cfgStart)
+            }));
+            prefetchedConfig.catch(() => {
+            });
+          }
+        }
       );
       if (!caller) return;
       const authDoneMs = performance.now();
-      const parsed = AttendanceScanSchema.safeParse(req.body);
       const perms = await resolveCallerAttendancePermissions(db, caller);
       const permDoneMs = performance.now();
       if (!perms.canQrScan) {
@@ -4295,16 +8367,20 @@ function registerAttendanceRoutes(app, deps) {
           error: "Forbidden: Your role is not permitted to submit custom scan timestamps."
         });
       }
-      const now = customScanTime ? new Date(customScanTime) : /* @__PURE__ */ new Date();
+      const now = preNow || (customScanTime ? new Date(customScanTime) : /* @__PURE__ */ new Date());
       if (Number.isNaN(now.getTime())) {
         return res.status(400).json({ success: false, error: "Invalid customScanTime timestamp." });
       }
       const kolkata = getKolkataTimeParts(now);
       const timeDisplay = kolkata.timeWithSeconds;
-      const qrParseStartMs = performance.now();
-      const { employeeId, token, format } = parseQrPayload(rawPayload);
-      const qrParseDoneMs = performance.now();
-      const qrParseMs = roundMs(qrParseDoneMs - qrParseStartMs);
+      let qrParseMs = preQrParseMs;
+      let qrParsed = preQr;
+      if (!qrParsed) {
+        const qrParseStartMs = performance.now();
+        qrParsed = parseQrPayload(rawPayload);
+        qrParseMs = roundMs(performance.now() - qrParseStartMs);
+      }
+      const { employeeId, token, format } = qrParsed;
       if (format === "INVALID" || !employeeId) {
         await writePunchLog({
           employeeId: "UNKNOWN",
@@ -4329,15 +8405,36 @@ function registerAttendanceRoutes(app, deps) {
       const outcome = await runWithOptionalClientRequestDedup(
         db,
         dedupKey,
-        () => withEmployeeScanLock(employeeId, async () => {
+        () => withEmployeeScanLock(employeeId, async ({ waitedForLock }) => {
           const lookupStartMs = performance.now();
           const yesterdayKey = getYesterdayKolkataDateKey(now);
-          const [empSnap, candidateSnap, shiftsRes, settingsRes] = await Promise.all([
-            db.collection("employees").doc(employeeId).get(),
-            db.collection("attendance").where("employeeId", "==", employeeId).where("shiftDate", ">=", yesterdayKey).get(),
-            getCachedShifts(db, DEFAULT_SHIFTS),
-            getCachedSystemSettings(db, DEFAULT_SETTINGS)
-          ]);
+          const canReuseEmployee = Boolean(prefetchedEmployee);
+          const canReuseAttendance = !waitedForLock && Boolean(prefetchedAttendance) && preYesterdayKey === yesterdayKey;
+          const canReuseConfig = Boolean(prefetchedConfig);
+          const parallelPrefetchUsed = canReuseEmployee && canReuseAttendance;
+          const empTask = canReuseEmployee ? prefetchedEmployee : (() => {
+            const s = performance.now();
+            return db.collection("employees").doc(employeeId).get().then((snap) => ({ snap, ms: roundMs(performance.now() - s) }));
+          })();
+          const attTask = canReuseAttendance ? prefetchedAttendance : (() => {
+            const s = performance.now();
+            return db.collection("attendance").where("employeeId", "==", employeeId).where("shiftDate", ">=", yesterdayKey).get().then((snap) => ({ snap, ms: roundMs(performance.now() - s), yesterdayKey }));
+          })();
+          const cfgTask = canReuseConfig ? prefetchedConfig : (() => {
+            const s = performance.now();
+            return Promise.all([
+              getCachedShifts(db, DEFAULT_SHIFTS),
+              getCachedSystemSettings(db, DEFAULT_SETTINGS)
+            ]).then(([shiftsRes2, settingsRes2]) => ({
+              shiftsRes: shiftsRes2,
+              settingsRes: settingsRes2,
+              ms: roundMs(performance.now() - s)
+            }));
+          })();
+          const [empResult, attResult, cfgResult] = await Promise.all([empTask, attTask, cfgTask]);
+          const empSnap = empResult.snap;
+          const candidateSnap = attResult.snap;
+          const { shiftsRes, settingsRes } = cfgResult;
           const lookupDoneMs = performance.now();
           if (!empSnap.exists) {
             await writePunchLog({
@@ -4435,15 +8532,33 @@ function registerAttendanceRoutes(app, deps) {
           const txDoneMs = performance.now();
           const lookupDuration = lookupDoneMs - lookupStartMs;
           const txDuration = txDoneMs - txStartMs;
+          const isCommittedPunch = punchRes.httpStatus === 200 && Boolean(punchRes.body?.success);
+          const isDuplicateReject = punchRes.body?.action === "REJECTED_DUPLICATE";
+          const txReads = isCommittedPunch || isDuplicateReject ? 1 : 0;
+          const txWrites = isCommittedPunch ? 3 : 1;
+          const configReads = (shiftsRes.cacheHit ? 0 : 1) + (settingsRes.cacheHit ? 0 : 1);
+          const totalFirestoreReads = (caller.authFirestoreReads ?? 0) + perms.extraReads + 1 + // employees/{id}
+          1 + // attendance query
+          configReads + txReads;
+          const totalFirestoreWrites = (caller.authFirestoreWrites ?? 0) + txWrites;
           const perf = {
             qrParseMs,
+            tokenVerifyMs: caller.tokenVerifyMs,
+            callerLookupMs: caller.callerLookupMs,
             authMs: roundMs(authDoneMs - reqStartMs),
             permissionMs: roundMs(permDoneMs - authDoneMs),
+            employeeLookupMs: empResult.ms,
+            attendanceLookupMs: attResult.ms,
+            configLookupMs: cfgResult.ms,
             lookupAndQueryMs: roundMs(lookupDuration),
             tokenValidationMs: roundMs(tokenValDoneMs - tokenValStartMs),
             txMs: roundMs(txDuration),
             firestoreOpMs: roundMs(lookupDuration + txDuration),
+            auditMs: 0,
             totalServerMs: roundMs(txDoneMs - reqStartMs),
+            firestoreReads: totalFirestoreReads,
+            firestoreWrites: totalFirestoreWrites,
+            parallelPrefetchUsed,
             cacheHitRolePerms: perms.cacheHitRolePerms,
             cacheHitConfig: shiftsRes.cacheHit && settingsRes.cacheHit,
             cacheHitUidRoute: Boolean(caller.cacheHitUidRoute)
@@ -4458,9 +8573,89 @@ function registerAttendanceRoutes(app, deps) {
           };
         })
       );
+      const scanTotalMs = roundMs(performance.now() - reqStartMs);
+      const outcomePerf = outcome.body?.perf;
+      const outcomeAction = String(outcome.body?.action || "REJECTED");
+      const resolvedDir = outcome.body?.scannerType === "OUT" || scannerType === "OUT" ? "OUT" : "IN";
+      const isSuccess = outcome.httpStatus >= 200 && outcome.httpStatus < 300 && Boolean(outcome.body?.success);
+      const isDuplicate = outcomeAction === "REJECTED_DUPLICATE";
+      recordQrPunchTelemetry(db, {
+        mode: resolvedDir === "OUT" ? "QR_OUT" : "QR_IN",
+        action: outcomeAction,
+        success: isSuccess,
+        isDuplicateRejection: isDuplicate,
+        timedOut: outcome.httpStatus === 408 || outcome.httpStatus === 504,
+        qrParseMs,
+        tokenVerifyMs: outcomePerf?.tokenVerifyMs ?? caller.tokenVerifyMs,
+        callerLookupMs: outcomePerf?.callerLookupMs ?? caller.callerLookupMs,
+        authMs: outcomePerf?.authMs ?? roundMs(authDoneMs - reqStartMs),
+        permissionMs: outcomePerf?.permissionMs ?? roundMs(permDoneMs - authDoneMs),
+        employeeLookupMs: outcomePerf?.employeeLookupMs,
+        attendanceLookupMs: outcomePerf?.attendanceLookupMs,
+        configLookupMs: outcomePerf?.configLookupMs,
+        lookupAndQueryMs: outcomePerf?.lookupAndQueryMs,
+        tokenValidationMs: outcomePerf?.tokenValidationMs,
+        txMs: outcomePerf?.txMs,
+        firestoreOpMs: outcomePerf?.firestoreOpMs,
+        auditMs: outcomePerf?.auditMs ?? 0,
+        firestoreReads: outcomePerf?.firestoreReads,
+        firestoreWrites: outcomePerf?.firestoreWrites,
+        totalServerMs: outcomePerf?.totalServerMs ?? scanTotalMs,
+        reasonCode: isSuccess ? void 0 : outcomeAction,
+        correlationId: req.correlationId
+      });
+      if (typeof outcomePerf?.lookupAndQueryMs === "number") {
+        recordDbOpMetric(db, {
+          operation: "QUERY",
+          collection: "employees+attendance",
+          durationMs: outcomePerf.lookupAndQueryMs,
+          success: true,
+          correlationId: req.correlationId
+        });
+      }
+      if (typeof outcomePerf?.txMs === "number") {
+        recordDbOpMetric(db, {
+          operation: "TRANSACTION",
+          collection: "attendance",
+          durationMs: outcomePerf.txMs,
+          success: outcome.httpStatus < 500,
+          correlationId: req.correlationId
+        });
+      }
+      recordActivityTelemetry(db, {
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        action: isSuccess ? resolvedDir === "OUT" ? "QR_PUNCH_OUT" : "QR_PUNCH_IN" : `QR_SCAN_${outcomeAction}`,
+        module: "Attendance Scanner",
+        result: isSuccess ? "Success" : "Failed",
+        correlationId: req.correlationId,
+        detail: `${resolvedDir} scan via ${scannerDevice} (${outcome.httpStatus})`
+      });
       return res.status(outcome.httpStatus).json(outcome.body);
     } catch (err) {
       console.error("[API Attendance Scan] Error:", err);
+      const errMsg = String(err?.message || "Attendance scan processing failed.");
+      recordDbOpMetric(db, {
+        operation: "TRANSACTION",
+        collection: "attendance",
+        durationMs: roundMs(performance.now() - reqStartMs),
+        success: false,
+        isPermissionDenied: errMsg.toLowerCase().includes("permission"),
+        isNetworkError: errMsg.toLowerCase().includes("timeout") || errMsg.toLowerCase().includes("unavailable"),
+        errorMessage: errMsg,
+        correlationId: req.correlationId
+      });
+      recordQrPunchTelemetry(db, {
+        mode: "QR_IN",
+        action: "SYSTEM_ERROR",
+        success: false,
+        isDuplicateRejection: false,
+        timedOut: errMsg.toLowerCase().includes("timeout"),
+        totalServerMs: roundMs(performance.now() - reqStartMs),
+        reasonCode: "SYSTEM_ERROR",
+        correlationId: req.correlationId
+      });
       return res.status(500).json({
         success: false,
         action: "REJECTED",
@@ -4472,16 +8667,56 @@ function registerAttendanceRoutes(app, deps) {
   app.post("/api/attendance/manual-punch", async (req, res) => {
     const reqStartMs = performance.now();
     try {
+      const parsed = ManualPunchSchema.safeParse(req.body);
+      let preNow = null;
+      let preYesterdayKey = null;
+      if (parsed.success) {
+        const candidateNow = parsed.data.customScanTime ? new Date(parsed.data.customScanTime) : /* @__PURE__ */ new Date();
+        if (!Number.isNaN(candidateNow.getTime())) {
+          preNow = candidateNow;
+          preYesterdayKey = getYesterdayKolkataDateKey(candidateNow);
+        }
+      }
+      let prefetchedEmployee = null;
+      let prefetchedAttendance = null;
+      let prefetchedConfig = null;
       const caller = await requireVerifiedCaller(
         req,
         res,
         "*",
         "Manual Employee ID Punch",
-        { prefetchUserPermission: true }
+        {
+          prefetchUserPermission: true,
+          onTokenVerified: () => {
+            if (!parsed.success) return;
+            const empId = parsed.data.employeeId;
+            const empStart = performance.now();
+            prefetchedEmployee = db.collection("employees").doc(empId).get().then((snap) => ({ snap, ms: roundMs(performance.now() - empStart) }));
+            prefetchedEmployee.catch(() => {
+            });
+            if (preYesterdayKey && !employeeScanLocks.has(empId)) {
+              const attStart = performance.now();
+              const yKey = preYesterdayKey;
+              prefetchedAttendance = db.collection("attendance").where("employeeId", "==", empId).where("shiftDate", ">=", yKey).get().then((snap) => ({ snap, ms: roundMs(performance.now() - attStart), yesterdayKey: yKey }));
+              prefetchedAttendance.catch(() => {
+              });
+            }
+            const cfgStart = performance.now();
+            prefetchedConfig = Promise.all([
+              getCachedShifts(db, DEFAULT_SHIFTS),
+              getCachedSystemSettings(db, DEFAULT_SETTINGS)
+            ]).then(([shiftsRes, settingsRes]) => ({
+              shiftsRes,
+              settingsRes,
+              ms: roundMs(performance.now() - cfgStart)
+            }));
+            prefetchedConfig.catch(() => {
+            });
+          }
+        }
       );
       if (!caller) return;
       const authDoneMs = performance.now();
-      const parsed = ManualPunchSchema.safeParse(req.body);
       const perms = await resolveCallerAttendancePermissions(db, caller);
       const permDoneMs = performance.now();
       if (!perms.canManualEntry) {
@@ -4522,7 +8757,7 @@ function registerAttendanceRoutes(app, deps) {
           error: "Forbidden: Your role is not permitted to submit custom punch timestamps."
         });
       }
-      const now = customScanTime ? new Date(customScanTime) : /* @__PURE__ */ new Date();
+      const now = preNow || (customScanTime ? new Date(customScanTime) : /* @__PURE__ */ new Date());
       if (Number.isNaN(now.getTime())) {
         return res.status(400).json({ success: false, error: "Invalid customScanTime timestamp." });
       }
@@ -4533,15 +8768,36 @@ function registerAttendanceRoutes(app, deps) {
       const outcome = await runWithOptionalClientRequestDedup(
         db,
         dedupKey,
-        () => withEmployeeScanLock(employeeId, async () => {
+        () => withEmployeeScanLock(employeeId, async ({ waitedForLock }) => {
           const lookupStartMs = performance.now();
           const yesterdayKey = getYesterdayKolkataDateKey(now);
-          const [empSnap, candidateSnap, shiftsRes, settingsRes] = await Promise.all([
-            db.collection("employees").doc(employeeId).get(),
-            db.collection("attendance").where("employeeId", "==", employeeId).where("shiftDate", ">=", yesterdayKey).get(),
-            getCachedShifts(db, DEFAULT_SHIFTS),
-            getCachedSystemSettings(db, DEFAULT_SETTINGS)
-          ]);
+          const canReuseEmployee = Boolean(prefetchedEmployee);
+          const canReuseAttendance = !waitedForLock && Boolean(prefetchedAttendance) && preYesterdayKey === yesterdayKey;
+          const canReuseConfig = Boolean(prefetchedConfig);
+          const parallelPrefetchUsed = canReuseEmployee && canReuseAttendance;
+          const empTask = canReuseEmployee ? prefetchedEmployee : (() => {
+            const s = performance.now();
+            return db.collection("employees").doc(employeeId).get().then((snap) => ({ snap, ms: roundMs(performance.now() - s) }));
+          })();
+          const attTask = canReuseAttendance ? prefetchedAttendance : (() => {
+            const s = performance.now();
+            return db.collection("attendance").where("employeeId", "==", employeeId).where("shiftDate", ">=", yesterdayKey).get().then((snap) => ({ snap, ms: roundMs(performance.now() - s), yesterdayKey }));
+          })();
+          const cfgTask = canReuseConfig ? prefetchedConfig : (() => {
+            const s = performance.now();
+            return Promise.all([
+              getCachedShifts(db, DEFAULT_SHIFTS),
+              getCachedSystemSettings(db, DEFAULT_SETTINGS)
+            ]).then(([shiftsRes2, settingsRes2]) => ({
+              shiftsRes: shiftsRes2,
+              settingsRes: settingsRes2,
+              ms: roundMs(performance.now() - s)
+            }));
+          })();
+          const [empResult, attResult, cfgResult] = await Promise.all([empTask, attTask, cfgTask]);
+          const empSnap = empResult.snap;
+          const candidateSnap = attResult.snap;
+          const { shiftsRes, settingsRes } = cfgResult;
           const lookupDoneMs = performance.now();
           if (!empSnap.exists) {
             await writePunchLog({
@@ -4611,6 +8867,7 @@ function registerAttendanceRoutes(app, deps) {
           });
           const txDoneMs = performance.now();
           let auditDoneMs = txDoneMs;
+          let auditWrites = 0;
           if (result.httpStatus === 200 && result.body.success) {
             await recordEnterpriseAuditEvent(db, {
               req,
@@ -4627,18 +8884,34 @@ function registerAttendanceRoutes(app, deps) {
               reason: reason || "Authorized operator manual Employee ID punch",
               captureGeo: false
             });
+            auditWrites = 1;
             auditDoneMs = performance.now();
           }
           const lookupDuration = lookupDoneMs - lookupStartMs;
           const txDuration = txDoneMs - txStartMs;
+          const isCommittedPunch = result.httpStatus === 200 && Boolean(result.body?.success);
+          const isDuplicateReject = result.body?.action === "REJECTED_DUPLICATE";
+          const txReads = isCommittedPunch || isDuplicateReject ? 1 : 0;
+          const txWrites = isCommittedPunch ? 3 : 1;
+          const configReads = (shiftsRes.cacheHit ? 0 : 1) + (settingsRes.cacheHit ? 0 : 1);
+          const totalFirestoreReads = (caller.authFirestoreReads ?? 0) + perms.extraReads + 1 + 1 + configReads + txReads;
+          const totalFirestoreWrites = (caller.authFirestoreWrites ?? 0) + txWrites + auditWrites;
           const perf = {
+            tokenVerifyMs: caller.tokenVerifyMs,
+            callerLookupMs: caller.callerLookupMs,
             authMs: roundMs(authDoneMs - reqStartMs),
             permissionMs: roundMs(permDoneMs - authDoneMs),
+            employeeLookupMs: empResult.ms,
+            attendanceLookupMs: attResult.ms,
+            configLookupMs: cfgResult.ms,
             lookupAndQueryMs: roundMs(lookupDuration),
             txMs: roundMs(txDuration),
             firestoreOpMs: roundMs(lookupDuration + txDuration),
             auditMs: roundMs(auditDoneMs - txDoneMs),
             totalServerMs: roundMs(auditDoneMs - reqStartMs),
+            firestoreReads: totalFirestoreReads,
+            firestoreWrites: totalFirestoreWrites,
+            parallelPrefetchUsed,
             cacheHitRolePerms: perms.cacheHitRolePerms,
             cacheHitConfig: shiftsRes.cacheHit && settingsRes.cacheHit,
             cacheHitUidRoute: Boolean(caller.cacheHitUidRoute)
@@ -4653,9 +8926,65 @@ function registerAttendanceRoutes(app, deps) {
           };
         })
       );
+      const manualTotalMs = roundMs(performance.now() - reqStartMs);
+      const outcomePerf = outcome.body?.perf;
+      const outcomeAction = String(outcome.body?.action || "REJECTED");
+      const isSuccess = outcome.httpStatus >= 200 && outcome.httpStatus < 300 && Boolean(outcome.body?.success);
+      const isDuplicate = outcomeAction === "REJECTED_DUPLICATE";
+      recordQrPunchTelemetry(db, {
+        mode: scannerType === "OUT" ? "MANUAL_OUT" : "MANUAL_IN",
+        action: outcomeAction,
+        success: isSuccess,
+        isDuplicateRejection: isDuplicate,
+        timedOut: outcome.httpStatus === 408 || outcome.httpStatus === 504,
+        tokenVerifyMs: outcomePerf?.tokenVerifyMs ?? caller.tokenVerifyMs,
+        callerLookupMs: outcomePerf?.callerLookupMs ?? caller.callerLookupMs,
+        authMs: outcomePerf?.authMs ?? roundMs(authDoneMs - reqStartMs),
+        permissionMs: outcomePerf?.permissionMs ?? roundMs(permDoneMs - authDoneMs),
+        employeeLookupMs: outcomePerf?.employeeLookupMs,
+        attendanceLookupMs: outcomePerf?.attendanceLookupMs,
+        configLookupMs: outcomePerf?.configLookupMs,
+        lookupAndQueryMs: outcomePerf?.lookupAndQueryMs,
+        txMs: outcomePerf?.txMs,
+        firestoreOpMs: outcomePerf?.firestoreOpMs,
+        auditMs: outcomePerf?.auditMs,
+        firestoreReads: outcomePerf?.firestoreReads,
+        firestoreWrites: outcomePerf?.firestoreWrites,
+        totalServerMs: outcomePerf?.totalServerMs ?? manualTotalMs,
+        reasonCode: isSuccess ? void 0 : outcomeAction,
+        correlationId: req.correlationId
+      });
+      if (typeof outcomePerf?.txMs === "number") {
+        recordDbOpMetric(db, {
+          operation: "TRANSACTION",
+          collection: "attendance",
+          durationMs: outcomePerf.txMs,
+          success: outcome.httpStatus < 500,
+          correlationId: req.correlationId
+        });
+      }
+      recordActivityTelemetry(db, {
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        action: isSuccess ? `MANUAL_PUNCH_${scannerType}` : `MANUAL_PUNCH_${outcomeAction}`,
+        module: "Attendance Scanner",
+        result: isSuccess ? "Success" : "Failed",
+        correlationId: req.correlationId,
+        detail: `Manual ${scannerType} entry (${outcome.httpStatus})`
+      });
       return res.status(outcome.httpStatus).json(outcome.body);
     } catch (err) {
       console.error("[API Manual Punch] Error:", err);
+      recordErrorTelemetry(db, {
+        source: "BACKEND",
+        module: "Attendance Scanner",
+        category: "MANUAL_PUNCH_ERROR",
+        severity: "CRITICAL",
+        message: err?.message || "Manual attendance punch processing failed.",
+        statusCode: 500,
+        correlationId: req.correlationId
+      });
       return res.status(500).json({
         success: false,
         action: "REJECTED",
@@ -4690,11 +9019,27 @@ function registerAttendanceRoutes(app, deps) {
         (r) => r.shiftDate === yesterdayKey && (r.shiftId === "NIGHT" || String(r.shiftNameSnapshot || "").toUpperCase().includes("NIGHT"))
       );
       if (yesterdayNight) {
-        activeRecord = yesterdayNight;
+        const isYesterdayNightOpen = yesterdayNight.currentState === "INSIDE" || !yesterdayNight.actualPunchOut && yesterdayNight.punchOutType === "NONE";
+        if (isYesterdayNightOpen || currentMins < 360) {
+          activeRecord = yesterdayNight;
+        }
       }
     }
     if (!activeRecord) {
-      activeRecord = existingRecords.find((r) => r.shiftDate === todayKey) || null;
+      const todayOpenRecord = existingRecords.find(
+        (r) => r.shiftDate === todayKey && (r.currentState === "INSIDE" || !r.actualPunchOut && r.punchOutType === "NONE")
+      );
+      if (todayOpenRecord) {
+        activeRecord = todayOpenRecord;
+      } else if (scannerType === "OUT") {
+        activeRecord = existingRecords.find((r) => r.shiftDate === todayKey) || null;
+      } else {
+        const expectedShiftMatch = identifyShiftForPunchIn(shifts, now);
+        const expectedShiftId = expectedShiftMatch?.shift?.id;
+        activeRecord = existingRecords.find(
+          (r) => r.shiftDate === todayKey && (!expectedShiftId || r.shiftId === expectedShiftId)
+        ) || null;
+      }
     }
     if (!scannerType) {
       const derivedState = activeRecord?.currentState || (activeRecord?.actualPunchOut ? "OUTSIDE" : activeRecord ? "INSIDE" : "OUTSIDE");
@@ -4703,8 +9048,8 @@ function registerAttendanceRoutes(app, deps) {
     if (scannerType === "IN") {
       if (activeRecord) {
         const docRef3 = db.collection("attendance").doc(activeRecord.id);
-        const eventId3 = `pe_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
-        const logId3 = `log_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
+        const eventId3 = `pe_${Date.now()}_${crypto4.randomBytes(3).toString("hex")}`;
+        const logId3 = `log_${Date.now()}_${crypto4.randomBytes(3).toString("hex")}`;
         const txRes2 = await db.runTransaction(async (tx) => {
           const snap = await tx.get(docRef3);
           const currentData = snap.exists ? snap.data() : activeRecord;
@@ -4744,6 +9089,10 @@ function registerAttendanceRoutes(app, deps) {
             totalDutyMinutes: 0,
             regularDutyMinutes: 0,
             overtimeMinutes: 0,
+            earlyOtMinutes: 0,
+            postShiftOtMinutes: 0,
+            totalOtMinutes: 0,
+            earlyOtFinalized: false,
             punches: [...existingPunches, punchEvent],
             updatedAt: now.toISOString()
           };
@@ -4850,12 +9199,16 @@ function registerAttendanceRoutes(app, deps) {
       }
       const { shift: shift2, shiftDate } = shiftMatch;
       const attendanceId = `att_${employee.employeeId}_${shiftDate}_${shift2.id}`;
-      const shiftStartMins = timeStringToMinutes(shift2.startTime);
+      const scheduleBounds = resolveShiftScheduleBounds(shiftDate, shift2);
       const grace = shift2.gracePeriodMinutes ?? settings.lateGraceMinutes ?? 15;
-      const isLate = !shift2.isOvernight ? currentMins > shiftStartMins + grace : currentMins >= 1200 ? currentMins > shiftStartMins + grace : true;
+      const isLate = now.getTime() > scheduleBounds.scheduledStartMs + grace * 6e4;
+      const earlyEval = evaluateEarlyPunchOnPunchIn({
+        firstInIso: now.toISOString(),
+        scheduledStartIso: scheduleBounds.scheduledStartIso
+      });
       const arrivalStatus = isLate ? "LATE" : "PRESENT";
-      const eventId2 = `pe_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
-      const logId2 = `log_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
+      const eventId2 = `pe_${Date.now()}_${crypto4.randomBytes(3).toString("hex")}`;
+      const logId2 = `log_${Date.now()}_${crypto4.randomBytes(3).toString("hex")}`;
       const firstPunchEvent = {
         id: eventId2,
         employeeId: employee.employeeId,
@@ -4889,7 +9242,10 @@ function registerAttendanceRoutes(app, deps) {
         shiftDate,
         punchIn: now.toISOString(),
         firstPunchIn: now.toISOString(),
-        scheduledPunchOut: shift2.endTime,
+        scheduledPunchIn: scheduleBounds.startTime,
+        scheduledPunchInIso: scheduleBounds.scheduledStartIso,
+        scheduledPunchOut: scheduleBounds.endTime,
+        scheduledPunchOutIso: scheduleBounds.scheduledEndIso,
         actualPunchOut: null,
         lastPunchOut: null,
         effectivePunchOut: null,
@@ -4899,6 +9255,13 @@ function registerAttendanceRoutes(app, deps) {
         totalDutyMinutes: 0,
         regularDutyMinutes: 0,
         overtimeMinutes: 0,
+        earlyArrivalMinutes: earlyEval.earlyArrivalMinutes,
+        provisionalEarlyOtMinutes: earlyEval.provisionalEarlyOtMinutes,
+        earlyOtMinutes: 0,
+        postShiftOtMinutes: 0,
+        totalOtMinutes: 0,
+        earlyOtFinalized: false,
+        earlyPunchPolicy: earlyEval.earlyPunchPolicy,
         attendanceStatus: "IN PROGRESS",
         isLate,
         arrivalStatus,
@@ -4933,7 +9296,7 @@ function registerAttendanceRoutes(app, deps) {
           qrVerificationMode,
           performedByUid: caller.uid,
           performedByLoginId: caller.loginId,
-          message: `First Punch In recorded for ${shift2.name} (${shiftDate}). Arrival: ${arrivalStatus}. Status: IN PROGRESS.`
+          message: `First Punch In recorded for ${shift2.name} (${shiftDate}). Arrival: ${arrivalStatus}${earlyEval.earlyArrivalMinutes > 0 ? `, Early: ${earlyEval.earlyArrivalMinutes}m (Provisional Early OT: ${earlyEval.provisionalEarlyOtMinutes}m)` : ""}. Status: IN PROGRESS.`
         });
         return { kind: "RECORDED", record: newAttendanceRecord };
       });
@@ -4962,7 +9325,7 @@ function registerAttendanceRoutes(app, deps) {
           employee,
           attendance: newAttendanceRecord,
           shift: shift2,
-          message: isLate ? `First Punch In Recorded for ${shift2.name} (Marked LATE).` : `First Punch In Recorded for ${shift2.name}.`,
+          message: isLate ? `First Punch In Recorded for ${shift2.name} (Marked LATE).` : earlyEval.provisionalEarlyOtMinutes > 0 ? `First Punch In Recorded for ${shift2.name} (Early ${formatMinutes(earlyEval.earlyArrivalMinutes)} \u2022 Provisional Early OT).` : earlyEval.earlyArrivalMinutes > 0 ? `First Punch In Recorded for ${shift2.name} (Early ${formatMinutes(earlyEval.earlyArrivalMinutes)} \u2022 <60m: 0 Early OT).` : `First Punch In Recorded for ${shift2.name}.`,
           time: timeDisplay,
           punchCount: 1
         }
@@ -4993,8 +9356,8 @@ function registerAttendanceRoutes(app, deps) {
       };
     }
     const docRef = db.collection("attendance").doc(activeRecord.id);
-    const eventId = `pe_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
-    const logId = `log_${Date.now()}_${crypto3.randomBytes(3).toString("hex")}`;
+    const eventId = `pe_${Date.now()}_${crypto4.randomBytes(3).toString("hex")}`;
+    const logId = `log_${Date.now()}_${crypto4.randomBytes(3).toString("hex")}`;
     const txOutRes = await db.runTransaction(async (tx) => {
       const snap = await tx.get(docRef);
       const currentData = snap.exists ? snap.data() : activeRecord;
@@ -5007,18 +9370,27 @@ function registerAttendanceRoutes(app, deps) {
         return { kind: "BOUNCE", record: currentData };
       }
       const firstInIso = currentData.firstPunchIn || currentData.punchIn;
-      const firstInDate = new Date(firstInIso);
-      const totalDutyMinutes = Math.max(
-        0,
-        Math.floor((now.getTime() - firstInDate.getTime()) / (1e3 * 60))
-      );
-      const scheduledStandardDutyMinutes = STANDARD_DUTY_MINUTES;
-      const regularDutyMinutes = Math.min(totalDutyMinutes, scheduledStandardDutyMinutes);
-      const overtimeMinutes = Math.max(0, totalDutyMinutes - scheduledStandardDutyMinutes);
-      const computedStatus = classifyCompletedDutyStatus(
-        totalDutyMinutes,
-        scheduledStandardDutyMinutes
-      );
+      const recordShift = shiftsMap.get(currentData.shiftId) || shifts[0];
+      const bounds = resolveShiftScheduleBounds(currentData.shiftDate || todayKey, {
+        ...recordShift,
+        shiftId: currentData.shiftId,
+        shiftNameSnapshot: currentData.shiftNameSnapshot,
+        scheduledPunchIn: currentData.scheduledPunchIn || recordShift?.startTime,
+        scheduledPunchOut: currentData.scheduledPunchOut || recordShift?.endTime
+      });
+      const scheduledStartIso = currentData.scheduledPunchInIso || bounds.scheduledStartIso;
+      const scheduledEndIso = currentData.scheduledPunchOutIso || bounds.scheduledEndIso;
+      const otEval = evaluateOptionAPunchOut({
+        firstInIso,
+        lastOutIso: now.toISOString(),
+        scheduledStartIso,
+        scheduledEndIso,
+        standardDutyMinutes: STANDARD_DUTY_MINUTES
+      });
+      const totalDutyMinutes = otEval.totalDutyMinutes;
+      const regularDutyMinutes = otEval.regularDutyMinutes;
+      const overtimeMinutes = otEval.overtimeMinutes;
+      const computedStatus = otEval.attendanceStatus;
       const outEvent = {
         id: eventId,
         employeeId: employee.employeeId,
@@ -5036,6 +9408,8 @@ function registerAttendanceRoutes(app, deps) {
         scannerDevice,
         dutyDurationMinutes: totalDutyMinutes,
         overtimeMinutes,
+        earlyOtMinutes: otEval.earlyOtMinutes,
+        postShiftOtMinutes: otEval.postShiftOtMinutes,
         status: "VALID_OUT",
         recordedByUid: caller.uid,
         recordedByLoginId: caller.loginId
@@ -5043,15 +9417,27 @@ function registerAttendanceRoutes(app, deps) {
       const existingPunches = Array.isArray(currentData.punches) ? currentData.punches : [];
       const updatedAttendance = {
         ...currentData,
+        scheduledPunchIn: currentData.scheduledPunchIn || bounds.startTime,
+        scheduledPunchInIso: scheduledStartIso,
+        scheduledPunchOut: currentData.scheduledPunchOut || bounds.endTime,
+        scheduledPunchOutIso: scheduledEndIso,
         actualPunchOut: now.toISOString(),
         lastPunchOut: now.toISOString(),
         effectivePunchOut: now.toISOString(),
         punchOutType: "ACTUAL",
         currentState: "OUTSIDE",
         punches: [...existingPunches, outEvent],
+        actualPresenceMinutes: otEval.actualPresenceMinutes,
         totalDutyMinutes,
         regularDutyMinutes,
         overtimeMinutes,
+        earlyArrivalMinutes: otEval.earlyArrivalMinutes,
+        provisionalEarlyOtMinutes: otEval.provisionalEarlyOtMinutes,
+        earlyOtMinutes: otEval.earlyOtMinutes,
+        postShiftOtMinutes: otEval.postShiftOtMinutes,
+        totalOtMinutes: otEval.totalOtMinutes,
+        earlyOtFinalized: true,
+        earlyPunchPolicy: EARLY_PUNCH_POLICY_ID,
         attendanceStatus: computedStatus,
         missedPunchOut: false,
         autoClosed: false,
@@ -5072,7 +9458,7 @@ function registerAttendanceRoutes(app, deps) {
         qrVerificationMode,
         performedByUid: caller.uid,
         performedByLoginId: caller.loginId,
-        message: `Punch Out recorded (${computedStatus}). Duty: ${formatMinutes(regularDutyMinutes)}, OT: ${formatMinutes(overtimeMinutes)}. Total: ${formatMinutes(totalDutyMinutes)}.`
+        message: `Punch Out recorded (${computedStatus}). Duty: ${formatMinutes(regularDutyMinutes)}, Early OT: ${formatMinutes(otEval.earlyOtMinutes)}, Post OT: ${formatMinutes(otEval.postShiftOtMinutes)}, Total OT: ${formatMinutes(overtimeMinutes)}. Total: ${formatMinutes(totalDutyMinutes)}.`
       });
       return {
         kind: "RECORDED",
@@ -5220,6 +9606,10 @@ function registerAttendanceRoutes(app, deps) {
               regularDutyMinutes: scheduledDuration,
               overtimeMinutes: 0,
               // Zero OT on auto-closed shifts
+              earlyOtMinutes: 0,
+              postShiftOtMinutes: 0,
+              totalOtMinutes: 0,
+              earlyOtFinalized: false,
               updatedAt: now.toISOString()
             };
             tx.set(docRef, next);
@@ -5316,17 +9706,52 @@ function registerAttendanceRoutes(app, deps) {
         let regularDutyMinutes = Number(current.regularDutyMinutes || 0);
         let overtimeMinutes = Number(current.overtimeMinutes || 0);
         let totalDutyMinutes = Number(current.totalDutyMinutes || 0);
+        let earlyArrivalMinutes = Number(current.earlyArrivalMinutes || 0);
+        let provisionalEarlyOtMinutes = Number(current.provisionalEarlyOtMinutes || 0);
+        let earlyOtMinutes = Number(current.earlyOtMinutes || 0);
+        let postShiftOtMinutes = Number(current.postShiftOtMinutes || 0);
+        let earlyOtFinalized = Boolean(current.earlyOtFinalized);
+        let actualPresenceMinutes = Number(current.actualPresenceMinutes || totalDutyMinutes || 0);
+        const bounds = resolveShiftScheduleBounds(current.shiftDate || "", current);
+        const scheduledStartIso = current.scheduledPunchInIso || bounds.scheduledStartIso;
         if (actualPunchOut) {
-          const inTime = new Date(current.firstPunchIn || current.punchIn).getTime();
+          const firstInIso = current.firstPunchIn || current.punchIn;
+          const inTime = new Date(firstInIso).getTime();
           const outTime = new Date(actualPunchOut).getTime();
           if (Number.isNaN(outTime)) {
             throw new Error("INVALID_PUNCH_OUT");
           }
-          totalDutyMinutes = Math.max(0, Math.floor((outTime - inTime) / (60 * 1e3)));
-          regularDutyMinutes = Math.min(totalDutyMinutes, STANDARD_DUTY_MINUTES);
-          overtimeMinutes = punchOutType === "AUTO" ? 0 : Math.max(0, totalDutyMinutes - STANDARD_DUTY_MINUTES);
+          if (punchOutType === "AUTO") {
+            totalDutyMinutes = Math.max(0, Math.floor((outTime - inTime) / (60 * 1e3)));
+            actualPresenceMinutes = totalDutyMinutes;
+            regularDutyMinutes = Math.min(totalDutyMinutes, STANDARD_DUTY_MINUTES);
+            overtimeMinutes = 0;
+            earlyOtMinutes = 0;
+            postShiftOtMinutes = 0;
+            earlyOtFinalized = false;
+          } else {
+            const otEval = evaluateOptionAPunchOut({
+              firstInIso,
+              lastOutIso: actualPunchOut,
+              scheduledStartIso,
+              scheduledEndIso: current.scheduledPunchOutIso || bounds.scheduledEndIso,
+              standardDutyMinutes: STANDARD_DUTY_MINUTES
+            });
+            actualPresenceMinutes = otEval.actualPresenceMinutes;
+            totalDutyMinutes = otEval.totalDutyMinutes;
+            regularDutyMinutes = otEval.regularDutyMinutes;
+            overtimeMinutes = otEval.overtimeMinutes;
+            earlyArrivalMinutes = otEval.earlyArrivalMinutes;
+            provisionalEarlyOtMinutes = otEval.provisionalEarlyOtMinutes;
+            earlyOtMinutes = otEval.earlyOtMinutes;
+            postShiftOtMinutes = otEval.postShiftOtMinutes;
+            earlyOtFinalized = true;
+          }
         } else if (punchOutType === "AUTO") {
           overtimeMinutes = 0;
+          earlyOtMinutes = 0;
+          postShiftOtMinutes = 0;
+          earlyOtFinalized = false;
         }
         const autoClassifySet = /* @__PURE__ */ new Set([
           "COMPLETED",
@@ -5343,9 +9768,21 @@ function registerAttendanceRoutes(app, deps) {
           punchOutType,
           currentState: actualPunchOut ? "OUTSIDE" : current.currentState || "OUTSIDE",
           attendanceStatus: finalAttendanceStatus,
+          scheduledPunchIn: current.scheduledPunchIn || bounds.startTime,
+          scheduledPunchInIso: scheduledStartIso,
+          scheduledPunchOut: current.scheduledPunchOut || bounds.endTime,
+          scheduledPunchOutIso: current.scheduledPunchOutIso || bounds.scheduledEndIso,
+          actualPresenceMinutes,
           totalDutyMinutes,
           regularDutyMinutes,
           overtimeMinutes,
+          earlyArrivalMinutes,
+          provisionalEarlyOtMinutes,
+          earlyOtMinutes,
+          postShiftOtMinutes,
+          totalOtMinutes: overtimeMinutes,
+          earlyOtFinalized,
+          earlyPunchPolicy: EARLY_PUNCH_POLICY_ID,
           correctionReason: reason.trim(),
           correctedBy: caller.loginId,
           correctedByUid: caller.uid,
@@ -5378,12 +9815,38 @@ function registerAttendanceRoutes(app, deps) {
         reason: reason.trim(),
         description: `Attendance record ${attendanceId} corrected by "${caller.loginId}".`
       });
+      recordDbOpMetric(db, {
+        operation: "TRANSACTION",
+        collection: "attendance",
+        durationMs: 0,
+        success: true,
+        correlationId: req.correlationId
+      });
+      recordActivityTelemetry(db, {
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        action: "ATTENDANCE_CORRECTION",
+        module: "Attendance History",
+        result: "Success",
+        correlationId: req.correlationId,
+        detail: `Corrected attendance ${attendanceId} -> ${txResult.updated.attendanceStatus}`
+      });
       return res.json({ success: true, record: txResult.updated });
     } catch (err) {
       if (err?.message === "INVALID_PUNCH_OUT") {
         return res.status(400).json({ success: false, error: "Invalid actualPunchOut timestamp." });
       }
       console.error("[API Attendance Correct] Error:", err);
+      recordErrorTelemetry(db, {
+        source: "BACKEND",
+        module: "Attendance History",
+        category: "CORRECTION_ERROR",
+        severity: "CRITICAL",
+        message: err?.message || "Failed to correct attendance record.",
+        statusCode: 500,
+        correlationId: req.correlationId
+      });
       return res.status(500).json({ success: false, error: "Failed to correct attendance record." });
     }
   });
@@ -5545,36 +10008,36 @@ function registerAttendanceRoutes(app, deps) {
 }
 
 // serverEmployees.ts
-import crypto4 from "crypto";
-import { z as z3 } from "zod";
+import crypto5 from "crypto";
+import { z as z4 } from "zod";
 var EMPLOYEE_ID_PATTERN2 = /^[A-Za-z0-9_.\-]+$/;
 var EMPLOYEE_BULK_BATCH_SIZE = 400;
-var BulkImportRowSchema = z3.object({
-  employeeId: z3.string().trim().min(1, "Employee ID is required.").max(128, "Employee ID must be 128 characters or fewer.").regex(
+var BulkImportRowSchema = z4.object({
+  employeeId: z4.string().trim().min(1, "Employee ID is required.").max(128, "Employee ID must be 128 characters or fewer.").regex(
     EMPLOYEE_ID_PATTERN2,
     "Employee ID may only contain letters, numbers, underscores (_), hyphens (-), and periods (.)."
   ),
-  employeeName: z3.string().trim().min(1, "Employee Name is required.").max(200, "Employee Name must be 200 characters or fewer."),
-  employeeType: z3.enum(["Permanent", "Staff", "Offroll"]),
-  section: z3.string().trim().min(1, "Section is required.").max(100),
-  department: z3.string().trim().min(1, "Department is required.").max(100),
-  floor: z3.string().trim().min(1, "Production Line is required.").max(100),
-  designation: z3.string().trim().min(1).max(120).default("Operator"),
-  employeeStatus: z3.enum(["Active", "Inactive"]),
-  rowNumber: z3.number().int().positive().optional()
+  employeeName: z4.string().trim().min(1, "Employee Name is required.").max(200, "Employee Name must be 200 characters or fewer."),
+  employeeType: z4.enum(["Permanent", "Staff", "Offroll"]),
+  section: z4.string().trim().min(1, "Section is required.").max(100),
+  department: z4.string().trim().min(1, "Department is required.").max(100),
+  floor: z4.string().trim().min(1, "Production Line is required.").max(100),
+  designation: z4.string().trim().min(1).max(120).default("Operator"),
+  employeeStatus: z4.enum(["Active", "Inactive"]),
+  rowNumber: z4.number().int().positive().optional()
 });
-var BulkImportRequestSchema = z3.object({
-  fileName: z3.string().trim().min(1, "File name is required.").max(255),
-  rows: z3.array(BulkImportRowSchema).min(1, "At least one employee row is required for import.").max(2e3, "A single import request supports up to 2,000 employee rows.")
+var BulkImportRequestSchema = z4.object({
+  fileName: z4.string().trim().min(1, "File name is required.").max(255),
+  rows: z4.array(BulkImportRowSchema).min(1, "At least one employee row is required for import.").max(2e3, "A single import request supports up to 2,000 employee rows.")
 });
 function generateServerQrToken(employeeId) {
-  const rand = crypto4.randomBytes(4).toString("hex").toUpperCase();
+  const rand = crypto5.randomBytes(4).toString("hex").toUpperCase();
   const ts = Date.now().toString(36).toUpperCase();
   return `QR_${employeeId}_${ts}_${rand}`;
 }
 var ADMIN_EXCEL_DEFAULTS = {
-  excel_import: { view: true, add: true, edit: true },
-  employees: { view: true, add: true, edit: true }
+  excel_import: { view: true, add: true, edit: true, delete: false },
+  employees: { view: true, add: true, edit: true, delete: false }
 };
 function evalModuleAction(caller, userPermData, rolePermData, moduleKey, action) {
   if (caller.role === "super_admin") return true;
@@ -5594,6 +10057,35 @@ function evalModuleAction(caller, userPermData, rolePermData, moduleKey, action)
     return Boolean(ADMIN_EXCEL_DEFAULTS[moduleKey]?.[action]);
   }
   return false;
+}
+var BulkEmployeeActionSchema = z4.object({
+  action: z4.enum(["ACTIVATE", "DEACTIVATE", "DELETE"]),
+  employeeIds: z4.array(z4.string().trim().min(1).max(128)).min(1, "At least one Employee ID is required.").max(1e3, "Bulk action supports up to 1,000 employees per request."),
+  confirmed: z4.literal(true, {
+    message: "Explicit confirmation is required before executing bulk employee actions."
+  }),
+  confirmPhrase: z4.string().trim().optional(),
+  reason: z4.string().trim().max(300).optional()
+});
+async function resolveCallerEmployeeActionPermissions(db, caller) {
+  if (caller.role === "super_admin") {
+    return { canView: true, canEdit: true, canDelete: true };
+  }
+  try {
+    const [userPermSnap, rolePermSnap] = await Promise.all([
+      caller.prefetchedUserPermSnap ? Promise.resolve(caller.prefetchedUserPermSnap) : db.collection("user_permissions").doc(caller.profileDocId).get(),
+      getCachedRolePermissionsDoc(db, caller.role)
+    ]);
+    const userPermData = userPermSnap.exists ? userPermSnap.data() : void 0;
+    const rolePermData = rolePermSnap.exists ? rolePermSnap.data : void 0;
+    const canView = evalModuleAction(caller, userPermData, rolePermData, "employees", "view");
+    const canEdit = canView && evalModuleAction(caller, userPermData, rolePermData, "employees", "edit");
+    const canDelete = canView && evalModuleAction(caller, userPermData, rolePermData, "employees", "delete");
+    return { canView, canEdit, canDelete };
+  } catch (err) {
+    console.warn("[Employee Bulk Action Permission Guard] Lookup failed; failing closed:", err?.message || err);
+    return { canView: false, canEdit: false, canDelete: false };
+  }
 }
 async function resolveCallerEmployeeImportPermissions(db, caller) {
   if (caller.role === "super_admin") {
@@ -5649,6 +10141,7 @@ function classifyBatchWriteError(err) {
 function registerEmployeeRoutes(app, deps) {
   const { db, requireVerifiedCaller } = deps;
   app.post("/api/employees/bulk-import", async (req, res) => {
+    const routeStartMs = performance.now();
     try {
       const caller = await requireVerifiedCaller(
         req,
@@ -5865,6 +10358,38 @@ function registerEmployeeRoutes(app, deps) {
             success: false
           }).catch(() => {
           });
+          const batchElapsedMs = Math.round((performance.now() - routeStartMs) * 100) / 100;
+          recordDbOpMetric(db, {
+            operation: "BATCH",
+            collection: "employees",
+            durationMs: batchElapsedMs,
+            success: false,
+            isPermissionDenied: isFirestorePermissionDeniedError(batchErr),
+            isNetworkError: classified.category === "NETWORK_OR_TIMEOUT",
+            recordCount: chunk.length,
+            errorMessage: classified.message,
+            correlationId: req.correlationId
+          });
+          recordImportExportTelemetry(db, {
+            type: "EXCEL_IMPORT",
+            module: "Excel Import / Update",
+            rowCount: rows.length,
+            durationMs: batchElapsedMs,
+            success: false,
+            actorLoginId: caller.loginId,
+            correlationId: req.correlationId,
+            detail: classified.message
+          });
+          recordActivityTelemetry(db, {
+            actorUid: caller.uid,
+            actorLoginId: caller.loginId,
+            actorRole: caller.role.toUpperCase(),
+            action: "EXCEL_IMPORT_FAILED",
+            module: "Excel Import / Update",
+            result: "Failed",
+            correlationId: req.correlationId,
+            detail: `${fileName}: ${committedIds.length} committed, ${failedRows.length} failed`
+          });
           return res.status(classified.status).json({
             success: false,
             code: classified.code,
@@ -5898,6 +10423,35 @@ function registerEmployeeRoutes(app, deps) {
         reason: `File upload: ${rows.length} validated rows`,
         success: true
       });
+      const totalImportMs = Math.round((performance.now() - routeStartMs) * 100) / 100;
+      recordDbOpMetric(db, {
+        operation: "BATCH",
+        collection: "employees",
+        durationMs: totalImportMs,
+        success: true,
+        recordCount: Math.max(1, operations.length),
+        correlationId: req.correlationId
+      });
+      recordImportExportTelemetry(db, {
+        type: "EXCEL_IMPORT",
+        module: "Excel Import / Update",
+        rowCount: rows.length,
+        durationMs: totalImportMs,
+        success: true,
+        actorLoginId: caller.loginId,
+        correlationId: req.correlationId,
+        detail: `${fileName}: ${insertedIds.length} inserted, ${updatedIds.length} updated, ${skippedIds.length} skipped`
+      });
+      recordActivityTelemetry(db, {
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        action: "EXCEL_IMPORT_COMMITTED",
+        module: "Excel Import / Update",
+        result: "Success",
+        correlationId: req.correlationId,
+        detail: `${fileName} (${committedIds.length} committed)`
+      });
       return res.json({
         success: true,
         savedCount: committedIds.length,
@@ -5915,11 +10469,542 @@ function registerEmployeeRoutes(app, deps) {
     } catch (err) {
       console.error("[Employee Bulk Import API] Error:", err);
       const classified = classifyBatchWriteError(err);
+      recordErrorTelemetry(db, {
+        source: "IMPORT_EXPORT",
+        module: "Excel Import / Update",
+        category: classified.code,
+        severity: "CRITICAL",
+        message: classified.message,
+        statusCode: classified.status,
+        correlationId: req.correlationId
+      });
       return res.status(classified.status).json({
         success: false,
         code: classified.code,
         category: classified.category,
         error: classified.message
+      });
+    }
+  });
+  app.post("/api/employees/bulk-action", async (req, res) => {
+    const bulkStartMs = performance.now();
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        "*",
+        "Employee Master Bulk Action",
+        { prefetchUserPermission: true }
+      );
+      if (!caller) return;
+      const parsed = BulkEmployeeActionSchema.safeParse(req.body || {});
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          code: "VALIDATION_ERROR",
+          error: parsed.error.issues[0]?.message || "Invalid employee bulk action payload."
+        });
+      }
+      const { action, confirmPhrase, reason } = parsed.data;
+      const uniqueIds = Array.from(
+        new Set(parsed.data.employeeIds.map((id) => id.trim().toUpperCase()).filter(Boolean))
+      );
+      if (uniqueIds.length === 0) {
+        return res.status(400).json({
+          success: false,
+          code: "VALIDATION_ERROR",
+          error: "At least one valid Employee ID is required."
+        });
+      }
+      const perms = await resolveCallerEmployeeActionPermissions(db, caller);
+      const isAuthorized = action === "DELETE" ? perms.canDelete : perms.canEdit;
+      if (!isAuthorized) {
+        await recordEnterpriseAuditEvent(db, {
+          req,
+          action: "unauthorized_access_attempt",
+          category: "SECURITY",
+          severity: "CRITICAL",
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: caller.role.toUpperCase(),
+          targetType: "EMPLOYEE",
+          targetId: "/api/employees/bulk-action",
+          actionSource: "EMPLOYEE_BULK_RBAC_GUARD",
+          description: `User "${caller.loginId}" (${caller.role}) blocked from Employee bulk ${action} due to missing employees.${action === "DELETE" ? "delete" : "edit"} permission.`,
+          success: false
+        });
+        return res.status(403).json({
+          success: false,
+          code: "EMPLOYEE_BULK_FORBIDDEN",
+          error: `Forbidden: Role "${caller.role.toUpperCase()}" is not authorized to perform bulk ${action} on employees.`
+        });
+      }
+      if (action === "DELETE" && String(confirmPhrase || "").trim().toUpperCase() !== "DELETE") {
+        return res.status(400).json({
+          success: false,
+          code: "CONFIRMATION_PHRASE_REQUIRED",
+          error: 'Permanent bulk deletion requires confirmPhrase="DELETE".'
+        });
+      }
+      const existingSnap = await db.collection("employees").get();
+      const empByUpperId = /* @__PURE__ */ new Map();
+      for (const d of existingSnap.docs) {
+        const data = d.data() || {};
+        const key = String(data.employeeId || d.id).trim().toUpperCase();
+        const entry = { docId: d.id, ref: db.collection("employees").doc(d.id), data };
+        if (key) empByUpperId.set(key, entry);
+        const docUpper = String(d.id).trim().toUpperCase();
+        if (docUpper && !empByUpperId.has(docUpper)) {
+          empByUpperId.set(docUpper, entry);
+        }
+      }
+      const protectedHistoryIds = /* @__PURE__ */ new Set();
+      if (action === "DELETE") {
+        const presentIds = uniqueIds.filter((id) => empByUpperId.has(id));
+        const QUERY_IN_LIMIT = 30;
+        for (let i = 0; i < presentIds.length; i += QUERY_IN_LIMIT) {
+          const chunk = presentIds.slice(i, i + QUERY_IN_LIMIT);
+          if (chunk.length === 0) continue;
+          const attSnap = await db.collection("attendance").where("employeeId", "in", chunk).get();
+          for (const attDoc of attSnap.docs) {
+            const empIdVal = String(attDoc.data()?.employeeId || "").trim().toUpperCase();
+            if (empIdVal) protectedHistoryIds.add(empIdVal);
+          }
+        }
+      }
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      const targetStatus = action === "ACTIVATE" ? "Active" : "Inactive";
+      const ops = [];
+      const skippedItems = [];
+      for (const empId of uniqueIds) {
+        const found = empByUpperId.get(empId);
+        if (!found) {
+          skippedItems.push({ id: empId, reason: "Employee record not found." });
+          continue;
+        }
+        if (action === "DELETE") {
+          if (protectedHistoryIds.has(empId)) {
+            skippedItems.push({
+              id: empId,
+              reason: "Protected: Employee has linked historical attendance/punch records. Deactivate/archive instead."
+            });
+            continue;
+          }
+          ops.push({ employeeId: empId, ref: found.ref });
+        } else {
+          if (found.data.employeeStatus === targetStatus) {
+            skippedItems.push({
+              id: empId,
+              reason: `Employee is already ${targetStatus}.`
+            });
+            continue;
+          }
+          ops.push({ employeeId: empId, ref: found.ref });
+        }
+      }
+      const committedIds = [];
+      const failedItems = [];
+      for (let i = 0; i < ops.length; i += EMPLOYEE_BULK_BATCH_SIZE) {
+        const chunk = ops.slice(i, i + EMPLOYEE_BULK_BATCH_SIZE);
+        try {
+          if (typeof db.batch === "function") {
+            const batch = db.batch();
+            for (const op of chunk) {
+              if (action === "DELETE") {
+                batch.delete(op.ref);
+              } else {
+                batch.update(op.ref, {
+                  employeeStatus: targetStatus,
+                  updatedAt: now
+                });
+              }
+            }
+            await batch.commit();
+          } else {
+            await Promise.all(
+              chunk.map(
+                (op) => action === "DELETE" ? op.ref.delete() : op.ref.update({ employeeStatus: targetStatus, updatedAt: now })
+              )
+            );
+          }
+          for (const op of chunk) {
+            committedIds.push(op.employeeId);
+          }
+        } catch (batchErr) {
+          const classified = classifyBatchWriteError(batchErr);
+          for (const rem of ops.slice(i)) {
+            failedItems.push({ id: rem.employeeId, error: classified.message });
+          }
+          await recordEnterpriseAuditEvent(db, {
+            req,
+            action: `EMPLOYEE_BULK_${action}_PARTIAL`,
+            category: "EMPLOYEE",
+            severity: "WARNING",
+            actorUid: caller.uid,
+            actorLoginId: caller.loginId,
+            actorRole: caller.role.toUpperCase(),
+            targetType: "EMPLOYEE",
+            targetId: uniqueIds.slice(0, 10).join(","),
+            newValue: {
+              action,
+              savedCount: committedIds.length,
+              skippedCount: skippedItems.length,
+              failedCount: failedItems.length
+            },
+            actionSource: "EMPLOYEE_MASTER_BULK",
+            reason: classified.message,
+            success: false
+          }).catch(() => {
+          });
+          return res.status(classified.status).json({
+            success: false,
+            code: classified.code,
+            action,
+            savedCount: committedIds.length,
+            skippedCount: skippedItems.length,
+            failedCount: failedItems.length,
+            partialCommit: committedIds.length > 0,
+            committedIds,
+            skippedItems,
+            failedItems,
+            error: classified.message
+          });
+        }
+      }
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: `EMPLOYEE_BULK_${action}`,
+        category: "EMPLOYEE",
+        severity: action === "DELETE" ? "WARNING" : "INFO",
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        targetType: "EMPLOYEE",
+        targetId: committedIds.slice(0, 10).join(",") || "EMPLOYEE_BATCH",
+        newValue: {
+          action,
+          savedCount: committedIds.length,
+          skippedCount: skippedItems.length,
+          sampleIds: committedIds.slice(0, 20)
+        },
+        actionSource: "EMPLOYEE_MASTER_BULK",
+        reason: reason || `Bulk ${action.toLowerCase()} executed from Employee Master`,
+        description: `Bulk ${action} processed ${committedIds.length} employees (${skippedItems.length} skipped/protected).`,
+        success: true
+      });
+      const totalBulkMs = Math.round((performance.now() - bulkStartMs) * 100) / 100;
+      recordDbOpMetric(db, {
+        operation: "BATCH",
+        collection: "employees",
+        durationMs: totalBulkMs,
+        success: true,
+        recordCount: Math.max(1, ops.length),
+        correlationId: req.correlationId
+      });
+      recordImportExportTelemetry(db, {
+        type: "BULK_ACTION",
+        module: "Employee Master",
+        rowCount: uniqueIds.length,
+        durationMs: totalBulkMs,
+        success: true,
+        actorLoginId: caller.loginId,
+        correlationId: req.correlationId,
+        detail: `Bulk ${action}: ${committedIds.length} saved, ${skippedItems.length} skipped`
+      });
+      recordActivityTelemetry(db, {
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        action: `EMPLOYEE_BULK_${action}`,
+        module: "Employee Master",
+        result: "Success",
+        correlationId: req.correlationId,
+        detail: `${committedIds.length} updated (${skippedItems.length} skipped)`
+      });
+      return res.json({
+        success: true,
+        action,
+        savedCount: committedIds.length,
+        skippedCount: skippedItems.length,
+        failedCount: 0,
+        partialCommit: false,
+        committedIds,
+        skippedItems,
+        failedItems: []
+      });
+    } catch (err) {
+      console.error("[Employee Bulk Action API] Error:", err);
+      const classified = classifyBatchWriteError(err);
+      recordErrorTelemetry(db, {
+        source: "BULK",
+        module: "Employee Master",
+        category: classified.code,
+        severity: "CRITICAL",
+        message: classified.message,
+        statusCode: classified.status,
+        correlationId: req.correlationId
+      });
+      return res.status(classified.status).json({
+        success: false,
+        code: classified.code,
+        error: classified.message
+      });
+    }
+  });
+}
+
+// serverMasters.ts
+import { z as z5 } from "zod";
+var MASTER_BULK_BATCH_SIZE = 400;
+var BulkMasterStatusSchema = z5.object({
+  resource: z5.enum(["shifts", "floors", "sections", "departments"]),
+  ids: z5.array(z5.string().trim().min(1).max(160)).min(1, "At least one record ID is required.").max(200, "Bulk master status update supports up to 200 records per request."),
+  status: z5.enum(["Active", "Inactive"]),
+  confirmed: z5.literal(true, {
+    message: "Explicit confirmation is required for bulk status updates."
+  })
+});
+var ADMIN_DEFAULT_EDIT_MODULES = /* @__PURE__ */ new Set(["shifts", "floors", "sections", "departments"]);
+function evalMasterEditPermission(caller, userPermData, rolePermData, moduleKey) {
+  if (caller.role === "super_admin") return true;
+  if (userPermData && userPermData.isCustomOverride !== false) {
+    const mod = userPermData.permissions?.[moduleKey];
+    if (mod && typeof mod.edit === "boolean") {
+      return mod.edit === true && mod.view !== false;
+    }
+  }
+  if (rolePermData) {
+    const mod = rolePermData.modulePermissions?.[moduleKey];
+    if (mod && typeof mod.edit === "boolean") {
+      return mod.edit === true && mod.view !== false;
+    }
+  }
+  if (caller.role === "admin") {
+    return ADMIN_DEFAULT_EDIT_MODULES.has(moduleKey);
+  }
+  return false;
+}
+async function canCallerEditMasterResource(db, caller, resource) {
+  if (caller.role === "super_admin") return true;
+  try {
+    const [userPermSnap, rolePermSnap] = await Promise.all([
+      caller.prefetchedUserPermSnap ? Promise.resolve(caller.prefetchedUserPermSnap) : db.collection("user_permissions").doc(caller.profileDocId).get(),
+      getCachedRolePermissionsDoc(db, caller.role)
+    ]);
+    const userPermData = userPermSnap.exists ? userPermSnap.data() : void 0;
+    const rolePermData = rolePermSnap.exists ? rolePermSnap.data : void 0;
+    return evalMasterEditPermission(caller, userPermData, rolePermData, resource);
+  } catch (err) {
+    console.warn("[Master Bulk RBAC] Permission lookup failed; failing closed:", err?.message || err);
+    return false;
+  }
+}
+function registerMasterRoutes(app, deps) {
+  const { db, requireVerifiedCaller } = deps;
+  app.post("/api/masters/bulk-status", async (req, res) => {
+    const masterStartMs = performance.now();
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        "*",
+        "Master Configuration Bulk Status Update",
+        { prefetchUserPermission: true }
+      );
+      if (!caller) return;
+      const parsed = BulkMasterStatusSchema.safeParse(req.body || {});
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          code: "VALIDATION_ERROR",
+          error: parsed.error.issues[0]?.message || "Invalid bulk status update payload."
+        });
+      }
+      const { resource, status } = parsed.data;
+      const uniqueIds = Array.from(new Set(parsed.data.ids.map((id) => id.trim()).filter(Boolean)));
+      if (uniqueIds.length === 0) {
+        return res.status(400).json({
+          success: false,
+          code: "VALIDATION_ERROR",
+          error: "At least one valid record ID is required."
+        });
+      }
+      const allowed = await canCallerEditMasterResource(db, caller, resource);
+      if (!allowed) {
+        await recordEnterpriseAuditEvent(db, {
+          req,
+          action: "unauthorized_access_attempt",
+          category: "SECURITY",
+          severity: "CRITICAL",
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: caller.role.toUpperCase(),
+          targetType: resource.toUpperCase(),
+          targetId: "/api/masters/bulk-status",
+          actionSource: "MASTER_BULK_RBAC_GUARD",
+          description: `User "${caller.loginId}" (${caller.role}) blocked from bulk updating "${resource}" status due to missing edit permission.`,
+          success: false
+        });
+        return res.status(403).json({
+          success: false,
+          code: "MASTER_BULK_FORBIDDEN",
+          error: `Forbidden: Role "${caller.role.toUpperCase()}" does not have edit permission for ${resource}.`
+        });
+      }
+      const existingSnap = await db.collection(resource).get();
+      const existingById = /* @__PURE__ */ new Map();
+      for (const docSnap of existingSnap.docs) {
+        existingById.set(docSnap.id, {
+          ref: db.collection(resource).doc(docSnap.id),
+          data: docSnap.data() || {}
+        });
+      }
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      const ops = [];
+      const skippedItems = [];
+      for (const id of uniqueIds) {
+        const entry = existingById.get(id);
+        if (!entry) {
+          skippedItems.push({ id, reason: "Record not found in database." });
+          continue;
+        }
+        if (entry.data.status === status) {
+          skippedItems.push({ id, reason: `Already ${status}.` });
+          continue;
+        }
+        ops.push({ id, ref: entry.ref });
+      }
+      const committedIds = [];
+      const failedItems = [];
+      for (let i = 0; i < ops.length; i += MASTER_BULK_BATCH_SIZE) {
+        const chunk = ops.slice(i, i + MASTER_BULK_BATCH_SIZE);
+        try {
+          if (typeof db.batch === "function") {
+            const batch = db.batch();
+            for (const op of chunk) {
+              batch.update(op.ref, { status, updatedAt: now });
+            }
+            await batch.commit();
+          } else {
+            await Promise.all(chunk.map((op) => op.ref.update({ status, updatedAt: now })));
+          }
+          for (const op of chunk) {
+            committedIds.push(op.id);
+          }
+        } catch (batchErr) {
+          const msg = isFirestorePermissionDeniedError(batchErr) ? "Database Admin SDK permission denied." : batchErr?.message || "Batch commit failed.";
+          for (const rem of ops.slice(i)) {
+            failedItems.push({ id: rem.id, error: msg });
+          }
+          await recordEnterpriseAuditEvent(db, {
+            req,
+            action: "MASTER_BULK_STATUS_PARTIAL",
+            category: "ORG",
+            severity: "WARNING",
+            actorUid: caller.uid,
+            actorLoginId: caller.loginId,
+            actorRole: caller.role.toUpperCase(),
+            targetType: resource.toUpperCase(),
+            targetId: uniqueIds.slice(0, 10).join(","),
+            newValue: { resource, status, savedCount: committedIds.length, failedCount: failedItems.length },
+            actionSource: "MASTER_BULK_STATUS",
+            reason: msg,
+            success: false
+          }).catch(() => {
+          });
+          return res.status(isFirestorePermissionDeniedError(batchErr) ? 503 : 500).json({
+            success: false,
+            resource,
+            status,
+            savedCount: committedIds.length,
+            skippedCount: skippedItems.length,
+            failedCount: failedItems.length,
+            partialCommit: committedIds.length > 0,
+            committedIds,
+            skippedItems,
+            failedItems,
+            error: msg
+          });
+        }
+      }
+      if (resource === "shifts" && committedIds.length > 0) {
+        invalidateConfigCaches(db);
+      }
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: "MASTER_BULK_STATUS_UPDATE",
+        category: "ORG",
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        targetType: resource.toUpperCase(),
+        targetId: committedIds.slice(0, 10).join(",") || resource,
+        newValue: {
+          resource,
+          status,
+          savedCount: committedIds.length,
+          skippedCount: skippedItems.length
+        },
+        actionSource: "MASTER_BULK_STATUS",
+        description: `Bulk updated ${committedIds.length} ${resource} record(s) to ${status} (skipped ${skippedItems.length}).`,
+        success: true
+      });
+      const masterElapsedMs = Math.round((performance.now() - masterStartMs) * 100) / 100;
+      const modName = resource === "shifts" ? "Shift Management" : "Organization Management";
+      recordDbOpMetric(db, {
+        operation: "BATCH",
+        collection: resource,
+        durationMs: masterElapsedMs,
+        success: true,
+        recordCount: Math.max(1, ops.length),
+        correlationId: req.correlationId
+      });
+      recordImportExportTelemetry(db, {
+        type: "BULK_ACTION",
+        module: modName,
+        rowCount: uniqueIds.length,
+        durationMs: masterElapsedMs,
+        success: true,
+        actorLoginId: caller.loginId,
+        correlationId: req.correlationId,
+        detail: `${resource} -> ${status}: ${committedIds.length} committed, ${skippedItems.length} skipped`
+      });
+      recordActivityTelemetry(db, {
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        action: `MASTER_BULK_${status.toUpperCase()}`,
+        module: modName,
+        result: "Success",
+        correlationId: req.correlationId,
+        detail: `${resource}: ${committedIds.length} updated`
+      });
+      return res.json({
+        success: true,
+        resource,
+        status,
+        savedCount: committedIds.length,
+        skippedCount: skippedItems.length,
+        failedCount: 0,
+        partialCommit: false,
+        committedIds,
+        skippedItems,
+        failedItems: []
+      });
+    } catch (err) {
+      console.error("[Master Bulk Status API] Error:", err);
+      recordErrorTelemetry(db, {
+        source: "BULK",
+        module: "Organization Management",
+        category: "MASTER_BULK_ERROR",
+        severity: "CRITICAL",
+        message: err?.message || "Master bulk status update failed.",
+        statusCode: 500,
+        correlationId: req.correlationId
+      });
+      return res.status(500).json({
+        success: false,
+        error: err?.message || "Master bulk status update failed."
       });
     }
   });
@@ -6187,19 +11272,19 @@ function resolveDashboardVisibility(params) {
 
 // server.ts
 function hashPassword(password) {
-  const salt = crypto5.randomBytes(16).toString("hex");
-  const hash = crypto5.scryptSync(password, salt, 64).toString("hex");
+  const salt = crypto6.randomBytes(16).toString("hex");
+  const hash = crypto6.scryptSync(password, salt, 64).toString("hex");
   return `${salt}:${hash}`;
 }
 function verifyPassword(password, storedHash) {
   if (!storedHash || !storedHash.includes(":")) return false;
   const [salt, expectedHash] = storedHash.split(":");
   if (!salt || !expectedHash) return false;
-  const actualHash = crypto5.scryptSync(password, salt, 64).toString("hex");
+  const actualHash = crypto6.scryptSync(password, salt, 64).toString("hex");
   const actualBuf = Buffer.from(actualHash, "hex");
   const expectedBuf = Buffer.from(expectedHash, "hex");
   if (actualBuf.length !== expectedBuf.length) return false;
-  return crypto5.timingSafeEqual(actualBuf, expectedBuf);
+  return crypto6.timingSafeEqual(actualBuf, expectedBuf);
 }
 async function syncExistingFirebaseAuthPassword(email, targetUid, newPassword, knownCurrentPassword) {
   if (typeof knownCurrentPassword !== "string" || knownCurrentPassword.length === 0) {
@@ -6265,17 +11350,17 @@ async function syncExistingFirebaseAuthPassword(email, targetUid, newPassword, k
     return { success: false, error: err?.message || "Firebase Auth sync error." };
   }
 }
-var VerifySessionInputSchema = z4.object({
-  loginId: z4.string().trim().min(1).max(64).optional(),
-  userId: z4.string().trim().min(1).max(128).optional()
+var VerifySessionInputSchema = z6.object({
+  loginId: z6.string().trim().min(1).max(64).optional(),
+  userId: z6.string().trim().min(1).max(128).optional()
 });
-var AdminSetPasswordInputSchema = z4.object({
-  targetLoginId: z4.string().trim().min(1, "targetLoginId is required.").max(64),
-  newPassword: z4.string().min(6, "Password must be at least 6 characters.").max(128),
-  mustChangePassword: z4.boolean().optional(),
-  unlockAccount: z4.boolean().optional(),
-  revokeSessions: z4.boolean().optional(),
-  currentTargetPassword: z4.string().optional()
+var AdminSetPasswordInputSchema = z6.object({
+  targetLoginId: z6.string().trim().min(1, "targetLoginId is required.").max(64),
+  newPassword: z6.string().min(6, "Password must be at least 6 characters.").max(128),
+  mustChangePassword: z6.boolean().optional(),
+  unlockAccount: z6.boolean().optional(),
+  revokeSessions: z6.boolean().optional(),
+  currentTargetPassword: z6.string().optional()
 });
 var RESERVED_CUSTOM_ROLE_ALIASES = /* @__PURE__ */ new Set([
   "superadmin",
@@ -6284,66 +11369,66 @@ var RESERVED_CUSTOM_ROLE_ALIASES = /* @__PURE__ */ new Set([
   "system",
   "super_admin_root"
 ]);
-var DynamicRoleIdSchema = z4.string().trim().min(2, "Role ID must be at least 2 characters.").max(64, "Role ID must be 64 characters or fewer.").transform((val) => deriveStrictRoleId(val)).refine((val) => VALID_ROLE_ID_REGEX.test(val), {
+var DynamicRoleIdSchema = z6.string().trim().min(2, "Role ID must be at least 2 characters.").max(64, "Role ID must be 64 characters or fewer.").transform((val) => deriveStrictRoleId(val)).refine((val) => VALID_ROLE_ID_REGEX.test(val), {
   message: "Role ID must start with a letter and contain only lowercase letters, numbers, or underscores."
 });
-var RoleDefinitionInputSchema = z4.object({
-  roleId: z4.string().trim().max(64).optional(),
-  roleName: z4.string().trim().min(2, "Role name must be at least 2 characters.").max(48, "Role name must be 48 characters or fewer."),
-  description: z4.string().trim().min(3, "Role description must be at least 3 characters.").max(500, "Role description must be 500 characters or fewer."),
-  isActive: z4.boolean().default(true),
-  defaultPermissions: z4.record(
-    z4.string(),
-    z4.object({
-      view: z4.boolean().optional(),
-      add: z4.boolean().optional(),
-      edit: z4.boolean().optional(),
-      delete: z4.boolean().optional()
+var RoleDefinitionInputSchema = z6.object({
+  roleId: z6.string().trim().max(64).optional(),
+  roleName: z6.string().trim().min(2, "Role name must be at least 2 characters.").max(48, "Role name must be 48 characters or fewer."),
+  description: z6.string().trim().min(3, "Role description must be at least 3 characters.").max(500, "Role description must be 500 characters or fewer."),
+  isActive: z6.boolean().default(true),
+  defaultPermissions: z6.record(
+    z6.string(),
+    z6.object({
+      view: z6.boolean().optional(),
+      add: z6.boolean().optional(),
+      edit: z6.boolean().optional(),
+      delete: z6.boolean().optional()
     })
   ).optional()
 });
-var CreateUserInputSchema = z4.object({
-  callerLoginId: z4.string().trim().min(1).max(64).optional(),
-  loginId: z4.string().trim().min(2, "Login ID must be at least 2 characters.").max(64).regex(/^[a-zA-Z0-9_.-]+$/, "Login ID can only contain letters, numbers, hyphens, underscores, and dots."),
-  name: z4.string().trim().min(1, "Name is required.").max(128),
-  email: z4.string().trim().email("Valid email is required.").max(128),
+var CreateUserInputSchema = z6.object({
+  callerLoginId: z6.string().trim().min(1).max(64).optional(),
+  loginId: z6.string().trim().min(2, "Login ID must be at least 2 characters.").max(64).regex(/^[a-zA-Z0-9_.-]+$/, "Login ID can only contain letters, numbers, hyphens, underscores, and dots."),
+  name: z6.string().trim().min(1, "Name is required.").max(128),
+  email: z6.string().trim().email("Valid email is required.").max(128),
   role: DynamicRoleIdSchema,
-  password: z4.string().min(6, "Password must be at least 6 characters.").max(128),
-  modulesAllowed: z4.array(z4.string().max(64)).optional(),
-  status: z4.enum(["Active", "Inactive"]).default("Active"),
-  mustChangePassword: z4.boolean().optional()
+  password: z6.string().min(6, "Password must be at least 6 characters.").max(128),
+  modulesAllowed: z6.array(z6.string().max(64)).optional(),
+  status: z6.enum(["Active", "Inactive"]).default("Active"),
+  mustChangePassword: z6.boolean().optional()
 });
-var DeleteUserInputSchema = z4.object({
-  callerLoginId: z4.string().trim().min(1).max(64).optional(),
-  targetId: z4.string().trim().min(1).max(128).optional(),
-  targetLoginId: z4.string().trim().min(1).max(64).optional()
+var DeleteUserInputSchema = z6.object({
+  callerLoginId: z6.string().trim().min(1).max(64).optional(),
+  targetId: z6.string().trim().min(1).max(128).optional(),
+  targetLoginId: z6.string().trim().min(1).max(64).optional()
 });
-var SetUserPermissionsInputSchema = z4.object({
-  callerLoginId: z4.string().trim().min(1).max(64).optional(),
-  targetId: z4.string().trim().min(1).max(128),
+var SetUserPermissionsInputSchema = z6.object({
+  callerLoginId: z6.string().trim().min(1).max(64).optional(),
+  targetId: z6.string().trim().min(1).max(128),
   role: DynamicRoleIdSchema.optional(),
-  status: z4.enum(["Active", "Inactive"]).optional(),
-  modulesAllowed: z4.array(z4.string().max(64)).optional(),
-  permissions: z4.record(
-    z4.string(),
-    z4.object({
-      view: z4.boolean().optional(),
-      add: z4.boolean().optional(),
-      edit: z4.boolean().optional(),
-      delete: z4.boolean().optional()
+  status: z6.enum(["Active", "Inactive"]).optional(),
+  modulesAllowed: z6.array(z6.string().max(64)).optional(),
+  permissions: z6.record(
+    z6.string(),
+    z6.object({
+      view: z6.boolean().optional(),
+      add: z6.boolean().optional(),
+      edit: z6.boolean().optional(),
+      delete: z6.boolean().optional()
     })
   ).optional()
 });
-var RolePermissionsInputSchema = z4.object({
-  callerLoginId: z4.string().trim().min(1).max(64).optional(),
+var RolePermissionsInputSchema = z6.object({
+  callerLoginId: z6.string().trim().min(1).max(64).optional(),
   roleId: DynamicRoleIdSchema,
-  modulePermissions: z4.record(
-    z4.string(),
-    z4.object({
-      view: z4.boolean().optional(),
-      add: z4.boolean().optional(),
-      edit: z4.boolean().optional(),
-      delete: z4.boolean().optional()
+  modulePermissions: z6.record(
+    z6.string(),
+    z6.object({
+      view: z6.boolean().optional(),
+      add: z6.boolean().optional(),
+      edit: z6.boolean().optional(),
+      delete: z6.boolean().optional()
     })
   )
 });
@@ -6419,6 +11504,7 @@ var DEFAULT_ROLE_PERMISSIONS = {
     user_rights: { view: true, add: true, edit: true, delete: true },
     audit_logs: { view: true, add: true, edit: true, delete: true },
     security_management: { view: true, add: true, edit: true, delete: true },
+    system_performance: { view: true, add: true, edit: true, delete: true },
     settings: { view: true, add: true, edit: true, delete: true },
     ...Object.fromEntries(
       Array.from(DASHBOARD_VISIBILITY_KEYS).map((k) => [
@@ -6445,6 +11531,7 @@ var DEFAULT_ROLE_PERMISSIONS = {
     user_rights: { view: false, add: false, edit: false, delete: false },
     audit_logs: { view: false, add: false, edit: false, delete: false },
     security_management: { view: false, add: false, edit: false, delete: false },
+    system_performance: { view: false, add: false, edit: false, delete: false },
     settings: { view: false, add: false, edit: false, delete: false }
   },
   user: {
@@ -6465,13 +11552,15 @@ var DEFAULT_ROLE_PERMISSIONS = {
     user_rights: { view: false, add: false, edit: false, delete: false },
     audit_logs: { view: false, add: false, edit: false, delete: false },
     security_management: { view: false, add: false, edit: false, delete: false },
+    system_performance: { view: false, add: false, edit: false, delete: false },
     settings: { view: false, add: false, edit: false, delete: false }
   }
 };
 var RESTRICTED_SUPER_ADMIN_MODULES = /* @__PURE__ */ new Set([
   "user_rights",
   "audit_logs",
-  "security_management"
+  "security_management",
+  "system_performance"
 ]);
 var SCANNER_CAPABILITY_KEYS = /* @__PURE__ */ new Set([
   "attendance.qr.scan",
@@ -6632,7 +11721,7 @@ async function seedInitialAccounts(db) {
       const userRef = db.collection("user_roles").doc(docId);
       const snap = await userRef.get();
       if (!snap.exists) {
-        const randomInitialHash = hashPassword(crypto5.randomBytes(24).toString("hex"));
+        const randomInitialHash = hashPassword(crypto6.randomBytes(24).toString("hex"));
         await userRef.set({
           id: docId,
           loginId: acc.loginId,
@@ -6698,6 +11787,9 @@ async function seedInitialAccounts(db) {
       if (sData.protectCriticalLogs === void 0) sUpdates.protectCriticalLogs = true;
       if (sData.captureGeoLocation === void 0) sUpdates.captureGeoLocation = true;
       if (sData.failedLoginAlertThreshold === void 0) sUpdates.failedLoginAlertThreshold = 5;
+      if (sData.superAdminLockoutResetHours === void 0) {
+        sUpdates.superAdminLockoutResetHours = DEFAULT_SUPER_ADMIN_LOCKOUT_RESET_HOURS;
+      }
       if (Object.keys(sUpdates).length > 0) {
         await settingsRef.update(sUpdates);
       }
@@ -6767,6 +11859,7 @@ function createApp(options = {}) {
   const projectId = options.projectId || adminCtx?.projectId || TARGET_PROJECT_ID;
   const databaseId = options.databaseId || adminCtx?.databaseId || TARGET_DATABASE_ID;
   const credentialMode = options.credentialMode || adminCtx?.credentialMode || "UNCONFIGURED";
+  const getNowMs = options.nowProvider || (() => Date.now());
   const app = express();
   app.set("trust proxy", 1);
   const allowedOrigins = buildAllowedOriginsSet(options.allowedOrigins);
@@ -6810,13 +11903,26 @@ function createApp(options = {}) {
         origin: permitted ? normalizeAllowedOrigin(rawOrigin) || false : false,
         credentials: permitted,
         methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allowedHeaders: ["Content-Type", "Authorization"],
+        allowedHeaders: ["Content-Type", "Authorization", "X-Correlation-ID"],
+        exposedHeaders: ["X-Correlation-ID", "X-Server-Process-Ms", "X-Payload-Bytes", "Server-Timing"],
         optionsSuccessStatus: 204
       });
     })
   );
+  app.use(createMonitoringRequestMiddleware(() => db));
+  app.use(
+    "/api/network/speedtest/upload",
+    express.raw({
+      type: ["application/octet-stream", "application/binary"],
+      limit: "600kb"
+    })
+  );
   const jsonBodyParser = express.json({ limit: "2mb" });
   app.use((req, res, next) => {
+    if (req.path === "/api/network/speedtest/upload" && Buffer.isBuffer(req.body)) {
+      req._body = true;
+      return next();
+    }
     const bodyDesc = Object.getOwnPropertyDescriptor(req, "body");
     const hasOwnBodyProp = Boolean(
       bodyDesc && ("value" in bodyDesc || typeof bodyDesc.get === "function")
@@ -6868,8 +11974,12 @@ function createApp(options = {}) {
   };
   app.get("/api/health", (_req, res) => {
     const effectiveWarning = runtimeFirestoreAccessError || adminCtx?.error;
+    const isOk = Boolean(db && !runtimeFirestoreAccessError);
+    if (db) {
+      noteServerHealthCheck(db, isOk ? "ok" : "degraded");
+    }
     res.json({
-      status: db && !runtimeFirestoreAccessError ? "ok" : "degraded",
+      status: isOk ? "ok" : "degraded",
       timestamp: (/* @__PURE__ */ new Date()).toISOString(),
       projectId,
       databaseId,
@@ -6885,6 +11995,15 @@ function createApp(options = {}) {
         success: false,
         code: "FIREBASE_ADMIN_UNCONFIGURED",
         error: adminCtx?.error || "Firebase Admin SDK is not initialized. Configure FIREBASE_SERVICE_ACCOUNT_KEY (or FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY) on the server."
+      });
+    });
+    app.use("/api", (err, _req, res, _next) => {
+      if (res.headersSent) return;
+      const status = typeof err?.status === "number" && err.status >= 400 && err.status < 600 ? err.status : 500;
+      res.status(status).json({
+        success: false,
+        code: err instanceof SyntaxError && status === 400 ? "INVALID_JSON_BODY" : "INTERNAL_API_ERROR",
+        error: err instanceof SyntaxError && status === 400 ? "Invalid JSON request body." : "Internal server error."
       });
     });
     return { app, db: null, auth: null, projectId, databaseId, credentialMode };
@@ -6919,10 +12038,35 @@ function createApp(options = {}) {
       success: params.success,
       sessionId: params.sessionId
     });
+    const actModule = params.action.includes("role") || params.action.includes("permission") || params.action.includes("account") ? "User Rights & Permissions" : "Audit Logs & Security";
+    recordActivityTelemetry(adminDb, {
+      actorUid: params.performedByUid || "system",
+      actorLoginId: params.performedByLoginId || params.loginId || "system",
+      actorRole: params.performedByRole || "SYSTEM",
+      action: params.action.toUpperCase(),
+      module: actModule,
+      result: params.success === false ? "Failed" : "Success",
+      correlationId: params.req?.correlationId,
+      detail: params.details
+    });
+    if (params.action.includes("unauthorized")) {
+      recordErrorTelemetry(adminDb, {
+        source: "AUTH",
+        module: "Audit Logs & Security",
+        category: "PERMISSION",
+        severity: "CRITICAL",
+        message: params.details || `Unauthorized attempt (${params.action})`,
+        statusCode: 403,
+        correlationId: params.req?.correlationId
+      });
+    }
   }
   async function requireVerifiedCaller(req, res, allowedRoles, actionLabel, options2) {
     try {
-      const caller = await verifyCallerIdentity(req, adminDb, auth, projectId, options2);
+      const caller = await verifyCallerIdentity(req, adminDb, auth, projectId, {
+        ...options2 || {},
+        nowMs: getNowMs()
+      });
       if (!caller) {
         await logAuditEvent({
           req,
@@ -7042,7 +12186,8 @@ function createApp(options = {}) {
     verifyPassword,
     hashPassword,
     syncExistingFirebaseAuthPassword,
-    requireVerifiedCaller
+    requireVerifiedCaller,
+    nowProvider: getNowMs
   });
   registerAttendanceRoutes(app, {
     db: adminDb,
@@ -7051,6 +12196,17 @@ function createApp(options = {}) {
   registerEmployeeRoutes(app, {
     db: adminDb,
     requireVerifiedCaller
+  });
+  registerMasterRoutes(app, {
+    db: adminDb,
+    requireVerifiedCaller
+  });
+  registerMonitoringRoutes(app, {
+    db: adminDb,
+    requireVerifiedCaller,
+    projectId,
+    databaseId,
+    credentialMode
   });
   app.post("/api/auth/verify-session", async (req, res) => {
     try {
@@ -7107,6 +12263,36 @@ function createApp(options = {}) {
       const secData = secSnap.exists ? secSnap.data() || {} : null;
       const isLocked = secData?.lockStatus === "LOCKED" || userData.lockStatus === "LOCKED" || userData.isLocked === true;
       if (isLocked) {
+        const isCanonicalSA = isCanonicalSuperAdminAccount(userDoc.id, userData);
+        if (isCanonicalSA) {
+          const nowMs = getNowMs();
+          const rawLockedUntilMs = typeof secData?.lockedUntilMs === "number" ? secData.lockedUntilMs : typeof userData.lockedUntilMs === "number" ? userData.lockedUntilMs : secData?.lockoutUntil ? Date.parse(String(secData.lockoutUntil)) : secData?.lockedUntil ? Date.parse(String(secData.lockedUntil)) : userData.lockoutUntil ? Date.parse(String(userData.lockoutUntil)) : userData.lockedUntil ? Date.parse(String(userData.lockedUntil)) : NaN;
+          if (Number.isFinite(rawLockedUntilMs)) {
+            if (nowMs < rawLockedUntilMs) {
+              const remainingSeconds = Math.max(1, Math.ceil((rawLockedUntilMs - nowMs) / 1e3));
+              const lockedUntilIso = secData?.lockoutUntil || secData?.lockedUntil || userData.lockoutUntil || userData.lockedUntil || new Date(rawLockedUntilMs).toISOString();
+              return res.status(401).json({
+                success: false,
+                active: false,
+                locked: true,
+                temporaryLock: true,
+                lockoutUntil: lockedUntilIso,
+                lockedUntil: lockedUntilIso,
+                lockedUntilMs: rawLockedUntilMs,
+                serverNowMs: nowMs,
+                remainingSeconds,
+                error: `Super Admin account is temporarily locked. Try again in ${formatLockoutDurationText(remainingSeconds)}.`
+              });
+            }
+            return res.status(401).json({
+              success: false,
+              active: false,
+              locked: false,
+              temporaryLock: false,
+              error: "Temporary lockout has expired. Please sign in again to reactivate your session."
+            });
+          }
+        }
         return res.status(401).json({
           success: false,
           active: false,
@@ -7340,7 +12526,7 @@ function createApp(options = {}) {
           },
           details: `Password reset by Super Admin "${cleanCallerId}" for "${cleanTargetId}" (${targetRole}, UID: ${targetUid}, email: ${matchedFirebaseEmail}). Force next login change: ${forceChange}.`
         });
-        const resetLogId = `reset_${Date.now()}_${crypto5.randomBytes(3).toString("hex")}`;
+        const resetLogId = `reset_${Date.now()}_${crypto6.randomBytes(3).toString("hex")}`;
         await adminDb.collection("password_reset_logs").doc(resetLogId).set({
           id: resetLogId,
           targetLoginId: cleanTargetId,
@@ -8002,6 +13188,146 @@ function createApp(options = {}) {
     } catch (err) {
       console.error("[Set User Permissions] Error:", err);
       return res.status(500).json({ success: false, error: err?.message || "Failed to update user permissions." });
+    }
+  });
+  const BulkUserStatusInputSchema = z6.object({
+    userIds: z6.array(z6.string().trim().min(1)).min(1, "Select at least one user account.").max(200),
+    status: z6.enum(["Active", "Inactive"]),
+    confirmed: z6.literal(true, {
+      message: "Explicit confirmation is required for bulk user status updates."
+    })
+  });
+  app.post("/api/admin/users/bulk-status", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, ["super_admin"], "Bulk User Status Update");
+      if (!caller) return;
+      const parsed = BulkUserStatusInputSchema.safeParse(req.body || {});
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || "Invalid bulk user status payload."
+        });
+      }
+      const { status } = parsed.data;
+      const uniqueIds = Array.from(new Set(parsed.data.userIds.map((id) => id.trim()).filter(Boolean)));
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      const allUsersSnap = await adminDb.collection("user_roles").get();
+      const userDocById = /* @__PURE__ */ new Map();
+      let activeSuperAdminCount = 0;
+      for (const docSnap of allUsersSnap.docs) {
+        const data = docSnap.data() || {};
+        userDocById.set(docSnap.id, data);
+        if (String(data.role || "").toLowerCase() === "super_admin" && data.status !== "Inactive") {
+          activeSuperAdminCount++;
+        }
+      }
+      const committedIds = [];
+      const skippedItems = [];
+      const failedItems = [];
+      for (const targetId of uniqueIds) {
+        const targetData = userDocById.get(targetId);
+        if (!targetData) {
+          skippedItems.push({ id: targetId, reason: "User account not found." });
+          continue;
+        }
+        const targetLogin = String(targetData.loginId || "").trim().toLowerCase();
+        const targetUid = String(targetData.authUid || targetData.uid || "");
+        const isSuper = String(targetData.role || "").toLowerCase() === "super_admin";
+        if (status === "Inactive") {
+          if (targetLogin === caller.loginId || targetId === caller.profileDocId) {
+            skippedItems.push({
+              id: targetId,
+              reason: "Protected: Cannot deactivate your own active account."
+            });
+            continue;
+          }
+          if (targetLogin === "superadmin" || targetId === "role_superadmin" || CANONICAL_PROTECTED_UIDS.has(targetUid)) {
+            skippedItems.push({
+              id: targetId,
+              reason: "Protected: Root canonical Super Admin account cannot be deactivated."
+            });
+            continue;
+          }
+          if (isSuper && activeSuperAdminCount <= 1) {
+            skippedItems.push({
+              id: targetId,
+              reason: "Protected: Cannot deactivate the last remaining active Super Admin."
+            });
+            continue;
+          }
+        }
+        if (targetData.status === status) {
+          skippedItems.push({ id: targetId, reason: `Account is already ${status}.` });
+          continue;
+        }
+        try {
+          await adminDb.collection("user_roles").doc(targetId).update({
+            status,
+            updatedAt: now
+          });
+          if (targetUid && !targetUid.startsWith("role_")) {
+            await syncUserUidIndex(adminDb, {
+              uid: targetUid,
+              roleDocId: targetId,
+              role: normalizeRoleValue(targetData.role || "user"),
+              status,
+              lockStatus: targetData.isLocked || targetData.lockStatus === "LOCKED" ? "LOCKED" : "ACTIVE",
+              loginId: targetLogin
+            });
+            invalidateUidRolePointer(adminDb, targetUid);
+            if (auth) {
+              await auth.updateUser(targetUid, { disabled: status === "Inactive" }).catch(() => {
+              });
+              if (status === "Inactive") {
+                await auth.revokeRefreshTokens(targetUid).catch(() => {
+                });
+              }
+            }
+          }
+          if (status === "Inactive" && isSuper) {
+            activeSuperAdminCount--;
+          } else if (status === "Active" && isSuper && targetData.status === "Inactive") {
+            activeSuperAdminCount++;
+          }
+          committedIds.push(targetId);
+        } catch (err) {
+          failedItems.push({ id: targetId, error: err?.message || "Failed to update account status." });
+        }
+      }
+      await logAuditEvent({
+        req,
+        action: "bulk_user_status_updated",
+        targetUid: committedIds.slice(0, 10).join(",") || "user_roles",
+        loginId: caller.loginId,
+        performedByUid: caller.uid,
+        performedByLoginId: caller.loginId,
+        performedByRole: "SUPER_ADMIN",
+        actionSource: "USER_RIGHTS_BULK_STATUS",
+        newValue: {
+          status,
+          savedCount: committedIds.length,
+          skippedCount: skippedItems.length,
+          failedCount: failedItems.length,
+          committedIds
+        },
+        details: `Super Admin bulk set ${committedIds.length} user account(s) to ${status} (skipped ${skippedItems.length}).`
+      });
+      const partialCommit = committedIds.length > 0 && failedItems.length > 0;
+      const statusCode = failedItems.length > 0 && committedIds.length === 0 ? 500 : 200;
+      return res.status(statusCode).json({
+        success: failedItems.length === 0,
+        status,
+        savedCount: committedIds.length,
+        skippedCount: skippedItems.length,
+        failedCount: failedItems.length,
+        partialCommit,
+        committedIds,
+        skippedItems,
+        failedItems
+      });
+    } catch (err) {
+      console.error("[Bulk User Status API] Error:", err);
+      return res.status(500).json({ success: false, error: err?.message || "Bulk user status update failed." });
     }
   });
   app.post("/api/admin/role-permissions", async (req, res) => {
@@ -8684,24 +14010,66 @@ function createApp(options = {}) {
   app.use("/api", (_req, res) => {
     res.status(404).json({ success: false, error: "API endpoint not found." });
   });
+  app.use("/api", (err, _req, res, _next) => {
+    if (res.headersSent) return;
+    const status = typeof err?.status === "number" && err.status >= 400 && err.status < 600 ? err.status : typeof err?.statusCode === "number" && err.statusCode >= 400 && err.statusCode < 600 ? err.statusCode : 500;
+    const isSyntaxErr = err instanceof SyntaxError && status === 400;
+    res.status(status).json({
+      success: false,
+      code: isSyntaxErr ? "INVALID_JSON_BODY" : "INTERNAL_API_ERROR",
+      error: isSyntaxErr ? "Invalid JSON request body." : status >= 500 ? "Internal server error." : String(err?.message || "API request failed.")
+    });
+  });
   return { app, db: adminDb, auth, projectId, databaseId, credentialMode };
+}
+function resolveServerPort(argv = process.argv.slice(2), env = process.env) {
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--port" && argv[i + 1]) {
+      const parsed = Number(argv[i + 1]);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    } else if (argv[i].startsWith("--port=")) {
+      const parsed = Number(argv[i].slice("--port=".length));
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+  }
+  const envPort = Number(env.PORT);
+  if (Number.isFinite(envPort) && envPort > 0) return envPort;
+  return env.NODE_ENV === "production" ? 8080 : 3e3;
+}
+function isApiRequestPath(reqPath) {
+  const clean = String(reqPath || "").split("?")[0];
+  return clean === "/api" || clean.startsWith("/api/");
 }
 async function startServer() {
   const { app, credentialMode, projectId, databaseId } = createApp();
-  const PORT = Number(process.env.PORT) || 8080;
+  const PORT = resolveServerPort();
+  app.use((req, res, next) => {
+    if (isApiRequestPath(req.path)) {
+      return res.status(404).json({ success: false, error: "API endpoint not found." });
+    }
+    return next();
+  });
   if (process.env.NODE_ENV !== "production") {
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true, host: "0.0.0.0", port: PORT },
       appType: "spa"
     });
-    app.use(vite.middlewares);
+    app.use((req, res, next) => {
+      if (isApiRequestPath(req.path)) {
+        return res.status(404).json({ success: false, error: "API endpoint not found." });
+      }
+      return vite.middlewares(req, res, next);
+    });
   } else {
     const distDir = path2.resolve(process.cwd(), "dist");
     const distIndex = path2.join(distDir, "index.html");
     if (fs2.existsSync(distIndex)) {
       app.use(express.static(distDir));
-      app.get("*", (_req, res) => {
+      app.get("*", (req, res) => {
+        if (isApiRequestPath(req.path)) {
+          return res.status(404).json({ success: false, error: "API endpoint not found." });
+        }
         res.sendFile(distIndex);
       });
     } else {
@@ -8743,7 +14111,9 @@ export {
   buildAllowedOriginsSet,
   createApp,
   hashPassword,
+  isApiRequestPath,
   normalizeAllowedOrigin,
+  resolveServerPort,
   sanitizeRoleModulePermissions,
   startServer,
   syncExistingFirebaseAuthPassword,

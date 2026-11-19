@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 import { Employee, Floor, Department, UserRoleRecord } from '../types';
 import { regenerateQrToken } from '../services/employeeService';
-import { RolePermissionRecord, hasModulePermission } from '../services/permissionService';
+import { RolePermissionRecord, hasModulePermission, normalizeRoleId } from '../services/permissionService';
 import { QrManagementSkeleton } from './Skeletons';
 import {
   IDENTITY_CARD_HEADER_TEXT,
@@ -151,6 +151,8 @@ export const QrManagement: React.FC<QrManagementProps> = ({
   const canEditQr = currentUserRole
     ? hasModulePermission(currentUserRole.role, 'qr_codes', 'edit', rolePermissions)
     : true;
+  const isAdminRole = normalizeRoleId(currentUserRole?.role) === 'admin';
+  const canReissueQr = Boolean(currentUserRole) && !isAdminRole && canEditQr;
 
   const [searchTerm, setSearchTerm] = useState('');
   const [filterFloor, setFilterFloor] = useState('ALL');
@@ -296,6 +298,7 @@ export const QrManagement: React.FC<QrManagementProps> = ({
   }, [qrRenderTargets]);
 
   const handleRegenerate = async (empId: string) => {
+    if (!canReissueQr) return;
     setActionError(null);
     setRegeneratingId(empId);
     try {
@@ -677,7 +680,7 @@ export const QrManagement: React.FC<QrManagementProps> = ({
                   >
                     <Printer className="w-3.5 h-3.5" />
                   </button>
-                  {canEditQr && (isConfirming ? (
+                  {canReissueQr && (isConfirming ? (
                     <div className="flex items-center gap-1">
                       <button
                         type="button"

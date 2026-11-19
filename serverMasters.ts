@@ -7,7 +7,7 @@ import {
   type VerifiedCaller,
   recordEnterpriseAuditEvent,
 } from './serverSecurityAudit.ts';
-import { getCachedRolePermissionsDoc } from './serverPerfCache.ts';
+import { getCachedRolePermissionsDoc, invalidateConfigCaches } from './serverPerfCache.ts';
 import {
   recordDbOpMetric,
   recordImportExportTelemetry,
@@ -239,6 +239,10 @@ export function registerMasterRoutes(app: express.Express, deps: MasterRoutesDep
             error: msg,
           });
         }
+      }
+
+      if (resource === 'shifts' && committedIds.length > 0) {
+        invalidateConfigCaches(db);
       }
 
       await recordEnterpriseAuditEvent(db, {

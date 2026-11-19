@@ -37,7 +37,9 @@ interface DbCacheStore {
   systemSettings?: CachedDocSnapshotLike;
   systemSettingsInFlight?: Promise<Record<string, any>>;
   roleDefs: Map<string, CachedDocSnapshotLike>;
+  roleDefsInFlight: Map<string, Promise<CachedDocSnapshotLike>>;
   rolePerms: Map<string, CachedDocSnapshotLike>;
+  rolePermsInFlight: Map<string, Promise<CachedDocSnapshotLike>>;
   uidRolePointers: Map<string, CachedUidRolePointer>;
   inFlightRequests: Map<string, Promise<any>>;
   recentIdempotentResponses: Map<string, { value: any; expiresAt: number }>;
@@ -50,7 +52,9 @@ function getStore(db: AdminFirestoreLike): DbCacheStore {
   if (!store) {
     store = {
       roleDefs: new Map(),
+      roleDefsInFlight: new Map(),
       rolePerms: new Map(),
+      rolePermsInFlight: new Map(),
       uidRolePointers: new Map(),
       inFlightRequests: new Map(),
       recentIdempotentResponses: new Map(),
@@ -60,9 +64,11 @@ function getStore(db: AdminFirestoreLike): DbCacheStore {
   return store;
 }
 
-const CONFIG_TTL_MS = 30_000;
-const ROLE_TTL_MS = 15_000;
-const UID_POINTER_TTL_MS = 60_000;
+// Low-churn metadata TTLs (all invalidated immediately on write paths;
+// employee status, QR tokens, attendance state, and user_roles/user_permissions are NEVER cached).
+const CONFIG_TTL_MS = 120_000;
+const ROLE_TTL_MS = 60_000;
+const UID_POINTER_TTL_MS = 300_000;
 
 /**
  * Non-authoritative structural routing hint (uid -> roleDocId) only.
@@ -197,13 +203,28 @@ export async function getCachedRoleDefDoc(
     return { exists: cached.exists, data: cached.data, cacheHit: true };
   }
 
-  const snap = await db.collection('roles').doc(cleanRole).get();
-  const entry: CachedDocSnapshotLike = {
-    exists: snap.exists,
-    data: snap.exists ? snap.data() || {} : undefined,
-    expiresAt: Date.now() + ROLE_TTL_MS,
-  };
-  store.roleDefs.set(cleanRole, entry);
+  let inFlight = store.roleDefsInFlight.get(cleanRole);
+  if (!inFlight) {
+    inFlight = db
+      .collection('roles')
+      .doc(cleanRole)
+      .get()
+      .then((snap) => {
+        const entry: CachedDocSnapshotLike = {
+          exists: snap.exists,
+          data: snap.exists ? snap.data() || {} : undefined,
+          expiresAt: Date.now() + ROLE_TTL_MS,
+        };
+        store.roleDefs.set(cleanRole, entry);
+        return entry;
+      })
+      .finally(() => {
+        store.roleDefsInFlight.delete(cleanRole);
+      });
+    store.roleDefsInFlight.set(cleanRole, inFlight);
+  }
+
+  const entry = await inFlight;
   return { exists: entry.exists, data: entry.data, cacheHit: false };
 }
 
@@ -221,13 +242,28 @@ export async function getCachedRolePermissionsDoc(
     return { exists: cached.exists, data: cached.data, cacheHit: true };
   }
 
-  const snap = await db.collection('role_permissions').doc(cleanRole).get();
-  const entry: CachedDocSnapshotLike = {
-    exists: snap.exists,
-    data: snap.exists ? snap.data() || {} : undefined,
-    expiresAt: Date.now() + ROLE_TTL_MS,
-  };
-  store.rolePerms.set(cleanRole, entry);
+  let inFlight = store.rolePermsInFlight.get(cleanRole);
+  if (!inFlight) {
+    inFlight = db
+      .collection('role_permissions')
+      .doc(cleanRole)
+      .get()
+      .then((snap) => {
+        const entry: CachedDocSnapshotLike = {
+          exists: snap.exists,
+          data: snap.exists ? snap.data() || {} : undefined,
+          expiresAt: Date.now() + ROLE_TTL_MS,
+        };
+        store.rolePerms.set(cleanRole, entry);
+        return entry;
+      })
+      .finally(() => {
+        store.rolePermsInFlight.delete(cleanRole);
+      });
+    store.rolePermsInFlight.set(cleanRole, inFlight);
+  }
+
+  const entry = await inFlight;
   return { exists: entry.exists, data: entry.data, cacheHit: false };
 }
 
@@ -301,14 +337,22 @@ export async function runWithOptionalClientRequestDedup<T>(
 // ============================================================================
 export interface AttendancePerfMetrics {
   qrParseMs?: number;
+  tokenVerifyMs?: number;
+  callerLookupMs?: number;
   authMs: number;
   permissionMs: number;
+  employeeLookupMs?: number;
+  attendanceLookupMs?: number;
+  configLookupMs?: number;
   lookupAndQueryMs: number;
   tokenValidationMs?: number;
   txMs: number;
   firestoreOpMs?: number;
   auditMs?: number;
   totalServerMs: number;
+  firestoreReads?: number;
+  firestoreWrites?: number;
+  parallelPrefetchUsed?: boolean;
   cacheHitRolePerms?: boolean;
   cacheHitConfig?: boolean;
   cacheHitUidRoute?: boolean;
