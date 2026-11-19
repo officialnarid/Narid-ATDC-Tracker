@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   User, 
   Lock, 
@@ -10,10 +10,116 @@ import {
   Calendar,
   QrCode,
   Users,
-  BarChart3
+  BarChart3,
+  Clock,
+  CheckCircle2,
+  RefreshCw
 } from 'lucide-react';
-import { loginWithLoginIdAndPassword, LoginAuthError } from '../services/authService';
+import {
+  loginWithLoginIdAndPassword,
+  fetchSuperAdminLockoutStatus,
+  LoginAuthError,
+} from '../services/authService';
 import { UserRoleRecord } from '../types';
+
+export interface ServerTempLockoutState {
+  loginId: string;
+  lockoutUntil: string;
+  lockedUntilMs: number;
+  lockDurationMinutes: number | null;
+  clockOffsetMs: number;
+}
+
+export interface ServerLockoutPayload {
+  locked?: boolean;
+  temporaryLock?: boolean;
+  loginId?: string;
+  lockoutUntil?: string | null;
+  lockedUntil?: string | null;
+  lockedUntilMs?: number | null;
+  serverNowMs?: number | null;
+  remainingSeconds?: number | null;
+  lockDurationMinutes?: number | null;
+}
+
+export function formatCountdownSeconds(totalSeconds: number): string {
+  const safe = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const mins = Math.floor(safe / 60);
+  const secs = safe % 60;
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
+export function computeRemainingLockoutSeconds(
+  lockedUntilMs: number,
+  clockOffsetMs = 0,
+  clientNowMs = Date.now()
+): number {
+  const estimatedServerNowMs = clientNowMs + clockOffsetMs;
+  const remainingMs = lockedUntilMs - estimatedServerNowMs;
+  if (remainingMs <= 0) return 0;
+  return Math.ceil(remainingMs / 1000);
+}
+
+export function deriveServerLockoutState(
+  payload: ServerLockoutPayload | null | undefined,
+  clientNowMs = Date.now()
+): ServerTempLockoutState | null {
+  if (!payload || !payload.temporaryLock || payload.locked === false) {
+    return null;
+  }
+
+  const rawIso = payload.lockoutUntil || payload.lockedUntil || null;
+  let lockedUntilMs: number | null =
+    typeof payload.lockedUntilMs === 'number' && Number.isFinite(payload.lockedUntilMs) && payload.lockedUntilMs > 0
+      ? payload.lockedUntilMs
+      : null;
+
+  if (lockedUntilMs === null && rawIso) {
+    const parsed = Date.parse(rawIso);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      lockedUntilMs = parsed;
+    }
+  }
+
+  const effectiveServerNowMs =
+    typeof payload.serverNowMs === 'number' && Number.isFinite(payload.serverNowMs)
+      ? payload.serverNowMs
+      : clientNowMs;
+
+  if (
+    lockedUntilMs === null &&
+    typeof payload.remainingSeconds === 'number' &&
+    Number.isFinite(payload.remainingSeconds) &&
+    payload.remainingSeconds > 0
+  ) {
+    lockedUntilMs = effectiveServerNowMs + Math.ceil(payload.remainingSeconds) * 1000;
+  }
+
+  if (lockedUntilMs === null) {
+    return null;
+  }
+
+  const clockOffsetMs =
+    typeof payload.serverNowMs === 'number' && Number.isFinite(payload.serverNowMs)
+      ? payload.serverNowMs - clientNowMs
+      : 0;
+
+  const remaining = computeRemainingLockoutSeconds(lockedUntilMs, clockOffsetMs, clientNowMs);
+  if (remaining <= 0) {
+    return null;
+  }
+
+  return {
+    loginId: (payload.loginId || 'superadmin').trim().toLowerCase(),
+    lockoutUntil: rawIso || new Date(lockedUntilMs).toISOString(),
+    lockedUntilMs,
+    lockDurationMinutes:
+      typeof payload.lockDurationMinutes === 'number' && Number.isFinite(payload.lockDurationMinutes)
+        ? payload.lockDurationMinutes
+        : null,
+    clockOffsetMs,
+  };
+}
 
 interface LoginProps {
   onLoginSuccess: (profile: UserRoleRecord) => void;
@@ -21,7 +127,7 @@ interface LoginProps {
 
 interface LoginAlertState {
   message: string;
-  tone: 'error' | 'warning' | 'locked' | 'ratelimit';
+  tone: 'error' | 'warning' | 'locked' | 'ratelimit' | 'ready';
   attemptNumber?: number;
   maxAttempts?: number;
   remainingAttempts?: number;
@@ -33,10 +139,185 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
   const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [alertState, setAlertState] = useState<LoginAlertState | null>(null);
+  const [tempLockout, setTempLockout] = useState<ServerTempLockoutState | null>(null);
+  const [remainingSeconds, setRemainingSeconds] = useState<number>(0);
+  const [isVerifyingExpiry, setIsVerifyingExpiry] = useState(false);
+  const [expiryVerificationError, setExpiryVerificationError] = useState<string | null>(null);
+
+  const isMountedRef = useRef(true);
+  const verifyingExpiryRef = useRef(false);
+  const retryTimerRef = useRef<number | null>(null);
+  const lastQueriedLoginIdRef = useRef<string>('');
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      if (retryTimerRef.current !== null) {
+        window.clearTimeout(retryTimerRef.current);
+      }
+    };
+  }, []);
+
+  const syncLockoutStatusFromServer = useCallback(
+    async (opts?: { isExpiryRecheck?: boolean; targetLoginId?: string }): Promise<boolean> => {
+      const isExpiryRecheck = Boolean(opts?.isExpiryRecheck);
+      if (isExpiryRecheck) {
+        if (verifyingExpiryRef.current) return false;
+        verifyingExpiryRef.current = true;
+        if (isMountedRef.current) {
+          setIsVerifyingExpiry(true);
+          setExpiryVerificationError(null);
+        }
+      }
+
+      try {
+        const status = await fetchSuperAdminLockoutStatus(opts?.targetLoginId ?? 'superadmin');
+        if (!isMountedRef.current) return false;
+
+        if (!status) {
+          if (isExpiryRecheck) {
+            // Never blindly unlock if server could not be reached — retry shortly
+            setExpiryVerificationError('Unable to verify expiry with server. Retrying...');
+            retryTimerRef.current = window.setTimeout(() => {
+              verifyingExpiryRef.current = false;
+              void syncLockoutStatusFromServer({
+                isExpiryRecheck: true,
+                targetLoginId: 'superadmin',
+              });
+            }, 2000);
+          }
+          return false;
+        }
+
+        const clientNowMs = Date.now();
+        const derived = deriveServerLockoutState(status, clientNowMs);
+
+        if (derived) {
+          const rem = computeRemainingLockoutSeconds(
+            derived.lockedUntilMs,
+            derived.clockOffsetMs,
+            clientNowMs
+          );
+          setTempLockout(derived);
+          setRemainingSeconds(rem);
+          setExpiryVerificationError(null);
+          setAlertState((prev) => (prev?.tone === 'locked' ? null : prev));
+          if (isExpiryRecheck) {
+            setIsVerifyingExpiry(false);
+            verifyingExpiryRef.current = false;
+          }
+          return true;
+        }
+
+        // If backend still asserts locked=true at a sub-second boundary, NEVER unlock prematurely
+        if (status.locked && status.temporaryLock) {
+          retryTimerRef.current = window.setTimeout(() => {
+            verifyingExpiryRef.current = false;
+            void syncLockoutStatusFromServer({
+              isExpiryRecheck: true,
+              targetLoginId: 'superadmin',
+            });
+          }, 1000);
+          return true;
+        }
+
+        // Backend independently confirmed account is NOT locked (or lockoutUntil <= serverNowMs)
+        setTempLockout(null);
+        setRemainingSeconds(0);
+        setExpiryVerificationError(null);
+        if (isExpiryRecheck) {
+          setIsVerifyingExpiry(false);
+          verifyingExpiryRef.current = false;
+          setAlertState({
+            tone: 'ready',
+            message: 'Account is now active. You may sign in again.',
+          });
+        }
+        return false;
+      } catch {
+        if (!isMountedRef.current) return false;
+        if (isExpiryRecheck) {
+          setExpiryVerificationError('Unable to verify expiry with server. Retrying...');
+          retryTimerRef.current = window.setTimeout(() => {
+            verifyingExpiryRef.current = false;
+            void syncLockoutStatusFromServer({
+              isExpiryRecheck: true,
+              targetLoginId: 'superadmin',
+            });
+          }, 2000);
+        }
+        return false;
+      }
+    },
+    []
+  );
+
+  // Hydrate authoritative Super Admin lockout status from backend on mount
+  // (Handles browser refresh & multi-device sync without using browser storage)
+  useEffect(() => {
+    void syncLockoutStatusFromServer({ targetLoginId: 'superadmin' });
+  }, [syncLockoutStatusFromServer]);
+
+  // Query backend lockout-status whenever canonical "superadmin" login ID is entered
+  useEffect(() => {
+    const clean = loginId.trim().toLowerCase();
+    if (clean !== 'superadmin') {
+      lastQueriedLoginIdRef.current = clean;
+      return;
+    }
+    if (lastQueriedLoginIdRef.current === 'superadmin') {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      lastQueriedLoginIdRef.current = 'superadmin';
+      void syncLockoutStatusFromServer({ targetLoginId: 'superadmin' });
+    }, 200);
+    return () => window.clearTimeout(timer);
+  }, [loginId, syncLockoutStatusFromServer]);
+
+  // Live 1-second server-offset countdown; MUST re-verify with backend at 00:00 before enabling login
+  useEffect(() => {
+    if (!tempLockout) {
+      setRemainingSeconds(0);
+      return;
+    }
+
+    const tick = () => {
+      const rem = computeRemainingLockoutSeconds(
+        tempLockout.lockedUntilMs,
+        tempLockout.clockOffsetMs
+      );
+      setRemainingSeconds(rem);
+      if (rem <= 0 && !verifyingExpiryRef.current) {
+        void syncLockoutStatusFromServer({
+          isExpiryRecheck: true,
+          targetLoginId: 'superadmin',
+        });
+      }
+    };
+
+    tick();
+    const intervalId = window.setInterval(tick, 1000);
+    return () => window.clearInterval(intervalId);
+  }, [tempLockout, syncLockoutStatusFromServer]);
+
+  const cleanLoginId = loginId.trim().toLowerCase();
+  const showSuperAdminTempLockout = Boolean(
+    tempLockout && (cleanLoginId === '' || cleanLoginId === 'superadmin')
+  );
+  const isTempLockBlockingSubmit = Boolean(
+    tempLockout &&
+      (remainingSeconds > 0 || isVerifyingExpiry) &&
+      (cleanLoginId === '' || cleanLoginId === 'superadmin')
+  );
 
   // Handle Sign In submission
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isTempLockBlockingSubmit) {
+      return;
+    }
     setAlertState(null);
 
     if (!loginId.trim()) {
@@ -51,12 +332,53 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
     setIsLoading(true);
     try {
       const { profile } = await loginWithLoginIdAndPassword(loginId, password, true);
+      setTempLockout(null);
+      setRemainingSeconds(0);
+      setIsVerifyingExpiry(false);
+      verifyingExpiryRef.current = false;
       onLoginSuccess(profile);
     } catch (err: any) {
       const authErr = err as LoginAuthError;
       const rawMsg = authErr?.message || 'Invalid password, check again';
 
-      if (authErr?.locked || authErr?.code === 'ACCOUNT_LOCKED' || rawMsg.includes('temporarily blocked')) {
+      const derived = deriveServerLockoutState(
+        {
+          locked: authErr?.locked,
+          temporaryLock: authErr?.temporaryLock,
+          loginId: loginId.trim().toLowerCase(),
+          lockoutUntil: authErr?.lockoutUntil || authErr?.lockedUntil,
+          lockedUntil: authErr?.lockedUntil,
+          lockedUntilMs: authErr?.lockedUntilMs,
+          serverNowMs: authErr?.serverNowMs,
+          remainingSeconds: authErr?.remainingSeconds,
+          lockDurationMinutes: authErr?.lockDurationMinutes,
+        },
+        Date.now()
+      );
+
+      if (derived) {
+        const rem = computeRemainingLockoutSeconds(derived.lockedUntilMs, derived.clockOffsetMs);
+        setTempLockout(derived);
+        setRemainingSeconds(rem);
+        setIsVerifyingExpiry(false);
+        setExpiryVerificationError(null);
+        verifyingExpiryRef.current = false;
+        setAlertState(null);
+      } else if (
+        authErr?.locked ||
+        authErr?.code === 'ACCOUNT_LOCKED' ||
+        authErr?.status === 423 ||
+        rawMsg.includes('temporarily blocked')
+      ) {
+        // If canonical Super Admin received 423 without timer metadata, verify authoritative status from backend
+        if (loginId.trim().toLowerCase() === 'superadmin') {
+          const recoveredTempLock = await syncLockoutStatusFromServer({
+            targetLoginId: 'superadmin',
+          });
+          if (recoveredTempLock) {
+            return;
+          }
+        }
         setAlertState({
           message: rawMsg,
           tone: 'locked',
@@ -254,17 +576,81 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
             <div className="w-16 h-1.5 bg-gradient-to-r from-blue-600 via-sky-500 to-cyan-400 rounded-full mx-auto mt-3.5 shadow-sm" />
           </div>
 
-          {/* Security Alert / Lockout / Warning Message Box */}
-          {alertState && (
+          {/* Canonical Super Admin Live Temporary Lockout Countdown Panel (Server-Authoritative) */}
+          {showSuperAdminTempLockout && tempLockout && (
+            <div
+              role="alert"
+              data-testid="superadmin-temp-lockout-panel"
+              className="mb-6 p-4 rounded-xl border border-amber-400 bg-amber-50 text-amber-950 shadow-xs"
+            >
+              <div className="flex items-start gap-2.5">
+                <Clock className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs sm:text-sm uppercase tracking-wider font-extrabold text-amber-950">
+                      ACCOUNT TEMPORARILY LOCKED
+                    </span>
+                    <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-amber-200/80 text-amber-900">
+                      Super Admin
+                    </span>
+                  </div>
+
+                  <div className="mt-3 rounded-lg bg-white/90 border border-amber-300/80 px-3.5 py-2.5 flex items-center justify-between gap-3">
+                    <span className="text-xs font-bold uppercase tracking-wider text-amber-900">
+                      Time Remaining:
+                    </span>
+                    <span
+                      data-testid="temp-lockout-countdown"
+                      className="font-mono tabular-nums text-xl sm:text-2xl font-black text-amber-950 tracking-wider"
+                    >
+                      {formatCountdownSeconds(remainingSeconds)}
+                    </span>
+                  </div>
+
+                  {typeof tempLockout.lockDurationMinutes === 'number' && (
+                    <div className="mt-2.5 text-xs font-semibold text-amber-900 flex items-center justify-between">
+                      <span>Lockout Duration:</span>
+                      <span data-testid="temp-lockout-duration" className="font-bold">
+                        {tempLockout.lockDurationMinutes}{' '}
+                        {tempLockout.lockDurationMinutes === 1 ? 'Minute' : 'Minutes'}
+                      </span>
+                    </div>
+                  )}
+
+                  <div className="mt-2.5 pt-2.5 border-t border-amber-300/70 text-[11px] sm:text-xs font-medium text-amber-900">
+                    {isVerifyingExpiry ? (
+                      <div className="flex items-center gap-2 font-semibold text-amber-950">
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
+                        <span>
+                          {expiryVerificationError || 'Verifying lockout expiry with server...'}
+                        </span>
+                      </div>
+                    ) : (
+                      <span>
+                        Account will automatically become active when the timer expires.
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Standard Security Alert / Permanent Lockout / Warning Message Box */}
+          {!showSuperAdminTempLockout && alertState && (
             <div
               role="alert"
               className={`mb-6 p-3.5 rounded-xl border text-xs sm:text-sm flex items-start gap-2.5 shadow-xs ${
-                alertState.tone === 'warning' || alertState.tone === 'ratelimit'
-                  ? 'bg-amber-50 border-amber-300 text-amber-900'
-                  : 'bg-red-50 border-red-300 text-red-800'
+                alertState.tone === 'ready'
+                  ? 'bg-emerald-50 border-emerald-300 text-emerald-900'
+                  : alertState.tone === 'warning' || alertState.tone === 'ratelimit'
+                    ? 'bg-amber-50 border-amber-300 text-amber-900'
+                    : 'bg-red-50 border-red-300 text-red-800'
               }`}
             >
-              {alertState.tone === 'locked' ? (
+              {alertState.tone === 'ready' ? (
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+              ) : alertState.tone === 'locked' ? (
                 <Lock className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
               ) : (
                 <AlertCircle
@@ -284,6 +670,11 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
                 {alertState.tone === 'warning' && (
                   <div className="text-[11px] uppercase tracking-wider font-extrabold text-amber-800 mb-0.5">
                     Security Warning — 1 Attempt Remaining
+                  </div>
+                )}
+                {alertState.tone === 'ready' && (
+                  <div className="text-[11px] uppercase tracking-wider font-extrabold text-emerald-800 mb-0.5">
+                    Account Automatically Reactivated
                   </div>
                 )}
                 <div>{alertState.message}</div>
@@ -347,13 +738,23 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
             {/* Modern Blue Gradient SIGN IN Button */}
             <button
               type="submit"
-              disabled={isLoading}
+              disabled={isLoading || isTempLockBlockingSubmit}
               className="w-full mt-3 bg-gradient-to-r from-blue-600 via-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 active:scale-[0.99] text-white font-bold py-3.5 px-6 rounded-2xl shadow-lg shadow-blue-600/30 flex items-center justify-center gap-2.5 transition-all disabled:opacity-70 disabled:cursor-not-allowed text-sm uppercase tracking-wider cursor-pointer"
             >
               {isLoading ? (
                 <>
                   <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
                   <span>Verifying Account...</span>
+                </>
+              ) : isVerifyingExpiry && showSuperAdminTempLockout ? (
+                <>
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                  <span>Verifying Lockout Expiry...</span>
+                </>
+              ) : isTempLockBlockingSubmit ? (
+                <>
+                  <Clock className="w-4 h-4" />
+                  <span>LOCKED ({formatCountdownSeconds(remainingSeconds)})</span>
                 </>
               ) : (
                 <>

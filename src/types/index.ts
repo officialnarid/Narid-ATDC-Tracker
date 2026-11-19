@@ -284,6 +284,7 @@ export interface SystemSetting {
   protectCriticalLogs?: boolean;
   captureGeoLocation?: boolean;
   failedLoginAlertThreshold?: number;
+  superAdminLockoutResetHours?: number;
 }
 
 export type UserRoleType = 'SUPER_ADMIN' | 'ADMIN' | 'USER' | 'super_admin' | 'admin' | 'user' | (string & {});
@@ -300,6 +301,12 @@ export interface UserRoleRecord {
   forcePasswordChange?: boolean;
   lockStatus?: 'ACTIVE' | 'LOCKED';
   isLocked?: boolean;
+  lockPolicyType?: 'PROGRESSIVE_TEMPORARY' | 'PERMANENT_MANUAL';
+  lockoutUntil?: string | null;
+  lockedUntil?: string | null;
+  lockedUntilMs?: number | null;
+  lockDurationMinutes?: number | null;
+  progressiveLockLevel?: number;
   consecutiveFailedAttempts?: number;
   passwordLastChangedAt?: string;
   passwordHash?: string;
@@ -326,6 +333,22 @@ export interface AccountSecurityRecord {
   firebaseUid: string;
   accountStatus: 'Active' | 'Inactive';
   lockStatus: 'ACTIVE' | 'LOCKED';
+  lockPolicyType?: 'PROGRESSIVE_TEMPORARY' | 'PERMANENT_MANUAL';
+  lockoutUntil?: string | null;
+  lockedUntil?: string | null;
+  lockedUntilMs?: number | null;
+  lockDurationMinutes?: number | null;
+  remainingLockSeconds?: number | null;
+  progressiveLockLevel?: number;
+  totalLockoutEvents?: number;
+  lastLockoutAt?: string | null;
+  lastLockExpiredAt?: string | null;
+  lockoutExpiredPendingLogin?: boolean;
+  cleanWindowStartAt?: string | null;
+  cleanLoginsSinceLastLockout?: number;
+  lockoutLevelResetAt?: string | null;
+  lockoutLevelResetBy?: string | null;
+  lockoutLevelResetReason?: string | null;
   consecutiveFailedAttempts: number;
   maxAttemptsAllowed: number;
   totalLoginAttempts: number;
@@ -376,6 +399,9 @@ export interface LoginAttemptRecord {
   attemptNumber?: number | null;
   consecutiveFailedAfter?: number | null;
   triggeredLock?: boolean;
+  lockDurationMinutes?: number | null;
+  lockoutUntil?: string | null;
+  lockedUntil?: string | null;
   ipAddress: string;
   geoLocation?: GeoLocationInfo;
   browser: string;
@@ -406,6 +432,8 @@ export interface SecurityAuditLogRecord {
 
 export interface SecurityOverviewResponse {
   success: boolean;
+  superAdminLockoutResetHours?: number;
+  serverNowMs?: number;
   kpis: {
     totalLoginAttempts: number;
     successfulLogins: number;

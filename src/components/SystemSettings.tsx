@@ -346,7 +346,7 @@ export const SystemSettingsView: React.FC<SystemSettingsProps> = ({
               )}
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
               <div>
                 <label className="block text-slate-700 font-semibold mb-1">Audit Retention Window (Days)</label>
                 <input
@@ -374,6 +374,28 @@ export const SystemSettingsView: React.FC<SystemSettingsProps> = ({
                 />
                 <span className="text-[10px] text-slate-400 mt-1 block">
                   Triggers CRITICAL security alert after consecutive failed login attempts.
+                </span>
+              </div>
+
+              <div>
+                <label className="block text-slate-700 font-semibold mb-1">
+                  Super Admin Lockout Level Reset (Hours)
+                </label>
+                <input
+                  type="number"
+                  min="6"
+                  max="720"
+                  value={settings.superAdminLockoutResetHours ?? 24}
+                  onChange={(e) =>
+                    setSettings({
+                      ...settings,
+                      superAdminLockoutResetHours: Math.min(720, Math.max(6, Number(e.target.value) || 24)),
+                    })
+                  }
+                  className="w-full border border-slate-300 rounded px-3 py-2 text-xs font-mono"
+                />
+                <span className="text-[10px] text-slate-400 mt-1 block">
+                  Sustained clean usage window (6–720h, default 24h) before Super Admin progressive lockout resets to 10m.
                 </span>
               </div>
             </div>

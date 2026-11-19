@@ -19,6 +19,7 @@ import {
   recordEnterpriseAuditEvent,
   recordLoginHistoryEntry,
   syncUserUidIndex,
+  isCanonicalSuperAdminAccount,
   type GeoLocationInfo,
   type UserAgentMeta,
 } from './serverSecurityAudit.ts';
@@ -30,6 +31,165 @@ import {
 export const MAX_CONSECUTIVE_FAILED_ATTEMPTS = 3;
 export const LOCKED_ACCOUNT_MESSAGE =
   'Your account has been temporarily blocked. Please contact Super Admin.';
+
+export const SUPER_ADMIN_PROGRESSIVE_LOCK_MINUTES = [10, 20, 30, 60] as const;
+export const DEFAULT_SUPER_ADMIN_LOCKOUT_RESET_HOURS = 24;
+export const MIN_SUPER_ADMIN_LOCKOUT_RESET_HOURS = 6;
+export const MAX_SUPER_ADMIN_LOCKOUT_RESET_HOURS = 720;
+
+export function computeSuperAdminLockDurationMinutes(progressiveLockLevel: number): number {
+  const safeLevel = Math.max(1, Math.floor(Number(progressiveLockLevel) || 1));
+  const idx = Math.min(safeLevel - 1, SUPER_ADMIN_PROGRESSIVE_LOCK_MINUTES.length - 1);
+  return SUPER_ADMIN_PROGRESSIVE_LOCK_MINUTES[idx];
+}
+
+export function formatLockoutDurationText(remainingSeconds: number): string {
+  const safeSec = Math.max(1, Math.ceil(Number(remainingSeconds) || 0));
+  const mins = Math.floor(safeSec / 60);
+  const secs = safeSec % 60;
+  if (mins <= 0) {
+    return `${secs} second${secs === 1 ? '' : 's'}`;
+  }
+  if (secs === 0) {
+    return `${mins} minute${mins === 1 ? '' : 's'}`;
+  }
+  return `${mins}m ${String(secs).padStart(2, '0')}s`;
+}
+
+export async function resolveSuperAdminLockoutResetHours(db: AdminFirestoreLike): Promise<number> {
+  let candidate: number | null = null;
+  try {
+    const snap = await db.collection('system_settings').doc('global').get();
+    if (snap.exists) {
+      const val = Number(snap.data()?.superAdminLockoutResetHours);
+      if (Number.isFinite(val) && val > 0) {
+        candidate = val;
+      }
+    }
+  } catch {
+    // non-blocking fallback to env/default
+  }
+  if (candidate === null && process.env.SUPER_ADMIN_LOCKOUT_RESET_HOURS) {
+    const envVal = Number(process.env.SUPER_ADMIN_LOCKOUT_RESET_HOURS);
+    if (Number.isFinite(envVal) && envVal > 0) {
+      candidate = envVal;
+    }
+  }
+  if (candidate === null) {
+    candidate = DEFAULT_SUPER_ADMIN_LOCKOUT_RESET_HOURS;
+  }
+  return Math.min(
+    MAX_SUPER_ADMIN_LOCKOUT_RESET_HOURS,
+    Math.max(MIN_SUPER_ADMIN_LOCKOUT_RESET_HOURS, Math.round(candidate))
+  );
+}
+
+export function resolveAuthoritativeLockedUntilMs(
+  secData?: Record<string, any> | null,
+  userData?: Record<string, any> | null
+): number | null {
+  const candidates: unknown[] = [
+    secData?.lockedUntilMs,
+    userData?.lockedUntilMs,
+    secData?.lockoutUntil,
+    secData?.lockedUntil,
+    userData?.lockoutUntil,
+    userData?.lockedUntil,
+  ];
+  for (const val of candidates) {
+    if (typeof val === 'number' && Number.isFinite(val) && val > 0) {
+      return val;
+    }
+    if (typeof val === 'string' && val.trim()) {
+      const parsed = Date.parse(val.trim());
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return parsed;
+      }
+    }
+  }
+  return null;
+}
+
+export function resolveAuthoritativeLockedUntilIso(
+  lockedUntilMs: number | null,
+  secData?: Record<string, any> | null,
+  userData?: Record<string, any> | null
+): string | null {
+  if (lockedUntilMs === null) return null;
+  const rawIso =
+    secData?.lockoutUntil ||
+    secData?.lockedUntil ||
+    userData?.lockoutUntil ||
+    userData?.lockedUntil;
+  if (typeof rawIso === 'string' && rawIso.trim() && Number.isFinite(Date.parse(rawIso.trim()))) {
+    return rawIso.trim();
+  }
+  return new Date(lockedUntilMs).toISOString();
+}
+
+export function resolveCanonicalSuperAdminLockWindow(
+  secData?: Record<string, any> | null,
+  userData?: Record<string, any> | null
+): {
+  lockedUntilMs: number | null;
+  lockoutUntil: string | null;
+  lockDurationMinutes: number | null;
+} {
+  const explicitMs = resolveAuthoritativeLockedUntilMs(secData, userData);
+  const explicitDuration =
+    typeof secData?.lockDurationMinutes === 'number' && Number.isFinite(secData.lockDurationMinutes)
+      ? secData.lockDurationMinutes
+      : typeof userData?.lockDurationMinutes === 'number' && Number.isFinite(userData.lockDurationMinutes)
+        ? userData.lockDurationMinutes
+        : null;
+
+  if (explicitMs !== null) {
+    const level = Math.max(
+      1,
+      Number(secData?.progressiveLockLevel ?? userData?.progressiveLockLevel ?? 1)
+    );
+    return {
+      lockedUntilMs: explicitMs,
+      lockoutUntil: resolveAuthoritativeLockedUntilIso(explicitMs, secData, userData),
+      lockDurationMinutes: explicitDuration ?? computeSuperAdminLockDurationMinutes(level),
+    };
+  }
+
+  // Legacy lock compatibility for canonical Super Admin ONLY:
+  // If a pre-policy lock recorded lockStatus='LOCKED' without lockoutUntil, anchor to lockedAt + progressive duration
+  const anchorCandidates = [
+    secData?.lockedAt,
+    userData?.lockedAt,
+    secData?.lastFailedAt,
+    secData?.updatedAt,
+    userData?.updatedAt,
+  ];
+  let anchorMs: number | null = null;
+  for (const raw of anchorCandidates) {
+    if (typeof raw === 'string' && raw.trim()) {
+      const parsed = Date.parse(raw.trim());
+      if (Number.isFinite(parsed) && parsed > 0) {
+        anchorMs = parsed;
+        break;
+      }
+    }
+  }
+  if (anchorMs === null) {
+    return { lockedUntilMs: null, lockoutUntil: null, lockDurationMinutes: explicitDuration };
+  }
+
+  const effectiveLevel = Math.max(
+    1,
+    Number(secData?.progressiveLockLevel ?? userData?.progressiveLockLevel ?? 1)
+  );
+  const derivedDuration = explicitDuration ?? computeSuperAdminLockDurationMinutes(effectiveLevel);
+  const derivedUntilMs = anchorMs + derivedDuration * 60 * 1000;
+  return {
+    lockedUntilMs: derivedUntilMs,
+    lockoutUntil: new Date(derivedUntilMs).toISOString(),
+    lockDurationMinutes: derivedDuration,
+  };
+}
 
 // ============================================================================
 // 1. Concurrency Mutex per Login ID (Serializes In-Instance Concurrent Bursts)
@@ -93,13 +253,14 @@ function getIpRateDocId(scopeKey: string): string {
 export async function checkIpProgressiveRateLimitPersistent(
   db: AdminFirestoreLike,
   ip: string,
-  loginId?: string
+  loginId?: string,
+  nowMs?: number
 ): Promise<{
   allowed: boolean;
   cooldownSeconds?: number;
   reason?: string;
 }> {
-  const now = Date.now();
+  const now = typeof nowMs === 'number' ? nowMs : Date.now();
   const keysToCheck = [
     ...(loginId ? [getIpScopeKey(ip, loginId)] : []),
     getIpScopeKey(ip, '__unknown_probe__'),
@@ -128,9 +289,10 @@ export async function recordIpFailurePersistent(
   db: AdminFirestoreLike,
   ip: string,
   kind: 'password' | 'unknown_id' | 'locked_hit' | 'firebase_throttle',
-  loginId?: string
+  loginId?: string,
+  nowMs?: number
 ): Promise<{ triggeredCooldown: boolean; cooldownSeconds: number }> {
-  const now = Date.now();
+  const now = typeof nowMs === 'number' ? nowMs : Date.now();
   const nowIso = new Date(now).toISOString();
   const cleanLogin = kind === 'unknown_id' ? '__unknown_probe__' : (loginId || '__global__').trim().toLowerCase();
   const scopeKey = getIpScopeKey(ip, cleanLogin);
@@ -523,13 +685,16 @@ export async function recordLoginAttemptDoc(
     attemptNumber?: number | null;
     consecutiveFailedAfter?: number | null;
     triggeredLock?: boolean;
+    lockDurationMinutes?: number | null;
+    lockedUntil?: string | null;
     sessionId?: string | null;
+    nowMs?: number;
     telemetry: AttemptTelemetryContext;
   }
 ): Promise<string> {
-  const nowDate = new Date();
-  const now = nowDate.toISOString();
-  const attemptId = `att_${nowDate.getTime()}_${crypto.randomBytes(4).toString('hex')}`;
+  const effectiveNowMs = typeof params.nowMs === 'number' ? params.nowMs : Date.now();
+  const now = new Date(effectiveNowMs).toISOString();
+  const attemptId = `att_${effectiveNowMs}_${crypto.randomBytes(4).toString('hex')}`;
 
   await db.collection('login_attempts').doc(attemptId).set({
     id: attemptId,
@@ -537,7 +702,7 @@ export async function recordLoginAttemptDoc(
     role: String(params.role || 'UNKNOWN').toUpperCase(),
     firebaseUid: params.firebaseUid || null,
     timestamp: now,
-    timestampMs: nowDate.getTime(),
+    timestampMs: effectiveNowMs,
     success: params.success,
     outcome: params.outcome,
     failureReasonCategory: params.failureReasonCategory,
@@ -545,6 +710,9 @@ export async function recordLoginAttemptDoc(
     attemptNumber: params.attemptNumber ?? null,
     consecutiveFailedAfter: params.consecutiveFailedAfter ?? null,
     triggeredLock: Boolean(params.triggeredLock),
+    lockDurationMinutes: params.lockDurationMinutes ?? null,
+    lockoutUntil: params.lockedUntil ?? null,
+    lockedUntil: params.lockedUntil ?? null,
     ipAddress: params.telemetry.ipAddress,
     geoLocation: params.telemetry.geoLocation,
     browser: params.telemetry.uaMeta.browser,
@@ -565,6 +733,9 @@ export async function recordSecurityAuditLogDoc(
       | 'LOGIN_ATTEMPT_WARNING'
       | 'ACCOUNT_LOCKED'
       | 'LOGIN_BLOCKED_WHILE_LOCKED'
+      | 'LOCKOUT_EXPIRED_REACTIVATED'
+      | 'LOGIN_SUCCESS_AFTER_LOCKOUT'
+      | 'LOCKOUT_LEVEL_RESET'
       | 'LOGIN_SUCCESS'
       | 'RATE_LIMIT_TRIGGERED'
       | 'FIREBASE_TOO_MANY_ATTEMPTS'
@@ -584,12 +755,13 @@ export async function recordSecurityAuditLogDoc(
     reason: string;
     details: string;
     metadata?: Record<string, any>;
+    nowMs?: number;
     telemetry: AttemptTelemetryContext;
   }
 ): Promise<string> {
-  const nowDate = new Date();
-  const now = nowDate.toISOString();
-  const logId = `saud_${nowDate.getTime()}_${crypto.randomBytes(4).toString('hex')}`;
+  const effectiveNowMs = typeof params.nowMs === 'number' ? params.nowMs : Date.now();
+  const now = new Date(effectiveNowMs).toISOString();
+  const logId = `saud_${effectiveNowMs}_${crypto.randomBytes(4).toString('hex')}`;
 
   const safeMeta: Record<string, any> = {};
   if (params.metadata) {
@@ -610,7 +782,7 @@ export async function recordSecurityAuditLogDoc(
     actorLoginId: (params.actorLoginId || params.targetLoginId || 'system').trim().toLowerCase(),
     actorRole: String(params.actorRole || 'SYSTEM').toUpperCase(),
     timestamp: now,
-    timestampMs: nowDate.getTime(),
+    timestampMs: effectiveNowMs,
     ipAddress: params.telemetry.ipAddress,
     geoLocation: params.telemetry.geoLocation,
     deviceInfo: {
@@ -647,6 +819,7 @@ export async function seedAccountSecurityRecords(db: AdminFirestoreLike): Promis
           role: String(uData.role || 'user'),
           status: String(uData.status || 'Active'),
           lockStatus: uData.isLocked || uData.lockStatus === 'LOCKED' ? 'LOCKED' : 'ACTIVE',
+          lockedUntilMs: typeof uData.lockedUntilMs === 'number' ? uData.lockedUntilMs : null,
           loginId,
         });
       }
@@ -654,6 +827,7 @@ export async function seedAccountSecurityRecords(db: AdminFirestoreLike): Promis
       const secId = `sec_${loginId}`;
       const secRef = db.collection('account_security').doc(secId);
       const secSnap = await secRef.get();
+      const isCanonicalSA = isCanonicalSuperAdminAccount(uDoc.id, uData);
 
       if (!secSnap.exists) {
         await secRef.set({
@@ -663,6 +837,7 @@ export async function seedAccountSecurityRecords(db: AdminFirestoreLike): Promis
           firebaseUid: uData.authUid || uDoc.id,
           email: uData.email || `${loginId}@narid.com`,
           lockStatus: uData.isLocked || uData.lockStatus === 'LOCKED' ? 'LOCKED' : 'ACTIVE',
+          lockPolicyType: isCanonicalSA ? 'PROGRESSIVE_TEMPORARY' : 'PERMANENT_MANUAL',
           consecutiveFailedAttempts: Number(uData.consecutiveFailedAttempts || 0),
           maxAttemptsAllowed: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
           totalLoginAttempts: 0,
@@ -670,7 +845,23 @@ export async function seedAccountSecurityRecords(db: AdminFirestoreLike): Promis
           totalFailedLogins: 0,
           forcePasswordChange: uData.mustChangePassword === true || uData.forcePasswordChange === true,
           lockedAt: uData.lockedAt || null,
+          lockoutUntil: uData.lockoutUntil || uData.lockedUntil || null,
+          lockedUntil: uData.lockedUntil || uData.lockoutUntil || null,
+          lockedUntilMs: typeof uData.lockedUntilMs === 'number' ? uData.lockedUntilMs : null,
+          lockDurationMinutes:
+            typeof uData.lockDurationMinutes === 'number' ? uData.lockDurationMinutes : null,
           lockReason: uData.lockReason || null,
+          progressiveLockLevel: Number(uData.progressiveLockLevel || 0),
+          totalLockoutEvents: Number(uData.totalLockoutEvents || 0),
+          lastLockoutAt: uData.lastLockoutAt || null,
+          lastLockExpiredAt: uData.lastLockExpiredAt || null,
+          cleanWindowStartAt: uData.cleanWindowStartAt || null,
+          cleanWindowStartMs:
+            typeof uData.cleanWindowStartMs === 'number' ? uData.cleanWindowStartMs : null,
+          cleanLoginsSinceLastLockout: Number(uData.cleanLoginsSinceLastLockout || 0),
+          pendingPostLockoutLoginAudit: Boolean(uData.pendingPostLockoutLoginAudit),
+          lockoutLevelResetAt: uData.lockoutLevelResetAt || null,
+          lockoutLevelResetReason: uData.lockoutLevelResetReason || null,
           lastFailedAt: null,
           lastFailedIp: null,
           lastFailedGeo: null,
@@ -697,6 +888,10 @@ export async function seedAccountSecurityRecords(db: AdminFirestoreLike): Promis
         }
         if (uData.authUid && sData.firebaseUid !== uData.authUid) {
           updates.firebaseUid = uData.authUid;
+        }
+        const expectedPolicy = isCanonicalSA ? 'PROGRESSIVE_TEMPORARY' : 'PERMANENT_MANUAL';
+        if (sData.lockPolicyType !== expectedPolicy) {
+          updates.lockPolicyType = expectedPolicy;
         }
         if (Object.keys(updates).length > 0) {
           updates.updatedAt = now;
@@ -730,6 +925,7 @@ export interface LoginSecurityDeps {
     allowedRoles: string[] | '*',
     actionLabel: string
   ) => Promise<VerifiedCaller | null>;
+  nowProvider?: () => number;
 }
 
 const UnblockAccountSchema = z.object({
@@ -744,6 +940,18 @@ const GenerateTempPasswordSchema = z.object({
   freshSuperAdminPassword: z.string().optional(),
 });
 
+const ResetSuperAdminLockoutLevelSchema = z.object({
+  reason: z
+    .string()
+    .trim()
+    .min(5, 'An explicit governance reason (at least 5 characters) is mandatory.')
+    .max(500),
+  confirmed: z.literal(true, {
+    message: 'Explicit confirmation is required to reset the Super Admin progressive lockout level.',
+  }),
+  freshSuperAdminPassword: z.string().optional(),
+});
+
 export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSecurityDeps) {
   const {
     db,
@@ -753,7 +961,9 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
     hashPassword,
     syncExistingFirebaseAuthPassword,
     requireVerifiedCaller,
+    nowProvider,
   } = deps;
+  const getNowMs = nowProvider || (() => Date.now());
 
   // A. Hardened POST /api/auth/login (Atomic 3-Strike Lockout + Persistent IP Rate Limit)
   app.post('/api/auth/login', async (req: Request, res: Response) => {
@@ -770,9 +980,15 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
 
       const cleanId = loginIdRaw.toLowerCase();
       const telemetry = await captureTelemetryContext(db, req);
+      const requestNowMs = getNowMs();
 
       // 1. Check Persistent Distributed IP Rate Limit
-      const ipCheck = await checkIpProgressiveRateLimitPersistent(db, telemetry.ipAddress, cleanId);
+      const ipCheck = await checkIpProgressiveRateLimitPersistent(
+        db,
+        telemetry.ipAddress,
+        cleanId,
+        requestNowMs
+      );
       if (!ipCheck.allowed) {
         await recordLoginAttemptDoc(db, {
           loginId: cleanId,
@@ -781,6 +997,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
           outcome: 'BLOCKED_RATE_LIMIT',
           failureReasonCategory: 'RATE_LIMITED',
           failureReason: ipCheck.reason || 'Rate limit cooldown active',
+          nowMs: requestNowMs,
           telemetry,
         });
         await recordSecurityAuditLogDoc(db, {
@@ -790,6 +1007,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
           reason: 'IP progressive rate limit cooldown blocked login attempt',
           details: `Blocked login attempt for "${cleanId}" from IP ${telemetry.ipAddress} (${ipCheck.cooldownSeconds}s remaining).`,
           metadata: { cooldownSeconds: ipCheck.cooldownSeconds },
+          nowMs: requestNowMs,
           telemetry,
         });
         return res.status(429).json({
@@ -912,40 +1130,148 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
           };
         }
 
-        const now = new Date().toISOString();
+        const nowMs = getNowMs();
+        const now = new Date(nowMs).toISOString();
         const deviceSummary = {
           browser: telemetry.uaMeta.browser,
           os: telemetry.uaMeta.os,
           deviceType: telemetry.uaMeta.deviceType,
         };
+        const isPreCheckedCanonicalSuperAdmin = isCanonicalSuperAdminAccount(userDoc.id, userData);
+        const superAdminResetHours = isPreCheckedCanonicalSuperAdmin
+          ? await resolveSuperAdminLockoutResetHours(db)
+          : DEFAULT_SUPER_ADMIN_LOCKOUT_RESET_HOURS;
+
+        type ExpiredLockInfo = {
+          previousLockedAt: string | null;
+          previousLockedUntil: string | null;
+          previousDurationMinutes: number | null;
+          retainedProgressiveLevel: number;
+        };
+
+        type AutoResetLevelInfo = {
+          previousLevel: number;
+          cleanWindowHours: number;
+          cleanLogins: number;
+        };
 
         const txOutcome = await db.runTransaction(async (tx) => {
-          const secSnap = await tx.get(secRef);
-          const curSec: Record<string, any> = secSnap.exists
-            ? (secSnap.data() || {})
+          const [secSnap, freshUserSnap] = await Promise.all([tx.get(secRef), tx.get(userRef)]);
+          const freshUserData: Record<string, any> = freshUserSnap.exists
+            ? (freshUserSnap.data() || {})
+            : userData;
+          const isCanonicalSA = isCanonicalSuperAdminAccount(userDoc.id, freshUserData);
+
+          let curSec: Record<string, any> = secSnap.exists
+            ? { ...(secSnap.data() || {}) }
             : {
                 id: `sec_${cleanId}`,
                 loginId: cleanId,
                 role: roleUpper,
                 firebaseUid,
-                email: userData.email || `${cleanId}@narid.com`,
-                lockStatus: userData.isLocked || userData.lockStatus === 'LOCKED' ? 'LOCKED' : 'ACTIVE',
-                consecutiveFailedAttempts: Number(userData.consecutiveFailedAttempts || 0),
+                email: freshUserData.email || `${cleanId}@narid.com`,
+                lockStatus:
+                  freshUserData.isLocked || freshUserData.lockStatus === 'LOCKED' ? 'LOCKED' : 'ACTIVE',
+                lockPolicyType: isCanonicalSA ? 'PROGRESSIVE_TEMPORARY' : 'PERMANENT_MANUAL',
+                consecutiveFailedAttempts: Number(freshUserData.consecutiveFailedAttempts || 0),
                 maxAttemptsAllowed: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
                 totalLoginAttempts: 0,
                 totalSuccessfulLogins: 0,
                 totalFailedLogins: 0,
-                forcePasswordChange: userData.mustChangePassword === true || userData.forcePasswordChange === true,
-                lockedAt: userData.lockedAt || null,
-                lockReason: userData.lockReason || null,
+                forcePasswordChange:
+                  freshUserData.mustChangePassword === true || freshUserData.forcePasswordChange === true,
+                lockedAt: freshUserData.lockedAt || null,
+                lockoutUntil: freshUserData.lockoutUntil || freshUserData.lockedUntil || null,
+                lockedUntil: freshUserData.lockedUntil || freshUserData.lockoutUntil || null,
+                lockedUntilMs:
+                  typeof freshUserData.lockedUntilMs === 'number' ? freshUserData.lockedUntilMs : null,
+                lockDurationMinutes:
+                  typeof freshUserData.lockDurationMinutes === 'number'
+                    ? freshUserData.lockDurationMinutes
+                    : null,
+                lockReason: freshUserData.lockReason || null,
+                progressiveLockLevel: Number(freshUserData.progressiveLockLevel || 0),
+                totalLockoutEvents: Number(freshUserData.totalLockoutEvents || 0),
+                lastLockoutAt: freshUserData.lastLockoutAt || null,
+                lastLockExpiredAt: freshUserData.lastLockExpiredAt || null,
+                cleanWindowStartAt: freshUserData.cleanWindowStartAt || null,
+                cleanWindowStartMs:
+                  typeof freshUserData.cleanWindowStartMs === 'number'
+                    ? freshUserData.cleanWindowStartMs
+                    : null,
+                cleanLoginsSinceLastLockout: Number(freshUserData.cleanLoginsSinceLastLockout || 0),
+                pendingPostLockoutLoginAudit: Boolean(freshUserData.pendingPostLockoutLoginAudit),
               };
 
-          const isCurrentlyLocked =
+          const saLockWindow = isCanonicalSA
+            ? resolveCanonicalSuperAdminLockWindow(curSec, freshUserData)
+            : {
+                lockedUntilMs: resolveAuthoritativeLockedUntilMs(curSec, freshUserData),
+                lockoutUntil: null,
+                lockDurationMinutes: null,
+              };
+          const existingLockedUntilMs = saLockWindow.lockedUntilMs;
+
+          let isCurrentlyLocked =
             curSec.lockStatus === 'LOCKED' ||
-            userData.lockStatus === 'LOCKED' ||
-            userData.isLocked === true;
+            freshUserData.lockStatus === 'LOCKED' ||
+            freshUserData.isLocked === true;
+
+          let expiredLockInfo: ExpiredLockInfo | null = null;
+
+          // Canonical Super Admin ONLY: automatically reactivate if temporary lockout has expired
+          if (isCurrentlyLocked && isCanonicalSA && existingLockedUntilMs !== null && nowMs >= existingLockedUntilMs) {
+            const retainedLevel = Number(
+              curSec.progressiveLockLevel ?? freshUserData.progressiveLockLevel ?? 0
+            );
+            expiredLockInfo = {
+              previousLockedAt: curSec.lockedAt || freshUserData.lockedAt || null,
+              previousLockedUntil:
+                saLockWindow.lockoutUntil ||
+                resolveAuthoritativeLockedUntilIso(existingLockedUntilMs, curSec, freshUserData),
+              previousDurationMinutes:
+                saLockWindow.lockDurationMinutes ??
+                curSec.lockDurationMinutes ??
+                freshUserData.lockDurationMinutes ??
+                null,
+              retainedProgressiveLevel: retainedLevel,
+            };
+            isCurrentlyLocked = false;
+            curSec = {
+              ...curSec,
+              lockStatus: 'ACTIVE',
+              lockPolicyType: 'PROGRESSIVE_TEMPORARY',
+              consecutiveFailedAttempts: 0,
+              lockedAt: null,
+              lockoutUntil: null,
+              lockedUntil: null,
+              lockedUntilMs: null,
+              lockDurationMinutes: null,
+              lockReason: null,
+              lastLockExpiredAt: now,
+              progressiveLockLevel: retainedLevel,
+              pendingPostLockoutLoginAudit: true,
+            };
+          }
 
           if (isCurrentlyLocked) {
+            const activeLockedUntilMs = isCanonicalSA ? existingLockedUntilMs : null;
+            const remainingSeconds =
+              isCanonicalSA && activeLockedUntilMs !== null
+                ? Math.max(1, Math.ceil((activeLockedUntilMs - nowMs) / 1000))
+                : null;
+            const lockedUntilIso =
+              isCanonicalSA && activeLockedUntilMs !== null
+                ? saLockWindow.lockoutUntil ||
+                  resolveAuthoritativeLockedUntilIso(activeLockedUntilMs, curSec, freshUserData)
+                : null;
+            const activeDurationMinutes = isCanonicalSA
+              ? (saLockWindow.lockDurationMinutes ??
+                curSec.lockDurationMinutes ??
+                freshUserData.lockDurationMinutes ??
+                null)
+              : null;
+
             tx.set(
               secRef,
               {
@@ -953,12 +1279,16 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
                 role: roleUpper,
                 firebaseUid,
                 lockStatus: 'LOCKED',
+                lockPolicyType: isCanonicalSA ? 'PROGRESSIVE_TEMPORARY' : 'PERMANENT_MANUAL',
                 totalLoginAttempts: Number(curSec.totalLoginAttempts || 0) + 1,
                 lastFailedAt: now,
                 lastFailedIp: telemetry.ipAddress,
                 lastFailedGeo: telemetry.geoLocation,
                 lastFailedDevice: deviceSummary,
-                lastFailedReason: 'Attempted login while account LOCKED',
+                lastFailedReason:
+                  isCanonicalSA && remainingSeconds !== null
+                    ? `Attempted login during active temporary lockout (${formatLockoutDurationText(remainingSeconds)} remaining)`
+                    : 'Attempted login while account LOCKED',
                 updatedAt: now,
               },
               { merge: true }
@@ -966,27 +1296,151 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
 
             return {
               kind: 'LOCKED_REJECT' as const,
+              isCanonicalSA,
+              temporaryLock: Boolean(isCanonicalSA && activeLockedUntilMs !== null),
+              lockedUntil: lockedUntilIso,
+              lockedUntilMs: activeLockedUntilMs,
+              serverNowMs: nowMs,
+              remainingSeconds,
+              lockDurationMinutes: activeDurationMinutes,
+              progressiveLockLevel: Number(
+                curSec.progressiveLockLevel ?? freshUserData.progressiveLockLevel ?? 0
+              ),
               consecutiveFailed: Number(curSec.consecutiveFailedAttempts || MAX_CONSECUTIVE_FAILED_ATTEMPTS),
+              expiredLockInfo: null as ExpiredLockInfo | null,
+              freshUserData,
             };
           }
 
           // Strictly verify against stored scrypt hash ONLY (no hardcoded fallback password)
-          const isPasswordValid = userData.passwordHash
-            ? verifyPassword(password, String(userData.passwordHash))
+          const isPasswordValid = freshUserData.passwordHash
+            ? verifyPassword(password, String(freshUserData.passwordHash))
             : false;
 
           if (!isPasswordValid) {
             const nextConsecutive = Number(curSec.consecutiveFailedAttempts || 0) + 1;
             const reachedLock = nextConsecutive >= MAX_CONSECUTIVE_FAILED_ATTEMPTS;
 
+            if (isCanonicalSA) {
+              const currentLevel = Number(
+                curSec.progressiveLockLevel ?? freshUserData.progressiveLockLevel ?? 0
+              );
+              const nextLevel = reachedLock ? currentLevel + 1 : currentLevel;
+              const durationMinutes = reachedLock
+                ? computeSuperAdminLockDurationMinutes(nextLevel)
+                : null;
+              const lockedUntilMs =
+                reachedLock && durationMinutes !== null
+                  ? nowMs + durationMinutes * 60 * 1000
+                  : null;
+              const lockedUntilIso =
+                lockedUntilMs !== null ? new Date(lockedUntilMs).toISOString() : null;
+              const totalLockoutEvents =
+                Number(curSec.totalLockoutEvents ?? freshUserData.totalLockoutEvents ?? 0) +
+                (reachedLock ? 1 : 0);
+              const lockReasonText =
+                reachedLock && durationMinutes !== null
+                  ? `Progressive temporary lockout (${durationMinutes} minutes) after ${nextConsecutive} consecutive failed password attempts`
+                  : null;
+
+              const secUpdate = {
+                ...curSec,
+                id: `sec_${cleanId}`,
+                loginId: cleanId,
+                role: roleUpper,
+                firebaseUid,
+                email: freshUserData.email || `${cleanId}@narid.com`,
+                lockStatus: reachedLock ? 'LOCKED' : 'ACTIVE',
+                lockPolicyType: 'PROGRESSIVE_TEMPORARY',
+                consecutiveFailedAttempts: nextConsecutive,
+                maxAttemptsAllowed: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
+                totalLoginAttempts: Number(curSec.totalLoginAttempts || 0) + 1,
+                totalFailedLogins: Number(curSec.totalFailedLogins || 0) + 1,
+                lastFailedAt: now,
+                lastFailedIp: telemetry.ipAddress,
+                lastFailedGeo: telemetry.geoLocation,
+                lastFailedDevice: deviceSummary,
+                lastFailedReason: reachedLock
+                  ? `Super Admin temporarily locked for ${durationMinutes} minutes after ${nextConsecutive} consecutive failed password attempts`
+                  : `Invalid password (Attempt ${nextConsecutive} of ${MAX_CONSECUTIVE_FAILED_ATTEMPTS})`,
+                lockedAt: reachedLock ? now : null,
+                lockoutUntil: lockedUntilIso,
+                lockedUntil: lockedUntilIso,
+                lockedUntilMs,
+                lockDurationMinutes: durationMinutes,
+                lockReason: lockReasonText,
+                progressiveLockLevel: nextLevel,
+                totalLockoutEvents,
+                lastLockoutAt: reachedLock ? now : (curSec.lastLockoutAt || freshUserData.lastLockoutAt || null),
+                lastLockExpiredAt: expiredLockInfo
+                  ? now
+                  : (curSec.lastLockExpiredAt || freshUserData.lastLockExpiredAt || null),
+                // Any failed password attempt clears the sustained clean usage window
+                cleanWindowStartAt: null,
+                cleanWindowStartMs: null,
+                cleanLoginsSinceLastLockout: 0,
+                pendingPostLockoutLoginAudit: reachedLock
+                  ? true
+                  : Boolean(expiredLockInfo || curSec.pendingPostLockoutLoginAudit),
+                updatedAt: now,
+              };
+
+              tx.set(secRef, secUpdate, { merge: true });
+              const userUpdates: Record<string, any> = {
+                consecutiveFailedAttempts: nextConsecutive,
+                isLocked: reachedLock,
+                lockStatus: reachedLock ? 'LOCKED' : 'ACTIVE',
+                lockPolicyType: 'PROGRESSIVE_TEMPORARY',
+                lockedAt: reachedLock ? now : null,
+                lockoutUntil: lockedUntilIso,
+                lockedUntil: lockedUntilIso,
+                lockedUntilMs,
+                lockDurationMinutes: durationMinutes,
+                lockReason: lockReasonText,
+                progressiveLockLevel: nextLevel,
+                totalLockoutEvents,
+                lastLockoutAt: secUpdate.lastLockoutAt,
+                lastLockExpiredAt: secUpdate.lastLockExpiredAt,
+                cleanWindowStartAt: null,
+                cleanWindowStartMs: null,
+                cleanLoginsSinceLastLockout: 0,
+                pendingPostLockoutLoginAudit: secUpdate.pendingPostLockoutLoginAudit,
+                updatedAt: now,
+              };
+              if (reachedLock) {
+                // Immediately invalidate any existing Super Admin session tokens on lockout
+                userUpdates.sessionRevokedAt = now;
+              }
+              tx.update(userRef, userUpdates);
+
+              return {
+                kind: reachedLock ? ('NOW_LOCKED' as const) : ('FAILED_PASSWORD' as const),
+                isCanonicalSA: true,
+                temporaryLock: reachedLock,
+                attemptNumber: nextConsecutive,
+                remainingAttempts: Math.max(0, MAX_CONSECUTIVE_FAILED_ATTEMPTS - nextConsecutive),
+                lockedUntil: lockedUntilIso,
+                lockedUntilMs,
+                serverNowMs: nowMs,
+                remainingSeconds: durationMinutes !== null ? durationMinutes * 60 : null,
+                lockDurationMinutes: durationMinutes,
+                progressiveLockLevel: nextLevel,
+                totalLockoutEvents,
+                expiredLockInfo,
+                freshUserData,
+              };
+            }
+
+            // Non-canonical roles (Admin, User, Custom Roles): unchanged permanent manual lock
             const secUpdate = {
               ...curSec,
               id: `sec_${cleanId}`,
               loginId: cleanId,
               role: roleUpper,
               firebaseUid,
-              email: userData.email || `${cleanId}@narid.com`,
+              email: freshUserData.email || `${cleanId}@narid.com`,
               lockStatus: reachedLock ? 'LOCKED' : 'ACTIVE',
+              lockPolicyType: 'PERMANENT_MANUAL',
               consecutiveFailedAttempts: nextConsecutive,
               maxAttemptsAllowed: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
               totalLoginAttempts: Number(curSec.totalLoginAttempts || 0) + 1,
@@ -1010,20 +1464,169 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
               consecutiveFailedAttempts: nextConsecutive,
               isLocked: reachedLock,
               lockStatus: reachedLock ? 'LOCKED' : 'ACTIVE',
-              lockedAt: reachedLock ? now : userData.lockedAt || null,
-              lockReason: reachedLock ? secUpdate.lockReason : userData.lockReason || null,
+              lockedAt: reachedLock ? now : freshUserData.lockedAt || null,
+              lockReason: reachedLock ? secUpdate.lockReason : freshUserData.lockReason || null,
               updatedAt: now,
             });
 
             return {
               kind: reachedLock ? ('NOW_LOCKED' as const) : ('FAILED_PASSWORD' as const),
+              isCanonicalSA: false,
+              temporaryLock: false,
               attemptNumber: nextConsecutive,
               remainingAttempts: Math.max(0, MAX_CONSECUTIVE_FAILED_ATTEMPTS - nextConsecutive),
+              lockedUntil: null as string | null,
+              lockedUntilMs: null as number | null,
+              serverNowMs: nowMs,
+              remainingSeconds: null as number | null,
+              lockDurationMinutes: null as number | null,
+              progressiveLockLevel: 0,
+              totalLockoutEvents: 0,
+              expiredLockInfo: null as ExpiredLockInfo | null,
+              freshUserData,
             };
           }
 
+          // Valid password!
           const mustChange =
-            userData.mustChangePassword === true || curSec.forcePasswordChange === true;
+            freshUserData.mustChangePassword === true || curSec.forcePasswordChange === true;
+
+          if (isCanonicalSA) {
+            const wasPostLockoutLogin = Boolean(
+              expiredLockInfo ||
+                curSec.pendingPostLockoutLoginAudit ||
+                freshUserData.pendingPostLockoutLoginAudit
+            );
+            const currentLevel = Number(
+              curSec.progressiveLockLevel ?? freshUserData.progressiveLockLevel ?? 0
+            );
+            let nextLevel = currentLevel;
+            let nextCleanStartAt: string | null =
+              curSec.cleanWindowStartAt || freshUserData.cleanWindowStartAt || null;
+            let nextCleanStartMs: number | null =
+              typeof curSec.cleanWindowStartMs === 'number'
+                ? curSec.cleanWindowStartMs
+                : typeof freshUserData.cleanWindowStartMs === 'number'
+                  ? freshUserData.cleanWindowStartMs
+                  : null;
+            let nextCleanLogins = Number(
+              curSec.cleanLoginsSinceLastLockout ?? freshUserData.cleanLoginsSinceLastLockout ?? 0
+            );
+            let autoResetLevelInfo: AutoResetLevelInfo | null = null;
+
+            if (currentLevel > 0) {
+              const requiredWindowMs = superAdminResetHours * 60 * 60 * 1000;
+              if (nextCleanStartMs !== null && nowMs - nextCleanStartMs >= requiredWindowMs) {
+                autoResetLevelInfo = {
+                  previousLevel: currentLevel,
+                  cleanWindowHours: superAdminResetHours,
+                  cleanLogins: nextCleanLogins + 1,
+                };
+                nextLevel = 0;
+                nextCleanStartAt = null;
+                nextCleanStartMs = null;
+                nextCleanLogins = 0;
+              } else {
+                if (nextCleanStartMs === null) {
+                  nextCleanStartMs = nowMs;
+                  nextCleanStartAt = now;
+                }
+                nextCleanLogins += 1;
+              }
+            } else {
+              nextCleanStartAt = null;
+              nextCleanStartMs = null;
+              nextCleanLogins = 0;
+            }
+
+            const resetReasonText = autoResetLevelInfo
+              ? `Automatic reset after ${superAdminResetHours}h of sustained clean Super Admin usage with zero failed password attempts`
+              : (curSec.lockoutLevelResetReason || freshUserData.lockoutLevelResetReason || null);
+            const resetAtText = autoResetLevelInfo
+              ? now
+              : (curSec.lockoutLevelResetAt || freshUserData.lockoutLevelResetAt || null);
+
+            tx.set(
+              secRef,
+              {
+                ...curSec,
+                id: `sec_${cleanId}`,
+                loginId: cleanId,
+                role: roleUpper,
+                firebaseUid,
+                email: freshUserData.email || `${cleanId}@narid.com`,
+                lockStatus: 'ACTIVE',
+                lockPolicyType: 'PROGRESSIVE_TEMPORARY',
+                consecutiveFailedAttempts: 0,
+                maxAttemptsAllowed: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
+                totalLoginAttempts: Number(curSec.totalLoginAttempts || 0) + 1,
+                totalSuccessfulLogins: Number(curSec.totalSuccessfulLogins || 0) + 1,
+                forcePasswordChange: mustChange,
+                lockedAt: null,
+                lockoutUntil: null,
+                lockedUntil: null,
+                lockedUntilMs: null,
+                lockDurationMinutes: null,
+                lockReason: null,
+                progressiveLockLevel: nextLevel,
+                totalLockoutEvents: Number(
+                  curSec.totalLockoutEvents ?? freshUserData.totalLockoutEvents ?? 0
+                ),
+                lastLockoutAt: curSec.lastLockoutAt || freshUserData.lastLockoutAt || null,
+                lastLockExpiredAt: expiredLockInfo
+                  ? now
+                  : (curSec.lastLockExpiredAt || freshUserData.lastLockExpiredAt || null),
+                cleanWindowStartAt: nextCleanStartAt,
+                cleanWindowStartMs: nextCleanStartMs,
+                cleanLoginsSinceLastLockout: nextCleanLogins,
+                pendingPostLockoutLoginAudit: false,
+                lockoutLevelResetAt: resetAtText,
+                lockoutLevelResetReason: resetReasonText,
+                lastSuccessAt: now,
+                lastSuccessIp: telemetry.ipAddress,
+                lastSuccessGeo: telemetry.geoLocation,
+                lastSuccessDevice: deviceSummary,
+                updatedAt: now,
+              },
+              { merge: true }
+            );
+
+            tx.update(userRef, {
+              consecutiveFailedAttempts: 0,
+              isLocked: false,
+              lockStatus: 'ACTIVE',
+              lockPolicyType: 'PROGRESSIVE_TEMPORARY',
+              lockedAt: null,
+              lockoutUntil: null,
+              lockedUntil: null,
+              lockedUntilMs: null,
+              lockDurationMinutes: null,
+              lockReason: null,
+              progressiveLockLevel: nextLevel,
+              lastLockExpiredAt: expiredLockInfo
+                ? now
+                : (freshUserData.lastLockExpiredAt || null),
+              cleanWindowStartAt: nextCleanStartAt,
+              cleanWindowStartMs: nextCleanStartMs,
+              cleanLoginsSinceLastLockout: nextCleanLogins,
+              pendingPostLockoutLoginAudit: false,
+              lockoutLevelResetAt: resetAtText,
+              lockoutLevelResetReason: resetReasonText,
+              lastSuccessLoginAt: now,
+              updatedAt: now,
+            });
+
+            return {
+              kind: 'SUCCESS' as const,
+              isCanonicalSA: true,
+              mustChange,
+              expiredLockInfo,
+              wasPostLockoutLogin,
+              autoResetLevelInfo,
+              progressiveLockLevel: nextLevel,
+              freshUserData,
+            };
+          }
 
           tx.set(
             secRef,
@@ -1033,7 +1636,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
               loginId: cleanId,
               role: roleUpper,
               firebaseUid,
-              email: userData.email || `${cleanId}@narid.com`,
+              email: freshUserData.email || `${cleanId}@narid.com`,
               lockStatus: 'ACTIVE',
               consecutiveFailedAttempts: 0,
               maxAttemptsAllowed: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
@@ -1059,20 +1662,87 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
 
           return {
             kind: 'SUCCESS' as const,
+            isCanonicalSA: false,
             mustChange,
+            expiredLockInfo: null as ExpiredLockInfo | null,
+            wasPostLockoutLogin: false,
+            autoResetLevelInfo: null as AutoResetLevelInfo | null,
+            progressiveLockLevel: 0,
+            freshUserData,
           };
         });
 
+        const resolvedUserData = txOutcome.freshUserData || userData;
+
+        // Audit automatic temporary lockout expiry & reactivation whenever it occurred
+        if (txOutcome.expiredLockInfo) {
+          await Promise.all([
+            recordSecurityAuditLogDoc(db, {
+              action: 'LOCKOUT_EXPIRED_REACTIVATED',
+              severity: 'INFO',
+              targetLoginId: cleanId,
+              targetRole: roleUpper,
+              targetUid: firebaseUid,
+              reason: 'Super Admin temporary lockout duration expired; account automatically reactivated',
+              details: `Temporary lockout for canonical Super Admin "${cleanId}" expired at ${txOutcome.expiredLockInfo.previousLockedUntil || now}. Consecutive failed counter reset to 0 while retaining progressive level ${txOutcome.expiredLockInfo.retainedProgressiveLevel}.`,
+              metadata: {
+                previousLockedAt: txOutcome.expiredLockInfo.previousLockedAt,
+                previousLockedUntil: txOutcome.expiredLockInfo.previousLockedUntil,
+                previousDurationMinutes: txOutcome.expiredLockInfo.previousDurationMinutes,
+                retainedProgressiveLevel: txOutcome.expiredLockInfo.retainedProgressiveLevel,
+              },
+              nowMs,
+              telemetry,
+            }),
+            recordEnterpriseAuditEvent(db, {
+              req,
+              action: 'super_admin_lockout_expired',
+              category: 'SECURITY',
+              severity: 'INFO',
+              actorUid: firebaseUid,
+              actorLoginId: cleanId,
+              actorRole: roleUpper,
+              targetType: 'ACCOUNT',
+              targetId: userDoc.id,
+              oldValue: {
+                lockStatus: 'LOCKED',
+                lockedUntil: txOutcome.expiredLockInfo.previousLockedUntil,
+                lockDurationMinutes: txOutcome.expiredLockInfo.previousDurationMinutes,
+              },
+              newValue: {
+                lockStatus: 'ACTIVE',
+                consecutiveFailedAttempts: 0,
+                progressiveLockLevel: txOutcome.expiredLockInfo.retainedProgressiveLevel,
+              },
+              actionSource: 'PROGRESSIVE_LOCKOUT_ENGINE',
+              description: `Canonical Super Admin temporary lockout expired; account automatically reactivated with progressive level ${txOutcome.expiredLockInfo.retainedProgressiveLevel} retained.`,
+              success: true,
+            }),
+          ]);
+        }
+
         if (txOutcome.kind === 'LOCKED_REJECT') {
           await syncUserUidIndex(db, {
-            uid: userData.authUid || null,
+            uid: resolvedUserData.authUid || null,
             roleDocId: userDoc.id,
-            role: String(userData.role || 'user'),
-            status: String(userData.status || 'Active'),
+            role: String(resolvedUserData.role || 'user'),
+            status: String(resolvedUserData.status || 'Active'),
             lockStatus: 'LOCKED',
+            lockedUntilMs: txOutcome.lockedUntilMs ?? null,
             loginId: cleanId,
           });
-          const ipRes = await recordIpFailurePersistent(db, telemetry.ipAddress, 'locked_hit', cleanId);
+          const ipRes = await recordIpFailurePersistent(
+            db,
+            telemetry.ipAddress,
+            'locked_hit',
+            cleanId,
+            nowMs
+          );
+          const lockedErrorMessage =
+            txOutcome.temporaryLock && txOutcome.remainingSeconds !== null
+              ? `Super Admin account is temporarily locked due to repeated failed password attempts. Try again in ${formatLockoutDurationText(txOutcome.remainingSeconds)}.`
+              : LOCKED_ACCOUNT_MESSAGE;
+
           await Promise.all([
             recordLoginAttemptDoc(db, {
               loginId: cleanId,
@@ -1081,8 +1751,13 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
               success: false,
               outcome: 'BLOCKED_LOCKED',
               failureReasonCategory: 'ACCOUNT_LOCKED',
-              failureReason: 'Login rejected because account status is LOCKED',
+              failureReason: txOutcome.temporaryLock
+                ? `Login rejected during active temporary lockout (${txOutcome.remainingSeconds}s remaining)`
+                : 'Login rejected because account status is LOCKED',
               consecutiveFailedAfter: txOutcome.consecutiveFailed,
+              lockDurationMinutes: txOutcome.lockDurationMinutes,
+              lockedUntil: txOutcome.lockedUntil,
+              nowMs,
               telemetry,
             }),
             recordSecurityAuditLogDoc(db, {
@@ -1091,8 +1766,21 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
               targetLoginId: cleanId,
               targetRole: roleUpper,
               targetUid: firebaseUid,
-              reason: 'Attempted login on locked account',
-              details: `Rejected login attempt for locked account "${cleanId}" (${roleUpper}) from IP ${telemetry.ipAddress}.`,
+              reason: txOutcome.temporaryLock
+                ? 'Attempted login during active Super Admin temporary lockout'
+                : 'Attempted login on locked account',
+              details: txOutcome.temporaryLock
+                ? `Rejected login attempt for temporarily locked Super Admin "${cleanId}" from IP ${telemetry.ipAddress} (${txOutcome.remainingSeconds}s remaining until ${txOutcome.lockedUntil}).`
+                : `Rejected login attempt for locked account "${cleanId}" (${roleUpper}) from IP ${telemetry.ipAddress}.`,
+              metadata: txOutcome.temporaryLock
+                ? {
+                    temporaryLock: true,
+                    lockedUntil: txOutcome.lockedUntil,
+                    remainingSeconds: txOutcome.remainingSeconds,
+                    lockDurationMinutes: txOutcome.lockDurationMinutes,
+                  }
+                : undefined,
+              nowMs,
               telemetry,
             }),
             recordLoginHistoryEntry(db, {
@@ -1102,7 +1790,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
               authUid: firebaseUid,
               role: roleUpper,
               success: false,
-              failureReason: LOCKED_ACCOUNT_MESSAGE,
+              failureReason: lockedErrorMessage,
             }),
             recordEnterpriseAuditEvent(db, {
               req,
@@ -1114,7 +1802,9 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
               actorRole: roleUpper,
               targetId: userDoc.id,
               actionSource: 'ACCOUNT_LOCKOUT_GUARD',
-              description: `Blocked login attempt on already locked account "${cleanId}".`,
+              description: txOutcome.temporaryLock
+                ? `Blocked login attempt on temporarily locked Super Admin "${cleanId}" (${txOutcome.remainingSeconds}s remaining).`
+                : `Blocked login attempt on already locked account "${cleanId}".`,
               success: false,
             }),
           ]);
@@ -1129,6 +1819,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
               reason: 'Repeated attempts against locked account triggered progressive IP cooldown',
               details: `IP ${telemetry.ipAddress} triggered ${ipRes.cooldownSeconds}s progressive cooldown after hammering locked account "${cleanId}".`,
               metadata: { cooldownSeconds: ipRes.cooldownSeconds },
+              nowMs,
               telemetry,
             });
           }
@@ -1141,8 +1832,29 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
             module: 'Authentication',
             result: 'Failed',
             correlationId: (req as any).correlationId,
-            detail: 'Attempted login on locked account',
+            detail: txOutcome.temporaryLock
+              ? `Blocked during temporary lockout (${txOutcome.remainingSeconds}s remaining)`
+              : 'Attempted login on locked account',
           });
+
+          if (txOutcome.temporaryLock) {
+            return {
+              status: 423,
+              body: {
+                success: false,
+                code: 'ACCOUNT_LOCKED',
+                locked: true,
+                temporaryLock: true,
+                lockoutUntil: txOutcome.lockedUntil,
+                lockedUntil: txOutcome.lockedUntil,
+                lockedUntilMs: txOutcome.lockedUntilMs,
+                serverNowMs: txOutcome.serverNowMs,
+                remainingSeconds: txOutcome.remainingSeconds,
+                lockDurationMinutes: txOutcome.lockDurationMinutes,
+                error: lockedErrorMessage,
+              },
+            };
+          }
 
           return {
             status: 423,
@@ -1150,6 +1862,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
               success: false,
               code: 'ACCOUNT_LOCKED',
               locked: true,
+              temporaryLock: false,
               error: LOCKED_ACCOUNT_MESSAGE,
             },
           };
@@ -1157,14 +1870,39 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
 
         if (txOutcome.kind === 'NOW_LOCKED') {
           await syncUserUidIndex(db, {
-            uid: userData.authUid || null,
+            uid: resolvedUserData.authUid || null,
             roleDocId: userDoc.id,
-            role: String(userData.role || 'user'),
-            status: String(userData.status || 'Active'),
+            role: String(resolvedUserData.role || 'user'),
+            status: String(resolvedUserData.status || 'Active'),
             lockStatus: 'LOCKED',
+            lockedUntilMs: txOutcome.lockedUntilMs ?? null,
             loginId: cleanId,
           });
-          await recordIpFailurePersistent(db, telemetry.ipAddress, 'password', cleanId);
+
+          // Immediately revoke Firebase refresh tokens when canonical Super Admin enters temporary lockout
+          if (
+            txOutcome.isCanonicalSA &&
+            auth &&
+            resolvedUserData.authUid &&
+            !String(resolvedUserData.authUid).startsWith('role_')
+          ) {
+            try {
+              await auth.revokeRefreshTokens(String(resolvedUserData.authUid));
+            } catch (revokeErr: any) {
+              console.warn(
+                '[Super Admin Progressive Lockout] revokeRefreshTokens notice:',
+                revokeErr?.message || revokeErr
+              );
+            }
+          }
+
+          await recordIpFailurePersistent(db, telemetry.ipAddress, 'password', cleanId, nowMs);
+
+          const isTempSA = txOutcome.isCanonicalSA && txOutcome.temporaryLock;
+          const lockedReasonMsg = isTempSA
+            ? `Super Admin account temporarily locked for ${txOutcome.lockDurationMinutes} minutes after ${txOutcome.attemptNumber} consecutive failed password attempts. Please wait before trying again.`
+            : LOCKED_ACCOUNT_MESSAGE;
+
           await Promise.all([
             recordLoginAttemptDoc(db, {
               loginId: cleanId,
@@ -1173,10 +1911,15 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
               success: false,
               outcome: 'FAILED_PASSWORD',
               failureReasonCategory: 'ACCOUNT_LOCKED',
-              failureReason: '3rd consecutive failed password attempt triggered automatic account lock',
+              failureReason: isTempSA
+                ? `3rd consecutive failed password triggered progressive temporary lockout (${txOutcome.lockDurationMinutes} minutes)`
+                : '3rd consecutive failed password attempt triggered automatic account lock',
               attemptNumber: txOutcome.attemptNumber,
               consecutiveFailedAfter: txOutcome.attemptNumber,
               triggeredLock: true,
+              lockDurationMinutes: txOutcome.lockDurationMinutes,
+              lockedUntil: txOutcome.lockedUntil,
+              nowMs,
               telemetry,
             }),
             recordSecurityAuditLogDoc(db, {
@@ -1185,9 +1928,25 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
               targetLoginId: cleanId,
               targetRole: roleUpper,
               targetUid: firebaseUid,
-              reason: 'Exceeded 3 consecutive failed password attempts',
-              details: `SECURITY ALERT: Account "${cleanId}" (${roleUpper}, UID: ${firebaseUid}) automatically LOCKED on failed attempt #${txOutcome.attemptNumber}.`,
-              metadata: { attemptNumber: txOutcome.attemptNumber, maxAttempts: MAX_CONSECUTIVE_FAILED_ATTEMPTS },
+              reason: isTempSA
+                ? `Super Admin progressive temporary lockout triggered (${txOutcome.lockDurationMinutes} minutes, level ${txOutcome.progressiveLockLevel})`
+                : 'Exceeded 3 consecutive failed password attempts',
+              details: isTempSA
+                ? `SECURITY ALERT: Canonical Super Admin "${cleanId}" (UID: ${firebaseUid}) temporarily LOCKED for ${txOutcome.lockDurationMinutes} minutes (progressive level ${txOutcome.progressiveLockLevel}, event #${txOutcome.totalLockoutEvents}) until ${txOutcome.lockedUntil}. Active sessions revoked.`
+                : `SECURITY ALERT: Account "${cleanId}" (${roleUpper}, UID: ${firebaseUid}) automatically LOCKED on failed attempt #${txOutcome.attemptNumber}.`,
+              metadata: isTempSA
+                ? {
+                    attemptNumber: txOutcome.attemptNumber,
+                    maxAttempts: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
+                    lockPolicyType: 'PROGRESSIVE_TEMPORARY',
+                    progressiveLockLevel: txOutcome.progressiveLockLevel,
+                    totalLockoutEvents: txOutcome.totalLockoutEvents,
+                    lockDurationMinutes: txOutcome.lockDurationMinutes,
+                    lockedUntil: txOutcome.lockedUntil,
+                    sessionsRevoked: true,
+                  }
+                : { attemptNumber: txOutcome.attemptNumber, maxAttempts: MAX_CONSECUTIVE_FAILED_ATTEMPTS },
+              nowMs,
               telemetry,
             }),
             recordLoginHistoryEntry(db, {
@@ -1197,19 +1956,34 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
               authUid: firebaseUid,
               role: roleUpper,
               success: false,
-              failureReason: `Locked after ${txOutcome.attemptNumber} consecutive failed attempts`,
+              failureReason: isTempSA
+                ? `Progressive temporary lockout (${txOutcome.lockDurationMinutes}m) after ${txOutcome.attemptNumber} failed attempts`
+                : `Locked after ${txOutcome.attemptNumber} consecutive failed attempts`,
             }),
             recordEnterpriseAuditEvent(db, {
               req,
-              action: 'failed_login_threshold_exceeded',
+              action: isTempSA ? 'super_admin_progressive_lockout' : 'failed_login_threshold_exceeded',
               category: 'SECURITY',
               severity: 'CRITICAL',
               actorUid: firebaseUid,
               actorLoginId: cleanId,
               actorRole: roleUpper,
+              targetType: 'ACCOUNT',
               targetId: userDoc.id,
-              actionSource: 'ACCOUNT_LOCKOUT_ENGINE',
-              description: `Account "${cleanId}" (${roleUpper}) automatically LOCKED after ${txOutcome.attemptNumber} consecutive failed password attempts.`,
+              newValue: isTempSA
+                ? {
+                    lockStatus: 'LOCKED',
+                    lockPolicyType: 'PROGRESSIVE_TEMPORARY',
+                    progressiveLockLevel: txOutcome.progressiveLockLevel,
+                    totalLockoutEvents: txOutcome.totalLockoutEvents,
+                    lockDurationMinutes: txOutcome.lockDurationMinutes,
+                    lockedUntil: txOutcome.lockedUntil,
+                  }
+                : undefined,
+              actionSource: isTempSA ? 'PROGRESSIVE_LOCKOUT_ENGINE' : 'ACCOUNT_LOCKOUT_ENGINE',
+              description: isTempSA
+                ? `Canonical Super Admin "${cleanId}" temporarily locked for ${txOutcome.lockDurationMinutes} minutes (level ${txOutcome.progressiveLockLevel}) after ${txOutcome.attemptNumber} consecutive failed attempts.`
+                : `Account "${cleanId}" (${roleUpper}) automatically LOCKED after ${txOutcome.attemptNumber} consecutive failed password attempts.`,
               success: false,
             }),
           ]);
@@ -1222,17 +1996,43 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
             module: 'Authentication',
             result: 'Failed',
             correlationId: (req as any).correlationId,
-            detail: `Auto-locked on attempt #${txOutcome.attemptNumber}`,
+            detail: isTempSA
+              ? `Progressive temporary lock (${txOutcome.lockDurationMinutes}m) on attempt #${txOutcome.attemptNumber}`
+              : `Auto-locked on attempt #${txOutcome.attemptNumber}`,
           });
           recordErrorTelemetry(db, {
             source: 'AUTH',
             module: 'Authentication',
             category: 'AUTH',
             severity: 'CRITICAL',
-            message: `Account locked after ${txOutcome.attemptNumber} failed attempts`,
+            message: isTempSA
+              ? `Super Admin temporarily locked (${txOutcome.lockDurationMinutes}m) after ${txOutcome.attemptNumber} failed attempts`
+              : `Account locked after ${txOutcome.attemptNumber} failed attempts`,
             statusCode: 423,
             correlationId: (req as any).correlationId,
           });
+
+          if (isTempSA) {
+            return {
+              status: 423,
+              body: {
+                success: false,
+                code: 'ACCOUNT_LOCKED',
+                locked: true,
+                temporaryLock: true,
+                lockoutUntil: txOutcome.lockedUntil,
+                lockedUntil: txOutcome.lockedUntil,
+                lockedUntilMs: txOutcome.lockedUntilMs,
+                serverNowMs: txOutcome.serverNowMs,
+                remainingSeconds: txOutcome.remainingSeconds,
+                lockDurationMinutes: txOutcome.lockDurationMinutes,
+                attemptNumber: txOutcome.attemptNumber,
+                maxAttempts: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
+                remainingAttempts: 0,
+                error: lockedReasonMsg,
+              },
+            };
+          }
 
           return {
             status: 423,
@@ -1240,6 +2040,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
               success: false,
               code: 'ACCOUNT_LOCKED',
               locked: true,
+              temporaryLock: false,
               attemptNumber: txOutcome.attemptNumber,
               maxAttempts: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
               remainingAttempts: 0,
@@ -1249,7 +2050,19 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
         }
 
         if (txOutcome.kind === 'FAILED_PASSWORD') {
-          await recordIpFailurePersistent(db, telemetry.ipAddress, 'password', cleanId);
+          if (txOutcome.expiredLockInfo) {
+            await syncUserUidIndex(db, {
+              uid: resolvedUserData.authUid || null,
+              roleDocId: userDoc.id,
+              role: String(resolvedUserData.role || 'user'),
+              status: String(resolvedUserData.status || 'Active'),
+              lockStatus: 'ACTIVE',
+              lockedUntilMs: null,
+              loginId: cleanId,
+            });
+          }
+
+          await recordIpFailurePersistent(db, telemetry.ipAddress, 'password', cleanId, nowMs);
           const isSecondWarning = txOutcome.attemptNumber === 2;
 
           await Promise.all([
@@ -1266,6 +2079,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
               attemptNumber: txOutcome.attemptNumber,
               consecutiveFailedAfter: txOutcome.attemptNumber,
               triggeredLock: false,
+              nowMs,
               telemetry,
             }),
             recordSecurityAuditLogDoc(db, {
@@ -1282,6 +2096,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
                 attemptNumber: txOutcome.attemptNumber,
                 remainingAttempts: txOutcome.remainingAttempts,
               },
+              nowMs,
               telemetry,
             }),
             recordLoginHistoryEntry(db, {
@@ -1347,25 +2162,31 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
         // SUCCESSFUL LOGIN -> Clear persistent IP cooldown and sync UID index
         await clearIpCooldownPersistent(db, telemetry.ipAddress, cleanId);
         await syncUserUidIndex(db, {
-          uid: userData.authUid || null,
+          uid: resolvedUserData.authUid || null,
           roleDocId: userDoc.id,
-          role: String(userData.role || 'user'),
-          status: String(userData.status || 'Active'),
+          role: String(resolvedUserData.role || 'user'),
+          status: String(resolvedUserData.status || 'Active'),
           lockStatus: 'ACTIVE',
+          lockedUntilMs: null,
           loginId: cleanId,
         });
 
         const sessionId = `sess_${crypto.randomBytes(10).toString('hex')}`;
         const sessionToken = crypto.randomBytes(32).toString('hex');
 
-        let effectiveModules = Array.isArray(userData.modulesAllowed) ? [...userData.modulesAllowed] : [];
-        if (String(userData.role || '').toLowerCase() === 'user' && !userData.dashboardAccessMigratedV1) {
+        let effectiveModules = Array.isArray(resolvedUserData.modulesAllowed)
+          ? [...resolvedUserData.modulesAllowed]
+          : [];
+        if (
+          String(resolvedUserData.role || '').toLowerCase() === 'user' &&
+          !resolvedUserData.dashboardAccessMigratedV1
+        ) {
           if (!effectiveModules.includes('dashboard')) {
             effectiveModules = ['dashboard', ...effectiveModules];
           }
         }
 
-        await Promise.all([
+        const successAuditTasks: Promise<any>[] = [
           recordLoginAttemptDoc(db, {
             loginId: cleanId,
             role: roleUpper,
@@ -1375,6 +2196,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
             failureReasonCategory: 'NONE',
             consecutiveFailedAfter: 0,
             sessionId,
+            nowMs,
             telemetry,
           }),
           recordSecurityAuditLogDoc(db, {
@@ -1389,6 +2211,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
             reason: 'Successful credential verification',
             details: `User "${cleanId}" (${roleUpper}) authenticated successfully. Consecutive failed counter reset to 0.`,
             metadata: { sessionId, forcePasswordChange: txOutcome.mustChange },
+            nowMs,
             telemetry,
           }),
           recordLoginHistoryEntry(db, {
@@ -1414,7 +2237,94 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
             description: `User "${cleanId}" (${roleUpper}) successfully authenticated.`,
             success: true,
           }),
-        ]);
+        ];
+
+        if (txOutcome.isCanonicalSA && txOutcome.wasPostLockoutLogin) {
+          successAuditTasks.push(
+            recordSecurityAuditLogDoc(db, {
+              action: 'LOGIN_SUCCESS_AFTER_LOCKOUT',
+              severity: 'INFO',
+              targetLoginId: cleanId,
+              targetRole: roleUpper,
+              targetUid: firebaseUid,
+              actorUid: firebaseUid,
+              actorLoginId: cleanId,
+              actorRole: roleUpper,
+              reason: 'First successful Super Admin login following temporary lockout expiry',
+              details: `Canonical Super Admin "${cleanId}" signed in successfully after temporary lockout expiry (session ${sessionId}). Progressive lockout level is ${txOutcome.progressiveLockLevel}.`,
+              metadata: {
+                sessionId,
+                progressiveLockLevel: txOutcome.progressiveLockLevel,
+              },
+              nowMs,
+              telemetry,
+            }),
+            recordEnterpriseAuditEvent(db, {
+              req,
+              action: 'login_success_after_lockout',
+              category: 'SECURITY',
+              severity: 'INFO',
+              actorUid: firebaseUid,
+              actorLoginId: cleanId,
+              actorRole: roleUpper,
+              targetType: 'ACCOUNT',
+              targetId: userDoc.id,
+              actionSource: 'PROGRESSIVE_LOCKOUT_ENGINE',
+              sessionId,
+              newValue: { progressiveLockLevel: txOutcome.progressiveLockLevel },
+              description: `Canonical Super Admin "${cleanId}" completed first successful login after temporary lockout expiry.`,
+              success: true,
+            })
+          );
+        }
+
+        if (txOutcome.isCanonicalSA && txOutcome.autoResetLevelInfo) {
+          successAuditTasks.push(
+            recordSecurityAuditLogDoc(db, {
+              action: 'LOCKOUT_LEVEL_RESET',
+              severity: 'INFO',
+              targetLoginId: cleanId,
+              targetRole: roleUpper,
+              targetUid: firebaseUid,
+              actorUid: firebaseUid,
+              actorLoginId: cleanId,
+              actorRole: roleUpper,
+              reason: `Automatic progressive lockout level reset after ${txOutcome.autoResetLevelInfo.cleanWindowHours}h sustained clean usage`,
+              details: `Canonical Super Admin "${cleanId}" progressive lockout level automatically reset from ${txOutcome.autoResetLevelInfo.previousLevel} to 0 after ${txOutcome.autoResetLevelInfo.cleanWindowHours} hours of clean usage with zero failed password attempts.`,
+              metadata: {
+                resetType: 'AUTOMATIC_SUSTAINED_CLEAN_USAGE',
+                previousLevel: txOutcome.autoResetLevelInfo.previousLevel,
+                newLevel: 0,
+                cleanWindowHours: txOutcome.autoResetLevelInfo.cleanWindowHours,
+                cleanLogins: txOutcome.autoResetLevelInfo.cleanLogins,
+              },
+              nowMs,
+              telemetry,
+            }),
+            recordEnterpriseAuditEvent(db, {
+              req,
+              action: 'super_admin_lockout_level_reset',
+              category: 'SECURITY',
+              severity: 'INFO',
+              actorUid: firebaseUid,
+              actorLoginId: cleanId,
+              actorRole: roleUpper,
+              targetType: 'ACCOUNT',
+              targetId: userDoc.id,
+              oldValue: { progressiveLockLevel: txOutcome.autoResetLevelInfo.previousLevel },
+              newValue: {
+                progressiveLockLevel: 0,
+                resetType: 'AUTOMATIC_SUSTAINED_CLEAN_USAGE',
+                cleanWindowHours: txOutcome.autoResetLevelInfo.cleanWindowHours,
+              },
+              actionSource: 'PROGRESSIVE_LOCKOUT_ENGINE',
+              description: `Canonical Super Admin progressive lockout level automatically reset from ${txOutcome.autoResetLevelInfo.previousLevel} to 0 after ${txOutcome.autoResetLevelInfo.cleanWindowHours}h of sustained clean usage.`,
+              success: true,
+            })
+          );
+        }
+
+        await Promise.all(successAuditTasks);
 
         recordActivityTelemetry(db, {
           actorUid: firebaseUid,
@@ -1427,7 +2337,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
           detail: `Authenticated session ${sessionId}`,
         });
 
-        const { passwordHash: _ph, ...sanitizedProfile } = userData;
+        const { passwordHash: _ph, ...sanitizedProfile } = resolvedUserData;
         return {
           status: 200,
           body: {
@@ -1439,6 +2349,11 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
               mustChangePassword: txOutcome.mustChange,
               forcePasswordChange: txOutcome.mustChange,
               lockStatus: 'ACTIVE',
+              lockedAt: null,
+              lockoutUntil: null,
+              lockedUntil: null,
+              lockedUntilMs: null,
+              lockDurationMinutes: null,
               consecutiveFailedAttempts: 0,
             },
             sessionToken,
@@ -1462,6 +2377,302 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
       return res.status(500).json({
         success: false,
         error: 'Authentication security service error. Please try again.',
+      });
+    }
+  });
+
+  // A2. Authoritative Canonical Super Admin Temporary Lockout Status (Server-Time Synchronized)
+  // Strictly scoped to canonical Super Admin — never leaks existence or lock status of Admin/User/Custom Roles.
+  app.get('/api/auth/lockout-status', async (req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    try {
+      const nowMs = getNowMs();
+      const rawLoginId = typeof req.query?.loginId === 'string' ? req.query.loginId.trim().toLowerCase() : '';
+
+      // Zero enumeration / zero leakage for Admin, User, or Custom Roles
+      if (rawLoginId && rawLoginId !== 'superadmin') {
+        return res.json({
+          success: true,
+          locked: false,
+          temporaryLock: false,
+          serverNowMs: nowMs,
+        });
+      }
+
+      let userDoc = await db.collection('user_roles').doc('role_superadmin').get();
+      if (!userDoc.exists) {
+        const snap = await db.collection('user_roles').where('loginId', '==', 'superadmin').limit(1).get();
+        if (!snap.empty) {
+          userDoc = snap.docs[0];
+        }
+      }
+
+      if (!userDoc || !userDoc.exists) {
+        return res.json({
+          success: true,
+          locked: false,
+          temporaryLock: false,
+          serverNowMs: nowMs,
+        });
+      }
+
+      const userData = userDoc.data() || {};
+      if (!isCanonicalSuperAdminAccount(userDoc.id, userData)) {
+        return res.json({
+          success: true,
+          locked: false,
+          temporaryLock: false,
+          serverNowMs: nowMs,
+        });
+      }
+
+      const secRef = db.collection('account_security').doc('sec_superadmin');
+      const userRef = db.collection('user_roles').doc(userDoc.id);
+      const secSnap = await secRef.get();
+      const secData = secSnap.exists ? (secSnap.data() || {}) : {};
+
+      const isCurrentlyLocked =
+        secData.lockStatus === 'LOCKED' ||
+        userData.lockStatus === 'LOCKED' ||
+        userData.isLocked === true;
+      const saLockWindow = resolveCanonicalSuperAdminLockWindow(secData, userData);
+      const existingLockedUntilMs = saLockWindow.lockedUntilMs;
+
+      if (!isCurrentlyLocked || existingLockedUntilMs === null) {
+        return res.json({
+          success: true,
+          locked: false,
+          temporaryLock: false,
+          serverNowMs: nowMs,
+        });
+      }
+
+      // Active temporary lockout: server time has NOT yet reached lockoutUntil
+      if (nowMs < existingLockedUntilMs) {
+        const remainingSeconds = Math.max(1, Math.ceil((existingLockedUntilMs - nowMs) / 1000));
+        const lockoutUntilIso =
+          saLockWindow.lockoutUntil ||
+          resolveAuthoritativeLockedUntilIso(existingLockedUntilMs, secData, userData);
+        const lockDurationMinutes = saLockWindow.lockDurationMinutes;
+
+        return res.json({
+          success: true,
+          locked: true,
+          temporaryLock: true,
+          loginId: 'superadmin',
+          lockoutUntil: lockoutUntilIso,
+          lockedUntil: lockoutUntilIso,
+          lockedUntilMs: existingLockedUntilMs,
+          serverNowMs: nowMs,
+          remainingSeconds,
+          lockDurationMinutes,
+        });
+      }
+
+      // Server independently verified lockoutUntil <= serverNowMs: atomically reactivate under mutex + transaction
+      const reactivationOutcome = await withLoginIdLock('superadmin', async () => {
+        const txNowMs = getNowMs();
+        const txNowIso = new Date(txNowMs).toISOString();
+
+        const txResult = await db.runTransaction(async (tx) => {
+          const [freshSecSnap, freshUserSnap] = await Promise.all([tx.get(secRef), tx.get(userRef)]);
+          const freshSec = freshSecSnap.exists ? (freshSecSnap.data() || {}) : {};
+          const freshUser = freshUserSnap.exists ? (freshUserSnap.data() || {}) : userData;
+
+          const txIsLocked =
+            freshSec.lockStatus === 'LOCKED' ||
+            freshUser.lockStatus === 'LOCKED' ||
+            freshUser.isLocked === true;
+          const txLockWindow = resolveCanonicalSuperAdminLockWindow(freshSec, freshUser);
+          const txLockedUntilMs = txLockWindow.lockedUntilMs;
+
+          if (!txIsLocked || txLockedUntilMs === null) {
+            return { kind: 'ALREADY_ACTIVE' as const, serverNowMs: txNowMs };
+          }
+
+          // Re-verify inside transaction in case account was freshly re-locked concurrently
+          if (txNowMs < txLockedUntilMs) {
+            const remSec = Math.max(1, Math.ceil((txLockedUntilMs - txNowMs) / 1000));
+            const iso =
+              txLockWindow.lockoutUntil ||
+              resolveAuthoritativeLockedUntilIso(txLockedUntilMs, freshSec, freshUser);
+            return {
+              kind: 'STILL_LOCKED' as const,
+              serverNowMs: txNowMs,
+              lockoutUntil: iso,
+              lockedUntilMs: txLockedUntilMs,
+              remainingSeconds: remSec,
+              lockDurationMinutes: txLockWindow.lockDurationMinutes,
+            };
+          }
+
+          const retainedLevel = Number(
+            freshSec.progressiveLockLevel ?? freshUser.progressiveLockLevel ?? 0
+          );
+          const previousLockedAt = freshSec.lockedAt || freshUser.lockedAt || null;
+          const previousLockedUntil = resolveAuthoritativeLockedUntilIso(
+            txLockedUntilMs,
+            freshSec,
+            freshUser
+          );
+          const previousDurationMinutes =
+            freshSec.lockDurationMinutes ?? freshUser.lockDurationMinutes ?? null;
+
+          tx.set(
+            secRef,
+            {
+              ...freshSec,
+              id: 'sec_superadmin',
+              loginId: 'superadmin',
+              role: 'SUPER_ADMIN',
+              firebaseUid: String(freshUser.authUid || userDoc.id),
+              email: freshUser.email || 'superadmin@narid.com',
+              lockStatus: 'ACTIVE',
+              lockPolicyType: 'PROGRESSIVE_TEMPORARY',
+              consecutiveFailedAttempts: 0,
+              lockedAt: null,
+              lockoutUntil: null,
+              lockedUntil: null,
+              lockedUntilMs: null,
+              lockDurationMinutes: null,
+              lockReason: null,
+              lastLockExpiredAt: txNowIso,
+              progressiveLockLevel: retainedLevel,
+              pendingPostLockoutLoginAudit: true,
+              updatedAt: txNowIso,
+            },
+            { merge: true }
+          );
+
+          tx.update(userRef, {
+            isLocked: false,
+            lockStatus: 'ACTIVE',
+            lockPolicyType: 'PROGRESSIVE_TEMPORARY',
+            consecutiveFailedAttempts: 0,
+            lockedAt: null,
+            lockoutUntil: null,
+            lockedUntil: null,
+            lockedUntilMs: null,
+            lockDurationMinutes: null,
+            lockReason: null,
+            lastLockExpiredAt: txNowIso,
+            progressiveLockLevel: retainedLevel,
+            pendingPostLockoutLoginAudit: true,
+            updatedAt: txNowIso,
+          });
+
+          return {
+            kind: 'REACTIVATED' as const,
+            serverNowMs: txNowMs,
+            nowIso: txNowIso,
+            firebaseUid: String(freshUser.authUid || userDoc.id),
+            authUid: freshUser.authUid || null,
+            role: String(freshUser.role || 'super_admin'),
+            status: String(freshUser.status || 'Active'),
+            previousLockedAt,
+            previousLockedUntil,
+            previousDurationMinutes,
+            retainedLevel,
+          };
+        });
+
+        if (txResult.kind === 'REACTIVATED') {
+          await syncUserUidIndex(db, {
+            uid: txResult.authUid,
+            roleDocId: userDoc.id,
+            role: txResult.role,
+            status: txResult.status,
+            lockStatus: 'ACTIVE',
+            lockedUntilMs: null,
+            loginId: 'superadmin',
+          });
+
+          const telemetry = await captureTelemetryContext(db, req);
+          await Promise.all([
+            recordSecurityAuditLogDoc(db, {
+              action: 'LOCKOUT_EXPIRED_REACTIVATED',
+              severity: 'INFO',
+              targetLoginId: 'superadmin',
+              targetRole: 'SUPER_ADMIN',
+              targetUid: txResult.firebaseUid,
+              reason: 'Super Admin temporary lockout duration expired; account automatically reactivated',
+              details: `Temporary lockout for canonical Super Admin "superadmin" expired at ${txResult.previousLockedUntil || txResult.nowIso}. Verified server-side and reactivated with progressive level ${txResult.retainedLevel} retained.`,
+              metadata: {
+                previousLockedAt: txResult.previousLockedAt,
+                previousLockedUntil: txResult.previousLockedUntil,
+                previousDurationMinutes: txResult.previousDurationMinutes,
+                retainedProgressiveLevel: txResult.retainedLevel,
+                verifiedVia: 'LOCKOUT_STATUS_CHECK',
+              },
+              nowMs: txResult.serverNowMs,
+              telemetry,
+            }),
+            recordEnterpriseAuditEvent(db, {
+              req,
+              action: 'super_admin_lockout_expired',
+              category: 'SECURITY',
+              severity: 'INFO',
+              actorUid: txResult.firebaseUid,
+              actorLoginId: 'superadmin',
+              actorRole: 'SUPER_ADMIN',
+              targetType: 'ACCOUNT',
+              targetId: userDoc.id,
+              oldValue: {
+                lockStatus: 'LOCKED',
+                lockoutUntil: txResult.previousLockedUntil,
+                lockDurationMinutes: txResult.previousDurationMinutes,
+              },
+              newValue: {
+                lockStatus: 'ACTIVE',
+                consecutiveFailedAttempts: 0,
+                progressiveLockLevel: txResult.retainedLevel,
+              },
+              actionSource: 'PROGRESSIVE_LOCKOUT_ENGINE',
+              description: `Canonical Super Admin "superadmin" temporary lockout expired and was automatically reactivated upon server verification (progressive level ${txResult.retainedLevel} retained).`,
+              success: true,
+            }),
+          ]);
+        }
+
+        return txResult;
+      });
+
+      if (reactivationOutcome.kind === 'STILL_LOCKED') {
+        return res.json({
+          success: true,
+          locked: true,
+          temporaryLock: true,
+          loginId: 'superadmin',
+          lockoutUntil: reactivationOutcome.lockoutUntil,
+          lockedUntil: reactivationOutcome.lockoutUntil,
+          lockedUntilMs: reactivationOutcome.lockedUntilMs,
+          serverNowMs: reactivationOutcome.serverNowMs,
+          remainingSeconds: reactivationOutcome.remainingSeconds,
+          lockDurationMinutes: reactivationOutcome.lockDurationMinutes,
+        });
+      }
+
+      return res.json({
+        success: true,
+        locked: false,
+        temporaryLock: false,
+        expiredReactivated: reactivationOutcome.kind === 'REACTIVATED',
+        serverNowMs: reactivationOutcome.serverNowMs,
+      });
+    } catch (err: any) {
+      if (isFirestorePermissionDeniedError(err)) {
+        const msg = formatAdminPermissionDeniedError(projectId, TARGET_DATABASE_ID);
+        return res.status(503).json({
+          success: false,
+          code: 'FIREBASE_ADMIN_PERMISSION_DENIED',
+          error: msg,
+        });
+      }
+      console.error('[Lockout Status API] Error:', err);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to check lockout status.',
       });
     }
   });
@@ -1514,12 +2725,15 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
       );
       if (!caller) return;
 
-      const [usersSnap, secSnap, attemptsSnap, secLogsSnap] = await Promise.all([
-        db.collection('user_roles').get(),
-        db.collection('account_security').get(),
-        db.collection('login_attempts').get(),
-        db.collection('security_audit_logs').get(),
-      ]);
+      const [usersSnap, secSnap, attemptsSnap, secLogsSnap, superAdminLockoutResetHours] =
+        await Promise.all([
+          db.collection('user_roles').get(),
+          db.collection('account_security').get(),
+          db.collection('login_attempts').get(),
+          db.collection('security_audit_logs').get(),
+          resolveSuperAdminLockoutResetHours(db),
+        ]);
+      const nowMs = getNowMs();
 
       const secByLoginId = new Map<string, any>();
       secSnap.docs.forEach((d) => {
@@ -1548,10 +2762,31 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
 
         const sec = secByLoginId.get(loginId) || {};
         const accAttempts = attempts.filter((a) => String(a.loginId || '').toLowerCase() === loginId);
-        const lockStatus =
-          sec.lockStatus === 'LOCKED' || uData.lockStatus === 'LOCKED' || uData.isLocked === true
-            ? 'LOCKED'
-            : 'ACTIVE';
+        const isCanonicalSA = isCanonicalSuperAdminAccount(uDoc.id, uData);
+        const saLockWindow = isCanonicalSA
+          ? resolveCanonicalSuperAdminLockWindow(sec, uData)
+          : {
+              lockedUntilMs: resolveAuthoritativeLockedUntilMs(sec, uData),
+              lockoutUntil: null,
+              lockDurationMinutes: null,
+            };
+        const lockedUntilMs = saLockWindow.lockedUntilMs;
+
+        const rawIsLocked =
+          sec.lockStatus === 'LOCKED' || uData.lockStatus === 'LOCKED' || uData.isLocked === true;
+        const lockoutExpiredPendingLogin = Boolean(
+          isCanonicalSA && rawIsLocked && lockedUntilMs !== null && nowMs >= lockedUntilMs
+        );
+        const effectiveLockStatus =
+          rawIsLocked && !lockoutExpiredPendingLogin ? 'LOCKED' : 'ACTIVE';
+        const remainingLockSeconds =
+          isCanonicalSA && effectiveLockStatus === 'LOCKED' && lockedUntilMs !== null
+            ? Math.max(0, Math.ceil((lockedUntilMs - nowMs) / 1000))
+            : 0;
+        const effectiveLockedUntilIso =
+          effectiveLockStatus === 'LOCKED'
+            ? saLockWindow.lockoutUntil || resolveAuthoritativeLockedUntilIso(lockedUntilMs, sec, uData)
+            : null;
 
         accountMap.set(loginId, {
           id: sec.id || `sec_${loginId}`,
@@ -1562,10 +2797,11 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
           role: String(uData.role || 'USER').toUpperCase(),
           firebaseUid: sec.firebaseUid || uData.authUid || uDoc.id,
           accountStatus: uData.status || 'Active',
-          lockStatus,
-          consecutiveFailedAttempts: Number(
-            sec.consecutiveFailedAttempts ?? uData.consecutiveFailedAttempts ?? 0
-          ),
+          lockStatus: effectiveLockStatus,
+          lockPolicyType: isCanonicalSA ? 'PROGRESSIVE_TEMPORARY' : 'PERMANENT_MANUAL',
+          consecutiveFailedAttempts: lockoutExpiredPendingLogin
+            ? 0
+            : Number(sec.consecutiveFailedAttempts ?? uData.consecutiveFailedAttempts ?? 0),
           maxAttemptsAllowed: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
           totalLoginAttempts: Number(sec.totalLoginAttempts ?? accAttempts.length),
           totalSuccessfulLogins: Number(
@@ -1576,8 +2812,46 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
           ),
           forcePasswordChange: Boolean(uData.mustChangePassword === true || sec.forcePasswordChange === true),
           mustChangePassword: Boolean(uData.mustChangePassword === true),
-          lockedAt: sec.lockedAt || uData.lockedAt || null,
-          lockReason: sec.lockReason || uData.lockReason || null,
+          lockedAt: effectiveLockStatus === 'LOCKED' ? (sec.lockedAt || uData.lockedAt || null) : null,
+          lockoutUntil: effectiveLockedUntilIso,
+          lockedUntil: effectiveLockedUntilIso,
+          lockedUntilMs: effectiveLockStatus === 'LOCKED' ? lockedUntilMs : null,
+          lockDurationMinutes:
+            effectiveLockStatus === 'LOCKED'
+              ? (saLockWindow.lockDurationMinutes ?? sec.lockDurationMinutes ?? uData.lockDurationMinutes ?? null)
+              : null,
+          remainingLockSeconds,
+          lockoutExpiredPendingLogin,
+          lockReason: effectiveLockStatus === 'LOCKED' ? (sec.lockReason || uData.lockReason || null) : null,
+          progressiveLockLevel: isCanonicalSA
+            ? Number(sec.progressiveLockLevel ?? uData.progressiveLockLevel ?? 0)
+            : 0,
+          totalLockoutEvents: isCanonicalSA
+            ? Number(sec.totalLockoutEvents ?? uData.totalLockoutEvents ?? 0)
+            : 0,
+          lastLockoutAt: isCanonicalSA ? (sec.lastLockoutAt || uData.lastLockoutAt || null) : null,
+          lastLockExpiredAt: isCanonicalSA
+            ? (sec.lastLockExpiredAt || uData.lastLockExpiredAt || null)
+            : null,
+          cleanWindowStartAt: isCanonicalSA
+            ? (sec.cleanWindowStartAt || uData.cleanWindowStartAt || null)
+            : null,
+          cleanWindowStartMs: isCanonicalSA
+            ? (typeof sec.cleanWindowStartMs === 'number'
+                ? sec.cleanWindowStartMs
+                : typeof uData.cleanWindowStartMs === 'number'
+                  ? uData.cleanWindowStartMs
+                  : null)
+            : null,
+          cleanLoginsSinceLastLockout: isCanonicalSA
+            ? Number(sec.cleanLoginsSinceLastLockout ?? uData.cleanLoginsSinceLastLockout ?? 0)
+            : 0,
+          lockoutLevelResetAt: isCanonicalSA
+            ? (sec.lockoutLevelResetAt || uData.lockoutLevelResetAt || null)
+            : null,
+          lockoutLevelResetReason: isCanonicalSA
+            ? (sec.lockoutLevelResetReason || uData.lockoutLevelResetReason || null)
+            : null,
           lastSuccessAt: sec.lastSuccessAt || uData.lastSuccessLoginAt || null,
           lastSuccessIp: sec.lastSuccessIp || null,
           lastSuccessGeo: sec.lastSuccessGeo || null,
@@ -1624,6 +2898,8 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
         accounts,
         recentAttempts: attempts.slice(0, 150),
         recentSecurityLogs: securityLogs.slice(0, 150),
+        superAdminLockoutResetHours,
+        serverNowMs: nowMs,
       });
     } catch (err: any) {
       if (isFirestorePermissionDeniedError(err)) {
@@ -1805,6 +3081,10 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
               consecutiveFailedAttempts: 0,
               maxAttemptsAllowed: MAX_CONSECUTIVE_FAILED_ATTEMPTS,
               lockedAt: null,
+              lockoutUntil: null,
+              lockedUntil: null,
+              lockedUntilMs: null,
+              lockDurationMinutes: null,
               lockReason: null,
               unblockedByUid: caller.uid,
               unblockedByLoginId: caller.loginId,
@@ -1820,6 +3100,10 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
             lockStatus: 'ACTIVE',
             consecutiveFailedAttempts: 0,
             lockedAt: null,
+            lockoutUntil: null,
+            lockedUntil: null,
+            lockedUntilMs: null,
+            lockDurationMinutes: null,
             lockReason: null,
             unblockedBy: caller.loginId,
             unblockedAt: now,
@@ -2235,6 +3519,217 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
       return res.status(500).json({
         success: false,
         error: err?.message || 'Failed to generate temporary password.',
+      });
+    }
+  });
+
+  // I. Explicit Approved Super Admin Progressive Lockout Level Reset (Strictly SUPER_ADMIN Only + Fresh Auth)
+  app.post('/api/security/reset-superadmin-lockout-level', async (req: Request, res: Response) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        ['super_admin'],
+        'Reset Super Admin Progressive Lockout Level'
+      );
+      if (!caller) return;
+
+      const parsed = ResetSuperAdminLockoutLevelSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || 'Invalid lockout level reset request.',
+        });
+      }
+
+      const reason = parsed.data.reason.trim();
+      const freshPassword = parsed.data.freshSuperAdminPassword;
+      const telemetry = await captureTelemetryContext(db, req);
+      const nowMs = getNowMs();
+      const now = new Date(nowMs).toISOString();
+
+      const nowSec = Math.floor(nowMs / 1000);
+      const isRecentTokenAuth =
+        typeof caller.authTime === 'number' && nowSec - caller.authTime <= 300;
+
+      let freshAuthVerified = false;
+      if (freshPassword && freshPassword.length > 0) {
+        const callerDoc = await db.collection('user_roles').doc(caller.profileDocId).get();
+        const callerHash = callerDoc.exists ? callerDoc.data()?.passwordHash : null;
+        if (callerHash && verifyPassword(freshPassword, String(callerHash))) {
+          freshAuthVerified = true;
+        } else {
+          await recordSecurityAuditLogDoc(db, {
+            action: 'UNAUTHORIZED_SECURITY_ACCESS',
+            severity: 'CRITICAL',
+            targetLoginId: 'superadmin',
+            targetRole: 'SUPER_ADMIN',
+            actorUid: caller.uid,
+            actorLoginId: caller.loginId,
+            actorRole: 'SUPER_ADMIN',
+            reason: 'Failed fresh Super Admin password verification for progressive lockout level reset',
+            details: `Super Admin "${caller.loginId}" entered an incorrect password during fresh re-authentication check for progressive lockout level reset.`,
+            nowMs,
+            telemetry,
+          });
+          return res.status(401).json({
+            success: false,
+            requiresFreshAuth: true,
+            error: 'Fresh Super Admin authentication failed: Incorrect Super Admin password.',
+          });
+        }
+      } else if (isRecentTokenAuth) {
+        freshAuthVerified = true;
+      }
+
+      if (!freshAuthVerified) {
+        return res.status(401).json({
+          success: false,
+          requiresFreshAuth: true,
+          error:
+            'Fresh Super Admin authentication is required before resetting the progressive lockout level. Please enter your current Super Admin password.',
+        });
+      }
+
+      const resetResult = await withLoginIdLock('superadmin', async () => {
+        let userDoc = await db.collection('user_roles').doc('role_superadmin').get();
+        if (!userDoc.exists) {
+          const snap = await db.collection('user_roles').where('loginId', '==', 'superadmin').limit(1).get();
+          if (!snap.empty) userDoc = snap.docs[0];
+        }
+        if (!userDoc || !userDoc.exists) {
+          return { notFound: true as const };
+        }
+
+        const userData = userDoc.data() || {};
+        if (!isCanonicalSuperAdminAccount(userDoc.id, userData)) {
+          return { notFound: true as const };
+        }
+
+        const firebaseUid = String(userData.authUid || userDoc.id);
+        const secRef = db.collection('account_security').doc('sec_superadmin');
+        const userRef = db.collection('user_roles').doc(userDoc.id);
+
+        let previousLevel = 0;
+        let totalLockoutEvents = 0;
+
+        await db.runTransaction(async (tx) => {
+          const [secSnap, freshUserSnap] = await Promise.all([tx.get(secRef), tx.get(userRef)]);
+          const curSec = secSnap.exists ? (secSnap.data() || {}) : {};
+          const freshUser = freshUserSnap.exists ? (freshUserSnap.data() || {}) : userData;
+
+          previousLevel = Number(curSec.progressiveLockLevel ?? freshUser.progressiveLockLevel ?? 0);
+          totalLockoutEvents = Number(curSec.totalLockoutEvents ?? freshUser.totalLockoutEvents ?? 0);
+
+          tx.set(
+            secRef,
+            {
+              ...curSec,
+              id: 'sec_superadmin',
+              loginId: 'superadmin',
+              role: 'SUPER_ADMIN',
+              firebaseUid,
+              email: freshUser.email || 'superadmin@narid.com',
+              lockPolicyType: 'PROGRESSIVE_TEMPORARY',
+              progressiveLockLevel: 0,
+              consecutiveFailedAttempts: 0,
+              cleanWindowStartAt: null,
+              cleanWindowStartMs: null,
+              cleanLoginsSinceLastLockout: 0,
+              lockoutLevelResetAt: now,
+              lockoutLevelResetReason: reason,
+              updatedAt: now,
+            },
+            { merge: true }
+          );
+
+          tx.update(userRef, {
+            progressiveLockLevel: 0,
+            consecutiveFailedAttempts: 0,
+            cleanWindowStartAt: null,
+            cleanWindowStartMs: null,
+            cleanLoginsSinceLastLockout: 0,
+            lockoutLevelResetAt: now,
+            lockoutLevelResetReason: reason,
+            updatedAt: now,
+          });
+        });
+
+        await Promise.all([
+          recordSecurityAuditLogDoc(db, {
+            action: 'LOCKOUT_LEVEL_RESET',
+            severity: 'CRITICAL',
+            targetLoginId: 'superadmin',
+            targetRole: 'SUPER_ADMIN',
+            targetUid: firebaseUid,
+            actorUid: caller.uid,
+            actorLoginId: caller.loginId,
+            actorRole: 'SUPER_ADMIN',
+            reason,
+            details: `Super Admin "${caller.loginId}" explicitly reset canonical Super Admin progressive lockout level from ${previousLevel} to 0. Historical lockout count (${totalLockoutEvents}) preserved. Reason: ${reason}`,
+            metadata: {
+              resetType: 'MANUAL_APPROVED_RESET',
+              previousLevel,
+              newLevel: 0,
+              totalLockoutEventsPreserved: totalLockoutEvents,
+            },
+            nowMs,
+            telemetry,
+          }),
+          recordEnterpriseAuditEvent(db, {
+            req,
+            action: 'super_admin_lockout_level_reset',
+            category: 'SECURITY',
+            severity: 'CRITICAL',
+            actorUid: caller.uid,
+            actorLoginId: caller.loginId,
+            actorRole: 'SUPER_ADMIN',
+            targetType: 'ACCOUNT',
+            targetId: userDoc.id,
+            oldValue: { progressiveLockLevel: previousLevel },
+            newValue: {
+              progressiveLockLevel: 0,
+              resetType: 'MANUAL_APPROVED_RESET',
+              totalLockoutEventsPreserved: totalLockoutEvents,
+              reason,
+            },
+            actionSource: 'SECURITY_CONTROL_LOCKOUT_RESET',
+            reason,
+            description: `Super Admin "${caller.loginId}" reset canonical Super Admin progressive lockout level from ${previousLevel} to 0.`,
+            success: true,
+          }),
+        ]);
+
+        return {
+          notFound: false as const,
+          previousLevel,
+          newLevel: 0,
+          totalLockoutEvents,
+          resetAt: now,
+        };
+      });
+
+      if (resetResult.notFound) {
+        return res.status(404).json({
+          success: false,
+          error: 'Canonical Super Admin account not found.',
+        });
+      }
+
+      return res.json({
+        success: true,
+        message: `Super Admin progressive lockout level reset from ${resetResult.previousLevel} to 0. Full lockout history (${resetResult.totalLockoutEvents} events) preserved.`,
+        ...resetResult,
+      });
+    } catch (err: any) {
+      if (isFirestorePermissionDeniedError(err)) {
+        const msg = formatAdminPermissionDeniedError(projectId, TARGET_DATABASE_ID);
+        return res.status(503).json({ success: false, code: 'FIREBASE_ADMIN_PERMISSION_DENIED', error: msg });
+      }
+      console.error('[Security Reset Super Admin Lockout Level API] Error:', err);
+      return res.status(500).json({
+        success: false,
+        error: err?.message || 'Failed to reset Super Admin progressive lockout level.',
       });
     }
   });

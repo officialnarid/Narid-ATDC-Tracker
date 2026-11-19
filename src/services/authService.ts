@@ -30,14 +30,89 @@ import { getAuthHeaders, sendServerAuditEvent } from './auditService';
 import { reportFirebaseThrottleSignal } from './securityService';
 
 export interface LoginAuthError extends Error {
+  status?: number;
   code?: string;
   locked?: boolean;
+  temporaryLock?: boolean;
+  lockoutUntil?: string | null;
+  lockedUntil?: string | null;
+  lockedUntilMs?: number | null;
+  serverNowMs?: number | null;
+  remainingSeconds?: number | null;
+  lockDurationMinutes?: number | null;
   warning?: boolean;
   attemptNumber?: number;
   maxAttempts?: number;
   remainingAttempts?: number;
   cooldownSeconds?: number;
   firebaseAbuseProtection?: boolean;
+}
+
+export interface SuperAdminLockoutStatus {
+  success: boolean;
+  locked: boolean;
+  temporaryLock: boolean;
+  loginId?: string;
+  lockoutUntil?: string | null;
+  lockedUntil?: string | null;
+  lockedUntilMs?: number | null;
+  serverNowMs: number;
+  remainingSeconds?: number | null;
+  lockDurationMinutes?: number | null;
+  expiredReactivated?: boolean;
+}
+
+export async function fetchSuperAdminLockoutStatus(
+  loginId?: string
+): Promise<SuperAdminLockoutStatus | null> {
+  if (!isApiBaseUsableForCurrentOrigin()) {
+    return null;
+  }
+  const cleanId = typeof loginId === 'string' ? loginId.trim().toLowerCase() : '';
+  // Never query backend lockout status for non-Super-Admin accounts
+  if (cleanId && cleanId !== 'superadmin') {
+    return {
+      success: true,
+      locked: false,
+      temporaryLock: false,
+      serverNowMs: Date.now(),
+    };
+  }
+  const queryStr = cleanId ? `?loginId=${encodeURIComponent(cleanId)}` : '';
+  const res = await executeApiFetch(
+    apiUrl(`/api/auth/lockout-status${queryStr}`),
+    {
+      method: 'GET',
+      cache: 'no-store',
+      headers: {
+        'Cache-Control': 'no-cache',
+      },
+    },
+    'GET /api/auth/lockout-status',
+    { preferSameOriginInPreview: true }
+  );
+  const parsed = await safeParseJsonResponse<SuperAdminLockoutStatus>(
+    res,
+    'GET /api/auth/lockout-status'
+  );
+  if (!parsed.ok || !parsed.data) {
+    return null;
+  }
+  const raw = parsed.data;
+  return {
+    success: Boolean(raw.success),
+    locked: Boolean(raw.locked),
+    temporaryLock: Boolean(raw.temporaryLock),
+    loginId: raw.loginId || (raw.locked ? 'superadmin' : undefined),
+    lockoutUntil: raw.lockoutUntil ?? raw.lockedUntil ?? null,
+    lockedUntil: raw.lockedUntil ?? raw.lockoutUntil ?? null,
+    lockedUntilMs: typeof raw.lockedUntilMs === 'number' ? raw.lockedUntilMs : null,
+    serverNowMs: typeof raw.serverNowMs === 'number' ? raw.serverNowMs : Date.now(),
+    remainingSeconds: typeof raw.remainingSeconds === 'number' ? raw.remainingSeconds : null,
+    lockDurationMinutes:
+      typeof raw.lockDurationMinutes === 'number' ? raw.lockDurationMinutes : null,
+    expiredReactivated: Boolean(raw.expiredReactivated),
+  };
 }
 
 // Default initial industrial user accounts (canonical *@narid.com kept active)
@@ -106,7 +181,8 @@ export async function getUserProfileByLoginId(loginId: string): Promise<UserRole
           headers,
           body: JSON.stringify({ loginId: cleanId }),
         },
-        'POST /api/auth/verify-session'
+        'POST /api/auth/verify-session',
+        { preferSameOriginInPreview: true }
       );
       const parsed = await safeParseJsonResponse<{ success?: boolean; profile?: UserRoleRecord }>(
         res,
@@ -211,7 +287,8 @@ export async function getUserProfileByEmail(email: string): Promise<UserRoleReco
             headers,
             body: JSON.stringify({}),
           },
-          'POST /api/auth/verify-session'
+          'POST /api/auth/verify-session',
+          { preferSameOriginInPreview: true }
         );
         const parsed = await safeParseJsonResponse<{ success?: boolean; profile?: UserRoleRecord }>(
           res,
@@ -287,7 +364,8 @@ export async function loginWithLoginIdAndPassword(
         password: passwordInput,
       }),
     },
-    'POST /api/auth/login'
+    'POST /api/auth/login',
+    { preferSameOriginInPreview: true, noRetryOnNetworkError: true }
   );
 
   const parsed = await safeParseJsonResponse<any>(res, 'POST /api/auth/login');
@@ -296,8 +374,18 @@ export async function loginWithLoginIdAndPassword(
     const authErr: LoginAuthError = new Error(
       parsed.errorMessage || data.error || 'Invalid password, check again'
     );
+    authErr.status = res.status;
     authErr.code = data.code || (parsed.isHtmlOrNonJson ? `HTTP_${res.status}_NON_JSON` : undefined);
     authErr.locked = Boolean(data.locked || res.status === 423);
+    authErr.temporaryLock = Boolean(data.temporaryLock);
+    authErr.lockoutUntil = data.lockoutUntil ?? data.lockedUntil ?? null;
+    authErr.lockedUntil = data.lockedUntil ?? data.lockoutUntil ?? null;
+    authErr.lockedUntilMs = typeof data.lockedUntilMs === 'number' ? data.lockedUntilMs : null;
+    authErr.serverNowMs = typeof data.serverNowMs === 'number' ? data.serverNowMs : null;
+    authErr.remainingSeconds =
+      typeof data.remainingSeconds === 'number' ? data.remainingSeconds : null;
+    authErr.lockDurationMinutes =
+      typeof data.lockDurationMinutes === 'number' ? data.lockDurationMinutes : null;
     authErr.warning = Boolean(data.warning);
     authErr.attemptNumber = data.attemptNumber;
     authErr.maxAttempts = data.maxAttempts;

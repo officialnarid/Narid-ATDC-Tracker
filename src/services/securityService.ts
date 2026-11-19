@@ -16,7 +16,8 @@ export async function fetchSecurityOverview(): Promise<SecurityOverviewResponse>
   return apiFetchJson<SecurityOverviewResponse>(
     '/api/security/overview',
     { headers },
-    'Failed to fetch security & lockout overview.'
+    'Failed to fetch security & lockout overview.',
+    { preferSameOriginInPreview: true }
   );
 }
 
@@ -114,6 +115,31 @@ export async function generateTemporaryPasswordForAccount(payload: {
       body: JSON.stringify(payload),
     },
     'Failed to generate temporary password.'
+  );
+}
+
+export async function resetSuperAdminLockoutLevel(payload: {
+  reason: string;
+  confirmed: boolean;
+  freshSuperAdminPassword?: string;
+}): Promise<{
+  success: boolean;
+  message: string;
+  previousLevel: number;
+  newLevel: number;
+  totalLockoutEvents: number;
+  resetAt: string;
+}> {
+  const headers = await getAuthHeaders();
+  return apiFetchJson(
+    '/api/security/reset-superadmin-lockout-level',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    },
+    'Failed to reset Super Admin progressive lockout level.',
+    { preferSameOriginInPreview: true }
   );
 }
 

@@ -29,7 +29,9 @@ function stripOptionalWrappingQuotes(raw?: string | null): string {
 
 export function isAiStudioPreviewHostname(hostname?: string): boolean {
   const cleanHost = String(hostname || '').trim().toLowerCase();
-  return Boolean(cleanHost && AI_STUDIO_PREVIEW_HOSTNAMES.has(cleanHost));
+  if (!cleanHost) return false;
+  if (AI_STUDIO_PREVIEW_HOSTNAMES.has(cleanHost)) return true;
+  return /^ais-(?:dev|pre)-[a-z0-9-]+\.run\.app$/i.test(cleanHost);
 }
 
 export function normalizeApiBaseUrl(raw?: string | null): string {
@@ -191,6 +193,7 @@ import { queueClientTelemetry } from '../utils/perfMonitor';
 export interface ExecuteApiFetchOptions {
   timeoutMs?: number;
   noRetryOnNetworkError?: boolean;
+  preferSameOriginInPreview?: boolean;
 }
 
 function createClientCorrelationId(): string {
@@ -214,7 +217,33 @@ function withCorrelationHeader(init: RequestInit | undefined, correlationId: str
   if (!headers.has('X-Correlation-ID')) {
     headers.set('X-Correlation-ID', correlationId);
   }
+  if (!headers.has('Accept')) {
+    headers.set('Accept', 'application/json');
+  }
   return { ...(init || {}), headers };
+}
+
+function isNginxWarmupHtmlBody(htmlText: string): boolean {
+  return /<title>\s*Starting Server\.\.\.\s*<\/title>/i.test(htmlText);
+}
+
+function isPreviewAuthBridgeHtml(res: Response, htmlText: string): boolean {
+  const finalUrl = String(res.url || '').toLowerCase();
+  if (
+    finalUrl.includes('/__cookie_check.html') ||
+    finalUrl.includes('applet-auth-bridge')
+  ) {
+    return true;
+  }
+  return /<title>\s*Cookie check\s*<\/title>/i.test(htmlText);
+}
+
+function isFrontendSpaIndexHtml(htmlText: string): boolean {
+  return (
+    /<div\s+id=["']root["']\s*>/i.test(htmlText) ||
+    /src=["']\/src\/main\.tsx["']/i.test(htmlText) ||
+    /<title>[^<]*Narid ATDC Tracker[^<]*<\/title>/i.test(htmlText)
+  );
 }
 
 export async function executeApiFetch(
@@ -266,16 +295,50 @@ export async function executeApiFetch(
       ) / 100
     );
 
+  const useStrictLocalPreviewBackend = Boolean(
+    isPreviewToVercel && sameOriginPath && options?.preferSameOriginInPreview
+  );
+  const sameOriginInit: RequestInit = {
+    ...effectiveInit,
+    credentials: effectiveInit.credentials ?? 'include',
+  };
+
   try {
-    let res = await fetch(url, effectiveInit);
-    if (isPreviewToVercel && res.status === 404 && sameOriginPath) {
-      try {
-        const clonedBody = await res.clone().json();
-        if (clonedBody && clonedBody.error === 'API endpoint not found.') {
-          res = await fetch(sameOriginPath, effectiveInit);
+    let res: Response;
+    if (useStrictLocalPreviewBackend) {
+      // Strictly target the local Preview Express backend with iframe cookie credentials.
+      // NEVER silently fall back to the older Vercel Production backend for Preview auth requests.
+      res = await fetch(sameOriginPath, sameOriginInit);
+
+      // For idempotent GET requests only (e.g. /api/auth/lockout-status), retry once briefly
+      // if AI Studio nginx served the transient /warmup.html page while Express was booting.
+      if (method === 'GET') {
+        const ct = (res.headers?.get?.('content-type') || '').toLowerCase();
+        if (ct.includes('text/html')) {
+          try {
+            const previewText = await res.clone().text();
+            if (isNginxWarmupHtmlBody(previewText)) {
+              await new Promise((r) => setTimeout(r, 600));
+              res = await fetch(sameOriginPath, sameOriginInit);
+            }
+          } catch {
+            // Leave original response intact
+          }
         }
-      } catch {
-        // Non-JSON 404: return original response cleanly
+      }
+    } else {
+      const targetInit: RequestInit =
+        url.startsWith('/') ? sameOriginInit : effectiveInit;
+      res = await fetch(url, targetInit);
+      if (isPreviewToVercel && res.status === 404 && sameOriginPath) {
+        try {
+          const clonedBody = await res.clone().json();
+          if (clonedBody && clonedBody.error === 'API endpoint not found.') {
+            res = await fetch(sameOriginPath, sameOriginInit);
+          }
+        } catch {
+          // Non-JSON 404: return original response cleanly
+        }
       }
     }
     if (!skipClientTelemetry && res.status >= 500) {
@@ -315,13 +378,20 @@ export async function executeApiFetch(
       );
     }
 
-    // In Google AI Studio Preview, both the shared Vercel backend and the local Express server (/api/*)
-    // connect to the same Firebase project/Firestore database. If a cross-origin request to Vercel fails
-    // at the network/CORS layer before reaching Vercel (e.g., preview browser restriction),
-    // transparently retry against same-origin /api/* once unless disabled.
-    if (isPreviewToVercel && sameOriginPath && !options?.noRetryOnNetworkError) {
+    // In Google AI Studio Preview, non-auth calls that target Vercel may retry same-origin /api/*
+    // if cross-origin Vercel fetch fails at the network layer. Strict Preview local backend calls
+    // (preferSameOriginInPreview) NEVER fall back to Vercel or hide local backend errors.
+    if (
+      !useStrictLocalPreviewBackend &&
+      isPreviewToVercel &&
+      sameOriginPath &&
+      !options?.noRetryOnNetworkError
+    ) {
       try {
-        return await fetch(sameOriginPath, baseInit);
+        return await fetch(sameOriginPath, {
+          ...baseInit,
+          credentials: baseInit.credentials ?? 'include',
+        });
       } catch {
         // Fall through to structured connectivity error below
       }
@@ -342,12 +412,15 @@ export async function executeApiFetch(
     }
 
     const label = endpointLabel || url;
-    const targetDesc =
-      getEffectiveApiBaseUrl() ||
-      (typeof window !== 'undefined' && window.location ? window.location.origin : 'backend API');
+    const targetDesc = useStrictLocalPreviewBackend
+      ? (typeof window !== 'undefined' && window.location ? window.location.origin : 'local Preview backend')
+      : getEffectiveApiBaseUrl() ||
+        (typeof window !== 'undefined' && window.location ? window.location.origin : 'backend API');
     const detail = err?.message ? ` (${err.message})` : '';
     throw new Error(
-      `Unable to reach ${label} at ${targetDesc}${detail}. Verify Vercel /api Serverless Functions (or VITE_API_BASE_URL) are deployed and reachable.`
+      useStrictLocalPreviewBackend
+        ? `Unable to reach local Preview backend for ${label} at ${targetDesc}${detail}. Verify the local Express server is running on port 3000.`
+        : `Unable to reach ${label} at ${targetDesc}${detail}. Verify Vercel /api Serverless Functions (or VITE_API_BASE_URL) are deployed and reachable.`
     );
   } finally {
     if (timeoutId !== null) {
@@ -401,6 +474,12 @@ export async function safeParseJsonResponse<T = any>(
       errorMessage = `HTTP 404 Not Found from ${label} (received ${contentType || (looksLikeHtml ? 'text/html' : 'non-JSON')} instead of backend JSON). Verify Vercel Serverless Function routing (/api/*) and vercel.json rewrites.`;
     } else if (status >= 500) {
       errorMessage = `Backend service error (HTTP ${status}${res.statusText ? ` ${res.statusText}` : ''} from ${label}). Received non-JSON response (${contentType || 'text/plain'}).`;
+    } else if (looksLikeHtml && isPreviewAuthBridgeHtml(res, trimmed)) {
+      errorMessage = `AI Studio Preview session authentication check intercepted ${label} (HTTP ${status} text/html). Please refresh the Preview window and sign in again.`;
+    } else if (looksLikeHtml && isNginxWarmupHtmlBody(trimmed)) {
+      errorMessage = `Local Preview backend server is starting up or returned HTTP 502/503 (${label} received warmup HTML instead of JSON). Please wait a moment and try again.`;
+    } else if (looksLikeHtml && isFrontendSpaIndexHtml(trimmed)) {
+      errorMessage = `API routing error: ${label} returned frontend HTML (index.html, HTTP ${status}) instead of backend JSON. Verify Express /api middleware order and proxy routing.`;
     } else {
       errorMessage = `Unexpected non-JSON response (HTTP ${status}${res.statusText ? ` ${res.statusText}` : ''} from ${label}, content-type: ${contentType || 'unknown'}).`;
     }
@@ -452,11 +531,12 @@ export async function parseApiJsonOrThrow<T = any>(
 export async function apiFetchJson<T = any>(
   path: string,
   init: RequestInit | undefined,
-  fallbackMessage: string
+  fallbackMessage: string,
+  options?: ExecuteApiFetchOptions
 ): Promise<T> {
   assertApiBaseConfigured();
   const method = (init?.method || 'GET').toUpperCase();
   const label = `${method} ${path}`;
-  const res = await executeApiFetch(apiUrl(path), init, label);
+  const res = await executeApiFetch(apiUrl(path), init, label, options);
   return parseApiJsonOrThrow<T>(res, fallbackMessage, label);
 }

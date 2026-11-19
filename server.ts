@@ -25,6 +25,7 @@ import {
   recordEnterpriseAuditEvent,
   syncUserUidIndex,
   removeUserUidIndex,
+  isCanonicalSuperAdminAccount,
 } from './serverSecurityAudit.ts';
 import {
   registerLoginSecurityRoutes,
@@ -35,6 +36,8 @@ import {
   withLoginIdLock,
   clearIpCooldownPersistent,
   MAX_CONSECUTIVE_FAILED_ATTEMPTS,
+  DEFAULT_SUPER_ADMIN_LOCKOUT_RESET_HOURS,
+  formatLockoutDurationText,
 } from './serverLoginSecurity.ts';
 import { registerAttendanceRoutes } from './serverAttendance.ts';
 import { registerEmployeeRoutes } from './serverEmployees.ts';
@@ -677,6 +680,9 @@ async function seedInitialAccounts(db: AdminFirestoreLike) {
       if (sData.protectCriticalLogs === undefined) sUpdates.protectCriticalLogs = true;
       if (sData.captureGeoLocation === undefined) sUpdates.captureGeoLocation = true;
       if (sData.failedLoginAlertThreshold === undefined) sUpdates.failedLoginAlertThreshold = 5;
+      if (sData.superAdminLockoutResetHours === undefined) {
+        sUpdates.superAdminLockoutResetHours = DEFAULT_SUPER_ADMIN_LOCKOUT_RESET_HOURS;
+      }
       if (Object.keys(sUpdates).length > 0) {
         await settingsRef.update(sUpdates);
       }
@@ -771,6 +777,7 @@ export interface ServerAppOptions {
   credentialMode?: 'SERVICE_ACCOUNT_ENV' | 'ADC' | 'UNCONFIGURED';
   allowedOrigins?: string[];
   disableBackgroundBoot?: boolean;
+  nowProvider?: () => number;
 }
 
 export function createApp(options: ServerAppOptions = {}) {
@@ -780,6 +787,7 @@ export function createApp(options: ServerAppOptions = {}) {
   const projectId = options.projectId || adminCtx?.projectId || TARGET_PROJECT_ID;
   const databaseId = options.databaseId || adminCtx?.databaseId || TARGET_DATABASE_ID;
   const credentialMode = options.credentialMode || adminCtx?.credentialMode || 'UNCONFIGURED';
+  const getNowMs = options.nowProvider || (() => Date.now());
 
   const app = express();
   app.set('trust proxy', 1);
@@ -950,6 +958,21 @@ export function createApp(options: ServerAppOptions = {}) {
           'Firebase Admin SDK is not initialized. Configure FIREBASE_SERVICE_ACCOUNT_KEY (or FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY) on the server.',
       });
     });
+    app.use('/api', (err: any, _req: Request, res: Response, _next: NextFunction) => {
+      if (res.headersSent) return;
+      const status =
+        typeof err?.status === 'number' && err.status >= 400 && err.status < 600
+          ? err.status
+          : 500;
+      res.status(status).json({
+        success: false,
+        code: err instanceof SyntaxError && status === 400 ? 'INVALID_JSON_BODY' : 'INTERNAL_API_ERROR',
+        error:
+          err instanceof SyntaxError && status === 400
+            ? 'Invalid JSON request body.'
+            : 'Internal server error.',
+      });
+    });
     return { app, db: null, auth: null, projectId, databaseId, credentialMode };
   }
 
@@ -1037,7 +1060,10 @@ export function createApp(options: ServerAppOptions = {}) {
     options?: { prefetchUserPermission?: boolean }
   ): Promise<VerifiedCaller | null> {
     try {
-      const caller = await verifyCallerIdentity(req, adminDb, auth, projectId, options);
+      const caller = await verifyCallerIdentity(req, adminDb, auth, projectId, {
+        ...(options || {}),
+        nowMs: getNowMs(),
+      });
       if (!caller) {
         await logAuditEvent({
           req,
@@ -1193,6 +1219,7 @@ export function createApp(options: ServerAppOptions = {}) {
     hashPassword,
     syncExistingFirebaseAuthPassword,
     requireVerifiedCaller,
+    nowProvider: getNowMs,
   });
 
   registerAttendanceRoutes(app, {
@@ -1303,6 +1330,54 @@ export function createApp(options: ServerAppOptions = {}) {
         userData.isLocked === true;
 
       if (isLocked) {
+        const isCanonicalSA = isCanonicalSuperAdminAccount(userDoc.id, userData);
+        if (isCanonicalSA) {
+          const nowMs = getNowMs();
+          const rawLockedUntilMs =
+            typeof secData?.lockedUntilMs === 'number'
+              ? secData.lockedUntilMs
+              : typeof userData.lockedUntilMs === 'number'
+                ? userData.lockedUntilMs
+                : secData?.lockoutUntil
+                  ? Date.parse(String(secData.lockoutUntil))
+                  : secData?.lockedUntil
+                    ? Date.parse(String(secData.lockedUntil))
+                    : userData.lockoutUntil
+                      ? Date.parse(String(userData.lockoutUntil))
+                      : userData.lockedUntil
+                        ? Date.parse(String(userData.lockedUntil))
+                        : NaN;
+          if (Number.isFinite(rawLockedUntilMs)) {
+            if (nowMs < rawLockedUntilMs) {
+              const remainingSeconds = Math.max(1, Math.ceil((rawLockedUntilMs - nowMs) / 1000));
+              const lockedUntilIso =
+                secData?.lockoutUntil ||
+                secData?.lockedUntil ||
+                userData.lockoutUntil ||
+                userData.lockedUntil ||
+                new Date(rawLockedUntilMs).toISOString();
+              return res.status(401).json({
+                success: false,
+                active: false,
+                locked: true,
+                temporaryLock: true,
+                lockoutUntil: lockedUntilIso,
+                lockedUntil: lockedUntilIso,
+                lockedUntilMs: rawLockedUntilMs,
+                serverNowMs: nowMs,
+                remainingSeconds,
+                error: `Super Admin account is temporarily locked. Try again in ${formatLockoutDurationText(remainingSeconds)}.`,
+              });
+            }
+            return res.status(401).json({
+              success: false,
+              active: false,
+              locked: false,
+              temporaryLock: false,
+              error: 'Temporary lockout has expired. Please sign in again to reactivate your session.',
+            });
+          }
+        }
         return res.status(401).json({
           success: false,
           active: false,
@@ -3359,12 +3434,61 @@ export function createApp(options: ServerAppOptions = {}) {
     res.status(404).json({ success: false, error: 'API endpoint not found.' });
   });
 
+  // Strict JSON error boundary for /api/* (e.g., malformed JSON body parser errors never emit HTML)
+  app.use('/api', (err: any, _req: Request, res: Response, _next: NextFunction) => {
+    if (res.headersSent) return;
+    const status =
+      typeof err?.status === 'number' && err.status >= 400 && err.status < 600
+        ? err.status
+        : typeof err?.statusCode === 'number' && err.statusCode >= 400 && err.statusCode < 600
+          ? err.statusCode
+          : 500;
+    const isSyntaxErr = err instanceof SyntaxError && status === 400;
+    res.status(status).json({
+      success: false,
+      code: isSyntaxErr ? 'INVALID_JSON_BODY' : 'INTERNAL_API_ERROR',
+      error: isSyntaxErr
+        ? 'Invalid JSON request body.'
+        : status >= 500
+          ? 'Internal server error.'
+          : String(err?.message || 'API request failed.'),
+    });
+  });
+
   return { app, db: adminDb, auth, projectId, databaseId, credentialMode };
+}
+
+export function resolveServerPort(argv: string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env): number {
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--port' && argv[i + 1]) {
+      const parsed = Number(argv[i + 1]);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    } else if (argv[i].startsWith('--port=')) {
+      const parsed = Number(argv[i].slice('--port='.length));
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+  }
+  const envPort = Number(env.PORT);
+  if (Number.isFinite(envPort) && envPort > 0) return envPort;
+  return env.NODE_ENV === 'production' ? 8080 : 3000;
+}
+
+export function isApiRequestPath(reqPath: string | undefined): boolean {
+  const clean = String(reqPath || '').split('?')[0];
+  return clean === '/api' || clean.startsWith('/api/');
 }
 
 export async function startServer() {
   const { app, credentialMode, projectId, databaseId } = createApp();
-  const PORT = Number(process.env.PORT) || 8080;
+  const PORT = resolveServerPort();
+
+  // Hard boundary before frontend middleware: /api/* must NEVER fall through to Vite or index.html
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (isApiRequestPath(req.path)) {
+      return res.status(404).json({ success: false, error: 'API endpoint not found.' });
+    }
+    return next();
+  });
 
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
@@ -3372,13 +3496,21 @@ export async function startServer() {
       server: { middlewareMode: true, host: '0.0.0.0', port: PORT },
       appType: 'spa',
     });
-    app.use(vite.middlewares);
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      if (isApiRequestPath(req.path)) {
+        return res.status(404).json({ success: false, error: 'API endpoint not found.' });
+      }
+      return vite.middlewares(req, res, next);
+    });
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
     const distIndex = path.join(distDir, 'index.html');
     if (fs.existsSync(distIndex)) {
       app.use(express.static(distDir));
-      app.get('*', (_req: Request, res: Response) => {
+      app.get('*', (req: Request, res: Response) => {
+        if (isApiRequestPath(req.path)) {
+          return res.status(404).json({ success: false, error: 'API endpoint not found.' });
+        }
         res.sendFile(distIndex);
       });
     } else {

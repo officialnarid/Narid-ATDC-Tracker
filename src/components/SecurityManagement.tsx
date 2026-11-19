@@ -21,6 +21,7 @@ import {
   Activity,
   FileSpreadsheet,
   Download,
+  RotateCcw,
 } from 'lucide-react';
 import {
   AccountSecurityRecord,
@@ -35,6 +36,7 @@ import {
   fetchSecurityAuditLogs,
   unblockLockedAccount,
   generateTemporaryPasswordForAccount,
+  resetSuperAdminLockoutLevel,
 } from '../services/securityService';
 import { UnauthorizedAccess } from './UnauthorizedAccess';
 import { useBulkSelection } from '../hooks/useBulkSelection';
@@ -125,6 +127,14 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
     generatedAt: string;
   } | null>(null);
   const [copiedTempPwd, setCopiedTempPwd] = useState<boolean>(false);
+
+  // Super Admin Progressive Lockout Level Reset Modal State
+  const [resetLevelTarget, setResetLevelTarget] = useState<AccountSecurityRecord | null>(null);
+  const [resetLevelReason, setResetLevelReason] = useState<string>('');
+  const [resetLevelConfirmed, setResetLevelConfirmed] = useState<boolean>(false);
+  const [resetLevelPassword, setResetLevelPassword] = useState<string>('');
+  const [isResettingLevel, setIsResettingLevel] = useState<boolean>(false);
+  const [resetLevelError, setResetLevelError] = useState<string | null>(null);
 
   const attemptsBulk = useBulkSelection<LoginAttemptRecord>({
     items: attemptsList,
@@ -417,6 +427,50 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
     setSubTab('audit_logs');
   };
 
+  const openResetLevelModal = (acc: AccountSecurityRecord) => {
+    setResetLevelTarget(acc);
+    setResetLevelReason('');
+    setResetLevelConfirmed(false);
+    setResetLevelPassword('');
+    setResetLevelError(null);
+  };
+
+  const handleConfirmResetLevel = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!resetLevelTarget) return;
+    setResetLevelError(null);
+
+    if (!resetLevelConfirmed) {
+      setResetLevelError('Please check the confirmation checkbox to authorize resetting the lockout escalation level.');
+      return;
+    }
+    if (resetLevelReason.trim().length < 5) {
+      setResetLevelError('Please provide an audit reason (minimum 5 characters).');
+      return;
+    }
+    if (!resetLevelPassword) {
+      setResetLevelError('Enter your current Super Admin password to complete fresh authentication.');
+      return;
+    }
+
+    setIsResettingLevel(true);
+    try {
+      const res = await resetSuperAdminLockoutLevel({
+        reason: resetLevelReason.trim(),
+        confirmed: true,
+        freshSuperAdminPassword: resetLevelPassword,
+      });
+      setResetLevelPassword('');
+      setBanner({ type: 'success', text: res.message });
+      setResetLevelTarget(null);
+      await loadSecurityData();
+    } catch (err: any) {
+      setResetLevelError(err?.message || 'Failed to reset progressive lockout level.');
+    } finally {
+      setIsResettingLevel(false);
+    }
+  };
+
   // Distinct IP/device history for currently inspected device modal
   const deviceAccountAttempts = useMemo(() => {
     if (!deviceAccount) return [];
@@ -625,6 +679,10 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
                 ) : (
                   accounts.map((acc) => {
                     const isLocked = acc.lockStatus === 'LOCKED';
+                    const isProgressivePolicy = acc.lockPolicyType === 'PROGRESSIVE_TEMPORARY';
+                    const progressiveLevel = Number(acc.progressiveLockLevel || 0);
+                    const totalLockEvents = Number(acc.totalLockoutEvents || 0);
+                    const resetHours = overview?.superAdminLockoutResetHours ?? 24;
                     const latestIp = acc.lastFailedIp && (!acc.lastSuccessAt || (acc.lastFailedAt || '') > acc.lastSuccessAt)
                       ? acc.lastFailedIp
                       : acc.lastSuccessIp || acc.lastFailedIp || 'N/A';
@@ -641,13 +699,21 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
                         className={`hover:bg-slate-50/80 transition ${isLocked ? 'bg-red-50/35' : ''}`}
                       >
                         <td className="py-3 px-4">
-                          <div className="flex items-center gap-2">
+                          <div className="flex flex-wrap items-center gap-1.5">
                             <span className="font-mono font-bold text-slate-900 text-sm">
                               {acc.loginId}
                             </span>
                             <span className="px-1.5 py-0.5 rounded bg-slate-800 text-white text-[10px] font-bold uppercase">
                               {acc.role}
                             </span>
+                            {isProgressivePolicy && (
+                              <span
+                                className="px-1.5 py-0.5 rounded bg-blue-50 border border-blue-200 text-blue-800 text-[10px] font-bold uppercase"
+                                title={`Progressive temporary lockout: 10m -> 20m -> 30m -> 60m. Auto-resets after ${resetHours}h clean usage.`}
+                              >
+                                Progressive Temp
+                              </span>
+                            )}
                             {acc.forcePasswordChange && (
                               <span
                                 className="px-1.5 py-0.5 rounded bg-amber-100 border border-amber-300 text-amber-900 text-[10px] font-bold uppercase"
@@ -666,21 +732,48 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
                         <td className="py-3 px-4">
                           {isLocked ? (
                             <div>
-                              <span className="inline-flex items-center gap-1 px-2 py-1 rounded bg-red-600 text-white font-bold text-[10px] uppercase tracking-wider">
-                                <Lock className="w-3 h-3" />
-                                LOCKED
+                              <span
+                                className={`inline-flex items-center gap-1 px-2 py-1 rounded font-bold text-[10px] uppercase tracking-wider ${
+                                  isProgressivePolicy
+                                    ? 'bg-amber-600 text-white'
+                                    : 'bg-red-600 text-white'
+                                }`}
+                              >
+                                {isProgressivePolicy ? <Clock className="w-3 h-3" /> : <Lock className="w-3 h-3" />}
+                                {isProgressivePolicy
+                                  ? `TEMP LOCKED (${acc.lockDurationMinutes || 10}m)`
+                                  : 'LOCKED'}
                               </span>
-                              {acc.lockedAt && (
-                                <div className="text-[10px] text-red-700 font-mono mt-1">
-                                  {formatDateTime(acc.lockedAt)}
+                              {isProgressivePolicy && acc.lockedUntil ? (
+                                <div className="text-[10px] text-amber-800 font-mono mt-1">
+                                  Until {formatDateTime(acc.lockedUntil)}
                                 </div>
+                              ) : (
+                                acc.lockedAt && (
+                                  <div className="text-[10px] text-red-700 font-mono mt-1">
+                                    {formatDateTime(acc.lockedAt)}
+                                  </div>
+                                )
                               )}
                             </div>
                           ) : (
-                            <span className="inline-flex items-center gap-1 px-2 py-1 rounded bg-emerald-100 text-emerald-800 border border-emerald-200 font-bold text-[10px] uppercase tracking-wider">
-                              <ShieldCheck className="w-3 h-3" />
-                              ACTIVE
-                            </span>
+                            <div>
+                              <span className="inline-flex items-center gap-1 px-2 py-1 rounded bg-emerald-100 text-emerald-800 border border-emerald-200 font-bold text-[10px] uppercase tracking-wider">
+                                <ShieldCheck className="w-3 h-3" />
+                                ACTIVE
+                              </span>
+                              {isProgressivePolicy && (
+                                <div className="text-[10px] font-mono text-slate-600 mt-1">
+                                  Escalation:{' '}
+                                  <span className={progressiveLevel > 0 ? 'font-bold text-amber-700' : 'text-emerald-700 font-semibold'}>
+                                    L{progressiveLevel}/4
+                                  </span>
+                                  {totalLockEvents > 0 && (
+                                    <span className="text-slate-400"> &bull; {totalLockEvents} hist</span>
+                                  )}
+                                </div>
+                              )}
+                            </div>
                           )}
                         </td>
 
@@ -692,6 +785,11 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
                             Success: <span className="text-emerald-700 font-semibold">{acc.totalSuccessfulLogins}</span> &bull; Failed:{' '}
                             <span className="text-red-700 font-semibold">{acc.totalFailedLogins}</span>
                           </div>
+                          {isProgressivePolicy && progressiveLevel > 0 && (
+                            <div className="text-[10px] text-slate-500 mt-0.5">
+                              Clean window: {resetHours}h auto-reset
+                            </div>
+                          )}
                         </td>
 
                         <td className="py-3 px-4 text-[11px] space-y-1 font-mono tabular-nums">
@@ -744,6 +842,23 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
                               <Globe className="w-3 h-3" />
                               <span>IP / Device</span>
                             </button>
+
+                            {isProgressivePolicy && (
+                              <button
+                                type="button"
+                                onClick={() => openResetLevelModal(acc)}
+                                disabled={progressiveLevel === 0}
+                                title="Reset Super Admin progressive lockout escalation level (retains lockout history)"
+                                className={`px-2 py-1 rounded font-bold text-[11px] flex items-center gap-1 cursor-pointer ${
+                                  progressiveLevel > 0
+                                    ? 'bg-blue-600 hover:bg-blue-700 text-white'
+                                    : 'bg-slate-100 text-slate-400 border border-slate-200 cursor-not-allowed'
+                                }`}
+                              >
+                                <RotateCcw className="w-3 h-3" />
+                                <span>Reset Level</span>
+                              </button>
+                            )}
 
                             <button
                               type="button"
@@ -1554,6 +1669,116 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
                 </div>
               </form>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: RESET SUPER ADMIN PROGRESSIVE LOCKOUT LEVEL */}
+      {resetLevelTarget && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 w-full max-w-lg overflow-hidden">
+            <div className="px-5 py-4 bg-slate-900 text-white flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <RotateCcw className="w-4 h-4 text-blue-400" />
+                <h3 className="text-sm font-bold tracking-wide uppercase">
+                  Reset Super Admin Progressive Lockout Level
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setResetLevelTarget(null)}
+                className="text-slate-400 hover:text-white cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleConfirmResetLevel} className="p-5 space-y-4 text-xs">
+              <div className="p-3 rounded-xl bg-blue-50 border border-blue-200 space-y-1 text-blue-950">
+                <div>
+                  <span className="text-blue-700">Target Account:</span>{' '}
+                  <strong className="font-mono">{resetLevelTarget.loginId}</strong> ({resetLevelTarget.role})
+                </div>
+                <div>
+                  <span className="text-blue-700">Current Escalation Level:</span>{' '}
+                  <strong className="font-mono">Level {resetLevelTarget.progressiveLockLevel || 0} / 4</strong>{' '}
+                  (Historical Lockouts: <strong>{resetLevelTarget.totalLockoutEvents || 0}</strong>)
+                </div>
+                <p className="text-[11px] text-blue-800 pt-1">
+                  Resets the progressive escalation level back to 0 (next 3-strike lock starts at 10 minutes) while preserving full lockout audit history.
+                </p>
+              </div>
+
+              <div>
+                <label className="block font-bold text-slate-700 mb-1">
+                  Fresh Super Admin Authentication (Your Current Password)
+                </label>
+                <input
+                  type="password"
+                  required
+                  value={resetLevelPassword}
+                  onChange={(e) => setResetLevelPassword(e.target.value)}
+                  placeholder="Re-enter Super Admin password to authorize"
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+
+              <div>
+                <label className="block font-bold text-slate-700 mb-1">
+                  Governance Reason (Mandatory Audit Note)
+                </label>
+                <input
+                  type="text"
+                  required
+                  minLength={5}
+                  value={resetLevelReason}
+                  onChange={(e) => setResetLevelReason(e.target.value)}
+                  placeholder="e.g., Security incident reviewed and resolved"
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+
+              <label className="flex items-start gap-2 cursor-pointer text-slate-700 font-medium">
+                <input
+                  type="checkbox"
+                  checked={resetLevelConfirmed}
+                  onChange={(e) => setResetLevelConfirmed(e.target.checked)}
+                  className="mt-0.5 rounded text-blue-600 focus:ring-blue-500 w-4 h-4"
+                />
+                <span>
+                  I confirm this approved security action to reset the canonical Super Admin progressive lockout level to 0.
+                </span>
+              </label>
+
+              {resetLevelError && (
+                <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-red-700 font-semibold">
+                  {resetLevelError}
+                </div>
+              )}
+
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setResetLevelTarget(null)}
+                  className="px-3.5 py-2 rounded-lg border border-slate-300 text-slate-700 font-semibold cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={
+                    isResettingLevel ||
+                    !resetLevelConfirmed ||
+                    !resetLevelPassword ||
+                    resetLevelReason.trim().length < 5
+                  }
+                  className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>{isResettingLevel ? 'Resetting...' : 'Reset Lockout Level'}</span>
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

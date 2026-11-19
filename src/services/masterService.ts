@@ -39,6 +39,7 @@ export const DEFAULT_SETTINGS: SystemSetting = {
   protectCriticalLogs: true,
   captureGeoLocation: true,
   failedLoginAlertThreshold: 5,
+  superAdminLockoutResetHours: 24,
 };
 
 export const DEFAULT_SHIFTS: Shift[] = [

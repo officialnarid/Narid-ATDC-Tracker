@@ -118,6 +118,24 @@ export interface UserAgentMeta {
   raw: string;
 }
 
+export const CANONICAL_SUPER_ADMIN_UID = 'oX2vdSx5jGcoUDxyA0SIYN3SEig2';
+
+export function isCanonicalSuperAdminAccount(
+  docId?: string | null,
+  data?: Record<string, any> | null
+): boolean {
+  const roleNorm = normalizeRoleValue(data?.role);
+  if (roleNorm !== 'super_admin') return false;
+  const cleanLogin = String(data?.loginId || '').trim().toLowerCase();
+  const cleanDocId = String(docId || '').trim().toLowerCase();
+  const cleanUid = String(data?.authUid || data?.uid || '').trim();
+  return (
+    cleanLogin === 'superadmin' ||
+    cleanDocId === 'role_superadmin' ||
+    cleanUid === CANONICAL_SUPER_ADMIN_UID
+  );
+}
+
 // Critical security / deletion / auth-integrity actions that must NEVER be deleted via log cleanup
 export const CRITICAL_PROTECTED_ACTIONS = new Set([
   'account_deleted',
@@ -128,6 +146,10 @@ export const CRITICAL_PROTECTED_ACTIONS = new Set([
   'unauthorized_access_attempt',
   'unauthorized_password_reset_attempt',
   'unauthorized_self_password_change',
+  'super_admin_progressive_lockout',
+  'super_admin_lockout_expired',
+  'login_success_after_lockout',
+  'super_admin_lockout_level_reset',
   'login_locked_rate_limit',
   'audit_controlled_deleted',
 ]);
@@ -174,6 +196,7 @@ export async function syncUserUidIndex(
     status?: string;
     loginId?: string;
     lockStatus?: string;
+    lockedUntilMs?: number | null;
   }
 ): Promise<void> {
   const uid = String(params.uid || '').trim();
@@ -181,21 +204,24 @@ export async function syncUserUidIndex(
     return;
   }
   const now = new Date().toISOString();
+  const payload: Record<string, any> = {
+    uid,
+    roleDocId: params.roleDocId,
+    role: normalizeRoleValue(params.role),
+    status: params.status || 'Active',
+    lockStatus: params.lockStatus || 'ACTIVE',
+    loginId: String(params.loginId || '').trim().toLowerCase(),
+    updatedAt: now,
+  };
+  if (params.lockedUntilMs !== undefined) {
+    payload.lockedUntilMs = params.lockedUntilMs;
+  } else if (payload.lockStatus !== 'LOCKED') {
+    payload.lockedUntilMs = null;
+  }
   await db
     .collection('user_uid_index')
     .doc(uid)
-    .set(
-      {
-        uid,
-        roleDocId: params.roleDocId,
-        role: normalizeRoleValue(params.role),
-        status: params.status || 'Active',
-        lockStatus: params.lockStatus || 'ACTIVE',
-        loginId: String(params.loginId || '').trim().toLowerCase(),
-        updatedAt: now,
-      },
-      { merge: true }
-    );
+    .set(payload, { merge: true });
 }
 
 export async function removeUserUidIndex(db: AdminFirestoreLike, uid?: string | null): Promise<void> {
@@ -217,7 +243,7 @@ export async function verifyCallerIdentity(
   db: AdminFirestoreLike,
   auth: AdminAuthLike | null,
   _projectId?: string,
-  options?: { prefetchUserPermission?: boolean }
+  options?: { prefetchUserPermission?: boolean; nowMs?: number }
 ): Promise<VerifiedCaller | null> {
   const authHeader = req.headers.authorization || '';
   if (!authHeader.startsWith('Bearer ')) {
@@ -374,7 +400,39 @@ export async function verifyCallerIdentity(
     throw err;
   }
 
-  if (matchedDoc.data.lockStatus === 'LOCKED' || matchedDoc.data.isLocked === true) {
+  const currentNowMs = typeof options?.nowMs === 'number' ? options.nowMs : Date.now();
+  const isLocked = matchedDoc.data.lockStatus === 'LOCKED' || matchedDoc.data.isLocked === true;
+  if (isLocked) {
+    const isCanonicalSuper = isCanonicalSuperAdminAccount(matchedDoc.id, matchedDoc.data);
+    const parsedIsoUntil =
+      matchedDoc.data.lockoutUntil
+        ? Date.parse(String(matchedDoc.data.lockoutUntil))
+        : matchedDoc.data.lockedUntil
+          ? Date.parse(String(matchedDoc.data.lockedUntil))
+          : NaN;
+    const lockedUntilMs =
+      (typeof matchedDoc.data.lockedUntilMs === 'number' && matchedDoc.data.lockedUntilMs > 0
+        ? matchedDoc.data.lockedUntilMs
+        : Number.isFinite(parsedIsoUntil) && parsedIsoUntil > 0
+          ? parsedIsoUntil
+          : null);
+    if (isCanonicalSuper && lockedUntilMs) {
+      if (currentNowMs < lockedUntilMs) {
+        const remainingSec = Math.max(1, Math.ceil((lockedUntilMs - currentNowMs) / 1000));
+        const mins = Math.floor(remainingSec / 60);
+        const secs = remainingSec % 60;
+        const waitText = mins > 0 ? `${mins}m ${String(secs).padStart(2, '0')}s` : `${secs}s`;
+        const err: any = new Error(
+          `Super Admin account is temporarily locked. Try again in ${waitText}.`
+        );
+        err.statusCode = 403;
+        throw err;
+      }
+      // Lockout window elapsed, but pre-lockout session must still re-authenticate cleanly via /api/auth/login
+      const err: any = new Error('Temporary lockout has expired. Please sign in again to reactivate your session.');
+      err.statusCode = 401;
+      throw err;
+    }
     const err: any = new Error('Your account has been temporarily blocked. Please contact Super Admin.');
     err.statusCode = 403;
     throw err;
