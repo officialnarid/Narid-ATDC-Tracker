@@ -32,10 +32,11 @@ import {
 } from '../services/attendanceService';
 import { exportTableToExcel } from '../services/exportService';
 import {
-  classifyCompletedDutyStatus,
+  evaluateOptionAPunchOut,
   formatDurationClock,
   getAttendanceStatusBadgeClasses,
   resolveAttendanceMetrics,
+  resolveShiftScheduleBounds,
   STANDARD_DUTY_MINUTES,
 } from '../utils/attendanceStatus';
 import { TableSkeletonRows } from './Skeletons';
@@ -250,13 +251,19 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
         shift: r.shiftNameSnapshot,
         shiftDate: r.shiftDate,
         state: m.state,
+        scheduledShiftStart: m.scheduledStartDisplay,
         punchIn: formatTimeDisplay(r.firstPunchIn || r.punchIn),
+        earlyArrival: m.earlyArrivalMinutes > 0 ? formatDurationClock(m.earlyArrivalMinutes) : '00:00',
         punchOut: m.isOpen ? 'In Progress' : formatTimeDisplay(r.lastPunchOut || r.actualPunchOut || r.effectivePunchOut),
         punchOutType: r.punchOutType,
         dutyHours: m.isOpen
           ? `00:00 Hours (In Progress: ${formatDurationClock(m.accumulatedDutyMinutes)})`
           : formatMinutes(m.completedDutyMinutes),
-        otHours: m.overtimeMinutes > 0 ? `${formatDurationClock(m.overtimeMinutes)} OT` : '00:00',
+        earlyOt: m.isOpen
+          ? (m.provisionalEarlyOtMinutes > 0 ? `${formatDurationClock(m.provisionalEarlyOtMinutes)} (Provisional)` : '00:00')
+          : formatDurationClock(m.earlyOtMinutes),
+        postShiftOt: m.isOpen ? '00:00' : formatDurationClock(m.postShiftOtMinutes),
+        otHours: !m.isOpen && m.overtimeMinutes > 0 ? `${formatDurationClock(m.overtimeMinutes)} OT` : '00:00',
         status: m.status,
       };
     });
@@ -271,11 +278,15 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
     { header: 'Shift', key: 'shift' },
     { header: 'Shift Date', key: 'shiftDate' },
     { header: 'State', key: 'state' },
-    { header: 'First In', key: 'punchIn' },
+    { header: 'Scheduled Shift Start', key: 'scheduledShiftStart' },
+    { header: 'Actual Punch In', key: 'punchIn' },
+    { header: 'Early Arrival Duration', key: 'earlyArrival' },
     { header: 'Last Out', key: 'punchOut' },
     { header: 'Punch Out Type', key: 'punchOutType' },
     { header: 'Completed Duty', key: 'dutyHours' },
-    { header: 'OT Hours', key: 'otHours' },
+    { header: 'Early OT', key: 'earlyOt' },
+    { header: 'Post-shift OT', key: 'postShiftOt' },
+    { header: 'Total OT', key: 'otHours' },
     { header: 'Attendance Status', key: 'status' },
   ];
 
@@ -547,23 +558,27 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
                 <th className="py-3 px-3.5">Emp ID</th>
                 <th className="py-3 px-3.5">Name</th>
                 <th className="py-3 px-3.5">Line / Dept</th>
-                <th className="py-3 px-3.5">Shift & Date</th>
+                <th className="py-3 px-3.5">Shift &amp; Date</th>
                 <th className="py-3 px-3.5">State</th>
-                <th className="py-3 px-3.5">First In</th>
+                <th className="py-3 px-3.5">Scheduled Start</th>
+                <th className="py-3 px-3.5">Actual Punch In</th>
+                <th className="py-3 px-3.5">Early Arrival</th>
                 <th className="py-3 px-3.5">Last Out</th>
                 <th className="py-3 px-3.5">Punches</th>
                 <th className="py-3 px-3.5">Regular Duty</th>
-                <th className="py-3 px-3.5">OT Hours</th>
+                <th className="py-3 px-3.5">Early OT</th>
+                <th className="py-3 px-3.5">Post-shift OT</th>
+                <th className="py-3 px-3.5">Total OT</th>
                 <th className="py-3 px-3.5">Status</th>
                 <th className="py-3 px-3.5 text-right">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {loading && records.length === 0 ? (
-                <TableSkeletonRows rows={8} cols={13} />
+                <TableSkeletonRows rows={8} cols={17} />
               ) : filteredRecords.length === 0 ? (
                 <tr>
-                  <td colSpan={13} className="py-8 text-center text-slate-400">
+                  <td colSpan={17} className="py-8 text-center text-slate-400">
                     No attendance records found for the selected filters.
                   </td>
                 </tr>
@@ -604,10 +619,22 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
                           {state}
                         </span>
                       </td>
-                      <td className="py-3 px-3.5 font-mono text-emerald-700 font-semibold">
+                      <td className="py-3 px-3.5 font-mono text-slate-700 whitespace-nowrap">
+                        {metrics.scheduledStartDisplay}
+                      </td>
+                      <td className="py-3 px-3.5 font-mono text-emerald-700 font-semibold whitespace-nowrap">
                         {formatTimeDisplay(rec.firstPunchIn || rec.punchIn)}
                       </td>
-                      <td className="py-3 px-3.5 font-mono font-semibold">
+                      <td className="py-3 px-3.5 font-mono whitespace-nowrap">
+                        {metrics.earlyArrivalMinutes > 0 ? (
+                          <span className="text-sky-700 font-semibold">
+                            {formatDurationClock(metrics.earlyArrivalMinutes)}
+                          </span>
+                        ) : (
+                          <span className="text-slate-400">00:00</span>
+                        )}
+                      </td>
+                      <td className="py-3 px-3.5 font-mono font-semibold whitespace-nowrap">
                         {!metrics.isOpen && (rec.lastPunchOut || rec.actualPunchOut) ? (
                           <span className="text-blue-700">{formatTimeDisplay(rec.lastPunchOut || rec.actualPunchOut)}</span>
                         ) : !metrics.isOpen && rec.punchOutType === 'AUTO' ? (
@@ -626,7 +653,7 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
                           <span>{punchCount} Event{punchCount !== 1 ? 's' : ''}</span>
                         </button>
                       </td>
-                      <td className="py-3 px-3.5 font-mono">
+                      <td className="py-3 px-3.5 font-mono whitespace-nowrap">
                         {metrics.isOpen ? (
                           <div>
                             <span className="font-bold text-slate-400 block">00:00 Hours</span>
@@ -647,8 +674,34 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
                           </div>
                         )}
                       </td>
-                      <td className="py-3 px-3.5 font-mono font-bold">
-                        {metrics.overtimeMinutes > 0 ? (
+                      <td className="py-3 px-3.5 font-mono whitespace-nowrap">
+                        {metrics.isOpen ? (
+                          metrics.provisionalEarlyOtMinutes > 0 ? (
+                            <span className="text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded text-[10px] font-semibold">
+                              {formatDurationClock(metrics.provisionalEarlyOtMinutes)} (Provisional)
+                            </span>
+                          ) : (
+                            <span className="text-slate-400">00:00</span>
+                          )
+                        ) : metrics.earlyOtMinutes > 0 ? (
+                          <span className="text-emerald-700 font-bold">
+                            {formatDurationClock(metrics.earlyOtMinutes)}
+                          </span>
+                        ) : (
+                          <span className="text-slate-400">00:00</span>
+                        )}
+                      </td>
+                      <td className="py-3 px-3.5 font-mono whitespace-nowrap">
+                        {!metrics.isOpen && metrics.postShiftOtMinutes > 0 ? (
+                          <span className="text-indigo-700 font-bold">
+                            {formatDurationClock(metrics.postShiftOtMinutes)}
+                          </span>
+                        ) : (
+                          <span className="text-slate-400">00:00</span>
+                        )}
+                      </td>
+                      <td className="py-3 px-3.5 font-mono font-bold whitespace-nowrap">
+                        {!metrics.isOpen && metrics.overtimeMinutes > 0 ? (
                           <span className="text-indigo-700 bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 rounded">
                             {metrics.otLabel}
                           </span>
@@ -788,12 +841,16 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
                         ? getNextDateKey(correctingRecord.shiftDate)
                         : correctingRecord.shiftDate;
                       const previewOutIso = `${targetDate}T${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:00+05:30`;
-                      const inMs = new Date(correctingRecord.firstPunchIn || correctingRecord.punchIn).getTime();
-                      const outMs = new Date(previewOutIso).getTime();
-                      if (!Number.isNaN(inMs) && !Number.isNaN(outMs) && outMs >= inMs) {
-                        const mins = Math.floor((outMs - inMs) / 60000);
-                        setCorrectionStatus(classifyCompletedDutyStatus(mins, STANDARD_DUTY_MINUTES));
-                      }
+                      const firstInIso = correctingRecord.firstPunchIn || correctingRecord.punchIn;
+                      const bounds = resolveShiftScheduleBounds(correctingRecord.shiftDate, correctingRecord);
+                      const evalPreview = evaluateOptionAPunchOut({
+                        firstInIso,
+                        lastOutIso: previewOutIso,
+                        scheduledStartIso: correctingRecord.scheduledPunchInIso || bounds.scheduledStartIso,
+                        scheduledEndIso: correctingRecord.scheduledPunchOutIso || bounds.scheduledEndIso,
+                        standardDutyMinutes: STANDARD_DUTY_MINUTES,
+                      });
+                      setCorrectionStatus(evalPreview.attendanceStatus);
                     }
                   }}
                   className="w-full border border-slate-300 rounded px-2.5 py-1.5 font-mono"
@@ -893,11 +950,23 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
             {(() => {
               const modalMetrics = resolveAttendanceMetrics(viewingPunchesRecord, nowMs);
               return (
-                <div className="mt-4 bg-slate-50 border border-slate-200 rounded-xl p-3.5 grid grid-cols-2 sm:grid-cols-5 gap-3 text-xs">
+                <div className="mt-4 bg-slate-50 border border-slate-200 rounded-xl p-3.5 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
                   <div>
-                    <span className="text-[10px] text-slate-400 font-semibold uppercase block">Official First In</span>
+                    <span className="text-[10px] text-slate-400 font-semibold uppercase block">Scheduled Shift Start</span>
+                    <span className="font-mono font-bold text-slate-700">
+                      {modalMetrics.scheduledStartDisplay}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-slate-400 font-semibold uppercase block">Actual Punch In</span>
                     <span className="font-mono font-bold text-emerald-700">
                       {formatTimeDisplay(viewingPunchesRecord.firstPunchIn || viewingPunchesRecord.punchIn)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-slate-400 font-semibold uppercase block">Early Arrival Duration</span>
+                    <span className="font-mono font-bold text-sky-700">
+                      {formatDurationClock(modalMetrics.earlyArrivalMinutes)}
                     </span>
                   </div>
                   <div>
@@ -909,19 +978,25 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
                     </span>
                   </div>
                   <div>
-                    <span className="text-[10px] text-slate-400 font-semibold uppercase block">
-                      {modalMetrics.isOpen ? 'Accumulated (Open)' : 'Completed Duty'}
-                    </span>
-                    <span className="font-mono font-bold text-slate-800">
+                    <span className="text-[10px] text-slate-400 font-semibold uppercase block">Early OT</span>
+                    <span className="font-mono font-bold text-emerald-700">
                       {modalMetrics.isOpen
-                        ? `${formatDurationClock(modalMetrics.accumulatedDutyMinutes)} Hours`
-                        : `${formatDurationClock(modalMetrics.completedDutyMinutes)} Hours`}
+                        ? (modalMetrics.provisionalEarlyOtMinutes > 0
+                            ? `${formatDurationClock(modalMetrics.provisionalEarlyOtMinutes)} (Provisional)`
+                            : '00:00')
+                        : formatDurationClock(modalMetrics.earlyOtMinutes)}
                     </span>
                   </div>
                   <div>
-                    <span className="text-[10px] text-slate-400 font-semibold uppercase block">Overtime (OT)</span>
+                    <span className="text-[10px] text-slate-400 font-semibold uppercase block">Post-shift OT</span>
                     <span className="font-mono font-bold text-indigo-700">
-                      {modalMetrics.overtimeMinutes > 0 ? modalMetrics.otLabel : '00:00'}
+                      {modalMetrics.isOpen ? '00:00' : formatDurationClock(modalMetrics.postShiftOtMinutes)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-slate-400 font-semibold uppercase block">Total OT</span>
+                    <span className="font-mono font-bold text-indigo-700">
+                      {!modalMetrics.isOpen && modalMetrics.overtimeMinutes > 0 ? modalMetrics.otLabel : '00:00'}
                     </span>
                   </div>
                   <div>

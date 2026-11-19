@@ -161,7 +161,7 @@ export const Reports: React.FC<ReportsProps> = ({
     { id: 'employee_wise', name: '8. Employee-wise Attendance', desc: 'Individual monthly duty card and punch records' },
     { id: 'late_arrival', name: '9. Late Arrival Report', desc: 'Employees marked late past grace window' },
     { id: 'missed_punch_out', name: '10. Missed Punch Out Report', desc: 'Auto-closed attendance records' },
-    { id: 'overtime', name: '11. Overtime (OT) Report', desc: 'Employees who completed beyond 8h30m duty' },
+    { id: 'overtime', name: '11. Overtime (OT) Report', desc: 'Finalized Early OT (≥60m), Post-shift OT & Total OT breakdown' },
     { id: 'absent_manpower', name: '12. Absent Manpower Report', desc: 'Scheduled employees with no punches' },
   ] as const;
 
@@ -184,12 +184,16 @@ export const Reports: React.FC<ReportsProps> = ({
           { header: 'Department', key: 'dept' },
           { header: 'Shift', key: 'shift' },
           { header: 'State', key: 'state' },
-          { header: 'First In', key: 'inTime' },
+          { header: 'Scheduled Shift Start', key: 'scheduledStart' },
+          { header: 'Actual Punch In', key: 'inTime' },
+          { header: 'Early Arrival Duration', key: 'earlyArrival' },
           { header: 'Last Out', key: 'outTime' },
           { header: 'Punches', key: 'punches' },
           { header: 'Out Type', key: 'outType' },
           { header: 'Duty Hours', key: 'duty' },
-          { header: 'OT Hours', key: 'ot' },
+          { header: 'Early OT', key: 'earlyOt' },
+          { header: 'Post-shift OT', key: 'postShiftOt' },
+          { header: 'Total OT', key: 'ot' },
           { header: 'Status', key: 'status' },
         ];
         rows = attendanceRecords.map(a => {
@@ -202,14 +206,20 @@ export const Reports: React.FC<ReportsProps> = ({
             dept: a.departmentIdSnapshot,
             shift: a.shiftNameSnapshot,
             state: m.state,
+            scheduledStart: m.scheduledStartDisplay,
             inTime: formatTimeDisplay(a.firstPunchIn || a.punchIn),
+            earlyArrival: formatDurationClock(m.earlyArrivalMinutes),
             outTime: m.isOpen ? 'In Progress' : formatTimeDisplay(a.lastPunchOut || a.actualPunchOut || a.effectivePunchOut),
             punches: a.punches?.length || (a.actualPunchOut ? 2 : 1),
             outType: a.punchOutType,
             duty: m.isOpen
               ? `00:00 Hours (Elapsed: ${formatDurationClock(m.accumulatedDutyMinutes)})`
               : `${formatDurationClock(m.completedDutyMinutes)} Hours`,
-            ot: m.overtimeMinutes > 0 ? m.otLabel : '00:00',
+            earlyOt: m.isOpen
+              ? (m.provisionalEarlyOtMinutes > 0 ? `${formatDurationClock(m.provisionalEarlyOtMinutes)} (Provisional)` : '00:00')
+              : formatDurationClock(m.earlyOtMinutes),
+            postShiftOt: m.isOpen ? '00:00' : formatDurationClock(m.postShiftOtMinutes),
+            ot: !m.isOpen && m.overtimeMinutes > 0 ? m.otLabel : '00:00',
             status: m.status,
           };
         });
@@ -338,22 +348,35 @@ export const Reports: React.FC<ReportsProps> = ({
           { header: 'Employee ID', key: 'employeeId' },
           { header: 'Name', key: 'name' },
           { header: 'Line / Dept', key: 'floorDept' },
-          { header: 'Punch In', key: 'inTime' },
+          { header: 'Shift', key: 'shift' },
+          { header: 'Scheduled Shift Start', key: 'scheduledStart' },
+          { header: 'Actual Punch In', key: 'inTime' },
           { header: 'Punch Out', key: 'outTime' },
+          { header: 'Early Arrival Duration', key: 'earlyArrival' },
           { header: 'Regular Duty', key: 'duty' },
-          { header: 'OT Duration', key: 'ot' },
+          { header: 'Early OT', key: 'earlyOt' },
+          { header: 'Post-shift OT', key: 'postShiftOt' },
+          { header: 'Total OT', key: 'ot' },
         ];
         rows = attendanceRecords
-          .filter(a => resolveAttendanceMetrics(a).overtimeMinutes > 0)
+          .filter(a => {
+            const m = resolveAttendanceMetrics(a);
+            return !m.isOpen && m.overtimeMinutes > 0;
+          })
           .map(a => {
             const m = resolveAttendanceMetrics(a);
             return {
               employeeId: a.employeeId,
               name: a.employeeNameSnapshot,
               floorDept: `${a.floorIdSnapshot} • ${a.departmentIdSnapshot}`,
+              shift: a.shiftNameSnapshot,
+              scheduledStart: m.scheduledStartDisplay,
               inTime: formatTimeDisplay(a.firstPunchIn || a.punchIn),
               outTime: formatTimeDisplay(a.lastPunchOut || a.actualPunchOut),
+              earlyArrival: formatDurationClock(m.earlyArrivalMinutes),
               duty: formatMinutes(m.regularDutyMinutes),
+              earlyOt: formatDurationClock(m.earlyOtMinutes),
+              postShiftOt: formatDurationClock(m.postShiftOtMinutes),
               ot: m.otLabel,
             };
           });
@@ -384,13 +407,19 @@ export const Reports: React.FC<ReportsProps> = ({
         break;
 
       default:
-        // Generic fallback
+        // Monthly / Shift-wise / Employee-wise breakdown
         cols = [
           { header: 'Employee ID', key: 'employeeId' },
           { header: 'Name', key: 'name' },
           { header: 'Date', key: 'date' },
+          { header: 'Shift', key: 'shift' },
+          { header: 'Scheduled Shift Start', key: 'scheduledStart' },
+          { header: 'Actual Punch In', key: 'inTime' },
+          { header: 'Early Arrival Duration', key: 'earlyArrival' },
           { header: 'Duty', key: 'duty' },
-          { header: 'OT', key: 'ot' },
+          { header: 'Early OT', key: 'earlyOt' },
+          { header: 'Post-shift OT', key: 'postShiftOt' },
+          { header: 'Total OT', key: 'ot' },
         ];
         rows = attendanceRecords.map(a => {
           const m = resolveAttendanceMetrics(a);
@@ -398,8 +427,16 @@ export const Reports: React.FC<ReportsProps> = ({
             employeeId: a.employeeId,
             name: a.employeeNameSnapshot,
             date: a.shiftDate,
+            shift: a.shiftNameSnapshot,
+            scheduledStart: m.scheduledStartDisplay,
+            inTime: formatTimeDisplay(a.firstPunchIn || a.punchIn),
+            earlyArrival: formatDurationClock(m.earlyArrivalMinutes),
             duty: m.isOpen ? '00:00 Hours' : `${formatDurationClock(m.completedDutyMinutes)} Hours`,
-            ot: m.overtimeMinutes > 0 ? m.otLabel : '00:00',
+            earlyOt: m.isOpen
+              ? (m.provisionalEarlyOtMinutes > 0 ? `${formatDurationClock(m.provisionalEarlyOtMinutes)} (Provisional)` : '00:00')
+              : formatDurationClock(m.earlyOtMinutes),
+            postShiftOt: m.isOpen ? '00:00' : formatDurationClock(m.postShiftOtMinutes),
+            ot: !m.isOpen && m.overtimeMinutes > 0 ? m.otLabel : '00:00',
           };
         });
     }

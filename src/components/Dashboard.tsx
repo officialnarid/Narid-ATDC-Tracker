@@ -32,7 +32,7 @@ import {
 } from '../types';
 import { collection, doc, getDocs, onSnapshot, query, where } from 'firebase/firestore';
 import { db, auth } from '../firebase';
-import { formatDateKey, formatMinutes } from '../services/attendanceService';
+import { formatDateKey, formatMinutes, formatTimeDisplay } from '../services/attendanceService';
 import { isModuleAllowedForUser } from '../services/authService';
 import {
   formatDurationClock,
@@ -1120,7 +1120,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
       {/* DRILLDOWN MODAL */}
       {drilldownTitle && (
         <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-xl max-w-4xl w-full max-h-[85vh] flex flex-col shadow-2xl border border-slate-200">
+          <div className="bg-white rounded-xl max-w-6xl w-full max-h-[85vh] flex flex-col shadow-2xl border border-slate-200">
             <div className="p-4 border-b border-slate-200 flex items-center justify-between">
               <div>
                 <h3 className="text-base font-bold text-slate-900">{drilldownTitle}</h3>
@@ -1134,23 +1134,30 @@ export const Dashboard: React.FC<DashboardProps> = ({
               </button>
             </div>
 
-            <div className="p-4 flex-1 overflow-y-auto">
+            <div className="p-4 flex-1 overflow-y-auto overflow-x-auto">
               <table className="w-full text-left text-xs">
                 <thead className="bg-slate-50 text-slate-600 uppercase font-semibold border-y border-slate-200">
                   <tr>
                     <th className="py-2 px-3">Emp ID</th>
                     <th className="py-2 px-3">Name</th>
-                    <th className="py-2 px-3">Line / Sec</th>
-                    <th className="py-2 px-3">Department</th>
-                    <th className="py-2 px-3">Type</th>
+                    <th className="py-2 px-3">Line / Dept</th>
+                    <th className="py-2 px-3">Scheduled Start</th>
+                    <th className="py-2 px-3">Actual Punch In</th>
+                    <th className="py-2 px-3">Early Arrival</th>
                     <th className="py-2 px-3">Status</th>
+                    {canShowOtHours && (
+                      <>
+                        <th className="py-2 px-3 text-right">Early OT</th>
+                        <th className="py-2 px-3 text-right">Post-shift OT</th>
+                      </>
+                    )}
                     <th className="py-2 px-3 text-right">
                       {canShowDutyHours && canShowOtHours
-                        ? 'Duty / OT'
+                        ? 'Duty / Total OT'
                         : canShowDutyHours
                           ? 'Duty'
                           : canShowOtHours
-                            ? 'OT'
+                            ? 'Total OT'
                             : 'Attendance'}
                     </th>
                   </tr>
@@ -1162,15 +1169,62 @@ export const Dashboard: React.FC<DashboardProps> = ({
                       <tr key={employee.employeeId} className="hover:bg-slate-50">
                         <td className="py-2 px-3 font-mono font-bold text-slate-800">{employee.employeeId}</td>
                         <td className="py-2 px-3 font-medium text-slate-900">{employee.employeeName}</td>
-                        <td className="py-2 px-3 text-slate-600">{employee.floor} • {employee.section}</td>
-                        <td className="py-2 px-3 text-slate-600">{employee.department}</td>
-                        <td className="py-2 px-3 text-slate-600">{employee.employeeType}</td>
+                        <td className="py-2 px-3 text-slate-600">{employee.floor} • {employee.department}</td>
+                        <td className="py-2 px-3 font-mono text-slate-600 whitespace-nowrap">
+                          {attendance && resolved ? resolved.scheduledStartDisplay : '--'}
+                        </td>
+                        <td className="py-2 px-3 font-mono text-emerald-700 font-semibold whitespace-nowrap">
+                          {attendance ? formatTimeDisplay(attendance.firstPunchIn || attendance.punchIn) : '--'}
+                        </td>
+                        <td className="py-2 px-3 font-mono text-sky-700 whitespace-nowrap">
+                          {attendance && resolved
+                            ? (resolved.earlyArrivalMinutes > 0 ? formatDurationClock(resolved.earlyArrivalMinutes) : '00:00')
+                            : '--'}
+                        </td>
                         <td className="py-2 px-3">
                           <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${getAttendanceStatusBadgeClasses(status)}`}>
                             {status}
                           </span>
                         </td>
-                        <td className="py-2 px-3 text-right font-mono text-[11px]">
+                        {canShowOtHours && (
+                          <>
+                            <td className="py-2 px-3 text-right font-mono text-[11px] whitespace-nowrap">
+                              {attendance && resolved ? (
+                                resolved.isOpen ? (
+                                  resolved.provisionalEarlyOtMinutes > 0 ? (
+                                    <span className="text-amber-700 font-semibold">
+                                      {formatDurationClock(resolved.provisionalEarlyOtMinutes)} (Provisional)
+                                    </span>
+                                  ) : (
+                                    <span className="text-slate-400">00:00</span>
+                                  )
+                                ) : resolved.earlyOtMinutes > 0 ? (
+                                  <span className="text-emerald-700 font-bold">
+                                    {formatDurationClock(resolved.earlyOtMinutes)}
+                                  </span>
+                                ) : (
+                                  <span className="text-slate-400">00:00</span>
+                                )
+                              ) : (
+                                <span className="text-slate-400">--</span>
+                              )}
+                            </td>
+                            <td className="py-2 px-3 text-right font-mono text-[11px] whitespace-nowrap">
+                              {attendance && resolved ? (
+                                !resolved.isOpen && resolved.postShiftOtMinutes > 0 ? (
+                                  <span className="text-indigo-700 font-bold">
+                                    {formatDurationClock(resolved.postShiftOtMinutes)}
+                                  </span>
+                                ) : (
+                                  <span className="text-slate-400">00:00</span>
+                                )
+                              ) : (
+                                <span className="text-slate-400">--</span>
+                              )}
+                            </td>
+                          </>
+                        )}
+                        <td className="py-2 px-3 text-right font-mono text-[11px] whitespace-nowrap">
                           {attendance && resolved ? (
                             resolved.isOpen ? (
                               <span className="text-sky-700">

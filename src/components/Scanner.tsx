@@ -1138,35 +1138,46 @@ export const Scanner: React.FC<ScannerProps> = ({
                         </span>
                       </div>
 
-                      {lastInResult.employee && (
-                        <div className="grid grid-cols-2 gap-2 pt-2 border-t border-white/10 text-xs">
-                          <div>
-                            <span className="text-slate-400 block text-[10px]">EMPLOYEE</span>
-                            <span className="font-bold text-white truncate block">
-                              {lastInResult.employee.employeeName} ({lastInResult.employee.employeeId})
-                            </span>
+                      {lastInResult.employee && (() => {
+                        const resolvedIn = resolveAttendanceMetrics(lastInResult.attendance);
+                        return (
+                          <div className="grid grid-cols-2 gap-2 pt-2 border-t border-white/10 text-xs">
+                            <div>
+                              <span className="text-slate-400 block text-[10px]">EMPLOYEE</span>
+                              <span className="font-bold text-white truncate block">
+                                {lastInResult.employee.employeeName} ({lastInResult.employee.employeeId})
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-slate-400 block text-[10px]">LINE / SECTION</span>
+                              <span className="font-semibold text-slate-200 block truncate">
+                                {lastInResult.employee.floor} • {lastInResult.employee.section}
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-slate-400 block text-[10px]">SCHEDULED START</span>
+                              <span className="font-semibold text-slate-200 block truncate">
+                                {resolvedIn.scheduledStartDisplay}
+                                {resolvedIn.earlyArrivalMinutes > 0
+                                  ? ` • Early ${formatDurationClock(resolvedIn.earlyArrivalMinutes)}`
+                                  : ''}
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-slate-400 block text-[10px]">SHIFT / STATUS</span>
+                              <span className="font-semibold text-emerald-400 block">
+                                {lastInResult.shift?.name || 'DAY SHIFT'} • INSIDE / IN PROGRESS
+                                {isAttendanceLate(lastInResult.attendance) ? ' (LATE)' : ''}
+                              </span>
+                              {resolvedIn.provisionalEarlyOtMinutes > 0 && (
+                                <span className="text-[10px] font-semibold text-amber-300 block">
+                                  Provisional Early OT: {formatDurationClock(resolvedIn.provisionalEarlyOtMinutes)} (Pending Punch Out)
+                                </span>
+                              )}
+                            </div>
                           </div>
-                          <div>
-                            <span className="text-slate-400 block text-[10px]">LINE / SECTION</span>
-                            <span className="font-semibold text-slate-200 block truncate">
-                              {lastInResult.employee.floor} • {lastInResult.employee.section}
-                            </span>
-                          </div>
-                          <div>
-                            <span className="text-slate-400 block text-[10px]">DEPARTMENT</span>
-                            <span className="font-semibold text-slate-200 block truncate">
-                              {lastInResult.employee.department}
-                            </span>
-                          </div>
-                          <div>
-                            <span className="text-slate-400 block text-[10px]">SHIFT / STATUS</span>
-                            <span className="font-semibold text-emerald-400 block">
-                              {lastInResult.shift?.name || 'DAY SHIFT'} • INSIDE / IN PROGRESS
-                              {isAttendanceLate(lastInResult.attendance) ? ' (LATE)' : ''}
-                            </span>
-                          </div>
-                        </div>
-                      )}
+                        );
+                      })()}
                     </div>
                   ) : (
                     <div className="border border-dashed border-slate-800 rounded-lg p-6 text-center text-xs text-slate-500">
@@ -1463,7 +1474,7 @@ export const Scanner: React.FC<ScannerProps> = ({
                               </span>
                             </div>
                             <div>
-                              <span className="text-slate-400 block text-[10px]">OVERTIME (OT)</span>
+                              <span className="text-slate-400 block text-[10px]">TOTAL OVERTIME (OT)</span>
                               <span className="font-bold text-amber-400 block">
                                 {resolvedOut.overtimeMinutes > 0
                                   ? resolvedOut.otLabel
@@ -1471,6 +1482,11 @@ export const Scanner: React.FC<ScannerProps> = ({
                                     ? lastOutResult.otFormatted
                                     : '00:00 Hours'}
                               </span>
+                              {(resolvedOut.earlyOtMinutes > 0 || resolvedOut.postShiftOtMinutes > 0) && (
+                                <span className="text-[10px] text-slate-300 block">
+                                  Early: {formatDurationClock(resolvedOut.earlyOtMinutes)} • Post: {formatDurationClock(resolvedOut.postShiftOtMinutes)}
+                                </span>
+                              )}
                             </div>
                             <div>
                               <span className="text-slate-400 block text-[10px]">STATE &amp; STATUS</span>
@@ -1527,7 +1543,7 @@ export const Scanner: React.FC<ScannerProps> = ({
                 <span>Standard 08:30 Duty</span>
               </div>
               <p className="text-xs text-slate-400">
-                Standard shift duty is 08h 30m (510 mins). OT = Max(0, Duty - 08:30). Missed punch auto-closes with 0 OT.
+                Standard shift duty is 08h 30m (510 mins). Early arrival &ge; 60m counts full Early OT + Post-shift OT on Punch Out. Missed punch auto-closes with 0 OT.
               </p>
             </div>
           </div>
