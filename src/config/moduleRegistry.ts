@@ -18,8 +18,8 @@ export const MODULE_LOADERS: Partial<Record<NavItem, DynamicModuleLoader>> = {
   user_rights: () => import('../components/UserRights'),
   audit_logs: () => import('../components/AuditLogsManagement'),
   security_management: () => import('../components/SecurityManagement'),
+  company_wifi_access: () => import('../components/CompanyWifiAccessControl'),
   system_performance: () => import('../components/SystemPerformance'),
-  settings: () => import('../components/SystemSettings'),
 };
 
 export function prefetchTabModule(tab: NavItem): Promise<unknown> | null {

@@ -113,40 +113,67 @@ const PunchInResultCard = React.memo<{ result: ScanResult | null }>(({ result })
       </div>
 
       {result.employee && resolvedIn && (
-        <div className="grid grid-cols-2 gap-2 pt-2 border-t border-white/10 text-xs">
-          <div>
-            <span className="text-slate-400 block text-[10px]">EMPLOYEE</span>
-            <span className="font-bold text-white truncate block">
-              {result.employee.employeeName} ({result.employee.employeeId})
-            </span>
-          </div>
-          <div>
-            <span className="text-slate-400 block text-[10px]">LINE / SECTION</span>
-            <span className="font-semibold text-slate-200 block truncate">
-              {result.employee.floor} • {result.employee.section}
-            </span>
-          </div>
-          <div>
-            <span className="text-slate-400 block text-[10px]">SCHEDULED START</span>
-            <span className="font-semibold text-slate-200 block truncate">
-              {resolvedIn.scheduledStartDisplay}
-              {resolvedIn.earlyArrivalMinutes > 0
-                ? ` • Early ${formatDurationClock(resolvedIn.earlyArrivalMinutes)}`
-                : ''}
-            </span>
-          </div>
-          <div>
-            <span className="text-slate-400 block text-[10px]">SHIFT / STATUS</span>
-            <span className="font-semibold text-emerald-400 block">
-              {result.shift?.name || 'DAY SHIFT'} • INSIDE / IN PROGRESS
-              {isAttendanceLate(result.attendance) ? ' (LATE)' : ''}
-            </span>
-            {resolvedIn.provisionalEarlyOtMinutes > 0 && (
-              <span className="text-[10px] font-semibold text-amber-300 block">
-                Provisional Early OT: {formatDurationClock(resolvedIn.provisionalEarlyOtMinutes)} (Pending Punch Out)
+        <div className="space-y-2.5 pt-2 border-t border-white/10 text-xs">
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <span className="text-slate-400 block text-[10px]">EMPLOYEE</span>
+              <span className="font-bold text-white truncate block">
+                {result.employee.employeeName} ({result.employee.employeeId})
               </span>
-            )}
+            </div>
+            <div>
+              <span className="text-slate-400 block text-[10px]">LINE / SECTION</span>
+              <span className="font-semibold text-slate-200 block truncate">
+                {result.employee.floor} • {result.employee.section}
+              </span>
+            </div>
+            <div>
+              <span className="text-slate-400 block text-[10px]">SCHEDULED START</span>
+              <span className="font-semibold text-slate-200 block truncate">
+                {resolvedIn.scheduledStartDisplay}
+                {resolvedIn.earlyArrivalMinutes > 0
+                  ? ` • Early ${formatDurationClock(resolvedIn.earlyArrivalMinutes)}`
+                  : ''}
+              </span>
+            </div>
+            <div>
+              <span className="text-slate-400 block text-[10px]">SHIFT / STATUS</span>
+              <span className="font-semibold text-emerald-400 block">
+                {result.shift?.name || 'DAY SHIFT'} • INSIDE / IN PROGRESS
+                {isAttendanceLate(result.attendance) ? ' (LATE)' : ''}
+              </span>
+              {resolvedIn.provisionalEarlyOtMinutes > 0 && (
+                <span className="text-[10px] font-semibold text-amber-300 block">
+                  Provisional Early OT: {formatDurationClock(resolvedIn.provisionalEarlyOtMinutes)} (Pending Punch Out)
+                </span>
+              )}
+            </div>
           </div>
+
+          {(() => {
+            const sched = result.punchOutSchedule || resolvedIn.punchOutSchedule;
+            if (!sched) return null;
+            return (
+              <div className="bg-slate-900/70 border border-white/10 rounded-md p-2.5 grid grid-cols-3 gap-2 text-[11px]">
+                <div>
+                  <span className="text-slate-400 block text-[9px] uppercase">Scheduled Shift End</span>
+                  <span className="font-mono font-bold text-slate-100">{sched.scheduledShiftEndDisplay}</span>
+                </div>
+                <div>
+                  <span className="text-slate-400 block text-[9px] uppercase">Regular Duty Ends</span>
+                  <span className="font-mono font-bold text-emerald-300">{sched.regularDutyCompletionDisplay}</span>
+                </div>
+                <div>
+                  <span className="text-slate-400 block text-[9px] uppercase">Max Eligible Out</span>
+                  <span className="font-mono font-bold text-amber-300">{sched.maxEligiblePunchOutDisplay}</span>
+                </div>
+                <div className="col-span-3 pt-1 border-t border-white/10 flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-300">
+                  <span>Max OT: <strong className="text-amber-300">{sched.maxOtDisplay}</strong></span>
+                  <span>Max Credited Working Time: <strong className="text-sky-300">{sched.maxCreditedWorkingDisplay}</strong></span>
+                </div>
+              </div>
+            );
+          })()}
         </div>
       )}
     </div>
@@ -168,6 +195,8 @@ const PunchOutResultCard = React.memo<{ result: ScanResult | null }>(({ result }
     );
   }
 
+  const wasReconciled = Boolean(result.reconciledFromAutoClose || result.attendance?.reconciledFromAutoClose);
+
   return (
     <div
       className={`p-4 rounded-lg border flex flex-col gap-3 transition-all ${
@@ -185,7 +214,11 @@ const PunchOutResultCard = React.memo<{ result: ScanResult | null }>(({ result }
           )}
           <div>
             <div className="text-[10px] uppercase font-bold tracking-wider opacity-80">
-              {result.success ? 'EXIT CONFIRMED' : 'EXIT REJECTED'}
+              {result.success
+                ? wasReconciled
+                  ? 'EXIT CONFIRMED • RECONCILED FROM AUTO-CLOSE'
+                  : 'EXIT CONFIRMED'
+                : 'EXIT REJECTED'}
             </div>
             <div className="text-sm font-bold text-white leading-tight">
               {result.message}
@@ -198,42 +231,58 @@ const PunchOutResultCard = React.memo<{ result: ScanResult | null }>(({ result }
       </div>
 
       {result.employee && resolvedOut && (
-        <div className="grid grid-cols-2 gap-2 pt-2 border-t border-white/10 text-xs">
-          <div>
-            <span className="text-slate-400 block text-[10px]">EMPLOYEE</span>
-            <span className="font-bold text-white truncate block">
-              {result.employee.employeeName} ({result.employee.employeeId})
-            </span>
-          </div>
-          <div>
-            <span className="text-slate-400 block text-[10px]">DUTY RECORDED</span>
-            <span className="font-bold text-emerald-400 block">
-              {result.attendance
-                ? `${formatDurationClock(resolvedOut.completedDutyMinutes)} Hours`
-                : result.dutyFormatted || '08:30 Hours'}
-            </span>
-          </div>
-          <div>
-            <span className="text-slate-400 block text-[10px]">TOTAL OVERTIME (OT)</span>
-            <span className="font-bold text-amber-400 block">
-              {resolvedOut.overtimeMinutes > 0
-                ? resolvedOut.otLabel
-                : result.otFormatted && result.otFormatted !== '00:00 Hours'
-                  ? result.otFormatted
-                  : '00:00 Hours'}
-            </span>
-            {(resolvedOut.earlyOtMinutes > 0 || resolvedOut.postShiftOtMinutes > 0) && (
-              <span className="text-[10px] text-slate-300 block">
-                Early: {formatDurationClock(resolvedOut.earlyOtMinutes)} • Post: {formatDurationClock(resolvedOut.postShiftOtMinutes)}
+        <div className="space-y-2.5 pt-2 border-t border-white/10 text-xs">
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <span className="text-slate-400 block text-[10px]">EMPLOYEE</span>
+              <span className="font-bold text-white truncate block">
+                {result.employee.employeeName} ({result.employee.employeeId})
               </span>
-            )}
+            </div>
+            <div>
+              <span className="text-slate-400 block text-[10px]">CREDITED DUTY</span>
+              <span className="font-bold text-emerald-400 block">
+                {result.attendance
+                  ? `${formatDurationClock(resolvedOut.completedDutyMinutes)} Hours`
+                  : result.dutyFormatted || '08:30 Hours'}
+              </span>
+            </div>
+            <div>
+              <span className="text-slate-400 block text-[10px]">TOTAL OVERTIME (OT)</span>
+              <span className="font-bold text-amber-400 block">
+                {resolvedOut.overtimeMinutes > 0
+                  ? resolvedOut.otLabel
+                  : result.otFormatted && result.otFormatted !== '00:00 Hours'
+                    ? result.otFormatted
+                    : '00:00 Hours'}
+              </span>
+              {(resolvedOut.earlyOtMinutes > 0 || resolvedOut.postShiftOtMinutes > 0) && (
+                <span className="text-[10px] text-slate-300 block">
+                  Early: {formatDurationClock(resolvedOut.earlyOtMinutes)} • Post: {formatDurationClock(resolvedOut.postShiftOtMinutes)}
+                  {resolvedOut.otCapApplied ? ' (Capped at 03:30)' : ''}
+                </span>
+              )}
+            </div>
+            <div>
+              <span className="text-slate-400 block text-[10px]">STATE &amp; STATUS</span>
+              <span className="font-semibold text-slate-200 block">
+                OUTSIDE • {resolvedOut.status} (Punch #{result.punchCount || 2})
+              </span>
+            </div>
           </div>
-          <div>
-            <span className="text-slate-400 block text-[10px]">STATE &amp; STATUS</span>
-            <span className="font-semibold text-slate-200 block">
-              OUTSIDE • {resolvedOut.status} (Punch #{result.punchCount || 2})
-            </span>
-          </div>
+
+          {(() => {
+            const sched = result.punchOutSchedule || resolvedOut.punchOutSchedule;
+            if (!sched) return null;
+            return (
+              <div className="bg-slate-900/70 border border-white/10 rounded-md p-2 flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-300">
+                <span>Scheduled End: <strong className="font-mono text-white">{sched.scheduledShiftEndDisplay}</strong></span>
+                <span>Regular Done: <strong className="font-mono text-emerald-300">{sched.regularDutyCompletionDisplay}</strong></span>
+                <span>Max Eligible Out: <strong className="font-mono text-amber-300">{sched.maxEligiblePunchOutDisplay}</strong></span>
+                <span>Limits: <strong className="text-sky-300">Max OT {sched.maxOtDisplay} / Max {sched.maxCreditedWorkingDisplay}</strong></span>
+              </div>
+            );
+          })()}
         </div>
       )}
     </div>
@@ -248,27 +297,27 @@ const ScannerGuidanceCards = React.memo(() => (
         <span>First Punch In Rule</span>
       </div>
       <p className="text-xs text-slate-400">
-        Earliest valid scan of the day is official daily <strong>firstPunchIn</strong>. Preserved across all multiple punches.
+        Earliest valid scan of the day is official daily <strong>firstPunchIn</strong>. Preserved across all multiple punches and auto-close reconciliation.
       </p>
     </div>
 
     <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl">
       <div className="flex items-center gap-2 text-xs font-bold text-indigo-400 uppercase mb-1">
         <LogOut className="w-4 h-4" />
-        <span>Last Punch Out Rule</span>
+        <span>Actual Punch Out &amp; Auto-Close</span>
       </div>
       <p className="text-xs text-slate-400">
-        Latest valid scan of the day is official daily <strong>lastPunchOut</strong>. Duty = Last Out - First In.
+        Open shifts provisionally auto-close at scheduled end (05:30 PM / 04:30 AM) with 0 OT. A genuine subsequent Punch Out reconciles AUTO CLOSED to ACTUAL.
       </p>
     </div>
 
     <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl">
       <div className="flex items-center gap-2 text-xs font-bold text-amber-400 uppercase mb-1">
         <Clock className="w-4 h-4" />
-        <span>Standard 08:30 Duty</span>
+        <span>Duty &amp; OT Limits (Max 12:00)</span>
       </div>
       <p className="text-xs text-slate-400">
-        Standard shift duty is 08h 30m (510 mins). Early arrival &ge; 60m counts full Early OT + Post-shift OT on Punch Out. Missed punch auto-closes with 0 OT.
+        Regular duty max 08:30 (510m). Early arrival &ge; 60m + Post-shift OT capped at 03:30 (210m) Max OT and 12:00 (720m) Max Credited Working Time.
       </p>
     </div>
   </div>

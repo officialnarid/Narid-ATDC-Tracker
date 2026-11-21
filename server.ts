@@ -55,6 +55,10 @@ import {
   recordActivityTelemetry,
   recordErrorTelemetry,
 } from './serverMonitoring.ts';
+import {
+  registerCompanyWifiRoutes,
+  enforceCompanyWifiAccess,
+} from './serverCompanyWifi.ts';
 import { resolveAttendanceMetrics } from './src/utils/attendanceStatus.ts';
 import {
   DASHBOARD_CARDS,
@@ -355,6 +359,7 @@ const DEFAULT_ROLE_PERMISSIONS: Record<
     user_rights: { view: true, add: true, edit: true, delete: true },
     audit_logs: { view: true, add: true, edit: true, delete: true },
     security_management: { view: true, add: true, edit: true, delete: true },
+    company_wifi_access: { view: true, add: true, edit: true, delete: true },
     system_performance: { view: true, add: true, edit: true, delete: true },
     settings: { view: true, add: true, edit: true, delete: true },
     ...Object.fromEntries(
@@ -382,6 +387,7 @@ const DEFAULT_ROLE_PERMISSIONS: Record<
     user_rights: { view: false, add: false, edit: false, delete: false },
     audit_logs: { view: false, add: false, edit: false, delete: false },
     security_management: { view: false, add: false, edit: false, delete: false },
+    company_wifi_access: { view: false, add: false, edit: false, delete: false },
     system_performance: { view: false, add: false, edit: false, delete: false },
     settings: { view: false, add: false, edit: false, delete: false },
   },
@@ -403,6 +409,7 @@ const DEFAULT_ROLE_PERMISSIONS: Record<
     user_rights: { view: false, add: false, edit: false, delete: false },
     audit_logs: { view: false, add: false, edit: false, delete: false },
     security_management: { view: false, add: false, edit: false, delete: false },
+    company_wifi_access: { view: false, add: false, edit: false, delete: false },
     system_performance: { view: false, add: false, edit: false, delete: false },
     settings: { view: false, add: false, edit: false, delete: false },
   },
@@ -412,6 +419,7 @@ export const RESTRICTED_SUPER_ADMIN_MODULES = new Set([
   'user_rights',
   'audit_logs',
   'security_management',
+  'company_wifi_access',
   'system_performance',
 ]);
 
@@ -840,7 +848,11 @@ export function createApp(options: ServerAppOptions = {}) {
         origin: permitted ? normalizeAllowedOrigin(rawOrigin) || false : false,
         credentials: permitted,
         methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-        allowedHeaders: ['Content-Type', 'Authorization', 'X-Correlation-ID'],
+        allowedHeaders: [
+          'Content-Type',
+          'Authorization',
+          'X-Correlation-ID',
+        ],
         exposedHeaders: ['X-Correlation-ID', 'X-Server-Process-Ms', 'X-Payload-Bytes', 'Server-Timing'],
         optionsSuccessStatus: 204,
       });
@@ -1051,7 +1063,7 @@ export function createApp(options: ServerAppOptions = {}) {
     }
   }
 
-  // Reusable Cryptographic Token + Strictly UID-Based RBAC Verification Helper
+  // Reusable Cryptographic Token + Strictly UID-Based RBAC + Company Wi-Fi Access Gate
   async function requireVerifiedCaller(
     req: Request,
     res: Response,
@@ -1059,6 +1071,7 @@ export function createApp(options: ServerAppOptions = {}) {
     actionLabel: string,
     options?: {
       prefetchUserPermission?: boolean;
+      skipWifiCheck?: boolean;
       onTokenVerified?: (verifiedUid: string) => void;
     }
   ): Promise<VerifiedCaller | null> {
@@ -1101,6 +1114,23 @@ export function createApp(options: ServerAppOptions = {}) {
           error: `Forbidden: Role "${caller.role.toUpperCase()}" is not permitted for ${actionLabel}.`,
         });
         return null;
+      }
+      // Authoritative Server-Side Company Wi-Fi Access Control Gate
+      // Super Admin ALWAYS bypasses Wi-Fi restrictions. Non-Super-Admin callers are verified on every protected request.
+      if (caller.role !== 'super_admin' && !options?.skipWifiCheck) {
+        const wifiResult = await enforceCompanyWifiAccess(adminDb, req, caller, {
+          nowMs: getNowMs(),
+        });
+        if (!wifiResult.allowed) {
+          res.status(wifiResult.httpStatus || 403).json(
+            wifiResult.safeErrorPayload || {
+              success: false,
+              code: 'COMPANY_WIFI_ACCESS_DENIED',
+              error: 'Access Denied: Please connect to an authorized Company Wi-Fi network.',
+            }
+          );
+          return null;
+        }
       }
       return caller;
     } catch (err: any) {
@@ -1246,6 +1276,12 @@ export function createApp(options: ServerAppOptions = {}) {
     projectId,
     databaseId,
     credentialMode,
+  });
+
+  registerCompanyWifiRoutes(app, {
+    db: adminDb,
+    requireVerifiedCaller,
+    nowProvider: getNowMs,
   });
 
   // ============================================================================

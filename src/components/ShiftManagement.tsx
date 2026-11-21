@@ -1,7 +1,24 @@
-import React, { useState } from 'react';
-import { Clock, Plus, Edit2, CheckCircle, XCircle, X, AlertCircle, FileSpreadsheet, Download } from 'lucide-react';
-import { Shift, UserRoleRecord } from '../types';
-import { saveShift } from '../services/masterService';
+import React, { useState, useEffect } from 'react';
+import {
+  Clock,
+  Plus,
+  Edit2,
+  CheckCircle,
+  CheckCircle2,
+  XCircle,
+  X,
+  AlertCircle,
+  AlertTriangle,
+  FileSpreadsheet,
+  Download,
+  Settings,
+  Save,
+  Lock,
+  FileSearch,
+} from 'lucide-react';
+import { Shift, SystemSetting, UserRoleRecord } from '../types';
+import { saveShift, getSystemSettings, updateSystemSettings } from '../services/masterService';
+import { isModuleAllowedForUser } from '../services/authService';
 import { RolePermissionRecord, hasModulePermission } from '../services/permissionService';
 import { formatMinutes } from '../services/attendanceService';
 import { ShiftManagementSkeleton } from './Skeletons';
@@ -26,6 +43,7 @@ interface ShiftManagementProps {
   onRefresh: () => void;
   currentUserRole?: UserRoleRecord | null;
   rolePermissions?: Record<string, RolePermissionRecord>;
+  onOpenAuditConsole?: () => void;
 }
 
 export const ShiftManagement: React.FC<ShiftManagementProps> = ({
@@ -35,7 +53,63 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({
   onRefresh,
   currentUserRole,
   rolePermissions,
+  onOpenAuditConsole,
 }) => {
+  const isSuperAdmin = currentUserRole?.role?.toUpperCase() === 'SUPER_ADMIN';
+  const canViewAttendanceConfig =
+    isSuperAdmin || isModuleAllowedForUser(currentUserRole, 'settings');
+  const [activeSubTab, setActiveSubTab] = useState<'shifts' | 'attendance_config'>('shifts');
+
+  // Attendance Configuration state (moved from System Settings)
+  const [attendanceConfig, setAttendanceConfig] = useState<SystemSetting | null>(null);
+  const [configLoading, setConfigLoading] = useState(false);
+  const [isSavingConfig, setIsSavingConfig] = useState(false);
+  const [configSaveSuccess, setConfigSaveSuccess] = useState(false);
+  const [configError, setConfigError] = useState<string | null>(null);
+
+  const loadAttendanceConfig = async () => {
+    setConfigLoading(true);
+    setConfigError(null);
+    try {
+      const s = await getSystemSettings();
+      setAttendanceConfig({
+        ...s,
+        auditRetentionDays: s.auditRetentionDays ?? 90,
+        protectCriticalLogs: s.protectCriticalLogs ?? true,
+        captureGeoLocation: s.captureGeoLocation ?? true,
+        failedLoginAlertThreshold: s.failedLoginAlertThreshold ?? 5,
+      });
+    } catch (err: any) {
+      setConfigError(err?.message || 'Failed to load attendance configuration.');
+    } finally {
+      setConfigLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (activeSubTab === 'attendance_config' && canViewAttendanceConfig && !attendanceConfig && !configLoading) {
+      void loadAttendanceConfig();
+    }
+  }, [activeSubTab, canViewAttendanceConfig]);
+
+  const handleSaveAttendanceConfig = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!attendanceConfig) return;
+    setIsSavingConfig(true);
+    setConfigError(null);
+    try {
+      await updateSystemSettings(attendanceConfig);
+      setConfigSaveSuccess(true);
+      setTimeout(() => setConfigSaveSuccess(false), 3000);
+      onRefresh();
+      await loadAttendanceConfig();
+    } catch (err: any) {
+      setConfigError(`Failed to save settings: ${err?.message || 'Unknown error'}`);
+    } finally {
+      setIsSavingConfig(false);
+    }
+  };
+
   const canAddShift = currentUserRole
     ? hasModulePermission(currentUserRole.role, 'shifts', 'add', rolePermissions)
     : true;
@@ -274,30 +348,295 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2.5">
-          {shifts.length > 0 && (
-            <label className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-100 border border-slate-200 text-xs font-semibold text-slate-700 cursor-pointer">
-              <SelectAllCheckbox
-                checked={bulk.isPageAllSelected}
-                indeterminate={bulk.isPageIndeterminate}
-                disabled={shifts.length === 0 || isBulkExecuting}
-                onChange={bulk.togglePageSelection}
-                ariaLabel="Select all shifts"
-              />
-              <span>Select All Shifts</span>
-            </label>
-          )}
-          {canAddShift && (
-            <button
-              onClick={handleOpenAdd}
-              className="bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs px-4 py-2 rounded flex items-center gap-1.5 shadow-sm transition cursor-pointer"
-            >
-              <Plus className="w-4 h-4" />
-              <span>Add Custom Shift</span>
-            </button>
-          )}
-        </div>
+        {activeSubTab === 'shifts' && (
+          <div className="flex flex-wrap items-center gap-2.5">
+            {shifts.length > 0 && (
+              <label className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-100 border border-slate-200 text-xs font-semibold text-slate-700 cursor-pointer">
+                <SelectAllCheckbox
+                  checked={bulk.isPageAllSelected}
+                  indeterminate={bulk.isPageIndeterminate}
+                  disabled={shifts.length === 0 || isBulkExecuting}
+                  onChange={bulk.togglePageSelection}
+                  ariaLabel="Select all shifts"
+                />
+                <span>Select All Shifts</span>
+              </label>
+            )}
+            {canAddShift && (
+              <button
+                onClick={handleOpenAdd}
+                className="bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs px-4 py-2 rounded flex items-center gap-1.5 shadow-sm transition cursor-pointer"
+              >
+                <Plus className="w-4 h-4" />
+                <span>Add Custom Shift</span>
+              </button>
+            )}
+          </div>
+        )}
       </div>
+
+      {/* Sub-navigation Tabs under Shift Management */}
+      {canViewAttendanceConfig && (
+        <div className="flex items-center gap-2 border-b border-slate-200">
+          <button
+            type="button"
+            onClick={() => setActiveSubTab('shifts')}
+            className={`pb-2.5 px-3 text-xs font-semibold transition border-b-2 inline-flex items-center gap-1.5 cursor-pointer ${
+              activeSubTab === 'shifts'
+                ? 'border-blue-600 text-blue-600'
+                : 'border-transparent text-slate-500 hover:text-slate-800'
+            }`}
+          >
+            <Clock className="w-3.5 h-3.5" />
+            <span>Shift Schedules</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveSubTab('attendance_config')}
+            className={`pb-2.5 px-3 text-xs font-semibold transition border-b-2 inline-flex items-center gap-1.5 cursor-pointer ${
+              activeSubTab === 'attendance_config'
+                ? 'border-blue-600 text-blue-600'
+                : 'border-transparent text-slate-500 hover:text-slate-800'
+            }`}
+          >
+            <Settings className="w-3.5 h-3.5" />
+            <span>Attendance Configuration</span>
+          </button>
+        </div>
+      )}
+
+      {activeSubTab === 'attendance_config' && canViewAttendanceConfig ? (
+        <div className="flex flex-col gap-4">
+          {configError && (
+            <div className="bg-red-50 text-red-900 border border-red-300 px-4 py-2.5 rounded-xl text-xs font-semibold flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+              <span>{configError}</span>
+            </div>
+          )}
+
+          {configLoading && !attendanceConfig ? (
+            <div className="p-8 text-center text-xs text-slate-500 bg-white rounded-xl border border-slate-200">
+              Loading attendance configuration...
+            </div>
+          ) : attendanceConfig ? (
+            <form
+              onSubmit={handleSaveAttendanceConfig}
+              className="bg-white rounded-xl border border-slate-200 shadow-2xs p-6 flex flex-col gap-6 max-w-4xl"
+            >
+              {configSaveSuccess && (
+                <div className="bg-emerald-50 text-emerald-800 p-3 rounded-lg border border-emerald-300 text-xs flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                  <span>Settings updated successfully!</span>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-5 text-xs">
+                <div>
+                  <label className="block text-slate-700 font-semibold mb-1">Company / Plant Name</label>
+                  <input
+                    type="text"
+                    required
+                    value={attendanceConfig.companyName}
+                    onChange={(e) => setAttendanceConfig({ ...attendanceConfig, companyName: e.target.value })}
+                    className="w-full border border-slate-300 rounded px-3 py-2 text-xs"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-slate-700 font-semibold mb-1">Website Title</label>
+                  <input
+                    type="text"
+                    required
+                    value={attendanceConfig.websiteName}
+                    onChange={(e) => setAttendanceConfig({ ...attendanceConfig, websiteName: e.target.value })}
+                    className="w-full border border-slate-300 rounded px-3 py-2 text-xs"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-slate-700 font-semibold mb-1">Timezone</label>
+                  <input
+                    type="text"
+                    disabled
+                    value={attendanceConfig.timezone}
+                    className="w-full border border-slate-300 bg-slate-100 rounded px-3 py-2 text-xs font-mono"
+                  />
+                  <span className="text-[10px] text-slate-400 mt-1 block">Asia/Kolkata (Indian Standard Time)</span>
+                </div>
+
+                <div>
+                  <label className="block text-slate-700 font-semibold mb-1">Late Arrival Grace Period (Minutes)</label>
+                  <input
+                    type="number"
+                    min="0"
+                    max="60"
+                    value={attendanceConfig.lateGraceMinutes}
+                    onChange={(e) => setAttendanceConfig({ ...attendanceConfig, lateGraceMinutes: Number(e.target.value) })}
+                    className="w-full border border-slate-300 rounded px-3 py-2 text-xs"
+                  />
+                  <span className="text-[10px] text-slate-400 mt-1 block">Punches after Shift Start + Grace are marked LATE.</span>
+                </div>
+
+                <div>
+                  <label className="block text-slate-700 font-semibold mb-1">Regular Scheduled Duty (Minutes)</label>
+                  <input
+                    type="number"
+                    min="300"
+                    max="720"
+                    value={attendanceConfig.scheduledDurationMinutes}
+                    onChange={(e) => setAttendanceConfig({ ...attendanceConfig, scheduledDurationMinutes: Number(e.target.value) })}
+                    className="w-full border border-slate-300 rounded px-3 py-2 text-xs"
+                  />
+                  <span className="text-[10px] text-slate-400 mt-1 block">510 minutes = 08 Hours 30 Minutes standard duty.</span>
+                </div>
+
+                <div>
+                  <label className="block text-slate-700 font-semibold mb-1">Overtime Threshold (Minutes)</label>
+                  <input
+                    type="number"
+                    min="300"
+                    max="720"
+                    value={attendanceConfig.overtimeThresholdMinutes}
+                    onChange={(e) => setAttendanceConfig({ ...attendanceConfig, overtimeThresholdMinutes: Number(e.target.value) })}
+                    className="w-full border border-slate-300 rounded px-3 py-2 text-xs"
+                  />
+                  <span className="text-[10px] text-slate-400 mt-1 block">Duration above this threshold qualifies as Overtime.</span>
+                </div>
+              </div>
+
+              {/* Security Monitoring & Audit Retention Governance */}
+              <div className="border-t border-slate-200 pt-5 space-y-4">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
+                      <Lock className="w-3.5 h-3.5 text-blue-600" />
+                      <span>Security Monitoring &amp; Audit Retention Policy</span>
+                    </h3>
+                    <p className="text-[11px] text-slate-500 mt-0.5">
+                      Controls retention eligibility, critical log immutability, IP geolocation enrichment, and failed login alert thresholds.
+                    </p>
+                  </div>
+                  {isSuperAdmin && onOpenAuditConsole && (
+                    <button
+                      type="button"
+                      onClick={onOpenAuditConsole}
+                      className="px-3 py-1.5 rounded-lg bg-[#0a192f] hover:bg-slate-800 text-white text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer shrink-0"
+                    >
+                      <FileSearch className="w-3.5 h-3.5 text-blue-400" />
+                      <span>Open Security Console</span>
+                    </button>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+                  <div>
+                    <label className="block text-slate-700 font-semibold mb-1">Audit Retention Window (Days)</label>
+                    <input
+                      type="number"
+                      min="30"
+                      max="3650"
+                      value={attendanceConfig.auditRetentionDays ?? 90}
+                      onChange={(e) =>
+                        setAttendanceConfig({ ...attendanceConfig, auditRetentionDays: Math.max(30, Number(e.target.value)) })
+                      }
+                      className="w-full border border-slate-300 rounded px-3 py-2 text-xs font-mono"
+                    />
+                    <span className="text-[10px] text-slate-400 mt-1 block">
+                      Default: 90 days before non-critical logs become eligible for Super Admin archival/review.
+                    </span>
+                  </div>
+
+                  <div>
+                    <label className="block text-slate-700 font-semibold mb-1">Failed Login Security Alert Threshold</label>
+                    <input
+                      type="number"
+                      min="3"
+                      max="20"
+                      value={attendanceConfig.failedLoginAlertThreshold ?? 5}
+                      onChange={(e) =>
+                        setAttendanceConfig({ ...attendanceConfig, failedLoginAlertThreshold: Math.max(3, Number(e.target.value)) })
+                      }
+                      className="w-full border border-slate-300 rounded px-3 py-2 text-xs font-mono"
+                    />
+                    <span className="text-[10px] text-slate-400 mt-1 block">
+                      Triggers CRITICAL security alert after consecutive failed login attempts.
+                    </span>
+                  </div>
+
+                  <div>
+                    <label className="block text-slate-700 font-semibold mb-1">
+                      Super Admin Lockout Level Reset (Hours)
+                    </label>
+                    <input
+                      type="number"
+                      min="6"
+                      max="720"
+                      value={attendanceConfig.superAdminLockoutResetHours ?? 24}
+                      onChange={(e) =>
+                        setAttendanceConfig({
+                          ...attendanceConfig,
+                          superAdminLockoutResetHours: Math.min(720, Math.max(6, Number(e.target.value) || 24)),
+                        })
+                      }
+                      className="w-full border border-slate-300 rounded px-3 py-2 text-xs font-mono"
+                    />
+                    <span className="text-[10px] text-slate-400 mt-1 block">
+                      Sustained clean usage window (6–720h, default 24h) before Super Admin progressive lockout resets to 10m.
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex flex-col sm:flex-row sm:items-center gap-4 text-xs">
+                  <label className="flex items-center gap-2 cursor-pointer font-medium text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={attendanceConfig.protectCriticalLogs ?? true}
+                      onChange={(e) => setAttendanceConfig({ ...attendanceConfig, protectCriticalLogs: e.target.checked })}
+                      className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4"
+                    />
+                    <span>Enforce immutable protection on CRITICAL security &amp; Important logs</span>
+                  </label>
+
+                  <label className="flex items-center gap-2 cursor-pointer font-medium text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={attendanceConfig.captureGeoLocation ?? true}
+                      onChange={(e) => setAttendanceConfig({ ...attendanceConfig, captureGeoLocation: e.target.checked })}
+                      className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4"
+                    />
+                    <span>Resolve coarse IP GeoLocation on login &amp; audit events</span>
+                  </label>
+                </div>
+              </div>
+
+              <div className="border-t border-slate-200 pt-4 flex items-center justify-between gap-4 flex-wrap">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    id="auto-punch-out"
+                    checked={attendanceConfig.autoPunchOutEnabled}
+                    onChange={(e) => setAttendanceConfig({ ...attendanceConfig, autoPunchOutEnabled: e.target.checked })}
+                    className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
+                  />
+                  <label htmlFor="auto-punch-out" className="text-xs font-semibold text-slate-800 cursor-pointer">
+                    Enable Automated Scheduled Shift Closing (Auto-closes open punches past scheduled shift end)
+                  </label>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={isSavingConfig || !isSuperAdmin}
+                  className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium px-4 py-2 rounded flex items-center gap-1.5 shadow-sm transition disabled:opacity-50 cursor-pointer"
+                >
+                  <Save className="w-4 h-4" />
+                  <span>{isSavingConfig ? 'Saving...' : 'Save Configuration'}</span>
+                </button>
+              </div>
+            </form>
+          ) : null}
+        </div>
+      ) : (
+      <>
 
       <BulkActionBar
         selectedCount={bulk.selectedCount}
@@ -454,6 +793,8 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({
           );
         })}
       </div>
+      )}
+      </>
       )}
 
       {/* EDIT / CREATE MODAL */}

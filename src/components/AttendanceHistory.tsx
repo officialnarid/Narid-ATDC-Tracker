@@ -1004,7 +1004,38 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
                     <span className={`inline-block mt-0.5 px-2 py-0.5 rounded text-[10px] font-bold ${getAttendanceStatusBadgeClasses(modalMetrics.status)}`}>
                       {modalMetrics.status}
                     </span>
+                    {modalMetrics.reconciledFromAutoClose && (
+                      <span className="block text-[9px] font-semibold text-indigo-700 mt-0.5">
+                        Reconciled from Auto-Close
+                      </span>
+                    )}
                   </div>
+                  {modalMetrics.punchOutSchedule && (
+                    <div className="col-span-2 sm:col-span-4 pt-2.5 mt-1 border-t border-slate-200 grid grid-cols-2 sm:grid-cols-3 gap-2">
+                      <div>
+                        <span className="text-[10px] text-slate-400 font-semibold uppercase block">Scheduled Shift End</span>
+                        <span className="font-mono font-bold text-slate-700">
+                          {modalMetrics.punchOutSchedule.scheduledShiftEndDisplay}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-[10px] text-slate-400 font-semibold uppercase block">Regular Duty Completion</span>
+                        <span className="font-mono font-bold text-emerald-700">
+                          {modalMetrics.punchOutSchedule.regularDutyCompletionDisplay}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-[10px] text-slate-400 font-semibold uppercase block">Max Eligible Punch-Out</span>
+                        <span className="font-mono font-bold text-amber-700">
+                          {modalMetrics.punchOutSchedule.maxEligiblePunchOutDisplay}
+                        </span>
+                      </div>
+                      <div className="col-span-2 sm:col-span-3 flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-500 pt-1">
+                        <span>Max OT: <strong className="text-slate-700">{modalMetrics.punchOutSchedule.maxOtDisplay}</strong></span>
+                        <span>Max Credited Working Time: <strong className="text-slate-700">{modalMetrics.punchOutSchedule.maxCreditedWorkingDisplay}</strong></span>
+                      </div>
+                    </div>
+                  )}
                 </div>
               );
             })()}

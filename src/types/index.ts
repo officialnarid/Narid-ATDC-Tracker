@@ -38,7 +38,28 @@ export interface PunchEvent {
   scannerDevice: string;
   dutyDurationMinutes?: number;
   overtimeMinutes?: number;
+  earlyOtMinutes?: number;
+  postShiftOtMinutes?: number;
+  reconciledFromAutoClose?: boolean;
+  previousPunchOutType?: PunchOutType;
+  previousAutoCloseEventId?: string | null;
   status: string;
+}
+
+export interface PunchOutScheduleDisplay {
+  scheduledShiftEndIso: string;
+  scheduledShiftEndDisplay: string;
+  regularDutyCompletionIso: string;
+  regularDutyCompletionDisplay: string;
+  maxEligiblePunchOutIso: string;
+  maxEligiblePunchOutDisplay: string;
+  maxRegularDutyMinutes: number;
+  maxOtMinutes: number;
+  maxCreditedWorkingMinutes: number;
+  maxOtDisplay: string;
+  maxCreditedWorkingDisplay: string;
+  eligibleEarlyOtMinutes: number;
+  remainingPostShiftOtMinutes: number;
 }
 
 export type AttendanceStatus = 
@@ -97,6 +118,14 @@ export interface AttendanceRecord {
   arrivalStatus?: 'PRESENT' | 'LATE';
   missedPunchOut?: boolean;
   autoClosed?: boolean;
+  autoClosedAt?: string | null;
+  autoCloseEventId?: string | null;
+  autoCloseEffectivePunchOut?: string | null;
+  reconciledFromAutoClose?: boolean;
+  reconciledAt?: string | null;
+  reconciledByUid?: string | null;
+  reconciledByLoginId?: string | null;
+  otCapApplied?: boolean;
   qrTokenReference: string;
   correctionReason?: string;
   correctedBy?: string;
@@ -460,6 +489,8 @@ export interface ScanResult {
   dutyFormatted?: string;
   otFormatted?: string;
   punchCount?: number;
+  reconciledFromAutoClose?: boolean;
+  punchOutSchedule?: PunchOutScheduleDisplay;
   perf?: {
     qrDetectMs?: number;
     qrParseMs?: number;

@@ -88,7 +88,7 @@ service cloud.firestore {
     function hasRoleModuleAction(mod, act) {
       return isSuperAdmin() || (
         isActiveUser() &&
-        !(mod in ['user_rights', 'audit_logs', 'security_management']) &&
+        !(mod in ['user_rights', 'audit_logs', 'security_management', 'company_wifi_access']) &&
         callerRoleId() != '' &&
         exists(/databases/$(database)/documents/role_permissions/$(callerRoleId())) &&
         get(/databases/$(database)/documents/role_permissions/$(callerRoleId())).data.modulePermissions is map &&
@@ -285,6 +285,27 @@ service cloud.firestore {
     // 17. Distributed IP Rate Limits (Backend Admin SDK Only — Zero Client Access)
     match /ip_rate_limits/{limitId} {
       allow read, write: if false;
+    }
+
+    // 18. Company Wi-Fi Access Control (Super Admin Read / Firebase Admin SDK Only Writes)
+    match /company_wifi_networks/{networkId} {
+      allow list, get: if isSuperAdmin();
+      allow create, update, delete: if false; // Strictly Firebase Admin SDK only
+    }
+
+    match /company_wifi_access_policies/{roleId} {
+      allow list, get: if isSuperAdmin();
+      allow create, update, delete: if false; // Strictly Firebase Admin SDK only
+    }
+
+    match /company_wifi_settings/{settingId} {
+      allow list, get: if isSuperAdmin();
+      allow create, update, delete: if false; // Strictly Firebase Admin SDK only
+    }
+
+    match /company_wifi_access_logs/{logId} {
+      allow list, get: if isSuperAdmin();
+      allow create, update, delete: if false; // Strictly Firebase Admin SDK only
     }
 
     // Default catch-all deny

@@ -330,7 +330,8 @@ describe('Approved Early Punch & Early Overtime Policy (Option A)', () => {
     expect(daySubThreshold.body.attendance.overtimeMinutes).toBe(60);
     expect(daySubThreshold.body.attendance.attendanceStatus).toBe('COMPLETED + OT');
 
-    // Night Shift cross-midnight: 06:00 PM (120m early) to 06:30 AM next morning (120m post-shift) => Total OT = 240m
+    // Night Shift cross-midnight: 06:00 PM (120m early) to 06:30 AM next morning (120m raw post-shift)
+    // Enforces 210m Total OT cap (120m Early OT + 90m Post OT = 210m) and 720m Max Credited Working Time
     await request(app)
       .post('/api/attendance/scan')
       .set('Authorization', `Bearer ${adminToken}`)
@@ -344,8 +345,10 @@ describe('Approved Early Punch & Early Overtime Policy (Option A)', () => {
     expect(nightCombined.body.attendance.shiftDate).toBe('2026-11-19');
     expect(nightCombined.body.attendance.earlyArrivalMinutes).toBe(120);
     expect(nightCombined.body.attendance.earlyOtMinutes).toBe(120);
-    expect(nightCombined.body.attendance.postShiftOtMinutes).toBe(120);
-    expect(nightCombined.body.attendance.overtimeMinutes).toBe(240);
+    expect(nightCombined.body.attendance.postShiftOtMinutes).toBe(90);
+    expect(nightCombined.body.attendance.overtimeMinutes).toBe(210);
+    expect(nightCombined.body.attendance.totalDutyMinutes).toBe(720);
+    expect(nightCombined.body.attendance.otCapApplied).toBe(true);
     expect(nightCombined.body.attendance.attendanceStatus).toBe('COMPLETED + OT');
   });
 

@@ -617,9 +617,10 @@ export function isModuleAllowedForUser(profile: UserRoleRecord | null | undefine
     return true; // Super Admin always has full access
   }
 
-  // Security Lockout Control, Audit Logs, User Rights & System Performance are strictly SUPER_ADMIN only
+  // Security Lockout Control, Company Wi-Fi Access Control, Audit Logs, User Rights & System Performance are strictly SUPER_ADMIN only
   if (
     tab === 'security_management' ||
+    tab === 'company_wifi_access' ||
     tab === 'audit_logs' ||
     tab === 'user_rights' ||
     tab === 'system_performance'
@@ -653,6 +654,7 @@ export function isModuleAllowedForRole(role: UserRoleType, tab: NavItem): boolea
   }
   if (
     tab === 'security_management' ||
+    tab === 'company_wifi_access' ||
     tab === 'audit_logs' ||
     tab === 'user_rights' ||
     tab === 'system_performance'

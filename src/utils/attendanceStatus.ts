@@ -1,4 +1,7 @@
 export const STANDARD_DUTY_MINUTES = 510; // 08 hours 30 minutes
+export const MAX_REGULAR_DUTY_MINUTES = 510; // 08 hours 30 minutes
+export const MAX_TOTAL_OT_MINUTES = 210; // 03 hours 30 minutes
+export const MAX_CREDITED_TOTAL_MINUTES = 720; // 12 hours 00 minutes
 export const HALF_DAY_MIN_MINUTES = 270; // 04 hours 30 minutes
 export const EARLY_OT_THRESHOLD_MINUTES = 60; // Option A: >= 60 mins early grants entire early duration as Early OT
 export const EARLY_PUNCH_POLICY_ID = 'OPTION_A_60M' as const;
@@ -8,6 +11,22 @@ export type DutyClassifiedStatus =
   | 'HALF DAY'
   | 'COMPLETED'
   | 'COMPLETED + OT';
+
+export interface PunchOutScheduleMetrics {
+  scheduledShiftEndIso: string;
+  scheduledShiftEndDisplay: string;
+  regularDutyCompletionIso: string;
+  regularDutyCompletionDisplay: string;
+  maxEligiblePunchOutIso: string;
+  maxEligiblePunchOutDisplay: string;
+  maxRegularDutyMinutes: number;
+  maxOtMinutes: number;
+  maxCreditedWorkingMinutes: number;
+  maxOtDisplay: string;
+  maxCreditedWorkingDisplay: string;
+  eligibleEarlyOtMinutes: number;
+  remainingPostShiftOtMinutes: number;
+}
 
 export interface ResolvedAttendanceMetrics {
   status: string;
@@ -21,6 +40,8 @@ export interface ResolvedAttendanceMetrics {
   otLabel: string;
   scheduledPunchIn: string;
   scheduledStartDisplay: string;
+  scheduledPunchOut: string;
+  scheduledEndDisplay: string;
   earlyArrivalMinutes: number;
   provisionalEarlyOtMinutes: number;
   earlyOtMinutes: number;
@@ -28,7 +49,17 @@ export interface ResolvedAttendanceMetrics {
   totalOtMinutes: number;
   earlyOtFinalized: boolean;
   isEarlyPunch: boolean;
+  otCapApplied: boolean;
+  reconciledFromAutoClose: boolean;
+  punchOutSchedule: PunchOutScheduleMetrics | null;
 }
+
+const KOLKATA_TIME_12H_FORMATTER = new Intl.DateTimeFormat('en-IN', {
+  timeZone: 'Asia/Kolkata',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: true,
+});
 
 const NON_WORKING_STATUSES = new Set([
   'ABSENT',
@@ -52,7 +83,13 @@ export function classifyCompletedDutyStatus(
   standardDutyMinutes: number = STANDARD_DUTY_MINUTES
 ): DutyClassifiedStatus {
   const safeMinutes = Math.max(0, Math.floor(Number.isFinite(completedDutyMinutes) ? completedDutyMinutes : 0));
-  const safeStandard = Math.max(1, Math.floor(Number.isFinite(standardDutyMinutes) ? standardDutyMinutes : STANDARD_DUTY_MINUTES));
+  const safeStandard = Math.max(
+    1,
+    Math.min(
+      MAX_REGULAR_DUTY_MINUTES,
+      Math.floor(Number.isFinite(standardDutyMinutes) ? standardDutyMinutes : STANDARD_DUTY_MINUTES)
+    )
+  );
 
   if (safeMinutes < HALF_DAY_MIN_MINUTES) {
     return 'SHORT LEAVE';
@@ -88,6 +125,13 @@ export function formatShiftTimeClock12h(timeStr: string | null | undefined): str
   const h12 = h24 % 12 || 12;
   const ampm = h24 >= 12 ? 'PM' : 'AM';
   return `${String(h12).padStart(2, '0')}:${String(rawM).padStart(2, '0')} ${ampm}`;
+}
+
+export function formatIsoTimeKolkata12h(isoString: string | null | undefined): string {
+  if (!isoString) return '--:--';
+  const dt = new Date(isoString);
+  if (Number.isNaN(dt.getTime())) return '--:--';
+  return KOLKATA_TIME_12H_FORMATTER.format(dt).toUpperCase();
 }
 
 export function getNextCalendarDateKey(dateKey: string): string {
@@ -166,9 +210,71 @@ export function resolveShiftScheduleBounds(
 }
 
 /**
+ * Computes expected Punch-Out timestamps in IST according to shift anchor,
+ * Option A Early OT policy (>= 60m), 510m Regular Duty, 210m Max OT, and 720m Max Credited Time:
+ * - shiftAnchorMs = firstIn < scheduledStart ? scheduledStart : firstIn
+ * - regularDutyCompletionMs = shiftAnchorMs + 510m
+ * - eligibleEarlyOtMinutes = earlyArrival >= 60 ? min(earlyArrival, 210) : 0
+ * - remainingPostShiftOtMinutes = max(0, 210 - eligibleEarlyOtMinutes)
+ * - maxEligiblePunchOutMs = regularDutyCompletionMs + remainingPostShiftOtMinutes
+ */
+export function computeExpectedPunchOutTimes(params: {
+  firstInIso: string;
+  scheduledStartIso: string;
+  scheduledEndIso: string;
+  standardDutyMinutes?: number;
+}): PunchOutScheduleMetrics | null {
+  const firstInMs = new Date(params.firstInIso).getTime();
+  const scheduledStartMs = new Date(params.scheduledStartIso).getTime();
+  const scheduledEndMs = new Date(params.scheduledEndIso).getTime();
+
+  if (!Number.isFinite(firstInMs) || !Number.isFinite(scheduledStartMs) || !Number.isFinite(scheduledEndMs)) {
+    return null;
+  }
+
+  const maxRegularDutyMinutes = Math.max(
+    1,
+    Math.min(
+      MAX_REGULAR_DUTY_MINUTES,
+      Math.floor(Number.isFinite(params.standardDutyMinutes) ? Number(params.standardDutyMinutes) : STANDARD_DUTY_MINUTES)
+    )
+  );
+  const earlyArrivalMinutes =
+    firstInMs < scheduledStartMs ? Math.max(0, Math.floor((scheduledStartMs - firstInMs) / 60000)) : 0;
+  const eligibleEarlyOtMinutes =
+    earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES
+      ? Math.min(earlyArrivalMinutes, MAX_TOTAL_OT_MINUTES)
+      : 0;
+  const remainingPostShiftOtMinutes = Math.max(0, MAX_TOTAL_OT_MINUTES - eligibleEarlyOtMinutes);
+
+  const shiftAnchorMs = firstInMs < scheduledStartMs ? scheduledStartMs : firstInMs;
+  const regularDutyCompletionMs = shiftAnchorMs + maxRegularDutyMinutes * 60000;
+  const maxEligiblePunchOutMs = regularDutyCompletionMs + remainingPostShiftOtMinutes * 60000;
+
+  const regularDutyCompletionIso = new Date(regularDutyCompletionMs).toISOString();
+  const maxEligiblePunchOutIso = new Date(maxEligiblePunchOutMs).toISOString();
+
+  return {
+    scheduledShiftEndIso: params.scheduledEndIso,
+    scheduledShiftEndDisplay: formatIsoTimeKolkata12h(params.scheduledEndIso),
+    regularDutyCompletionIso,
+    regularDutyCompletionDisplay: formatIsoTimeKolkata12h(regularDutyCompletionIso),
+    maxEligiblePunchOutIso,
+    maxEligiblePunchOutDisplay: formatIsoTimeKolkata12h(maxEligiblePunchOutIso),
+    maxRegularDutyMinutes,
+    maxOtMinutes: MAX_TOTAL_OT_MINUTES,
+    maxCreditedWorkingMinutes: MAX_CREDITED_TOTAL_MINUTES,
+    maxOtDisplay: `${formatDurationClock(MAX_TOTAL_OT_MINUTES)} Hours`,
+    maxCreditedWorkingDisplay: `${formatDurationClock(MAX_CREDITED_TOTAL_MINUTES)} Hours`,
+    eligibleEarlyOtMinutes,
+    remainingPostShiftOtMinutes,
+  };
+}
+
+/**
  * Option A Early Punch Evaluation on Punch In:
  * - < 60 mins before scheduled shift start -> record earlyArrivalMinutes, award 0 Early OT.
- * - >= 60 mins before scheduled shift start -> provisional Early OT equals entire earlyArrivalMinutes.
+ * - >= 60 mins before scheduled shift start -> provisional Early OT equals min(earlyArrivalMinutes, 210).
  * Open shifts remain IN PROGRESS with finalized overtimeMinutes = 0 until Punch Out.
  */
 export function evaluateEarlyPunchOnPunchIn(params: {
@@ -189,7 +295,9 @@ export function evaluateEarlyPunchOnPunchIn(params: {
       : 0;
 
   const provisionalEarlyOtMinutes =
-    earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES ? earlyArrivalMinutes : 0;
+    earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES
+      ? Math.min(earlyArrivalMinutes, MAX_TOTAL_OT_MINUTES)
+      : 0;
 
   return {
     earlyArrivalMinutes,
@@ -200,11 +308,16 @@ export function evaluateEarlyPunchOnPunchIn(params: {
 }
 
 /**
- * Option A Finalized Punch Out / Correction Evaluation:
+ * Option A Finalized Punch Out / Correction Evaluation with Strict Duty & OT Caps:
+ * - Max Regular Duty = 510 mins (08:30 hours)
+ * - Max Total OT = 210 mins (03:30 hours)
+ * - Max Credited Total Working Time = 720 mins (12:00 hours)
+ *
  * Strictly separates non-overlapping intervals:
- * 1. Early Arrival interval: [firstIn, scheduledStart] -> Eligible Early OT iff >= 60m AND regular duty completed.
- * 2. Regular Duty + Post-Shift interval: [max(firstIn, scheduledStart), lastOut] -> 510m regular + excess as Post-shift OT.
- * Total OT = Eligible Early OT + Eligible Post-shift OT (never double-counted).
+ * 1. Early Arrival interval: [firstIn, scheduledStart] -> Eligible Early OT iff >= 60m AND regular duty completed (capped to 210m).
+ * 2. Regular Duty + Post-Shift interval: [max(firstIn, scheduledStart), lastOut] -> 510m regular + excess as Post-shift OT (capped to remaining OT budget).
+ * Total OT = min(earlyOtMinutes + postShiftOtMinutes, 210).
+ * Total Credited Duty = min(regularDutyMinutes + totalOtMinutes, 720).
  */
 export function evaluateOptionAPunchOut(params: {
   firstInIso: string;
@@ -222,13 +335,17 @@ export function evaluateOptionAPunchOut(params: {
   totalOtMinutes: number;
   regularDutyMinutes: number;
   totalDutyMinutes: number;
+  otCapApplied: boolean;
   attendanceStatus: DutyClassifiedStatus;
   earlyOtFinalized: true;
   earlyPunchPolicy: typeof EARLY_PUNCH_POLICY_ID;
 } {
   const standardDutyMinutes = Math.max(
     1,
-    Math.floor(Number.isFinite(params.standardDutyMinutes) ? Number(params.standardDutyMinutes) : STANDARD_DUTY_MINUTES)
+    Math.min(
+      MAX_REGULAR_DUTY_MINUTES,
+      Math.floor(Number.isFinite(params.standardDutyMinutes) ? Number(params.standardDutyMinutes) : STANDARD_DUTY_MINUTES)
+    )
   );
   const firstInMs = new Date(params.firstInIso).getTime();
   const lastOutMs = new Date(params.lastOutIso).getTime();
@@ -245,6 +362,7 @@ export function evaluateOptionAPunchOut(params: {
       totalOtMinutes: 0,
       regularDutyMinutes: 0,
       totalDutyMinutes: 0,
+      otCapApplied: false,
       attendanceStatus: 'SHORT LEAVE',
       earlyOtFinalized: true,
       earlyPunchPolicy: EARLY_PUNCH_POLICY_ID,
@@ -256,19 +374,29 @@ export function evaluateOptionAPunchOut(params: {
     Number.isFinite(scheduledStartMs) && firstInMs < scheduledStartMs
       ? Math.max(0, Math.floor((scheduledStartMs - firstInMs) / 60000))
       : 0;
-  const provisionalEarlyOtMinutes =
+  const rawEarlyOtMinutes =
     earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES ? earlyArrivalMinutes : 0;
+  const provisionalEarlyOtMinutes = Math.min(rawEarlyOtMinutes, MAX_TOTAL_OT_MINUTES);
 
   const shiftAnchorMs =
     Number.isFinite(scheduledStartMs) && firstInMs < scheduledStartMs ? scheduledStartMs : firstInMs;
   const fromShiftStartMinutes = Math.max(0, Math.floor((lastOutMs - shiftAnchorMs) / 60000));
 
   if (fromShiftStartMinutes >= standardDutyMinutes) {
-    const regularDutyMinutes = standardDutyMinutes;
-    const postShiftOtMinutes = fromShiftStartMinutes - standardDutyMinutes;
-    const earlyOtMinutes = provisionalEarlyOtMinutes;
-    const overtimeMinutes = earlyOtMinutes + postShiftOtMinutes;
-    const totalDutyMinutes = regularDutyMinutes + overtimeMinutes;
+    const regularDutyMinutes = Math.min(fromShiftStartMinutes, MAX_REGULAR_DUTY_MINUTES, standardDutyMinutes);
+    const rawPostShiftOtMinutes = Math.max(0, fromShiftStartMinutes - standardDutyMinutes);
+
+    // Apply 210-minute total OT cap: Early OT first (never exceeding 210m), Post-Shift OT uses remaining budget
+    const earlyOtMinutes = Math.min(rawEarlyOtMinutes, MAX_TOTAL_OT_MINUTES);
+    const remainingOtBudget = Math.max(0, MAX_TOTAL_OT_MINUTES - earlyOtMinutes);
+    const postShiftOtMinutes = Math.min(rawPostShiftOtMinutes, remainingOtBudget);
+    const totalOtMinutes = Math.min(earlyOtMinutes + postShiftOtMinutes, MAX_TOTAL_OT_MINUTES);
+    const overtimeMinutes = totalOtMinutes;
+    const totalDutyMinutes = Math.min(regularDutyMinutes + totalOtMinutes, MAX_CREDITED_TOTAL_MINUTES);
+    const otCapApplied =
+      rawEarlyOtMinutes + rawPostShiftOtMinutes > MAX_TOTAL_OT_MINUTES ||
+      regularDutyMinutes + rawEarlyOtMinutes + rawPostShiftOtMinutes > MAX_CREDITED_TOTAL_MINUTES;
+
     return {
       actualPresenceMinutes,
       earlyArrivalMinutes,
@@ -276,17 +404,21 @@ export function evaluateOptionAPunchOut(params: {
       earlyOtMinutes,
       postShiftOtMinutes,
       overtimeMinutes,
-      totalOtMinutes: overtimeMinutes,
+      totalOtMinutes,
       regularDutyMinutes,
       totalDutyMinutes,
+      otCapApplied,
       attendanceStatus: overtimeMinutes > 0 ? 'COMPLETED + OT' : 'COMPLETED',
       earlyOtFinalized: true,
       earlyPunchPolicy: EARLY_PUNCH_POLICY_ID,
     };
   }
 
-  // Did not complete full scheduled duty duration: award zero OT and preserve Half Day / Short Leave classification
-  const countedDuty = earlyArrivalMinutes > 0 ? fromShiftStartMinutes : actualPresenceMinutes;
+  // Did not complete full scheduled duty duration: forfeit Early OT and preserve Half Day / Short Leave classification
+  const countedDuty = Math.min(
+    earlyArrivalMinutes > 0 ? fromShiftStartMinutes : actualPresenceMinutes,
+    MAX_REGULAR_DUTY_MINUTES
+  );
   const attendanceStatus = classifyCompletedDutyStatus(countedDuty, standardDutyMinutes);
   return {
     actualPresenceMinutes,
@@ -298,6 +430,7 @@ export function evaluateOptionAPunchOut(params: {
     totalOtMinutes: 0,
     regularDutyMinutes: countedDuty,
     totalDutyMinutes: countedDuty,
+    otCapApplied: false,
     attendanceStatus,
     earlyOtFinalized: true,
     earlyPunchPolicy: EARLY_PUNCH_POLICY_ID,
@@ -336,16 +469,17 @@ export function isAttendanceRecordOpen(record: Record<string, any> | null | unde
 }
 
 /**
- * Authoritatively resolves an attendance record's status, duty breakdown, OT, and early punch breakdown.
- * Safe for both new Option A records and legacy Firestore records without modifying stored history.
+ * Authoritatively resolves an attendance record's status, duty breakdown, OT, early punch breakdown,
+ * and expected Punch-Out schedule. Safe for both new Option A records and legacy Firestore records.
  */
 export function resolveAttendanceMetrics(
   record: Record<string, any> | null | undefined,
   nowMs: number = Date.now(),
   standardDutyMinutes: number = STANDARD_DUTY_MINUTES
 ): ResolvedAttendanceMetrics {
-  const { startTime: defaultStart } = resolveScheduledShiftDefaults(record);
+  const { startTime: defaultStart, endTime: defaultEnd } = resolveScheduledShiftDefaults(record);
   const scheduledStartDisplay = formatShiftTimeClock12h(defaultStart);
+  const scheduledEndDisplay = formatShiftTimeClock12h(defaultEnd);
 
   if (!record) {
     return {
@@ -360,6 +494,8 @@ export function resolveAttendanceMetrics(
       otLabel: '00:00',
       scheduledPunchIn: defaultStart,
       scheduledStartDisplay,
+      scheduledPunchOut: defaultEnd,
+      scheduledEndDisplay,
       earlyArrivalMinutes: 0,
       provisionalEarlyOtMinutes: 0,
       earlyOtMinutes: 0,
@@ -367,11 +503,34 @@ export function resolveAttendanceMetrics(
       totalOtMinutes: 0,
       earlyOtFinalized: false,
       isEarlyPunch: false,
+      otCapApplied: false,
+      reconciledFromAutoClose: false,
+      punchOutSchedule: null,
     };
   }
 
   const rawStatus = String(record.attendanceStatus || '').trim().toUpperCase();
   const isLate = isAttendanceLate(record);
+  const reconciledFromAutoClose = Boolean(record.reconciledFromAutoClose);
+
+  // Compute expected Punch-Out schedule when first punch-in & shift schedule are known
+  const firstInForSchedule = record.firstPunchIn || record.punchIn;
+  let punchOutSchedule: PunchOutScheduleMetrics | null = null;
+  if (firstInForSchedule && (record.scheduledPunchInIso || record.shiftDate)) {
+    const bounds = record.shiftDate
+      ? resolveShiftScheduleBounds(record.shiftDate, record)
+      : null;
+    const schedStartIso = record.scheduledPunchInIso || bounds?.scheduledStartIso;
+    const schedEndIso = record.scheduledPunchOutIso || bounds?.scheduledEndIso;
+    if (schedStartIso && schedEndIso) {
+      punchOutSchedule = computeExpectedPunchOutTimes({
+        firstInIso: firstInForSchedule,
+        scheduledStartIso: schedStartIso,
+        scheduledEndIso: schedEndIso,
+        standardDutyMinutes,
+      });
+    }
+  }
 
   // 1. Non-working explicit statuses (ABSENT, LEAVE, WEEKLY_OFF, HOLIDAY)
   if (NON_WORKING_STATUSES.has(rawStatus)) {
@@ -387,6 +546,8 @@ export function resolveAttendanceMetrics(
       otLabel: '00:00',
       scheduledPunchIn: defaultStart,
       scheduledStartDisplay,
+      scheduledPunchOut: defaultEnd,
+      scheduledEndDisplay,
       earlyArrivalMinutes: 0,
       provisionalEarlyOtMinutes: 0,
       earlyOtMinutes: 0,
@@ -394,18 +555,21 @@ export function resolveAttendanceMetrics(
       totalOtMinutes: 0,
       earlyOtFinalized: false,
       isEarlyPunch: false,
+      otCapApplied: false,
+      reconciledFromAutoClose: false,
+      punchOutSchedule: null,
     };
   }
 
   const storedEarlyArrival = Math.max(0, Math.floor(Number(record.earlyArrivalMinutes || 0) || 0));
   const computedProvisionalEarlyOt =
     typeof record.provisionalEarlyOtMinutes === 'number' && Number.isFinite(record.provisionalEarlyOtMinutes)
-      ? Math.max(0, Math.floor(record.provisionalEarlyOtMinutes))
+      ? Math.min(Math.max(0, Math.floor(record.provisionalEarlyOtMinutes)), MAX_TOTAL_OT_MINUTES)
       : storedEarlyArrival >= EARLY_OT_THRESHOLD_MINUTES
-      ? storedEarlyArrival
+      ? Math.min(storedEarlyArrival, MAX_TOTAL_OT_MINUTES)
       : 0;
 
-  // 2. Auto-closed or Missed Punch Out (only when not currently re-entered INSIDE)
+  // 2. Auto-closed or Missed Punch Out (only when not currently re-entered INSIDE and not reconciled to ACTUAL)
   const reenteredInside =
     String(record.currentState || '').toUpperCase() === 'INSIDE' &&
     String(record.punchOutType || '').toUpperCase() === 'NONE';
@@ -417,11 +581,12 @@ export function resolveAttendanceMetrics(
       rawStatus === 'MISSED PUNCH OUT' ||
       record.missedPunchOut === true)
   ) {
-    const completedDutyMinutes = Math.max(
+    const rawCompleted = Math.max(
       0,
       Math.floor(Number(record.totalDutyMinutes ?? record.regularDutyMinutes ?? 0) || 0)
     );
-    const regularDutyMinutes = Math.min(completedDutyMinutes, standardDutyMinutes);
+    const regularDutyMinutes = Math.min(rawCompleted, MAX_REGULAR_DUTY_MINUTES, standardDutyMinutes);
+    const completedDutyMinutes = regularDutyMinutes;
     return {
       status: rawStatus === 'MISSED PUNCH OUT' ? 'MISSED PUNCH OUT' : 'AUTO CLOSED',
       state: 'OUTSIDE',
@@ -434,6 +599,8 @@ export function resolveAttendanceMetrics(
       otLabel: '00:00',
       scheduledPunchIn: defaultStart,
       scheduledStartDisplay,
+      scheduledPunchOut: defaultEnd,
+      scheduledEndDisplay,
       earlyArrivalMinutes: storedEarlyArrival,
       provisionalEarlyOtMinutes: 0,
       earlyOtMinutes: 0,
@@ -441,6 +608,9 @@ export function resolveAttendanceMetrics(
       totalOtMinutes: 0,
       earlyOtFinalized: false,
       isEarlyPunch: storedEarlyArrival > 0,
+      otCapApplied: false,
+      reconciledFromAutoClose: false,
+      punchOutSchedule,
     };
   }
 
@@ -465,6 +635,8 @@ export function resolveAttendanceMetrics(
       otLabel: '00:00',
       scheduledPunchIn: defaultStart,
       scheduledStartDisplay,
+      scheduledPunchOut: defaultEnd,
+      scheduledEndDisplay,
       earlyArrivalMinutes: storedEarlyArrival,
       provisionalEarlyOtMinutes: computedProvisionalEarlyOt,
       earlyOtMinutes: 0,
@@ -472,10 +644,13 @@ export function resolveAttendanceMetrics(
       totalOtMinutes: 0,
       earlyOtFinalized: false,
       isEarlyPunch: storedEarlyArrival > 0,
+      otCapApplied: false,
+      reconciledFromAutoClose,
+      punchOutSchedule,
     };
   }
 
-  // 4. Closed shift with valid Punch Out
+  // 4. Closed shift with valid Actual Punch Out
   const firstInIso = record.firstPunchIn || record.punchIn;
   const lastOutIso = record.lastPunchOut || record.actualPunchOut || record.effectivePunchOut;
   const firstInMs = firstInIso ? new Date(firstInIso).getTime() : NaN;
@@ -488,11 +663,21 @@ export function resolveAttendanceMetrics(
 
   if (isOptionARecord) {
     let earlyArrivalMinutes = storedEarlyArrival;
-    let earlyOtMinutes = Math.max(0, Math.floor(Number(record.earlyOtMinutes || 0) || 0));
-    let postShiftOtMinutes = Math.max(0, Math.floor(Number(record.postShiftOtMinutes || 0) || 0));
-    let completedDutyMinutes = Math.max(0, Math.floor(Number(record.totalDutyMinutes || 0) || 0));
-    let regularDutyMinutes = Math.max(0, Math.floor(Number(record.regularDutyMinutes || 0) || 0));
-    let overtimeMinutes = earlyOtMinutes + postShiftOtMinutes;
+    let earlyOtMinutes = Math.min(Math.max(0, Math.floor(Number(record.earlyOtMinutes || 0) || 0)), MAX_TOTAL_OT_MINUTES);
+    let postShiftOtMinutes = Math.min(
+      Math.max(0, Math.floor(Number(record.postShiftOtMinutes || 0) || 0)),
+      Math.max(0, MAX_TOTAL_OT_MINUTES - earlyOtMinutes)
+    );
+    let regularDutyMinutes = Math.min(
+      Math.max(0, Math.floor(Number(record.regularDutyMinutes || 0) || 0)),
+      MAX_REGULAR_DUTY_MINUTES
+    );
+    let overtimeMinutes = Math.min(earlyOtMinutes + postShiftOtMinutes, MAX_TOTAL_OT_MINUTES);
+    let completedDutyMinutes = Math.min(
+      Math.max(0, Math.floor(Number(record.totalDutyMinutes || 0) || 0)),
+      MAX_CREDITED_TOTAL_MINUTES
+    );
+    let otCapApplied = Boolean(record.otCapApplied);
 
     const scheduledStartIso =
       record.scheduledPunchInIso ||
@@ -511,8 +696,9 @@ export function resolveAttendanceMetrics(
       overtimeMinutes = evaluated.overtimeMinutes;
       regularDutyMinutes = evaluated.regularDutyMinutes;
       completedDutyMinutes = evaluated.totalDutyMinutes;
+      otCapApplied = evaluated.otCapApplied;
     } else if (overtimeMinutes === 0 && typeof record.overtimeMinutes === 'number') {
-      overtimeMinutes = Math.max(0, Math.floor(record.overtimeMinutes));
+      overtimeMinutes = Math.min(Math.max(0, Math.floor(record.overtimeMinutes)), MAX_TOTAL_OT_MINUTES);
     }
 
     const status = classifyCompletedDutyStatus(completedDutyMinutes, standardDutyMinutes);
@@ -528,39 +714,48 @@ export function resolveAttendanceMetrics(
       otLabel: formatOtBadge(overtimeMinutes),
       scheduledPunchIn: defaultStart,
       scheduledStartDisplay,
+      scheduledPunchOut: defaultEnd,
+      scheduledEndDisplay,
       earlyArrivalMinutes,
-      provisionalEarlyOtMinutes: earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES ? earlyArrivalMinutes : 0,
+      provisionalEarlyOtMinutes:
+        earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES
+          ? Math.min(earlyArrivalMinutes, MAX_TOTAL_OT_MINUTES)
+          : 0,
       earlyOtMinutes,
       postShiftOtMinutes,
       totalOtMinutes: overtimeMinutes,
       earlyOtFinalized: true,
       isEarlyPunch: earlyArrivalMinutes > 0,
+      otCapApplied,
+      reconciledFromAutoClose,
+      punchOutSchedule,
     };
   }
 
-  // Legacy closed record fallback (never mutates historical classification or stored OT)
-  let completedDutyMinutes = 0;
+  // Legacy closed record fallback (preserves historical classification while respecting caps)
+  let rawCompleted = 0;
   if (
     typeof record.totalDutyMinutes === 'number' &&
     Number.isFinite(record.totalDutyMinutes) &&
     record.totalDutyMinutes > 0
   ) {
-    completedDutyMinutes = Math.floor(record.totalDutyMinutes);
+    rawCompleted = Math.floor(record.totalDutyMinutes);
   } else if (Number.isFinite(firstInMs) && Number.isFinite(lastOutMs) && lastOutMs >= firstInMs) {
-    completedDutyMinutes = Math.floor((lastOutMs - firstInMs) / 60000);
+    rawCompleted = Math.floor((lastOutMs - firstInMs) / 60000);
   } else if (
     typeof record.regularDutyMinutes === 'number' ||
     typeof record.overtimeMinutes === 'number'
   ) {
-    completedDutyMinutes = Math.max(
+    rawCompleted = Math.max(
       0,
       Math.floor(Number(record.regularDutyMinutes || 0) + Number(record.overtimeMinutes || 0))
     );
   }
 
-  const regularDutyMinutes = Math.min(completedDutyMinutes, standardDutyMinutes);
-  const overtimeMinutes =
-    completedDutyMinutes > standardDutyMinutes ? completedDutyMinutes - standardDutyMinutes : 0;
+  const regularDutyMinutes = Math.min(rawCompleted, MAX_REGULAR_DUTY_MINUTES, standardDutyMinutes);
+  const rawOt = rawCompleted > regularDutyMinutes ? rawCompleted - regularDutyMinutes : 0;
+  const overtimeMinutes = Math.min(rawOt, MAX_TOTAL_OT_MINUTES);
+  const completedDutyMinutes = Math.min(regularDutyMinutes + overtimeMinutes, MAX_CREDITED_TOTAL_MINUTES);
   const status = classifyCompletedDutyStatus(completedDutyMinutes, standardDutyMinutes);
 
   return {
@@ -575,6 +770,8 @@ export function resolveAttendanceMetrics(
     otLabel: formatOtBadge(overtimeMinutes),
     scheduledPunchIn: defaultStart,
     scheduledStartDisplay,
+    scheduledPunchOut: defaultEnd,
+    scheduledEndDisplay,
     earlyArrivalMinutes: 0,
     provisionalEarlyOtMinutes: 0,
     earlyOtMinutes: 0,
@@ -582,6 +779,9 @@ export function resolveAttendanceMetrics(
     totalOtMinutes: overtimeMinutes,
     earlyOtFinalized: true,
     isEarlyPunch: false,
+    otCapApplied: rawOt > MAX_TOTAL_OT_MINUTES || rawCompleted > MAX_CREDITED_TOTAL_MINUTES,
+    reconciledFromAutoClose,
+    punchOutSchedule,
   };
 }
 

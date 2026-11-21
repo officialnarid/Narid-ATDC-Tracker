@@ -376,6 +376,67 @@
         "reason": { "type": "string" }
       },
       "required": ["id", "action", "severity", "actorUid", "actorLoginId", "timestamp"]
+    },
+    "CompanyWifiNetwork": {
+      "title": "CompanyWifiNetwork",
+      "description": "Registered Company Wi-Fi network identified by server-observed Public IPv4/IPv6 address or CIDR range",
+      "type": "object",
+      "properties": {
+        "networkId": { "type": "string", "maxLength": 128 },
+        "networkName": { "type": "string", "minLength": 2, "maxLength": 80 },
+        "publicIp": { "type": "string", "maxLength": 64 },
+        "cidrRange": { "type": "string", "maxLength": 64 },
+        "ipVersion": { "type": "string", "enum": ["ipv4", "ipv6"] },
+        "status": { "type": "string", "enum": ["Active", "Inactive"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string", "maxLength": 128 },
+        "updatedBy": { "type": "string", "maxLength": 128 }
+      },
+      "required": ["networkId", "networkName", "publicIp", "status", "createdAt", "updatedAt"]
+    },
+    "CompanyWifiAccessPolicy": {
+      "title": "CompanyWifiAccessPolicy",
+      "description": "Role-wise Company Wi-Fi access policy for ADMIN and USER (SUPER_ADMIN is always unrestricted)",
+      "type": "object",
+      "properties": {
+        "roleId": { "type": "string", "enum": ["admin", "user"] },
+        "allowedNetworkIds": { "type": "array", "description": "Assigned Company Wi-Fi network IDs" },
+        "accessMode": { "type": "string", "enum": ["RESTRICTED", "UNRESTRICTED"] },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "updatedBy": { "type": "string", "maxLength": 128 }
+      },
+      "required": ["roleId", "accessMode", "updatedAt"]
+    },
+    "CompanyWifiSettings": {
+      "title": "CompanyWifiSettings",
+      "description": "Global Company Wi-Fi Access Control enforcement setting (defaults to OFF)",
+      "type": "object",
+      "properties": {
+        "enforcementEnabled": { "type": "boolean" },
+        "trustedProxyHops": { "type": "number" },
+        "policyVersion": { "type": "number" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "updatedBy": { "type": "string", "maxLength": 128 }
+      },
+      "required": ["enforcementEnabled", "policyVersion"]
+    },
+    "CompanyWifiAccessLog": {
+      "title": "CompanyWifiAccessLog",
+      "description": "Audit log for Company Wi-Fi network/policy edits, enforcement toggles, and blocked access attempts",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "actorUid": { "type": "string", "maxLength": 128 },
+        "actorLoginId": { "type": "string", "maxLength": 128 },
+        "actorRole": { "type": "string", "maxLength": 64 },
+        "eventType": { "type": "string", "maxLength": 64 },
+        "observedIp": { "type": "string", "maxLength": 64 },
+        "networkId": { "type": "string", "maxLength": 128 },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "result": { "type": "string", "enum": ["Allowed", "Blocked", "Updated"] }
+      },
+      "required": ["id", "actorUid", "actorRole", "eventType", "observedIp", "timestamp", "result"]
     }
   },
   "firestore": {
@@ -466,6 +527,22 @@
     "/security_audit_logs/{logId}": {
       "schema": "SecurityAuditLog",
       "description": "Immutable security governance audit trail"
+    },
+    "/company_wifi_networks/{networkId}": {
+      "schema": "CompanyWifiNetwork",
+      "description": "Company Wi-Fi networks registered with Public IP / CIDR ranges"
+    },
+    "/company_wifi_access_policies/{roleId}": {
+      "schema": "CompanyWifiAccessPolicy",
+      "description": "Role-wise Company Wi-Fi access policies (admin, user)"
+    },
+    "/company_wifi_settings/{settingId}": {
+      "schema": "CompanyWifiSettings",
+      "description": "Global Company Wi-Fi enforcement toggle and policy version"
+    },
+    "/company_wifi_access_logs/{logId}": {
+      "schema": "CompanyWifiAccessLog",
+      "description": "Audit logs for Company Wi-Fi policy changes and blocked access attempts"
     }
   }
 }

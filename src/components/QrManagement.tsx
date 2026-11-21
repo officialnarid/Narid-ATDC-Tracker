@@ -17,10 +17,10 @@ import { regenerateQrToken } from '../services/employeeService';
 import { RolePermissionRecord, hasModulePermission, normalizeRoleId } from '../services/permissionService';
 import { QrManagementSkeleton } from './Skeletons';
 import {
-  IDENTITY_CARD_HEADER_TEXT,
-  buildEmployeeQrPayload,
   downloadEmployeeIdentityCardPng,
+  generatePureEmployeeQrDataUrl,
 } from '../utils/qrIdentityCard';
+import { EmployeeIdentityPrintCard } from './EmployeeQrCard';
 import { useBulkSelection } from '../hooks/useBulkSelection';
 import {
   BulkActionBar,
@@ -31,101 +31,7 @@ import {
 import { CrossPageSelectConfirmModal } from './BulkConfirmModal';
 import { downloadQrIdentityCardsZip } from '../services/bulkActionService';
 
-interface EmployeeIdentityPrintCardProps {
-  employee: Employee;
-  qrUrl?: string;
-}
-
-export const EmployeeIdentityPrintCard: React.FC<EmployeeIdentityPrintCardProps> = ({
-  employee,
-  qrUrl,
-}) => (
-  <div className="qr-identity-print-card border border-slate-300 rounded-lg overflow-hidden flex flex-col items-center text-center bg-white shadow-2xs">
-    {/* Top Corporate Bar */}
-    <div className="w-full h-1.5 bg-blue-900" />
-
-    {/* HEADER */}
-    <div className="w-full bg-slate-50 border-b border-slate-200 px-3 py-2 text-center">
-      <div className="text-[9px] font-bold tracking-[0.14em] text-blue-900 uppercase">
-        {IDENTITY_CARD_HEADER_TEXT.title}
-      </div>
-      <div className="text-xs font-extrabold text-slate-900 leading-tight mt-0.5">
-        {IDENTITY_CARD_HEADER_TEXT.brand}
-      </div>
-    </div>
-
-    {/* CENTER: Pure Unobstructed QR Code */}
-    <div className="px-4 pt-3 pb-2 flex items-center justify-center">
-      <div className="w-32 h-32 bg-white border border-slate-300 p-1.5 rounded flex items-center justify-center">
-        {qrUrl ? (
-          <img
-            src={qrUrl}
-            alt={employee.employeeId}
-            className="w-full h-full object-contain"
-          />
-        ) : (
-          <div className="w-full h-full bg-slate-100 rounded" />
-        )}
-      </div>
-    </div>
-
-    {/* EMPLOYEE DETAILS BELOW QR */}
-    <div className="px-3 pb-2.5 w-full space-y-1">
-      <div>
-        <div className="text-[8px] font-bold uppercase tracking-wider text-slate-500">
-          Employee ID
-        </div>
-        <div className="font-mono text-sm font-extrabold text-slate-900 leading-tight">
-          {employee.employeeId}
-        </div>
-      </div>
-      <div>
-        <div className="text-[8px] font-bold uppercase tracking-wider text-slate-500">
-          Employee Name
-        </div>
-        <div className="text-xs font-bold text-slate-900 leading-snug break-words">
-          {employee.employeeName}
-        </div>
-      </div>
-      <div>
-        <div className="text-[8px] font-bold uppercase tracking-wider text-slate-500">
-          Designation
-        </div>
-        <div className="text-[11px] font-bold text-blue-700 leading-tight break-words">
-          {employee.designation || '—'}
-        </div>
-      </div>
-    </div>
-
-    {/* BOTTOM DETAILS */}
-    <div className="w-full mt-auto bg-slate-50 border-t border-slate-200 grid grid-cols-3 divide-x divide-slate-200 text-center">
-      <div className="px-1.5 py-2">
-        <span className="block text-[8px] font-bold uppercase tracking-wider text-slate-500">
-          Line
-        </span>
-        <span className="block text-[10px] font-bold text-slate-900 leading-tight mt-0.5 break-words">
-          {employee.floor || '—'}
-        </span>
-      </div>
-      <div className="px-1.5 py-2">
-        <span className="block text-[8px] font-bold uppercase tracking-wider text-slate-500">
-          Section
-        </span>
-        <span className="block text-[10px] font-bold text-slate-900 leading-tight mt-0.5 break-words">
-          {employee.section || '—'}
-        </span>
-      </div>
-      <div className="px-1.5 py-2">
-        <span className="block text-[8px] font-bold uppercase tracking-wider text-slate-500">
-          Department
-        </span>
-        <span className="block text-[10px] font-bold text-slate-900 leading-tight mt-0.5 break-words">
-          {employee.department || '—'}
-        </span>
-      </div>
-    </div>
-  </div>
-);
+export { EmployeeIdentityPrintCard };
 
 interface QrManagementProps {
   employees: Employee[];
@@ -241,14 +147,11 @@ export const QrManagement: React.FC<QrManagementProps> = ({
         return;
       }
 
-      const QRCodeMod = await import('qrcode');
-      const QRCode = QRCodeMod.default || QRCodeMod;
-      if (cancelled) return;
-
       const map: Record<string, string> = {};
       const pending: Employee[] = [];
 
       for (const emp of targetList) {
+        if (!emp.employeeId || !emp.qrCodeToken) continue;
         const cacheKey = `${emp.employeeId}:${emp.qrCodeToken}`;
         const cached = qrCacheRef.current.get(cacheKey);
         if (cached) {
@@ -270,8 +173,7 @@ export const QrManagement: React.FC<QrManagementProps> = ({
         const results = await Promise.all(
           batch.map(async (emp) => {
             try {
-              const payload = buildEmployeeQrPayload(emp);
-              const dataUrl = await QRCode.toDataURL(payload, { width: 240, margin: 2 });
+              const dataUrl = await generatePureEmployeeQrDataUrl(emp, 240);
               return { emp, dataUrl };
             } catch (e) {
               console.error(e);

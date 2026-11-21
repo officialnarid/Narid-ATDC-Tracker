@@ -1,0 +1,1298 @@
+# NARID ATDC TRACKER
+# NETWORK & LOCATION ACCESS CONTROL SYSTEM
+## Complete Enterprise-Level Implementation Specification
+
+### 1. PROJECT OBJECTIVE
+
+Implement a new enterprise-level security module named:
+
+**NETWORK & LOCATION ACCESS CONTROL**
+
+This module will allow the Super Admin to control which network or geographical connectivity methods are authorized for every application role.
+
+The Super Admin must have complete control over:
+- Which Role can access the application.
+- From which Public IP Address a Role can access.
+- From which approved Address / Factory Location a Role can access.
+- From which GPS Location a Role can access.
+- Which connectivity conditions are mandatory.
+- Whether multiple conditions use AND or OR logic.
+- Which Network Groups are assigned to each Role.
+- Whether access is permanent or temporary.
+- Access requests and approvals.
+- Security logs and alerts.
+- Historical policy versions and restoration.
+
+This must be a server-enforced security system, not just a frontend visibility restriction.
+
+---
+
+# 2. SUPER ADMIN – UNRESTRICTED ACCESS
+
+Super Admin must always have unrestricted connectivity access.
+
+Super Admin can:
+- Login from any Wi-Fi network.
+- Login from any Public IP Address.
+- Access from any geographical location.
+- Access from any factory, office, home or external network.
+- Manage all connectivity configurations.
+- Configure all Role-wise restrictions.
+- Approve or reject access requests.
+- Restore previous policies.
+- View all Security Logs and Alerts.
+
+**CRITICAL RULE:**
+
+No IP, Wi-Fi, Address or GPS restriction must block the Super Admin.
+
+The connectivity restriction engine must never accidentally lock out Super Admin.
+
+However, existing Firebase Authentication, account security, password verification and existing Super Admin RBAC protections must remain active.
+
+---
+
+# 3. OTHER ROLES – SUPER ADMIN CONTROLLED ACCESS
+
+All other existing and custom roles must follow the connectivity policy configured by Super Admin.
+
+Examples of roles:
+- Admin
+- Production
+- Quality
+- User
+- Existing custom roles
+
+Do not hardcode only these example roles.
+
+Automatically integrate with the existing Role Management / RBAC system.
+
+Connectivity policies must be applied Role-wise to all users assigned to that Role.
+
+Individual employee-level connectivity overrides are NOT required in this implementation.
+
+When a user changes Role, the new Role's connectivity policy must apply immediately.
+
+---
+
+# 4. NEW NAVIGATION SECTION
+
+Add a new navigation section:
+
+**Security & Access**
+  → Network & Location Access
+
+This module must be accessible only to Super Admin.
+
+Other roles must not be able to:
+- View the configuration.
+- Modify policies.
+- Access policy management APIs.
+- View internal allowlists.
+- Restore policy versions.
+- Approve connectivity requests.
+
+Use the existing application navigation, design system, responsive layout and authorization structure.
+
+---
+
+# 5. NETWORK & LOCATION ACCESS DASHBOARD
+
+Create a professional enterprise-level dashboard.
+
+Display the following statistics:
+
+1. Total Network Groups.
+2. Total Allowed Public IP Addresses.
+3. Total Approved Locations.
+4. Total Active Role Policies.
+5. Total Temporary Approvals.
+6. Pending Access Requests.
+7. Total Blocked Access Attempts.
+8. Unread Security Alerts.
+
+Provide dashboard sections:
+
+- Connectivity Overview.
+- Role-wise Access Policies.
+- Network Group Management.
+- IP Address Management.
+- Location Management.
+- Access Requests.
+- Temporary Approvals.
+- Security Logs.
+- Security Alerts.
+- Policy Audit History.
+- Policy Version Restore.
+
+Use clean tables, search, filters, pagination, status indicators and appropriate confirmation dialogs.
+
+All dashboard statistics must come from actual persisted data, not hardcoded sample values.
+
+---
+
+# 6. CONNECTIVITY METHODS
+
+Support three independently configurable connectivity methods.
+
+## A. PUBLIC IP ADDRESS
+
+Allow Super Admin to add and manage:
+
+- IPv4 Addresses.
+- IPv6 Addresses.
+- Multiple Public IP Addresses.
+- CIDR ranges where supported.
+- Named IP entries.
+- IP descriptions.
+- Active / Inactive status.
+- Optional expiry for individual entries.
+
+Example:
+
+Name: Noida Plant WiFi
+Public IP: 203.xxx.xxx.xxx
+Status: Active
+
+Name: Head Office Internet
+Public IP: 103.xxx.xxx.xxx
+Status: Active
+
+Super Admin must be able to Add, Edit, Disable and Delete IP entries.
+
+IMPORTANT:
+
+Use the actual client Public IP observed by the trusted backend/proxy.
+
+Do not blindly trust arbitrary X-Forwarded-For headers.
+
+Configure trusted proxy handling carefully according to the actual Vercel/Express architecture.
+
+Do not treat a private LAN IP as the Public IP.
+
+## B. ADDRESS-BASED ACCESS
+
+Allow Super Admin to enter a physical address.
+
+Fields:
+- Location Name.
+- Complete Address.
+- City.
+- State.
+- Country.
+- Latitude.
+- Longitude.
+- Allowed Radius in meters.
+- Status.
+- Description.
+
+Convert the entered address into geographical coordinates through a suitable geocoding mechanism, or allow Super Admin to enter coordinates manually.
+
+An address is a location reference, not an independent browser-verifiable identity.
+
+Actual location enforcement must use validated GPS coordinates and configured radius.
+
+Do not claim that typing an address into the browser proves the user is physically present there.
+
+## C. GPS LOCATION-BASED ACCESS
+
+Allow Super Admin to configure:
+
+- Location Name.
+- Latitude.
+- Longitude.
+- Allowed Radius.
+- Required GPS Accuracy.
+- Active / Inactive status.
+
+Example:
+
+Noida Plant:
+Latitude: Configurable
+Longitude: Configurable
+Allowed Radius: 200 meters
+
+GPS access validation must:
+
+1. Request browser location permission.
+2. Obtain current coordinates.
+3. Obtain reported location accuracy.
+4. Compare the user's coordinates with the approved location.
+5. Validate the distance against the configured radius.
+6. Reject missing, invalid or insufficiently accurate location data according to policy.
+
+Use a reliable geographical distance calculation such as the Haversine formula.
+
+Do not treat browser GPS as tamper-proof. Document GPS spoofing limitations.
+
+Do not store unnecessary continuous GPS tracking history.
+
+---
+
+# 7. IMPORTANT WIFI / SSID LIMITATION
+
+A normal browser-based website cannot reliably read the connected Wi-Fi SSID.
+
+Therefore:
+
+- Do not pretend to detect Wi-Fi names directly.
+- Allow Super Admin to use Wi-Fi names as informational labels.
+- Enforce actual network restrictions through Public IP verification.
+- If a future enterprise network integration is required, keep that as a separate optional integration.
+
+Example:
+
+Network Label: Factory-WiFi-01
+Enforcement: Approved Factory Public IP.
+
+---
+
+# 8. NETWORK & LOCATION GROUP MANAGEMENT
+
+Create a complete Network Group Management module.
+
+Super Admin must be able to:
+
+- Create multiple groups.
+- Edit groups.
+- Enable / Disable groups.
+- Delete groups.
+- Add multiple IP entries to a group.
+- Add multiple approved locations to a group.
+- View all entries belonging to a group.
+- Search and filter groups.
+- Assign the same group to multiple roles.
+
+Example Groups:
+
+1. Noida Plant.
+2. Greater Noida Plant.
+3. Head Office.
+4. Remote Office.
+
+Each group can contain multiple IP addresses and locations.
+
+Also support individual IP and Location entries that are not part of any group.
+
+A Role can have:
+- Multiple assigned groups.
+- Individual IP entries.
+- Individual location entries.
+
+One Group can be assigned to multiple Roles.
+
+The same group can have different access logic for different Roles.
+
+Do not automatically make one group's rules identical across every Role.
+
+---
+
+# 9. ROLE-WISE CONNECTIVITY POLICY BUILDER
+
+This is the most important module.
+
+Create a dynamic policy builder for every existing and custom Role.
+
+Super Admin must be able to independently configure:
+
+### Connectivity Methods
+
+- Public IP Address.
+- Physical Address / GPS Location.
+- GPS Location.
+- Multiple Network Groups.
+- Individual IP / Location entries.
+
+### Policy Configuration
+
+Allow Super Admin to configure:
+
+- IP Only.
+- Address / GPS Only.
+- GPS Only.
+- IP AND GPS.
+- IP OR GPS.
+- Custom combinations.
+- Multiple conditions.
+- Multiple assigned groups.
+- Custom AND / OR logic.
+
+Do not force a fixed policy on all Roles.
+
+The Super Admin must decide the exact combination for each Role.
+
+### Example 1
+
+Role: Admin
+
+Condition:
+Approved IP AND Approved GPS Location.
+
+Both conditions must match.
+
+### Example 2
+
+Role: Production
+
+Condition:
+Approved IP OR Approved GPS Location.
+
+Either condition can match.
+
+### Example 3
+
+Role: Quality
+
+Condition:
+Approved IP Only.
+
+### Example 4
+
+Role: User
+
+Condition:
+Approved GPS Location Only.
+
+These are examples, not hardcoded defaults.
+
+### IMPORTANT POLICY ENGINE REQUIREMENTS
+
+Implement a deterministic policy evaluator.
+
+- AND means every condition in that logical group must pass.
+- OR means at least one condition in that logical group must pass.
+- Disabled conditions must not accidentally behave as failed mandatory conditions.
+- Empty policies must not accidentally grant access.
+- Invalid or incomplete policies must fail closed for restricted roles.
+- Policy evaluation must be consistent on frontend and backend, with the backend authoritative.
+- Show a human-readable policy summary before saving.
+
+Provide a policy preview/testing interface for Super Admin.
+
+Example:
+
+Admin Access Rule:
+(IP = Approved) AND (GPS = Approved)
+
+Result:
+Both must match.
+
+---
+
+# 10. MULTIPLE GROUP EVALUATION
+
+A Role can have multiple assigned Network Groups.
+
+Super Admin must be able to independently configure how those groups are evaluated.
+
+Support:
+
+- OR between groups.
+- AND between groups.
+- Custom nested AND / OR conditions where technically appropriate.
+
+Example:
+
+Production Role:
+
+Group 1: Noida Plant
+Group 2: Greater Noida Plant
+
+Group 1 Policy:
+IP AND GPS.
+
+Group 2 Policy:
+IP OR GPS.
+
+Groups Combination:
+OR.
+
+Result:
+Access is granted when at least one complete group policy passes.
+
+Do not incorrectly evaluate a partially matching group as successful.
+
+Show the complete policy tree in the Super Admin interface.
+
+---
+
+# 11. POLICY ACTIVATION AND IMMEDIATE ENFORCEMENT
+
+Policy changes must become effective immediately after successful save.
+
+Examples:
+
+- An IP is removed.
+- A GPS location is changed.
+- A Group is disabled.
+- A Role's policy changes.
+- A Role's assigned Groups change.
+- An AND/OR condition changes.
+- A temporary approval expires.
+
+All these changes must trigger immediate policy revalidation.
+
+### Existing Active Sessions
+
+Do not validate connectivity only at login.
+
+Protected API requests must also enforce the current policy.
+
+When a previously authorized user becomes unauthorized:
+
+- Reject the next protected API request.
+- Terminate or invalidate the unauthorized session according to the existing authentication architecture.
+- Clear access to protected application data.
+- Redirect the user to the Access Restricted screen.
+- Do not allow cached frontend data to bypass server authorization.
+
+Use reliable policy versioning or invalidation mechanisms.
+
+Do not depend only on an in-memory cache.
+
+All backend instances must observe policy updates.
+
+Super Admin must remain unrestricted by connectivity policy.
+
+---
+
+# 12. COMPLETE ACCESS BLOCKING
+
+When a Role does not satisfy its connectivity policy:
+
+Show a dedicated Access Restricted page.
+
+The user must not access:
+- Dashboard.
+- Attendance.
+- Employee Master.
+- QR Management.
+- Reports.
+- Settings.
+- Other protected modules.
+- Protected backend APIs.
+
+Return an appropriate HTTP authorization response, such as 403, with a safe structured JSON error.
+
+Do not return HTTP 200 for an unauthorized request.
+
+Do not expose:
+- Internal allowlists.
+- Other users' IP addresses.
+- GPS coordinates of protected locations.
+- Internal policy configuration.
+- Security implementation details.
+
+### User-Facing Messages
+
+Examples:
+
+ACCESS RESTRICTED
+
+Your current network is not authorized to access NARID ATDC Tracker.
+
+Possible reasons:
+- Unauthorized IP Address.
+- Network Not Authorized.
+- Location Not Allowed.
+- GPS Permission Required.
+- Connectivity Verification Failed.
+- Access Approval Expired.
+
+Display:
+
+Contact Super Admin.
+
+Provide the appropriate retry option when GPS permission or connectivity verification can be corrected.
+
+---
+
+# 13. GPS PERMISSION FAILURE – RETRY
+
+When GPS is mandatory and the user denies location permission:
+
+- Block access.
+- Show Location Permission Required.
+- Provide an Enable Location instruction.
+- Provide a Retry button.
+- Allow the user to retry location verification.
+- Recheck permission and coordinates.
+
+When GPS is disabled at device level:
+
+- Show a clear instruction to enable device location.
+- Keep protected access blocked until verification succeeds.
+
+Do not automatically bypass GPS using IP unless the configured policy explicitly allows IP as an alternative.
+
+Do not treat an inaccurate GPS result as a successful match.
+
+---
+
+# 14. CONNECTIVITY VERIFICATION FAILURE – FAIL CLOSED
+
+If the system cannot verify required connectivity:
+
+- Block protected access.
+- Do not grant temporary unrestricted access.
+- Do not silently bypass verification.
+- Do not treat API errors as successful authorization.
+- Show a safe verification failure message.
+
+Examples:
+- IP verification server unavailable.
+- GPS verification unavailable.
+- Invalid location data.
+- Policy service unavailable.
+- Policy configuration invalid.
+
+Super Admin must retain unrestricted connectivity access, but existing authentication security must remain enforced.
+
+---
+
+# 15. ACCESS REQUEST SYSTEM
+
+When access is denied because of an unauthorized network or location, show:
+
+**REQUEST ACCESS**
+
+The user can submit a request to Super Admin.
+
+### Automatically Collected Information
+
+Where available, capture:
+
+- Employee Name.
+- Employee ID.
+- Current Role.
+- Current Public IP.
+- Date and Time.
+- Access Method.
+- Location verification result.
+- GPS coordinates only when necessary and permitted.
+- Access Denied Reason.
+- Related Policy ID.
+- Current application session reference.
+
+Do not allow users to overwrite trusted server-observed IP data.
+
+### Additional User-Entered Details
+
+Provide fields for:
+
+- Request Reason.
+- Network / Wi-Fi Description.
+- Office / Factory Name.
+- Additional Comments.
+
+Allow the user to submit a request even if GPS permission was denied, while clearly recording that GPS verification was unavailable.
+
+### Request Status
+
+Support:
+
+- Pending.
+- Approved.
+- Rejected.
+- Expired.
+- Revoked.
+
+Prevent duplicate uncontrolled requests.
+
+Add appropriate rate limiting and request validation.
+
+---
+
+# 16. SUPER ADMIN ACCESS REQUEST MANAGEMENT
+
+Add an Access Requests section in the Super Admin dashboard.
+
+Display:
+
+- Employee Name.
+- Employee ID.
+- Role.
+- Requested IP.
+- Requested Access Method.
+- Location / Factory.
+- Request Date.
+- Reason.
+- Status.
+
+Provide:
+
+- View Details.
+- Approve.
+- Reject.
+- Add Approval Notes.
+- View Request History.
+
+Super Admin must explicitly approve or reject every request.
+
+A submitted request must NEVER automatically authorize an IP or Location.
+
+### Approval Types
+
+Support both:
+
+A. PERMANENT APPROVAL
+
+- Can be Role-wide.
+- Adds the approved entry to the applicable Role connectivity policy.
+- Remains active until Super Admin changes or removes it.
+- Must create a policy audit entry.
+
+B. TEMPORARY APPROVAL
+
+- Can be Role-wide.
+- Can be Requester Only.
+- Must support configurable duration.
+
+Suggested quick durations:
+- 1 Hour.
+- 8 Hours.
+- 24 Hours.
+- 7 Days.
+- Custom Duration.
+
+Temporary approval must automatically expire.
+
+Expiry must be enforced by the backend even if no user is online.
+
+After expiry:
+- Remove authorization from effective policy evaluation.
+- Revalidate existing sessions.
+- Record an expiry event.
+- Create the appropriate Security Log.
+
+Temporary approval must not silently modify the permanent Role policy.
+
+---
+
+# 17. SECURITY LOGS
+
+Create a dedicated Security Logs module.
+
+Record all relevant events:
+
+- Authorized access.
+- Unauthorized access.
+- IP mismatch.
+- GPS mismatch.
+- Location permission failure.
+- Connectivity verification failure.
+- Access request submitted.
+- Access request approved.
+- Access request rejected.
+- Temporary approval created.
+- Temporary approval expired.
+- Temporary approval revoked.
+- Policy created.
+- Policy updated.
+- Policy enabled.
+- Policy disabled.
+- Policy restored.
+- Invalid access attempts.
+
+### Log Fields
+
+- Event ID.
+- Employee Name.
+- Employee ID.
+- Role.
+- Date and Time.
+- Observed Public IP.
+- Access Method.
+- Location verification result.
+- Policy ID / Version.
+- Event Type.
+- Result: Allowed / Denied.
+- Denial Reason.
+- Related Request ID.
+- Correlation ID.
+
+Use pagination, filters and search.
+
+Do not scan the entire Security Logs collection for every page request.
+
+Do not expose sensitive logs to unauthorized roles.
+
+Security Logs must be persisted in Firestore and must not depend only on in-memory storage.
+
+Do not automatically delete audit records unless an explicitly approved retention policy exists.
+
+---
+
+# 18. REAL-TIME SECURITY ALERTS
+
+Super Admin must receive alerts inside the application dashboard only.
+
+Do not implement email notifications or browser push notifications in this scope.
+
+When an unauthorized access attempt occurs:
+
+- Create a Security Alert.
+- Display a real-time dashboard notification.
+- Update the unread alert counter.
+- Link the alert to its Security Log.
+
+Support alert statuses:
+
+- New.
+- Read.
+- Resolved.
+
+Provide:
+
+- Mark as Read.
+- Mark as Resolved.
+- View Details.
+
+Show:
+- Employee ID.
+- Name.
+- Role.
+- Attempt Time.
+- Denial Reason.
+- Public IP where available.
+
+Implement rate limiting, deduplication and alert cooldown to prevent alert flooding.
+
+Repeated attempts must still be recorded in Security Logs, even when alert notifications are grouped or throttled.
+
+Do not falsely increment alert occurrence counts on every ordinary API request.
+
+---
+
+# 19. COMPLETE POLICY AUDIT HISTORY
+
+Every connectivity policy modification must be permanently auditable.
+
+Record:
+
+- Changed By.
+- Super Admin User ID.
+- Date and Time.
+- Role.
+- Policy ID.
+- Previous Configuration.
+- New Configuration.
+- Previous Version.
+- New Version.
+- Action Type.
+- Change Reason.
+- Related Network Groups.
+
+Support audit actions:
+
+- Create.
+- Edit.
+- Delete.
+- Enable.
+- Disable.
+- Group Assignment.
+- Group Removal.
+- IP Addition.
+- IP Removal.
+- Location Addition.
+- Location Removal.
+- AND / OR Change.
+- Permanent Approval.
+- Temporary Approval.
+- Restore.
+
+Store complete policy snapshots or an equivalent versioned representation.
+
+Old policy versions must remain available for review.
+
+Do not overwrite or destroy historical audit information.
+
+---
+
+# 20. POLICY VERSION RESTORE
+
+Allow Super Admin to view previous policy versions.
+
+Provide:
+
+- Version Number.
+- Created By.
+- Date and Time.
+- Change Summary.
+- Previous Settings.
+- New Settings.
+- View Version.
+- Restore Version.
+
+Before restoring:
+
+- Show a confirmation dialog.
+- Display the policy version being restored.
+- Show the current version that will be replaced.
+- Ask for a mandatory restoration reason.
+
+After Restore:
+
+1. Restore the selected policy configuration.
+2. Create a new policy version.
+3. Preserve all previous versions.
+4. Record the restoration action in the audit history.
+5. Immediately enforce the restored policy.
+6. Revalidate existing sessions.
+
+Never delete the audit history when restoring an old policy.
+
+---
+
+# 21. NO SCHEDULE-BASED RESTRICTIONS
+
+Do not implement connectivity schedules in this version.
+
+No:
+- Day-wise access restrictions.
+- Start Time.
+- End Time.
+- Weekly schedules.
+- Date-range schedules.
+
+Policies remain active until Super Admin modifies, disables, revokes or expires them.
+
+Temporary approvals have their own expiry duration and must remain supported.
+
+---
+
+# 22. SUPER ADMIN EMERGENCY RECOVERY
+
+Implement a safe emergency recovery mechanism.
+
+The purpose is to prevent accidental Super Admin lockout or permanent administrative loss.
+
+The selected recovery design must include:
+
+- Fresh password verification.
+- Existing Master PIN verification where available.
+- Secure secondary authorized Super Admin recovery where supported by the existing account architecture.
+
+Do not invent a default Master PIN.
+
+Do not hardcode recovery credentials.
+
+Do not expose recovery secrets in frontend code, logs or Firestore-readable client data.
+
+Require explicit confirmation and create a mandatory Security Audit Event for recovery actions.
+
+Do not weaken Firebase Authentication, account lockout protections or existing Super Admin security.
+
+The recovery mechanism must never allow ordinary Admin or User roles to bypass connectivity restrictions.
+
+---
+
+# 23. TECHNICAL ARCHITECTURE AND BACKEND ENFORCEMENT
+
+This is a critical security requirement.
+
+Inspect the current NARID ATDC Tracker architecture before implementation.
+
+Existing stack includes:
+- React frontend.
+- Express backend.
+- Firebase Authentication.
+- Firestore.
+- Firebase Admin SDK.
+- Vercel production deployment.
+
+Use the existing architecture and named Firestore database.
+
+### Backend Responsibilities
+
+Create secure backend services for:
+
+- Policy management.
+- Role-wise policy evaluation.
+- IP verification.
+- GPS verification.
+- Network Group management.
+- Access request submission.
+- Access request approval.
+- Temporary approval expiry.
+- Security logging.
+- Alert management.
+- Policy versioning and restore.
+
+All sensitive policy operations must use authenticated backend APIs and Firebase Admin SDK.
+
+Do not allow frontend Firestore writes to bypass authorization.
+
+### Server-side Enforcement
+
+Every protected API request must verify:
+
+1. Firebase authentication.
+2. Token validity and existing revocation checks.
+3. Current user account status.
+4. Existing RBAC authorization.
+5. Current Role.
+6. Current connectivity policy.
+7. Actual server-observed Public IP.
+8. Required GPS verification evidence.
+9. Temporary approval status.
+10. Current policy version.
+
+Never rely exclusively on frontend checks.
+
+A manually constructed API request must not bypass the policy engine.
+
+### Security Requirements
+
+- Fail closed for restricted roles.
+- Validate all request inputs using existing validation conventions or Zod.
+- Prevent NoSQL injection and malformed data.
+- Use server-side timestamps.
+- Enforce least privilege.
+- Protect policy APIs against CSRF where applicable.
+- Apply suitable rate limiting.
+- Avoid exposing sensitive information.
+- Prevent unauthorized direct Firestore access.
+- Maintain existing authentication and RBAC security.
+
+Do not weaken existing verifyIdToken(token, true) revocation checks.
+
+Do not replace existing security mechanisms with unreviewed shortcuts.
+
+---
+
+# 24. FIRESTORE DATA DESIGN
+
+First inspect the current database schema and naming conventions.
+
+Design appropriate collections or documents for:
+
+- network_access_settings
+- network_groups
+- network_ip_entries
+- network_locations
+- role_connectivity_policies
+- connectivity_policy_versions
+- connectivity_access_requests
+- connectivity_temporary_approvals
+- connectivity_security_logs
+- connectivity_security_alerts
+
+These are suggested logical names; adapt them to the existing database conventions.
+
+Requirements:
+
+- Use the existing Firebase project and named Firestore database.
+- Use deterministic document IDs where appropriate.
+- Avoid duplicate records.
+- Use Firestore transactions or batched writes where atomicity is required.
+- Add indexes for actual query patterns.
+- Paginate large collections.
+- Do not perform unbounded collection scans.
+- Maintain audit history.
+- Do not store unnecessary personal location data.
+
+Do not create another Firebase project or another database.
+
+Do not reset or reseed existing data.
+
+---
+
+# 25. USER EXPERIENCE AND UI DESIGN
+
+The new module must match the existing NARID ATDC Tracker premium enterprise design.
+
+Use:
+- Responsive layout.
+- Clean dashboard cards.
+- Professional data tables.
+- Clear status indicators.
+- Search and filters.
+- Pagination.
+- Confirmation dialogs.
+- Loading skeletons.
+- Empty states.
+- Error handling.
+- Mobile-friendly views.
+
+Create clear forms for:
+
+1. Add IP Address.
+2. Add Location.
+3. Create Network Group.
+4. Assign Group to Role.
+5. Configure Role Policy.
+6. Configure AND / OR Rules.
+7. Approve Access Request.
+8. Create Temporary Approval.
+9. Restore Previous Policy.
+
+Show a readable policy summary before saving.
+
+Do not expose technical implementation details to ordinary users.
+
+---
+
+# 26. PREVIEW AND PRODUCTION SAFETY
+
+This application currently uses the existing Firebase project and named Firestore database for Preview and Production.
+
+Continue using the existing project and database. Do not create a separate Firebase project.
+
+However, Preview and Production are not isolated data environments.
+
+Therefore:
+
+- Inspect all Preview API routing.
+- Do not allow accidental Preview requests to modify Production security policies.
+- Do not run real employee access-blocking tests against Production users.
+- Use safe test accounts and controlled test conditions.
+- Avoid real employee attendance or QR punch operations.
+- Do not modify existing employee, attendance or QR records.
+
+Do not push changes to GitHub.
+
+Do not deploy to Vercel.
+
+Do not modify Production Firestore Rules.
+
+Do not modify Production environment variables.
+
+Wait for explicit approval before any Production deployment or security policy activation.
+
+---
+
+# 27. TESTING AND VERIFICATION
+
+Create comprehensive automated tests.
+
+### A. Super Admin Tests
+
+- Super Admin can access from any IP.
+- Super Admin can access from any location.
+- Connectivity policy cannot block Super Admin.
+- Existing authentication security remains enforced.
+
+### B. Role-wise Tests
+
+Test all existing and custom roles.
+
+Verify:
+- Correct Role assignment.
+- Correct policy selection.
+- Role change immediately applies new policy.
+- Individual user cannot bypass Role restrictions.
+
+### C. IP Tests
+
+- Approved IPv4.
+- Approved IPv6.
+- CIDR range.
+- Unauthorized IP.
+- Multiple IPs.
+- IP change.
+- Trusted proxy handling.
+- Spoofed forwarding headers.
+
+### D. GPS Tests
+
+- Approved coordinates.
+- Outside-radius coordinates.
+- Missing permission.
+- GPS disabled.
+- Inaccurate location.
+- Invalid coordinates.
+- Location spoofing limitations.
+- Retry functionality.
+
+### E. Policy Logic Tests
+
+- IP AND GPS.
+- IP OR GPS.
+- IP only.
+- GPS only.
+- Multiple conditions.
+- Multiple groups.
+- AND between groups.
+- OR between groups.
+- Custom nested rules.
+- Disabled conditions.
+- Empty policy.
+- Invalid policy.
+
+### F. Immediate Enforcement Tests
+
+- Change active IP policy.
+- Disable Network Group.
+- Remove assigned Group.
+- Change Role policy.
+- Restore previous policy.
+- Expire temporary approval.
+
+Verify unauthorized existing sessions lose protected API access on the next request.
+
+### G. Access Request Tests
+
+- Automatic data collection.
+- Additional user-entered details.
+- Pending request.
+- Approve.
+- Reject.
+- Permanent Role-wide approval.
+- Temporary Role-wide approval.
+- Temporary Requester-only approval.
+- Expiry.
+- Revocation.
+
+### H. Security Tests
+
+- Direct API access bypass.
+- Unauthorized policy modification.
+- Unauthorized Firestore access.
+- Token revocation.
+- Invalid authentication.
+- Role escalation attempt.
+- Rate limiting.
+- Audit integrity.
+- Alert deduplication.
+- Super Admin recovery.
+
+### I. Application Regression Tests
+
+Verify existing features remain functional:
+
+- Login and Logout.
+- Employee Master.
+- Attendance.
+- QR Management.
+- QR Punch-In / Punch-Out.
+- Shift Management.
+- Reports.
+- User Rights.
+- Role Permissions.
+- Security Dashboard.
+- Existing audit logs.
+
+Do not break existing application functionality.
+
+---
+
+# 28. IMPLEMENTATION WORKFLOW
+
+Follow this sequence.
+
+**Phase 1 – Existing Architecture Audit**
+- Inspect navigation.
+- Inspect authentication.
+- Inspect existing RBAC.
+- Inspect Express middleware.
+- Inspect Firestore database.
+- Identify every protected API.
+- Identify Preview and Production API routing.
+- Report the proposed implementation architecture.
+
+**Phase 2 – Backend Foundation**
+- Build policy data model.
+- Build server-side policy evaluator.
+- Build trusted IP verification.
+- Build GPS validation.
+- Build role-wise policy enforcement.
+- Build safe policy versioning.
+
+**Phase 3 – Super Admin UI**
+- Build dashboard.
+- Build IP management.
+- Build location management.
+- Build Network Groups.
+- Build Role-wise policy builder.
+- Build Access Request Management.
+
+**Phase 4 – Monitoring and Audit**
+- Build Security Logs.
+- Build Dashboard Alerts.
+- Build Policy History.
+- Build Policy Restore.
+- Build Temporary Approval expiry.
+
+**Phase 5 – Security and Testing**
+- Run automated tests.
+- Run TypeScript checks.
+- Run production build.
+- Run regression tests.
+- Verify protected API enforcement.
+- Verify no existing module is broken.
+
+Do not skip the architecture audit.
+
+If a requirement cannot be implemented reliably because of browser, hosting, GPS or network limitations, explain the limitation and propose a technically valid alternative instead of pretending it works.
+
+---
+
+# 29. FINAL ACCEPTANCE CRITERIA
+
+The implementation will be considered ready for review only when:
+
+1. Super Admin has unrestricted connectivity access.
+2. All other roles follow Super Admin-configured policies.
+3. Policies are configurable without code changes.
+4. IP, Address and GPS restrictions work according to their configured logic.
+5. AND / OR conditions work correctly.
+6. Multiple Network Groups work correctly.
+7. Policy updates are enforced immediately.
+8. Unauthorized access is completely blocked.
+9. GPS permission retry works.
+10. Connectivity verification failures are fail-closed.
+11. Access Requests work.
+12. Permanent and Temporary approvals work.
+13. Role-wide and Requester-only temporary approvals work.
+14. Temporary approvals expire automatically.
+15. Security Logs persist correctly.
+16. Real-time Dashboard Alerts work.
+17. Complete Policy Audit History works.
+18. Previous Policy Restore works.
+19. Emergency Super Admin recovery works securely.
+20. Existing application features remain unaffected.
+
+---
+
+# 30. STRICT FINAL INSTRUCTIONS
+
+Implement this feature in the AI Studio workspace only.
+
+Do not:
+- Push to GitHub.
+- Deploy to Vercel.
+- Modify Production Firestore Rules.
+- Modify existing Firebase Authentication accounts.
+- Reset or reseed existing Firestore data.
+- Modify employee records.
+- Modify attendance records.
+- Modify QR tokens.
+- Modify existing attendance or punch logic.
+- Weaken existing authentication or security controls.
+- Introduce hardcoded Super Admin credentials.
+- Activate restrictive policies for existing production users automatically.
+
+Start by inspecting the existing codebase and preparing a detailed implementation plan.
+
+Then implement the module carefully in the AI Studio workspace, using the existing project architecture.
+
+At completion, provide:
+
+1. Architecture audit summary.
+2. All modified and newly created files.
+3. Firestore collections and indexes introduced.
+4. Backend API list.
+5. Role-wise policy functionality.
+6. Security implementation details.
+7. Automated test results.
+8. TypeScript and build results.
+9. Known browser/network limitations.
+10. Preview testing instructions.
+11. Any remaining risks.
+
+Keep the master connectivity restriction system OFF by default until explicitly enabled by Super Admin.
+
+Do not activate any restrictions on existing production users automatically.
+
+**Wait for my explicit approval before GitHub push, Vercel deployment, Production security-rule changes, or activation of restrictive Production policies.**

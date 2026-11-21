@@ -53,8 +53,11 @@ import {
   exportChunkedToCsv,
   exportChunkedToExcel,
 } from '../services/bulkActionService';
-import { EmployeeIdentityPrintCard } from './QrManagement';
-import { generatePureEmployeeQrDataUrl } from '../utils/qrIdentityCard';
+import { EmployeeIdentityPrintCard } from './EmployeeQrCard';
+import {
+  downloadEmployeeIdentityCardPng,
+  generatePureEmployeeQrDataUrl,
+} from '../utils/qrIdentityCard';
 
 interface EmployeeMasterProps {
   employees: Employee[];
@@ -116,21 +119,37 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
   // View badge modal
   const [viewEmployee, setViewEmployee] = useState<Employee | null>(null);
   const [badgeQrUrl, setBadgeQrUrl] = useState<string | null>(null);
+  const [isDownloadingBadge, setIsDownloadingBadge] = useState(false);
+  const [badgeDownloadError, setBadgeDownloadError] = useState<string | null>(null);
 
-  // Generate QR image on demand when viewing badge
+  // Generate QR image on demand when viewing badge using centralized Master Card utility
   const handleOpenBadge = async (emp: Employee) => {
     setViewEmployee(emp);
+    setBadgeQrUrl(null);
+    setBadgeDownloadError(null);
+    if (!emp.qrCodeToken) {
+      setBadgeDownloadError(`QR security token is missing for ${emp.employeeId || 'this employee'}.`);
+      return;
+    }
     try {
-      const QRCodeMod = await import('qrcode');
-      const QRCode = QRCodeMod.default || QRCodeMod;
-      const qrPayload = JSON.stringify({
-        employeeId: emp.employeeId,
-        token: emp.qrCodeToken,
-      });
-      const url = await QRCode.toDataURL(qrPayload, { width: 220, margin: 2 });
+      const url = await generatePureEmployeeQrDataUrl(emp, 240);
       setBadgeQrUrl(url);
-    } catch (e) {
+    } catch (e: any) {
       console.error('Failed to generate QR data URL:', e);
+      setBadgeDownloadError(e?.message || 'Failed to generate QR preview.');
+    }
+  };
+
+  // Download full Master Employee QR Identity Card PNG (identical to QR Management)
+  const handleDownloadBadgeCard = async (emp: Employee) => {
+    setBadgeDownloadError(null);
+    setIsDownloadingBadge(true);
+    try {
+      await downloadEmployeeIdentityCardPng(emp);
+    } catch (e: any) {
+      setBadgeDownloadError(e?.message || `Failed to download QR identity card for ${emp.employeeId}.`);
+    } finally {
+      setIsDownloadingBadge(false);
     }
   };
 
@@ -211,11 +230,10 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
     if (!canReissueQr) return;
     if (!confirm(`Are you sure you want to regenerate the QR token for ${employeeId}? Old QR code will be invalidated.`)) return;
     try {
-      await regenerateQrToken(employeeId);
+      const newToken = await regenerateQrToken(employeeId);
       onRefresh();
       if (viewEmployee && viewEmployee.employeeId === employeeId) {
-        const updated = employees.find(e => e.employeeId === employeeId);
-        if (updated) handleOpenBadge(updated);
+        await handleOpenBadge({ ...viewEmployee, qrCodeToken: newToken });
       }
     } catch (err: any) {
       alert(`Error regenerating token: ${err.message}`);
@@ -1093,66 +1111,54 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
       )}
 
       {/* VIEW ID BADGE & QR MODAL */}
-      {viewEmployee && badgeQrUrl && (
+      {viewEmployee && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-sm w-full shadow-2xl border border-slate-200 overflow-hidden flex flex-col">
-            <div className="bg-blue-900 text-white p-4 flex items-center justify-between">
-              <div>
-                <div className="text-[10px] uppercase tracking-wider text-blue-200">Factory Identity Card</div>
-                <h4 className="font-bold text-sm tracking-wide">Narid ATDC Tracker</h4>
+            <div className="bg-slate-900 text-white px-4 py-3 flex items-center justify-between">
+              <div className="text-xs font-bold tracking-wide">
+                Employee QR Identity Card
               </div>
               <button
-                onClick={() => setViewEmployee(null)}
-                className="p-1 rounded hover:bg-blue-800 text-blue-200"
+                type="button"
+                onClick={() => {
+                  setViewEmployee(null);
+                  setBadgeDownloadError(null);
+                }}
+                className="p-1 rounded hover:bg-slate-800 text-slate-300 hover:text-white cursor-pointer"
+                aria-label="Close Identity Card Preview"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            {/* Printable ID card body */}
-            <div className="p-6 flex flex-col items-center text-center">
-              <div className="w-44 h-44 bg-white p-2 rounded-xl border border-slate-200 shadow-inner flex items-center justify-center mb-4">
-                <img src={badgeQrUrl} alt="QR Code" className="w-full h-full object-contain" />
-              </div>
+            {/* Centralized Master Employee QR Card preview */}
+            <div className="p-4 bg-slate-100 flex flex-col gap-3">
+              <EmployeeIdentityPrintCard
+                employee={viewEmployee}
+                qrUrl={badgeQrUrl || undefined}
+              />
 
-              <div className="font-mono text-lg font-black text-slate-900 tracking-wider">
-                {viewEmployee.employeeId}
-              </div>
-              <div className="text-base font-bold text-slate-800 mt-0.5">
-                {viewEmployee.employeeName}
-              </div>
-              <div className="text-xs text-blue-600 font-semibold mt-0.5">
-                {viewEmployee.designation}
-              </div>
+              {badgeDownloadError && (
+                <div className="bg-red-50 border border-red-200 text-red-700 px-3 py-2 rounded-lg text-[11px]">
+                  {badgeDownloadError}
+                </div>
+              )}
 
-              <div className="w-full border-t border-slate-200 my-4 pt-3 grid grid-cols-3 gap-1 text-[11px] text-slate-600">
-                <div>
-                  <span className="text-[10px] text-slate-400 block uppercase">Line</span>
-                  <span className="font-bold text-slate-800">{viewEmployee.floor}</span>
-                </div>
-                <div>
-                  <span className="text-[10px] text-slate-400 block uppercase">Section</span>
-                  <span className="font-bold text-slate-800">{viewEmployee.section}</span>
-                </div>
-                <div>
-                  <span className="text-[10px] text-slate-400 block uppercase">Department</span>
-                  <span className="font-bold text-slate-800">{viewEmployee.department}</span>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-2 mt-2 w-full">
-                <a
-                  href={badgeQrUrl}
-                  download={`QR_${viewEmployee.employeeId}.png`}
-                  className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs py-2 rounded font-medium flex items-center justify-center gap-1.5 transition"
+              <div className="flex items-center gap-2 w-full">
+                <button
+                  type="button"
+                  disabled={isDownloadingBadge || !viewEmployee.qrCodeToken}
+                  onClick={() => handleDownloadBadgeCard(viewEmployee)}
+                  className="flex-1 bg-slate-800 hover:bg-slate-900 text-white text-xs py-2 rounded font-medium flex items-center justify-center gap-1.5 transition disabled:opacity-50 cursor-pointer"
                 >
                   <Download className="w-3.5 h-3.5" />
-                  <span>Download QR</span>
-                </a>
+                  <span>{isDownloadingBadge ? 'Generating...' : 'Download QR'}</span>
+                </button>
                 {canReissueQr && (
                   <button
+                    type="button"
                     onClick={() => handleRegenerateToken(viewEmployee.employeeId)}
-                    className="bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 text-xs px-3 py-2 rounded font-medium flex items-center gap-1 transition"
+                    className="bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 text-xs px-3 py-2 rounded font-medium flex items-center gap-1 transition cursor-pointer"
                     title="Revoke and generate new QR token"
                   >
                     <RotateCcw className="w-3.5 h-3.5" />

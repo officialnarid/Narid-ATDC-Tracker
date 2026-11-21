@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import * as QRCode from 'qrcode';
@@ -15,7 +17,9 @@ import {
   type Canvas2DLike,
   type CanvasLike,
 } from '../src/utils/qrIdentityCard';
+import { EmployeeQrCard, EmployeeIdentityPrintCard as CentralizedPrintCard } from '../src/components/EmployeeQrCard';
 import { EmployeeIdentityPrintCard, QrManagement } from '../src/components/QrManagement';
+import { downloadQrIdentityCardsZip } from '../src/services/bulkActionService';
 
 interface RecordedTextDraw {
   text: string;
@@ -341,5 +345,106 @@ describe('Employee QR Identity Card Download & Print Rendering', () => {
     );
     expect(superAdminHtml).toContain('Download QR');
     expect(superAdminHtml).toContain('Revoke &amp; Re-issue Security Token');
+  });
+
+  it('6. Uses a single centralized EmployeeQrCard component and gracefully handles missing optional employee details without breaking download or print', async () => {
+    expect(EmployeeIdentityPrintCard).toBe(EmployeeQrCard);
+    expect(CentralizedPrintCard).toBe(EmployeeQrCard);
+
+    const partialEmployee: Employee = {
+      employeeId: 'TST_PARTIAL_404',
+      employeeName: 'SURESH KUMAR',
+      employeeType: 'Permanent',
+      section: '',
+      department: '',
+      floor: '',
+      designation: '',
+      qrCodeToken: 'QR_TST_PARTIAL_404_TOKEN',
+      employeeStatus: 'Active',
+      createdAt: '2025-04-01T09:00:00.000Z',
+      updatedAt: '2025-04-01T09:00:00.000Z',
+    };
+
+    const qrDataUrl = await generatePureEmployeeQrDataUrl(partialEmployee, 240);
+
+    // Canvas PNG card gracefully falls back to "—" without throwing
+    const { canvas, texts, images } = createRecordingCanvas();
+    drawEmployeeIdentityCardToCanvas(canvas, partialEmployee, { src: qrDataUrl });
+    expect(canvas.width).toBe(IDENTITY_CARD_WIDTH);
+    expect(canvas.height).toBe(IDENTITY_CARD_HEIGHT);
+    expect(images).toHaveLength(1);
+    const drawnStrings = texts.map((t) => t.text);
+    expect(drawnStrings).toContain('FACTORY IDENTITY CARD');
+    expect(drawnStrings).toContain('Narid ATDC Tracker');
+    expect(drawnStrings).toContain('TST_PARTIAL_404');
+    expect(drawnStrings).toContain('SURESH KUMAR');
+    // 4 missing optional fields (designation, floor, section, department) -> 4 "—" fallbacks
+    expect(drawnStrings.filter((t) => t === '—').length).toBe(4);
+
+    // React Master Card renders gracefully with "—" fallbacks
+    const html = renderToStaticMarkup(
+      React.createElement(EmployeeQrCard, {
+        employee: partialEmployee,
+        qrUrl: qrDataUrl,
+      })
+    );
+    expect(html).toContain('FACTORY IDENTITY CARD');
+    expect(html).toContain('Narid ATDC Tracker');
+    expect(html).toContain('TST_PARTIAL_404');
+    expect(html).toContain('SURESH KUMAR');
+    expect((html.match(/—/g) || []).length).toBeGreaterThanOrEqual(4);
+  });
+
+  it('7. Enforces global Master QR Card standard across EmployeeMaster, QrManagement, and bulk ZIP exports (no standalone raw QR-only downloads)', async () => {
+    const srcRoot = path.resolve(process.cwd(), 'src');
+    const employeeMasterSrc = fs.readFileSync(
+      path.join(srcRoot, 'components', 'EmployeeMaster.tsx'),
+      'utf8'
+    );
+    const qrManagementSrc = fs.readFileSync(
+      path.join(srcRoot, 'components', 'QrManagement.tsx'),
+      'utf8'
+    );
+
+    // EmployeeMaster uses centralized Master Card downloader & component, never standalone raw QR <a> download
+    expect(employeeMasterSrc).toContain('downloadEmployeeIdentityCardPng');
+    expect(employeeMasterSrc).toContain('downloadQrIdentityCardsZip');
+    expect(employeeMasterSrc).toContain("from './EmployeeQrCard'");
+    expect(employeeMasterSrc).not.toContain("import('qrcode')");
+    expect(employeeMasterSrc).not.toContain('download={`QR_${viewEmployee.employeeId}.png`}');
+
+    // QrManagement uses centralized Master Card component & QR helper, never duplicate qrcode import
+    expect(qrManagementSrc).toContain('downloadEmployeeIdentityCardPng');
+    expect(qrManagementSrc).toContain('downloadQrIdentityCardsZip');
+    expect(qrManagementSrc).toContain("from './EmployeeQrCard'");
+    expect(qrManagementSrc).not.toContain("import('qrcode')");
+
+    // Bulk ZIP export works identically for EMPLOYEE_MASTER and QR_MANAGEMENT and gracefully skips missing-token records
+    const missingTokenEmp: Employee = {
+      ...SAMPLE_EMPLOYEES[0],
+      employeeId: 'TST_NO_TOKEN_999',
+      qrCodeToken: '',
+    };
+    const fakePngBlob = new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], { type: 'image/png' });
+    const renderedIds: string[] = [];
+
+    const { result, zipBlob } = await downloadQrIdentityCardsZip(
+      [SAMPLE_EMPLOYEES[0], missingTokenEmp, SAMPLE_EMPLOYEES[1]],
+      {
+        auditSource: 'EMPLOYEE_MASTER',
+        skipDownloadTrigger: true,
+        renderCardBlob: async (emp) => {
+          renderedIds.push(emp.employeeId);
+          return fakePngBlob;
+        },
+      }
+    );
+
+    expect(zipBlob).not.toBeNull();
+    expect(result.exportedCount).toBe(2);
+    expect(result.exportedIds).toEqual(['TST_CARD_101', 'TST_CARD_202']);
+    expect(result.skippedIds).toEqual(['TST_NO_TOKEN_999']);
+    expect(result.failedItems).toEqual([]);
+    expect(renderedIds).toEqual(['TST_CARD_101', 'TST_CARD_202']);
   });
 });

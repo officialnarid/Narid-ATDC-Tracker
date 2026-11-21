@@ -102,6 +102,7 @@ export const TAB_TO_MODULE_NAME: Record<string, string> = {
   user_rights: 'User Rights & Permissions',
   audit_logs: 'Audit Logs & Security',
   security_management: 'Audit Logs & Security',
+  company_wifi_access: 'Company Wi-Fi Access Control',
   system_performance: 'System Performance',
   settings: 'System Settings',
 };

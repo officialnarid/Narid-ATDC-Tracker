@@ -18,9 +18,11 @@ import {
 } from './serverPerfCache.ts';
 import {
   classifyCompletedDutyStatus,
+  computeExpectedPunchOutTimes,
   EARLY_PUNCH_POLICY_ID,
   evaluateEarlyPunchOnPunchIn,
   evaluateOptionAPunchOut,
+  MAX_REGULAR_DUTY_MINUTES,
   resolveShiftScheduleBounds,
   STANDARD_DUTY_MINUTES,
 } from './src/utils/attendanceStatus.ts';
@@ -958,6 +960,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           const qrVerificationMode = token ? 'TOKEN_VERIFIED' : 'UNTOKENIZED_EMPLOYEE';
           const txStartMs = performance.now();
           const punchRes = await executePunchForVerifiedEmployee({
+            req,
             employee,
             caller,
             now,
@@ -1359,6 +1362,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
 
           const txStartMs = performance.now();
           const result = await executePunchForVerifiedEmployee({
+            req,
             employee,
             caller,
             now,
@@ -1518,6 +1522,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
   });
 
   async function executePunchForVerifiedEmployee(params: {
+    req?: Request;
     employee: Record<string, any>;
     caller: VerifiedCaller;
     now: Date;
@@ -1532,6 +1537,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
     candidateSnap: AdminQuerySnapLike;
   }): Promise<{ httpStatus: number; body: Record<string, any> }> {
     const {
+      req,
       employee,
       caller,
       now,
@@ -1556,43 +1562,80 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           .map((d) => d.data()!)
           .sort((a, b) => new Date(b.punchIn).getTime() - new Date(a.punchIn).getTime());
 
+        const isNightRecord = (r: Record<string, any>) =>
+          r.shiftId === 'NIGHT' || String(r.shiftNameSnapshot || '').toUpperCase().includes('NIGHT');
+        const isOpenRecord = (r: Record<string, any>) =>
+          r.currentState === 'INSIDE' || (!r.actualPunchOut && r.punchOutType === 'NONE');
+        const isAutoClosedReconcilableRecord = (r: Record<string, any>) =>
+          r.punchOutType === 'AUTO' &&
+          r.autoClosed === true &&
+          !r.actualPunchOut &&
+          r.reconciledFromAutoClose !== true;
+
+        const todayRecords = existingRecords.filter((r) => r.shiftDate === todayKey);
+        const yesterdayNight = existingRecords.find(
+          (r) => r.shiftDate === yesterdayKey && isNightRecord(r)
+        );
+        // Night shift continuation window on date D+1 extends up to 18:00 IST (before next Night Shift window starts),
+        // ensuring genuine post-09:00 AM Night Shift Punch-Outs still attach to date D's Night Shift.
+        const isWithinNightContinuationWindow = Boolean(
+          yesterdayNight &&
+            currentMins < 18 * 60 &&
+            now.getTime() >= new Date(yesterdayNight.firstPunchIn || yesterdayNight.punchIn).getTime()
+        );
+
         let activeRecord: Record<string, any> | null = null;
-        if (currentMins < 540) {
-          const yesterdayNight = existingRecords.find(
-            (r) =>
-              r.shiftDate === yesterdayKey &&
-              (r.shiftId === 'NIGHT' || String(r.shiftNameSnapshot || '').toUpperCase().includes('NIGHT'))
-          );
-          if (yesterdayNight) {
-            const isYesterdayNightOpen =
-              yesterdayNight.currentState === 'INSIDE' ||
-              (!yesterdayNight.actualPunchOut && yesterdayNight.punchOutType === 'NONE');
-            // Always attach to yesterday's Night shift if still INSIDE (e.g. OT checkout after 06:00 AM)
-            // OR if currently before 06:00 AM (cross-midnight Night shift window).
+        if (scannerType === 'OUT') {
+          // Priority 1: Open record on todayKey
+          const todayOpen = todayRecords.find(isOpenRecord);
+          if (todayOpen) {
+            activeRecord = todayOpen;
+          } else if (yesterdayNight && isOpenRecord(yesterdayNight) && isWithinNightContinuationWindow) {
+            // Priority 2: Open Night Shift record from yesterdayKey (including after 09:00 AM)
+            activeRecord = yesterdayNight;
+          } else {
+            // Priority 3: Reconcilable provisional AUTO CLOSED record on todayKey
+            const todayAutoClosed = todayRecords.find(isAutoClosedReconcilableRecord);
+            if (todayAutoClosed) {
+              activeRecord = todayAutoClosed;
+            } else if (
+              todayRecords.length === 0 &&
+              yesterdayNight &&
+              isAutoClosedReconcilableRecord(yesterdayNight) &&
+              isWithinNightContinuationWindow
+            ) {
+              // Priority 4: Reconcilable provisional AUTO CLOSED Night Shift record from yesterdayKey
+              // (only when employee has NOT started a new shift on todayKey)
+              activeRecord = yesterdayNight;
+            } else if (todayRecords.length > 0) {
+              // Priority 5: Already-closed today record (for clean duplicate OUT 409 rejection)
+              activeRecord = todayRecords[0];
+            } else if (yesterdayNight && isWithinNightContinuationWindow) {
+              // Priority 6: Already-closed yesterday Night Shift record (for clean duplicate OUT 409 rejection)
+              activeRecord = yesterdayNight;
+            }
+          }
+        } else {
+          // ScannerType 'IN' or auto-detect
+          if (yesterdayNight && isWithinNightContinuationWindow) {
+            const isYesterdayNightOpen = isOpenRecord(yesterdayNight);
+            // Attach to yesterday's Night shift if still open OR before 06:00 AM (cross-midnight Night shift window)
             if (isYesterdayNightOpen || currentMins < 360) {
               activeRecord = yesterdayNight;
             }
           }
-        }
-        if (!activeRecord) {
-          const todayOpenRecord = existingRecords.find(
-            (r) =>
-              r.shiftDate === todayKey &&
-              (r.currentState === 'INSIDE' || (!r.actualPunchOut && r.punchOutType === 'NONE'))
-          );
-          if (todayOpenRecord) {
-            activeRecord = todayOpenRecord;
-          } else if (scannerType === 'OUT') {
-            activeRecord = existingRecords.find((r) => r.shiftDate === todayKey) || null;
-          } else {
-            const expectedShiftMatch = identifyShiftForPunchIn(shifts, now);
-            const expectedShiftId = expectedShiftMatch?.shift?.id;
-            activeRecord =
-              existingRecords.find(
-                (r) =>
-                  r.shiftDate === todayKey &&
-                  (!expectedShiftId || r.shiftId === expectedShiftId)
-              ) || null;
+          if (!activeRecord) {
+            const todayOpenRecord = todayRecords.find(isOpenRecord);
+            if (todayOpenRecord) {
+              activeRecord = todayOpenRecord;
+            } else {
+              const expectedShiftMatch = identifyShiftForPunchIn(shifts, now);
+              const expectedShiftId = expectedShiftMatch?.shift?.id;
+              activeRecord =
+                todayRecords.find(
+                  (r) => !expectedShiftId || r.shiftId === expectedShiftId
+                ) || null;
+            }
           }
         }
 
@@ -1734,6 +1777,19 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             }
 
             const shift = shiftsMap.get(txRes.record.shiftId) || shifts[0];
+            const reentryBounds = resolveShiftScheduleBounds(txRes.record.shiftDate || todayKey, {
+              ...shift,
+              shiftId: txRes.record.shiftId,
+              shiftNameSnapshot: txRes.record.shiftNameSnapshot,
+              scheduledPunchIn: txRes.record.scheduledPunchIn || shift?.startTime,
+              scheduledPunchOut: txRes.record.scheduledPunchOut || shift?.endTime,
+            });
+            const reentrySchedule = computeExpectedPunchOutTimes({
+              firstInIso: txRes.record.firstPunchIn || txRes.record.punchIn,
+              scheduledStartIso: txRes.record.scheduledPunchInIso || reentryBounds.scheduledStartIso,
+              scheduledEndIso: txRes.record.scheduledPunchOutIso || reentryBounds.scheduledEndIso,
+              standardDutyMinutes: STANDARD_DUTY_MINUTES,
+            });
             return {
               httpStatus: 200,
               body: {
@@ -1744,6 +1800,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                 employee,
                 attendance: txRes.record,
                 shift,
+                punchOutSchedule: reentrySchedule || undefined,
                 message: `Punch In Successfully Recorded (Re-entry #${txRes.record.punches.length}).`,
                 time: timeDisplay,
                 punchCount: txRes.record.punches.length,
@@ -1903,6 +1960,13 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             };
           }
 
+          const firstInSchedule = computeExpectedPunchOutTimes({
+            firstInIso: newAttendanceRecord.firstPunchIn,
+            scheduledStartIso: scheduleBounds.scheduledStartIso,
+            scheduledEndIso: scheduleBounds.scheduledEndIso,
+            standardDutyMinutes: STANDARD_DUTY_MINUTES,
+          });
+
           return {
             httpStatus: 200,
             body: {
@@ -1913,6 +1977,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
               employee,
               attendance: newAttendanceRecord,
               shift,
+              punchOutSchedule: firstInSchedule || undefined,
               message: isLate
                 ? `First Punch In Recorded for ${shift.name} (Marked LATE).`
                 : earlyEval.provisionalEarlyOtMinutes > 0
@@ -1961,24 +2026,42 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         const txOutRes = await db.runTransaction(async (tx) => {
           const snap = await tx.get(docRef);
           const currentData = snap.exists ? snap.data()! : activeRecord!;
+
+          if (String(currentData.employeeId || '').toUpperCase() !== String(employee.employeeId || '').toUpperCase()) {
+            return { kind: 'EMPLOYEE_MISMATCH' as const, record: currentData };
+          }
+
           const currentState =
             currentData.currentState ||
             (currentData.actualPunchOut || currentData.punchOutType === 'ACTUAL' ? 'OUTSIDE' : 'INSIDE');
 
-          if (currentState === 'OUTSIDE') {
+          // Provisional AUTO CLOSED record can be atomically reconciled exactly once by a genuine Actual Punch-Out.
+          const isAutoClosedReconcilable =
+            currentData.punchOutType === 'AUTO' &&
+            currentData.autoClosed === true &&
+            !currentData.actualPunchOut &&
+            currentData.reconciledFromAutoClose !== true;
+
+          if (currentState === 'OUTSIDE' && !isAutoClosedReconcilable) {
             return { kind: 'CONSECUTIVE_OUT' as const, record: currentData };
           }
 
-          const lastPunchTime =
+          const firstInIso = currentData.firstPunchIn || currentData.punchIn;
+          const firstInMs = new Date(firstInIso).getTime();
+          if (!Number.isFinite(firstInMs) || now.getTime() < firstInMs) {
+            return { kind: 'INVALID_TIME' as const, record: currentData };
+          }
+
+          // Compare bounce against actual employee punch events (never against auto-close updatedAt)
+          const lastEmployeePunchTime =
             Array.isArray(currentData.punches) && currentData.punches.length > 0
               ? new Date(currentData.punches[currentData.punches.length - 1].timestamp).getTime()
-              : new Date(currentData.updatedAt || currentData.punchIn).getTime();
+              : firstInMs;
 
-          if (Math.abs(now.getTime() - lastPunchTime) < 3000) {
+          if (!isAutoClosedReconcilable && Math.abs(now.getTime() - lastEmployeePunchTime) < 3000) {
             return { kind: 'BOUNCE' as const, record: currentData };
           }
 
-          const firstInIso = currentData.firstPunchIn || currentData.punchIn;
           const recordShift = shiftsMap.get(currentData.shiftId) || shifts[0];
           const bounds = resolveShiftScheduleBounds(currentData.shiftDate || todayKey, {
             ...recordShift,
@@ -2022,7 +2105,10 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             overtimeMinutes,
             earlyOtMinutes: otEval.earlyOtMinutes,
             postShiftOtMinutes: otEval.postShiftOtMinutes,
-            status: 'VALID_OUT',
+            reconciledFromAutoClose: isAutoClosedReconcilable,
+            previousPunchOutType: isAutoClosedReconcilable ? 'AUTO' : 'NONE',
+            previousAutoCloseEventId: isAutoClosedReconcilable ? (currentData.autoCloseEventId || null) : null,
+            status: isAutoClosedReconcilable ? 'RECONCILED_ACTUAL_OUT' : 'VALID_OUT',
             recordedByUid: caller.uid,
             recordedByLoginId: caller.loginId,
           };
@@ -2030,6 +2116,8 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           const existingPunches = Array.isArray(currentData.punches) ? currentData.punches : [];
           const updatedAttendance: Record<string, any> = {
             ...currentData,
+            firstPunchIn: firstInIso,
+            punchIn: currentData.punchIn || firstInIso,
             scheduledPunchIn: currentData.scheduledPunchIn || bounds.startTime,
             scheduledPunchInIso: scheduledStartIso,
             scheduledPunchOut: currentData.scheduledPunchOut || bounds.endTime,
@@ -2051,9 +2139,18 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             totalOtMinutes: otEval.totalOtMinutes,
             earlyOtFinalized: true,
             earlyPunchPolicy: EARLY_PUNCH_POLICY_ID,
+            otCapApplied: otEval.otCapApplied,
             attendanceStatus: computedStatus,
             missedPunchOut: false,
             autoClosed: false,
+            ...(isAutoClosedReconcilable
+              ? {
+                  reconciledFromAutoClose: true,
+                  reconciledAt: now.toISOString(),
+                  reconciledByUid: caller.uid,
+                  reconciledByLoginId: caller.loginId,
+                }
+              : {}),
             updatedByUid: caller.uid,
             updatedByLoginId: caller.loginId,
             updatedAt: now.toISOString(),
@@ -2072,7 +2169,9 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             qrVerificationMode,
             performedByUid: caller.uid,
             performedByLoginId: caller.loginId,
-            message: `Punch Out recorded (${computedStatus}). Duty: ${formatMinutes(regularDutyMinutes)}, Early OT: ${formatMinutes(otEval.earlyOtMinutes)}, Post OT: ${formatMinutes(otEval.postShiftOtMinutes)}, Total OT: ${formatMinutes(overtimeMinutes)}. Total: ${formatMinutes(totalDutyMinutes)}.`,
+            message: isAutoClosedReconcilable
+              ? `Actual Punch Out reconciled from provisional AUTO CLOSED (${computedStatus}). Duty: ${formatMinutes(regularDutyMinutes)}, Early OT: ${formatMinutes(otEval.earlyOtMinutes)}, Post OT: ${formatMinutes(otEval.postShiftOtMinutes)}, Total OT: ${formatMinutes(overtimeMinutes)}. Total: ${formatMinutes(totalDutyMinutes)}.`
+              : `Punch Out recorded (${computedStatus}). Duty: ${formatMinutes(regularDutyMinutes)}, Early OT: ${formatMinutes(otEval.earlyOtMinutes)}, Post OT: ${formatMinutes(otEval.postShiftOtMinutes)}, Total OT: ${formatMinutes(overtimeMinutes)}. Total: ${formatMinutes(totalDutyMinutes)}.`,
           });
 
           return {
@@ -2080,8 +2179,29 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             record: updatedAttendance,
             regularDutyMinutes,
             overtimeMinutes,
+            reconciledFromAutoClose: isAutoClosedReconcilable,
+            previousAutoCloseEffective: currentData.autoCloseEffectivePunchOut || currentData.effectivePunchOut || null,
+            scheduledStartIso,
+            scheduledEndIso,
           };
         });
+
+        if (txOutRes.kind === 'EMPLOYEE_MISMATCH' || txOutRes.kind === 'INVALID_TIME') {
+          return {
+            httpStatus: 400,
+            body: {
+              success: false,
+              action: 'REJECTED',
+              scannerType: 'OUT',
+              employee,
+              message:
+                txOutRes.kind === 'EMPLOYEE_MISMATCH'
+                  ? 'Punch Out rejected: Attendance record does not match scanned employee.'
+                  : 'Punch Out rejected: Punch-Out timestamp cannot be earlier than Punch-In.',
+              time: timeDisplay,
+            },
+          };
+        }
 
         if (txOutRes.kind === 'CONSECUTIVE_OUT') {
           await writePunchLog({
@@ -2127,7 +2247,32 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           };
         }
 
+        if (txOutRes.reconciledFromAutoClose) {
+          await recordEnterpriseAuditEvent(db, {
+            req,
+            action: 'RECONCILE_AUTO_CLOSED_PUNCH_OUT',
+            category: 'ATTENDANCE',
+            actorUid: caller.uid,
+            actorLoginId: caller.loginId,
+            actorRole: caller.role.toUpperCase(),
+            employeeId: employee.employeeId,
+            targetType: 'ATTENDANCE',
+            targetId: txOutRes.record.id,
+            oldValue: `AUTO CLOSED (Effective Out: ${txOutRes.previousAutoCloseEffective || 'Scheduled End'}, OT: 00:00)`,
+            newValue: `ACTUAL (${txOutRes.record.attendanceStatus}, Out: ${txOutRes.record.actualPunchOut}, Duty: ${formatMinutes(txOutRes.record.totalDutyMinutes)}, OT: ${formatMinutes(txOutRes.overtimeMinutes)})`,
+            actionSource: scannerDevice === 'MANUAL' ? 'MANUAL_SCANNER_RECONCILIATION' : 'QR_SCANNER_RECONCILIATION',
+            reason: 'Genuine actual Punch-Out received after provisional shift auto-close',
+            captureGeo: false,
+          });
+        }
+
         const shift = shiftsMap.get(txOutRes.record.shiftId) || shifts[0];
+        const outSchedule = computeExpectedPunchOutTimes({
+          firstInIso: txOutRes.record.firstPunchIn || txOutRes.record.punchIn,
+          scheduledStartIso: txOutRes.scheduledStartIso,
+          scheduledEndIso: txOutRes.scheduledEndIso,
+          standardDutyMinutes: STANDARD_DUTY_MINUTES,
+        });
         return {
           httpStatus: 200,
           body: {
@@ -2135,10 +2280,14 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             action: 'PUNCH_OUT',
             scannerType: 'OUT',
             currentState: 'OUTSIDE',
+            reconciledFromAutoClose: txOutRes.reconciledFromAutoClose,
             employee,
             attendance: txOutRes.record,
             shift,
-            message: 'Punch Out Successfully Recorded.',
+            punchOutSchedule: outSchedule || undefined,
+            message: txOutRes.reconciledFromAutoClose
+              ? 'Actual Punch Out Recorded (Reconciled from Auto-Close).'
+              : 'Punch Out Successfully Recorded.',
             time: timeDisplay,
             dutyFormatted: formatMinutes(txOutRes.regularDutyMinutes),
             otFormatted: formatMinutes(txOutRes.overtimeMinutes),
@@ -2211,46 +2360,94 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           break;
         }
         const record = docSnap.data()!;
-        if (record.actualPunchOut || record.punchOutType !== 'NONE') continue;
+        if (record.actualPunchOut || record.punchOutType !== 'NONE' || record.autoClosed === true) continue;
 
         const shift = shiftsMap.get(record.shiftId);
         if (!shift) continue;
 
-        const scheduledEndIso = getShiftScheduledEndIso(record.shiftDate, shift);
+        const scheduledEndIso = record.scheduledPunchOutIso || getShiftScheduledEndIso(record.shiftDate, shift);
         const scheduledEndDate = new Date(scheduledEndIso);
 
-        if (now.getTime() > scheduledEndDate.getTime()) {
-          const scheduledDuration = shift.scheduledDurationMinutes || settings.scheduledDurationMinutes || 510;
+        if (now.getTime() >= scheduledEndDate.getTime()) {
+          const scheduledDuration = Math.min(
+            shift.scheduledDurationMinutes || settings.scheduledDurationMinutes || STANDARD_DUTY_MINUTES,
+            MAX_REGULAR_DUTY_MINUTES
+          );
           const docRef = db.collection('attendance').doc(record.id);
+          const autoEventId = `pe_auto_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+          const autoDisplayTime = getKolkataTimeParts(scheduledEndDate).timeWithSeconds;
 
-          const updatedRecord = await db.runTransaction(async (tx) => {
-            const freshSnap = await tx.get(docRef);
-            if (!freshSnap.exists) return null;
-            const fresh = freshSnap.data()!;
-            if (fresh.actualPunchOut || fresh.punchOutType !== 'NONE') return null;
+          const updatedRecord = await withEmployeeScanLock(record.employeeId, () =>
+            db.runTransaction(async (tx) => {
+              const freshSnap = await tx.get(docRef);
+              if (!freshSnap.exists) return null;
+              const fresh = freshSnap.data()!;
+              // Atomic concurrency guard: if Actual Punch-Out or another Auto-Close already committed, never overwrite.
+              if (
+                fresh.actualPunchOut ||
+                fresh.punchOutType !== 'NONE' ||
+                fresh.autoClosed === true ||
+                fresh.currentState === 'OUTSIDE'
+              ) {
+                return null;
+              }
 
-            const next = {
-              ...fresh,
-              actualPunchOut: null,
-              lastPunchOut: null,
-              effectivePunchOut: scheduledEndIso,
-              punchOutType: 'AUTO',
-              currentState: 'OUTSIDE',
-              attendanceStatus: 'AUTO CLOSED',
-              missedPunchOut: true,
-              autoClosed: true,
-              totalDutyMinutes: scheduledDuration,
-              regularDutyMinutes: scheduledDuration,
-              overtimeMinutes: 0, // Zero OT on auto-closed shifts
-              earlyOtMinutes: 0,
-              postShiftOtMinutes: 0,
-              totalOtMinutes: 0,
-              earlyOtFinalized: false,
-              updatedAt: now.toISOString(),
-            };
-            tx.set(docRef, next);
-            return next;
-          });
+              const autoCloseEvent = {
+                id: autoEventId,
+                employeeId: fresh.employeeId,
+                employeeName: fresh.employeeNameSnapshot || '',
+                eventType: 'OUT',
+                timestamp: now.toISOString(),
+                effectivePunchOut: scheduledEndIso,
+                displayTime: autoDisplayTime,
+                shiftDate: fresh.shiftDate,
+                shiftId: fresh.shiftId,
+                shiftName: fresh.shiftNameSnapshot || shift.name,
+                floor: fresh.floorIdSnapshot || '',
+                section: fresh.sectionIdSnapshot || '',
+                department: fresh.departmentIdSnapshot || '',
+                scannerType: 'OUT',
+                scannerDevice: 'SYSTEM_AUTO',
+                dutyDurationMinutes: scheduledDuration,
+                overtimeMinutes: 0,
+                earlyOtMinutes: 0,
+                postShiftOtMinutes: 0,
+                status: 'AUTO_CLOSE',
+                recordedByUid: caller.uid,
+                recordedByLoginId: caller.loginId,
+              };
+
+              const next = {
+                ...fresh,
+                firstPunchIn: fresh.firstPunchIn || fresh.punchIn,
+                punchIn: fresh.punchIn || fresh.firstPunchIn,
+                scheduledPunchOutIso: scheduledEndIso,
+                actualPunchOut: null,
+                lastPunchOut: null,
+                effectivePunchOut: scheduledEndIso,
+                punchOutType: 'AUTO',
+                currentState: 'OUTSIDE',
+                attendanceStatus: 'AUTO CLOSED',
+                missedPunchOut: true,
+                autoClosed: true,
+                autoClosedAt: now.toISOString(),
+                autoCloseEventId: autoEventId,
+                autoCloseEffectivePunchOut: scheduledEndIso,
+                totalDutyMinutes: scheduledDuration,
+                regularDutyMinutes: scheduledDuration,
+                overtimeMinutes: 0, // Strictly zero OT on auto-closed shifts
+                earlyOtMinutes: 0,
+                postShiftOtMinutes: 0,
+                totalOtMinutes: 0,
+                earlyOtFinalized: false,
+                otCapApplied: false,
+                updatedAt: now.toISOString(),
+              };
+              tx.set(docRef, next);
+              tx.set(db.collection('punch_events').doc(autoEventId), autoCloseEvent);
+              return next;
+            })
+          );
 
           if (updatedRecord) {
             closedRecords.push(updatedRecord);
@@ -2264,7 +2461,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                 scannerDevice: 'SYSTEM_AUTO',
                 performedByUid: caller.uid,
                 performedByLoginId: caller.loginId,
-                message: `Auto-closed at scheduled shift end (${shift.endTime}). Status: AUTO CLOSED. OT: 00:00.`,
+                message: `Provisional auto-close at scheduled shift end (${shift.endTime}). Status: AUTO CLOSED. OT: 00:00.`,
               }),
               recordEnterpriseAuditEvent(db, {
                 req,
@@ -2278,7 +2475,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                 targetId: record.id,
                 newValue: `Auto-closed at ${scheduledEndIso}, Duty: ${formatMinutes(scheduledDuration)}, OT: 00:00`,
                 actionSource: 'SYSTEM_SCHEDULER',
-                reason: 'Employee missed scanning Punch Out at scheduled shift closing',
+                reason: 'Provisional auto-close at scheduled shift end (reconcilable by genuine Punch-Out)',
                 captureGeo: false,
               }),
             ]);
@@ -2369,14 +2566,17 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           if (Number.isNaN(outTime)) {
             throw new Error('INVALID_PUNCH_OUT');
           }
+          let otCapApplied = Boolean(current.otCapApplied);
           if (punchOutType === 'AUTO') {
-            totalDutyMinutes = Math.max(0, Math.floor((outTime - inTime) / (60 * 1000)));
-            actualPresenceMinutes = totalDutyMinutes;
-            regularDutyMinutes = Math.min(totalDutyMinutes, STANDARD_DUTY_MINUTES);
+            const rawPresence = Math.max(0, Math.floor((outTime - inTime) / (60 * 1000)));
+            actualPresenceMinutes = rawPresence;
+            regularDutyMinutes = Math.min(rawPresence, MAX_REGULAR_DUTY_MINUTES);
+            totalDutyMinutes = regularDutyMinutes;
             overtimeMinutes = 0;
             earlyOtMinutes = 0;
             postShiftOtMinutes = 0;
             earlyOtFinalized = false;
+            otCapApplied = false;
           } else {
             const otEval = evaluateOptionAPunchOut({
               firstInIso,
@@ -2394,8 +2594,61 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             earlyOtMinutes = otEval.earlyOtMinutes;
             postShiftOtMinutes = otEval.postShiftOtMinutes;
             earlyOtFinalized = true;
+            otCapApplied = otEval.otCapApplied;
           }
+
+          const autoClassifySet = new Set([
+            'COMPLETED',
+            'COMPLETED + OT',
+            'HALF DAY',
+            'SHORT LEAVE',
+            'PRESENT',
+          ]);
+          const finalAttendanceStatus =
+            punchOutType === 'ACTUAL' && actualPunchOut && autoClassifySet.has(attendanceStatus)
+              ? classifyCompletedDutyStatus(totalDutyMinutes, STANDARD_DUTY_MINUTES)
+              : attendanceStatus;
+
+          const updatedFields = {
+            actualPunchOut: punchOutType === 'AUTO' ? null : actualPunchOut,
+            lastPunchOut: punchOutType === 'AUTO' ? null : actualPunchOut,
+            effectivePunchOut: actualPunchOut || current.effectivePunchOut || null,
+            punchOutType,
+            currentState: actualPunchOut ? 'OUTSIDE' : current.currentState || 'OUTSIDE',
+            attendanceStatus: finalAttendanceStatus,
+            autoClosed: punchOutType === 'AUTO',
+            missedPunchOut: punchOutType === 'AUTO' || finalAttendanceStatus === 'MISSED PUNCH OUT',
+            scheduledPunchIn: current.scheduledPunchIn || bounds.startTime,
+            scheduledPunchInIso: scheduledStartIso,
+            scheduledPunchOut: current.scheduledPunchOut || bounds.endTime,
+            scheduledPunchOutIso: current.scheduledPunchOutIso || bounds.scheduledEndIso,
+            actualPresenceMinutes,
+            totalDutyMinutes,
+            regularDutyMinutes,
+            overtimeMinutes,
+            earlyArrivalMinutes,
+            provisionalEarlyOtMinutes,
+            earlyOtMinutes,
+            postShiftOtMinutes,
+            totalOtMinutes: overtimeMinutes,
+            earlyOtFinalized,
+            otCapApplied,
+            earlyPunchPolicy: EARLY_PUNCH_POLICY_ID,
+            correctionReason: reason.trim(),
+            correctedBy: caller.loginId,
+            correctedByUid: caller.uid,
+            updatedAt: new Date().toISOString(),
+          };
+
+          tx.update(docRef, updatedFields);
+          return {
+            notFound: false as const,
+            current,
+            updated: { ...current, ...updatedFields },
+          };
         } else if (punchOutType === 'AUTO') {
+          regularDutyMinutes = Math.min(regularDutyMinutes || STANDARD_DUTY_MINUTES, MAX_REGULAR_DUTY_MINUTES);
+          totalDutyMinutes = regularDutyMinutes;
           overtimeMinutes = 0;
           earlyOtMinutes = 0;
           postShiftOtMinutes = 0;
@@ -2415,12 +2668,14 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             : attendanceStatus;
 
         const updatedFields = {
-          actualPunchOut: actualPunchOut || current.actualPunchOut || null,
-          lastPunchOut: actualPunchOut || current.lastPunchOut || null,
+          actualPunchOut: punchOutType === 'AUTO' ? null : (actualPunchOut || current.actualPunchOut || null),
+          lastPunchOut: punchOutType === 'AUTO' ? null : (actualPunchOut || current.lastPunchOut || null),
           effectivePunchOut: actualPunchOut || current.effectivePunchOut || null,
           punchOutType,
           currentState: actualPunchOut ? 'OUTSIDE' : current.currentState || 'OUTSIDE',
           attendanceStatus: finalAttendanceStatus,
+          autoClosed: punchOutType === 'AUTO',
+          missedPunchOut: punchOutType === 'AUTO' || finalAttendanceStatus === 'MISSED PUNCH OUT',
           scheduledPunchIn: current.scheduledPunchIn || bounds.startTime,
           scheduledPunchInIso: scheduledStartIso,
           scheduledPunchOut: current.scheduledPunchOut || bounds.endTime,
@@ -2435,6 +2690,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           postShiftOtMinutes,
           totalOtMinutes: overtimeMinutes,
           earlyOtFinalized,
+          otCapApplied: Boolean(current.otCapApplied),
           earlyPunchPolicy: EARLY_PUNCH_POLICY_ID,
           correctionReason: reason.trim(),
           correctedBy: caller.loginId,

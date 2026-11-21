@@ -51,6 +51,16 @@ import {
 } from './utils/perfMonitor';
 import { startClientTelemetryFlushLoop } from './services/monitoringService';
 import { startBackgroundNetworkMonitoring } from './services/networkMonitorService';
+import {
+  type CompanyWifiBlockedState,
+  checkMyCompanyWifiAccess,
+  clearCompanyWifiBlocked,
+  subscribeCompanyWifiBlocked,
+} from './services/companyWifiService';
+import {
+  COMPANY_WIFI_DENIED_CODE,
+  COMPANY_WIFI_DENIED_MESSAGE,
+} from './utils/companyWifiUtils';
 
 // Secondary Modules (code-split via resilient lazyWithRetry + moduleRegistry prefetching)
 const EmployeeMaster = lazyWithRetry(() => import('./components/EmployeeMaster'), m => m.EmployeeMaster, 'employees');
@@ -65,8 +75,9 @@ const Reports = lazyWithRetry(() => import('./components/Reports'), m => m.Repor
 const UserRights = lazyWithRetry(() => import('./components/UserRights'), m => m.UserRights, 'user_rights');
 const AuditLogsManagement = lazyWithRetry(() => import('./components/AuditLogsManagement'), m => m.AuditLogsManagement, 'audit_logs');
 const SecurityManagement = lazyWithRetry(() => import('./components/SecurityManagement'), m => m.SecurityManagement, 'security_management');
+const CompanyWifiAccessControl = lazyWithRetry(() => import('./components/CompanyWifiAccessControl'), m => m.CompanyWifiAccessControl, 'company_wifi_access');
+const CompanyWifiBlockedScreen = lazyWithRetry(() => import('./components/CompanyWifiBlockedScreen'), m => m.CompanyWifiBlockedScreen, 'company_wifi_blocked');
 const SystemPerformance = lazyWithRetry(() => import('./components/SystemPerformance'), m => m.SystemPerformance, 'system_performance');
-const SystemSettingsView = lazyWithRetry(() => import('./components/SystemSettings'), m => m.SystemSettingsView, 'settings');
 const UnauthorizedAccess = lazyWithRetry(() => import('./components/UnauthorizedAccess'), m => m.UnauthorizedAccess, 'unauthorized');
 
 const VALID_TABS: NavItem[] = [
@@ -84,8 +95,8 @@ const VALID_TABS: NavItem[] = [
   'user_rights',
   'audit_logs',
   'security_management',
+  'company_wifi_access',
   'system_performance',
-  'settings',
 ];
 
 function normalizeTabCandidate(raw: string | null | undefined): NavItem | null {
@@ -129,10 +140,58 @@ export default function App() {
   const [masterDataError, setMasterDataError] = useState<string | null>(null);
   const [rolePermissions, setRolePermissions] = useState<Record<string, RolePermissionRecord>>({});
   const [currentUserPermOverride, setCurrentUserPermOverride] = useState<UserPermissionRecordWithOverride | null>(null);
+  const [wifiBlockedState, setWifiBlockedState] = useState<CompanyWifiBlockedState | null>(null);
+  const [isCheckingWifiAccess, setIsCheckingWifiAccess] = useState<boolean>(false);
   const navTimerRef = useRef<(() => number) | null>(null);
   const appBootTimerRef = useRef<(() => number) | null>(startPerfTimer());
   const currentTabRef = useRef<NavItem>(currentTab);
   currentTabRef.current = currentTab;
+
+  // Immediate Cross-Request Enforcement Listener:
+  // If ANY protected backend API returns HTTP 403 COMPANY_WIFI_ACCESS_DENIED, immediately clear protected
+  // in-memory data and display the Company Wi-Fi Required screen. Super Admin is never restricted.
+  useEffect(() => {
+    return subscribeCompanyWifiBlocked((nextState) => {
+      if (currentUserRole?.role?.toUpperCase() === 'SUPER_ADMIN') {
+        setWifiBlockedState(null);
+        return;
+      }
+      if (nextState) {
+        setEmployees([]);
+        setFullscreenTab(null);
+      }
+      setWifiBlockedState(nextState);
+    });
+  }, [currentUserRole?.role]);
+
+  const verifyCompanyWifiForProfile = useCallback(async (profile: UserRoleRecord): Promise<boolean> => {
+    if (profile.role?.toUpperCase() === 'SUPER_ADMIN' || profile.loginId?.toLowerCase() === 'superadmin') {
+      clearCompanyWifiBlocked();
+      setWifiBlockedState(null);
+      return true;
+    }
+    setIsCheckingWifiAccess(true);
+    try {
+      const result = await checkMyCompanyWifiAccess();
+      if (result.allowed) {
+        clearCompanyWifiBlocked();
+        setWifiBlockedState(null);
+        return true;
+      }
+      setEmployees([]);
+      setWifiBlockedState({
+        code: result.code || COMPANY_WIFI_DENIED_CODE,
+        message: result.error || COMPANY_WIFI_DENIED_MESSAGE,
+        receivedAtMs: Date.now(),
+      });
+      return false;
+    } catch {
+      // Fail-safe: protected APIs still enforce authoritatively on every call
+      return true;
+    } finally {
+      setIsCheckingWifiAccess(false);
+    }
+  }, []);
 
   // Real-time synchronization of Role Permissions matrix (only when authenticated)
   useEffect(() => {
@@ -270,10 +329,15 @@ export default function App() {
             } catch {}
             setCurrentUser(fbUser);
             setCurrentUserRole(profile);
-            const isPrivileged = profile.role === 'super_admin' || profile.role === 'admin';
-            loadAllMasterData(isPrivileged);
+            const wifiOk = await verifyCompanyWifiForProfile(profile);
+            if (wifiOk) {
+              const isPrivileged = profile.role === 'super_admin' || profile.role === 'admin';
+              loadAllMasterData(isPrivileged);
+            }
           } else {
             logoutUser();
+            clearCompanyWifiBlocked();
+            setWifiBlockedState(null);
             setCurrentUser(null);
             setCurrentUserRole(null);
           }
@@ -293,6 +357,8 @@ export default function App() {
             sessionStorage.removeItem('narid_session_id');
           } catch {}
         }
+        clearCompanyWifiBlocked();
+        setWifiBlockedState(null);
         setCurrentUser(null);
         setCurrentUserRole(null);
         setIsAuthChecking(false);
@@ -303,10 +369,10 @@ export default function App() {
       isMounted = false;
       unsubscribe();
     };
-  }, [loadAllMasterData]);
+  }, [loadAllMasterData, verifyCompanyWifiForProfile]);
 
   // Handle successful login
-  const handleLoginSuccess = (profile: UserRoleRecord) => {
+  const handleLoginSuccess = async (profile: UserRoleRecord) => {
     const fbUser = auth.currentUser || ({ uid: profile.id, email: profile.email } as any);
     setCurrentUser(fbUser);
     setCurrentUserRole(profile);
@@ -317,8 +383,11 @@ export default function App() {
       window.history.replaceState(null, '', `/${destinationTab}`);
     } catch {}
     if (auth.currentUser) {
-      const isPrivileged = profile.role === 'super_admin' || profile.role === 'admin';
-      loadAllMasterData(isPrivileged);
+      const wifiOk = await verifyCompanyWifiForProfile(profile);
+      if (wifiOk) {
+        const isPrivileged = profile.role === 'super_admin' || profile.role === 'admin';
+        loadAllMasterData(isPrivileged);
+      }
     }
   };
 
@@ -378,6 +447,8 @@ export default function App() {
     } catch (err) {
       console.error('Logout error:', err);
     } finally {
+      clearCompanyWifiBlocked();
+      setWifiBlockedState(null);
       setCurrentUser(null);
       setCurrentUserRole(null);
       try {
@@ -469,10 +540,14 @@ export default function App() {
           handleLogout('session_expired');
           return;
         }
-        const parsed = await safeParseJsonResponse<{ success?: boolean }>(
+        const parsed = await safeParseJsonResponse<{ success?: boolean; code?: string }>(
           res,
           'POST /api/auth/verify-session'
         );
+        // Company Wi-Fi 403 is handled by the global blocked listener (do NOT force sign-out so user sees the Wi-Fi access notice)
+        if (res.status === 403 && parsed.data?.code === COMPANY_WIFI_DENIED_CODE) {
+          return;
+        }
         if (!parsed.isHtmlOrNonJson && parsed.data && parsed.data.success === false) {
           console.warn('[Session Guard] Session revoked or account deactivated.');
           handleLogout('session_expired');
@@ -530,6 +605,36 @@ export default function App() {
         }}
         onCancelLogout={handleLogout}
       />
+    );
+  }
+
+  // 2.2 Company Wi-Fi Access Verification Gate (Non-Super-Admin Only)
+  if (isCheckingWifiAccess && currentUserRole.role?.toUpperCase() !== 'SUPER_ADMIN') {
+    return (
+      <div className="h-screen w-screen flex flex-col items-center justify-center bg-[#00183b] text-white">
+        <div className="w-10 h-10 border-3 border-blue-500 border-t-transparent rounded-full animate-spin mb-4" />
+        <p className="text-xs font-mono tracking-widest text-blue-200 uppercase">
+          VERIFYING AUTHORIZED COMPANY WI-FI...
+        </p>
+      </div>
+    );
+  }
+
+  if (wifiBlockedState && currentUserRole.role?.toUpperCase() !== 'SUPER_ADMIN') {
+    return (
+      <Suspense fallback={<div className="h-screen w-screen bg-slate-100" />}>
+        <CompanyWifiBlockedScreen
+          currentUserRole={currentUserRole}
+          blockedState={wifiBlockedState}
+          onAccessRestored={() => {
+            clearCompanyWifiBlocked();
+            setWifiBlockedState(null);
+            const isPrivileged = currentUserRole.role === 'super_admin' || currentUserRole.role === 'admin';
+            loadAllMasterData(isPrivileged);
+          }}
+          onLogout={() => handleLogout('logout')}
+        />
+      </Suspense>
     );
   }
 
@@ -689,6 +794,7 @@ export default function App() {
                   onRefresh={() => loadAllMasterData(false)}
                   currentUserRole={currentUserRole}
                   rolePermissions={rolePermissions}
+                  onOpenAuditConsole={() => handleSelectTab('audit_logs')}
                 />
               )}
 
@@ -750,6 +856,18 @@ export default function App() {
                 )
               )}
 
+              {currentTab === 'company_wifi_access' && isModuleAllowedForUser(currentUserRole, 'company_wifi_access') && (
+                currentUserRole.role?.toUpperCase() === 'SUPER_ADMIN' ? (
+                  <CompanyWifiAccessControl currentUserRole={currentUserRole} />
+                ) : (
+                  <UnauthorizedAccess
+                    currentTab={currentTab}
+                    currentUserRole={currentUserRole}
+                    onGoHome={() => setCurrentTab(getDefaultTabForRole(currentUserRole.role, currentUserRole))}
+                  />
+                )
+              )}
+
               {currentTab === 'system_performance' && isModuleAllowedForUser(currentUserRole, 'system_performance') && (
                 currentUserRole.role?.toUpperCase() === 'SUPER_ADMIN' ? (
                   <SystemPerformance />
@@ -762,13 +880,6 @@ export default function App() {
                 )
               )}
 
-              {currentTab === 'settings' && isModuleAllowedForUser(currentUserRole, 'settings') && (
-                <SystemSettingsView
-                  onRefreshData={loadAllMasterData}
-                  currentUserRole={currentUserRole}
-                  onOpenAuditConsole={() => handleSelectTab('audit_logs')}
-                />
-              )}
             </Suspense>
             </ModuleErrorBoundary>
           )}

@@ -76,11 +76,27 @@ describe('Firestore Security Rules (Strict Zero-Trust UID RBAC)', () => {
     expect(rulesContent).toMatch(/match \/\{document=\*\*\}[\s\S]*allow\s+read,\s*write:\s*if\s+false;/);
   });
 
+  it('blocks direct client writes to all 4 Company Wi-Fi Access Control collections and restricts reads to Super Admin', () => {
+    const companyWifiCollections = [
+      'company_wifi_networks',
+      'company_wifi_access_policies',
+      'company_wifi_settings',
+      'company_wifi_access_logs',
+    ];
+    for (const col of companyWifiCollections) {
+      const block = extractMatchBlock(col);
+      expect(block).toMatch(/allow\s+(?:read|list,\s*get|get,\s*list):\s*if\s+isSuperAdmin\(\);/);
+      expect(block).toMatch(/allow\s+create,\s*update,\s*delete:\s*if\s+false;/);
+    }
+  });
+
   it('supports future dynamic roles via active-role and role_permissions helpers without unapproved hardcoded future roles', () => {
     expect(rulesContent).toContain('function callerRoleId()');
     expect(rulesContent).toContain('function isRoleActive()');
     expect(rulesContent).toContain('function hasRoleModuleAction(mod, act)');
-    expect(rulesContent).toContain("!(mod in ['user_rights', 'audit_logs', 'security_management'])");
+    expect(rulesContent).toContain(
+      "!(mod in ['user_rights', 'audit_logs', 'security_management', 'company_wifi_access'])"
+    );
     expect(rulesContent).toContain("isSystemRole(callerRoleId())");
 
     // Verify dynamic role module action wiring for operational master collections

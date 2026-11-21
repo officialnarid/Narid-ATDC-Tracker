@@ -190,6 +190,15 @@ export class ApiRequestError<T = any> extends Error {
 
 import { queueClientTelemetry } from '../utils/perfMonitor';
 
+type CompanyWifiBlockedHandler = (payload: Record<string, any>) => void;
+let companyWifiBlockedHandler: CompanyWifiBlockedHandler | null = null;
+
+export function registerCompanyWifiBlockedHandler(
+  handler: CompanyWifiBlockedHandler | null
+): void {
+  companyWifiBlockedHandler = handler;
+}
+
 export interface ExecuteApiFetchOptions {
   timeoutMs?: number;
   noRetryOnNetworkError?: boolean;
@@ -501,6 +510,19 @@ export async function safeParseJsonResponse<T = any>(
           parsed.message ||
           `HTTP ${status}${res.statusText ? ` ${res.statusText}` : ''} (${endpointLabel || 'API request'})`
       );
+
+  if (
+    !ok &&
+    status === 403 &&
+    parsed?.code === 'COMPANY_WIFI_ACCESS_DENIED' &&
+    companyWifiBlockedHandler
+  ) {
+    try {
+      companyWifiBlockedHandler(parsed);
+    } catch {
+      // Never interfere with normal response parsing
+    }
+  }
 
   return {
     ok,

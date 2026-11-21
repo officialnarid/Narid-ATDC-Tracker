@@ -3,8 +3,8 @@ import express from "express";
 import cors from "cors";
 import fs2 from "fs";
 import path2 from "path";
-import crypto6 from "crypto";
-import { z as z6 } from "zod";
+import crypto7 from "crypto";
+import { z as z7 } from "zod";
 
 // serverFirebaseAdmin.ts
 import fs from "fs";
@@ -7424,9 +7424,18 @@ import { z as z3 } from "zod";
 
 // src/utils/attendanceStatus.ts
 var STANDARD_DUTY_MINUTES = 510;
+var MAX_REGULAR_DUTY_MINUTES = 510;
+var MAX_TOTAL_OT_MINUTES = 210;
+var MAX_CREDITED_TOTAL_MINUTES = 720;
 var HALF_DAY_MIN_MINUTES = 270;
 var EARLY_OT_THRESHOLD_MINUTES = 60;
 var EARLY_PUNCH_POLICY_ID = "OPTION_A_60M";
+var KOLKATA_TIME_12H_FORMATTER = new Intl.DateTimeFormat("en-IN", {
+  timeZone: "Asia/Kolkata",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: true
+});
 var NON_WORKING_STATUSES = /* @__PURE__ */ new Set([
   "ABSENT",
   "LEAVE",
@@ -7437,7 +7446,13 @@ var NON_WORKING_STATUSES = /* @__PURE__ */ new Set([
 ]);
 function classifyCompletedDutyStatus(completedDutyMinutes, standardDutyMinutes = STANDARD_DUTY_MINUTES) {
   const safeMinutes = Math.max(0, Math.floor(Number.isFinite(completedDutyMinutes) ? completedDutyMinutes : 0));
-  const safeStandard = Math.max(1, Math.floor(Number.isFinite(standardDutyMinutes) ? standardDutyMinutes : STANDARD_DUTY_MINUTES));
+  const safeStandard = Math.max(
+    1,
+    Math.min(
+      MAX_REGULAR_DUTY_MINUTES,
+      Math.floor(Number.isFinite(standardDutyMinutes) ? standardDutyMinutes : STANDARD_DUTY_MINUTES)
+    )
+  );
   if (safeMinutes < HALF_DAY_MIN_MINUTES) {
     return "SHORT LEAVE";
   }
@@ -7469,6 +7484,12 @@ function formatShiftTimeClock12h(timeStr) {
   const h12 = h24 % 12 || 12;
   const ampm = h24 >= 12 ? "PM" : "AM";
   return `${String(h12).padStart(2, "0")}:${String(rawM).padStart(2, "0")} ${ampm}`;
+}
+function formatIsoTimeKolkata12h(isoString) {
+  if (!isoString) return "--:--";
+  const dt = new Date(isoString);
+  if (Number.isNaN(dt.getTime())) return "--:--";
+  return KOLKATA_TIME_12H_FORMATTER.format(dt).toUpperCase();
 }
 function getNextCalendarDateKey(dateKey) {
   const [y, m, d] = String(dateKey || "1970-01-01").split("-").map(Number);
@@ -7510,11 +7531,49 @@ function resolveShiftScheduleBounds(shiftDate, shiftOrRecord) {
     scheduledEndMs: new Date(scheduledEndIso).getTime()
   };
 }
+function computeExpectedPunchOutTimes(params) {
+  const firstInMs = new Date(params.firstInIso).getTime();
+  const scheduledStartMs = new Date(params.scheduledStartIso).getTime();
+  const scheduledEndMs = new Date(params.scheduledEndIso).getTime();
+  if (!Number.isFinite(firstInMs) || !Number.isFinite(scheduledStartMs) || !Number.isFinite(scheduledEndMs)) {
+    return null;
+  }
+  const maxRegularDutyMinutes = Math.max(
+    1,
+    Math.min(
+      MAX_REGULAR_DUTY_MINUTES,
+      Math.floor(Number.isFinite(params.standardDutyMinutes) ? Number(params.standardDutyMinutes) : STANDARD_DUTY_MINUTES)
+    )
+  );
+  const earlyArrivalMinutes = firstInMs < scheduledStartMs ? Math.max(0, Math.floor((scheduledStartMs - firstInMs) / 6e4)) : 0;
+  const eligibleEarlyOtMinutes = earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES ? Math.min(earlyArrivalMinutes, MAX_TOTAL_OT_MINUTES) : 0;
+  const remainingPostShiftOtMinutes = Math.max(0, MAX_TOTAL_OT_MINUTES - eligibleEarlyOtMinutes);
+  const shiftAnchorMs = firstInMs < scheduledStartMs ? scheduledStartMs : firstInMs;
+  const regularDutyCompletionMs = shiftAnchorMs + maxRegularDutyMinutes * 6e4;
+  const maxEligiblePunchOutMs = regularDutyCompletionMs + remainingPostShiftOtMinutes * 6e4;
+  const regularDutyCompletionIso = new Date(regularDutyCompletionMs).toISOString();
+  const maxEligiblePunchOutIso = new Date(maxEligiblePunchOutMs).toISOString();
+  return {
+    scheduledShiftEndIso: params.scheduledEndIso,
+    scheduledShiftEndDisplay: formatIsoTimeKolkata12h(params.scheduledEndIso),
+    regularDutyCompletionIso,
+    regularDutyCompletionDisplay: formatIsoTimeKolkata12h(regularDutyCompletionIso),
+    maxEligiblePunchOutIso,
+    maxEligiblePunchOutDisplay: formatIsoTimeKolkata12h(maxEligiblePunchOutIso),
+    maxRegularDutyMinutes,
+    maxOtMinutes: MAX_TOTAL_OT_MINUTES,
+    maxCreditedWorkingMinutes: MAX_CREDITED_TOTAL_MINUTES,
+    maxOtDisplay: `${formatDurationClock(MAX_TOTAL_OT_MINUTES)} Hours`,
+    maxCreditedWorkingDisplay: `${formatDurationClock(MAX_CREDITED_TOTAL_MINUTES)} Hours`,
+    eligibleEarlyOtMinutes,
+    remainingPostShiftOtMinutes
+  };
+}
 function evaluateEarlyPunchOnPunchIn(params) {
   const firstInMs = new Date(params.firstInIso).getTime();
   const scheduledStartMs = new Date(params.scheduledStartIso).getTime();
   const earlyArrivalMinutes = Number.isFinite(firstInMs) && Number.isFinite(scheduledStartMs) && firstInMs < scheduledStartMs ? Math.max(0, Math.floor((scheduledStartMs - firstInMs) / 6e4)) : 0;
-  const provisionalEarlyOtMinutes = earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES ? earlyArrivalMinutes : 0;
+  const provisionalEarlyOtMinutes = earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES ? Math.min(earlyArrivalMinutes, MAX_TOTAL_OT_MINUTES) : 0;
   return {
     earlyArrivalMinutes,
     provisionalEarlyOtMinutes,
@@ -7525,7 +7584,10 @@ function evaluateEarlyPunchOnPunchIn(params) {
 function evaluateOptionAPunchOut(params) {
   const standardDutyMinutes = Math.max(
     1,
-    Math.floor(Number.isFinite(params.standardDutyMinutes) ? Number(params.standardDutyMinutes) : STANDARD_DUTY_MINUTES)
+    Math.min(
+      MAX_REGULAR_DUTY_MINUTES,
+      Math.floor(Number.isFinite(params.standardDutyMinutes) ? Number(params.standardDutyMinutes) : STANDARD_DUTY_MINUTES)
+    )
   );
   const firstInMs = new Date(params.firstInIso).getTime();
   const lastOutMs = new Date(params.lastOutIso).getTime();
@@ -7541,6 +7603,7 @@ function evaluateOptionAPunchOut(params) {
       totalOtMinutes: 0,
       regularDutyMinutes: 0,
       totalDutyMinutes: 0,
+      otCapApplied: false,
       attendanceStatus: "SHORT LEAVE",
       earlyOtFinalized: true,
       earlyPunchPolicy: EARLY_PUNCH_POLICY_ID
@@ -7548,15 +7611,20 @@ function evaluateOptionAPunchOut(params) {
   }
   const actualPresenceMinutes = Math.max(0, Math.floor((lastOutMs - firstInMs) / 6e4));
   const earlyArrivalMinutes = Number.isFinite(scheduledStartMs) && firstInMs < scheduledStartMs ? Math.max(0, Math.floor((scheduledStartMs - firstInMs) / 6e4)) : 0;
-  const provisionalEarlyOtMinutes = earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES ? earlyArrivalMinutes : 0;
+  const rawEarlyOtMinutes = earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES ? earlyArrivalMinutes : 0;
+  const provisionalEarlyOtMinutes = Math.min(rawEarlyOtMinutes, MAX_TOTAL_OT_MINUTES);
   const shiftAnchorMs = Number.isFinite(scheduledStartMs) && firstInMs < scheduledStartMs ? scheduledStartMs : firstInMs;
   const fromShiftStartMinutes = Math.max(0, Math.floor((lastOutMs - shiftAnchorMs) / 6e4));
   if (fromShiftStartMinutes >= standardDutyMinutes) {
-    const regularDutyMinutes = standardDutyMinutes;
-    const postShiftOtMinutes = fromShiftStartMinutes - standardDutyMinutes;
-    const earlyOtMinutes = provisionalEarlyOtMinutes;
-    const overtimeMinutes = earlyOtMinutes + postShiftOtMinutes;
-    const totalDutyMinutes = regularDutyMinutes + overtimeMinutes;
+    const regularDutyMinutes = Math.min(fromShiftStartMinutes, MAX_REGULAR_DUTY_MINUTES, standardDutyMinutes);
+    const rawPostShiftOtMinutes = Math.max(0, fromShiftStartMinutes - standardDutyMinutes);
+    const earlyOtMinutes = Math.min(rawEarlyOtMinutes, MAX_TOTAL_OT_MINUTES);
+    const remainingOtBudget = Math.max(0, MAX_TOTAL_OT_MINUTES - earlyOtMinutes);
+    const postShiftOtMinutes = Math.min(rawPostShiftOtMinutes, remainingOtBudget);
+    const totalOtMinutes = Math.min(earlyOtMinutes + postShiftOtMinutes, MAX_TOTAL_OT_MINUTES);
+    const overtimeMinutes = totalOtMinutes;
+    const totalDutyMinutes = Math.min(regularDutyMinutes + totalOtMinutes, MAX_CREDITED_TOTAL_MINUTES);
+    const otCapApplied = rawEarlyOtMinutes + rawPostShiftOtMinutes > MAX_TOTAL_OT_MINUTES || regularDutyMinutes + rawEarlyOtMinutes + rawPostShiftOtMinutes > MAX_CREDITED_TOTAL_MINUTES;
     return {
       actualPresenceMinutes,
       earlyArrivalMinutes,
@@ -7564,15 +7632,19 @@ function evaluateOptionAPunchOut(params) {
       earlyOtMinutes,
       postShiftOtMinutes,
       overtimeMinutes,
-      totalOtMinutes: overtimeMinutes,
+      totalOtMinutes,
       regularDutyMinutes,
       totalDutyMinutes,
+      otCapApplied,
       attendanceStatus: overtimeMinutes > 0 ? "COMPLETED + OT" : "COMPLETED",
       earlyOtFinalized: true,
       earlyPunchPolicy: EARLY_PUNCH_POLICY_ID
     };
   }
-  const countedDuty = earlyArrivalMinutes > 0 ? fromShiftStartMinutes : actualPresenceMinutes;
+  const countedDuty = Math.min(
+    earlyArrivalMinutes > 0 ? fromShiftStartMinutes : actualPresenceMinutes,
+    MAX_REGULAR_DUTY_MINUTES
+  );
   const attendanceStatus = classifyCompletedDutyStatus(countedDuty, standardDutyMinutes);
   return {
     actualPresenceMinutes,
@@ -7584,6 +7656,7 @@ function evaluateOptionAPunchOut(params) {
     totalOtMinutes: 0,
     regularDutyMinutes: countedDuty,
     totalDutyMinutes: countedDuty,
+    otCapApplied: false,
     attendanceStatus,
     earlyOtFinalized: true,
     earlyPunchPolicy: EARLY_PUNCH_POLICY_ID
@@ -7616,8 +7689,9 @@ function isAttendanceRecordOpen(record) {
   return Boolean(record.firstPunchIn || record.punchIn);
 }
 function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinutes = STANDARD_DUTY_MINUTES) {
-  const { startTime: defaultStart } = resolveScheduledShiftDefaults(record);
+  const { startTime: defaultStart, endTime: defaultEnd } = resolveScheduledShiftDefaults(record);
   const scheduledStartDisplay = formatShiftTimeClock12h(defaultStart);
+  const scheduledEndDisplay = formatShiftTimeClock12h(defaultEnd);
   if (!record) {
     return {
       status: "ABSENT",
@@ -7631,17 +7705,38 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       otLabel: "00:00",
       scheduledPunchIn: defaultStart,
       scheduledStartDisplay,
+      scheduledPunchOut: defaultEnd,
+      scheduledEndDisplay,
       earlyArrivalMinutes: 0,
       provisionalEarlyOtMinutes: 0,
       earlyOtMinutes: 0,
       postShiftOtMinutes: 0,
       totalOtMinutes: 0,
       earlyOtFinalized: false,
-      isEarlyPunch: false
+      isEarlyPunch: false,
+      otCapApplied: false,
+      reconciledFromAutoClose: false,
+      punchOutSchedule: null
     };
   }
   const rawStatus = String(record.attendanceStatus || "").trim().toUpperCase();
   const isLate = isAttendanceLate(record);
+  const reconciledFromAutoClose = Boolean(record.reconciledFromAutoClose);
+  const firstInForSchedule = record.firstPunchIn || record.punchIn;
+  let punchOutSchedule = null;
+  if (firstInForSchedule && (record.scheduledPunchInIso || record.shiftDate)) {
+    const bounds = record.shiftDate ? resolveShiftScheduleBounds(record.shiftDate, record) : null;
+    const schedStartIso = record.scheduledPunchInIso || bounds?.scheduledStartIso;
+    const schedEndIso = record.scheduledPunchOutIso || bounds?.scheduledEndIso;
+    if (schedStartIso && schedEndIso) {
+      punchOutSchedule = computeExpectedPunchOutTimes({
+        firstInIso: firstInForSchedule,
+        scheduledStartIso: schedStartIso,
+        scheduledEndIso: schedEndIso,
+        standardDutyMinutes
+      });
+    }
+  }
   if (NON_WORKING_STATUSES.has(rawStatus)) {
     return {
       status: rawStatus,
@@ -7655,24 +7750,30 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       otLabel: "00:00",
       scheduledPunchIn: defaultStart,
       scheduledStartDisplay,
+      scheduledPunchOut: defaultEnd,
+      scheduledEndDisplay,
       earlyArrivalMinutes: 0,
       provisionalEarlyOtMinutes: 0,
       earlyOtMinutes: 0,
       postShiftOtMinutes: 0,
       totalOtMinutes: 0,
       earlyOtFinalized: false,
-      isEarlyPunch: false
+      isEarlyPunch: false,
+      otCapApplied: false,
+      reconciledFromAutoClose: false,
+      punchOutSchedule: null
     };
   }
   const storedEarlyArrival = Math.max(0, Math.floor(Number(record.earlyArrivalMinutes || 0) || 0));
-  const computedProvisionalEarlyOt = typeof record.provisionalEarlyOtMinutes === "number" && Number.isFinite(record.provisionalEarlyOtMinutes) ? Math.max(0, Math.floor(record.provisionalEarlyOtMinutes)) : storedEarlyArrival >= EARLY_OT_THRESHOLD_MINUTES ? storedEarlyArrival : 0;
+  const computedProvisionalEarlyOt = typeof record.provisionalEarlyOtMinutes === "number" && Number.isFinite(record.provisionalEarlyOtMinutes) ? Math.min(Math.max(0, Math.floor(record.provisionalEarlyOtMinutes)), MAX_TOTAL_OT_MINUTES) : storedEarlyArrival >= EARLY_OT_THRESHOLD_MINUTES ? Math.min(storedEarlyArrival, MAX_TOTAL_OT_MINUTES) : 0;
   const reenteredInside = String(record.currentState || "").toUpperCase() === "INSIDE" && String(record.punchOutType || "").toUpperCase() === "NONE";
   if (!reenteredInside && (record.autoClosed === true || String(record.punchOutType || "").toUpperCase() === "AUTO" || rawStatus === "AUTO CLOSED" || rawStatus === "MISSED PUNCH OUT" || record.missedPunchOut === true)) {
-    const completedDutyMinutes2 = Math.max(
+    const rawCompleted2 = Math.max(
       0,
       Math.floor(Number(record.totalDutyMinutes ?? record.regularDutyMinutes ?? 0) || 0)
     );
-    const regularDutyMinutes2 = Math.min(completedDutyMinutes2, standardDutyMinutes);
+    const regularDutyMinutes2 = Math.min(rawCompleted2, MAX_REGULAR_DUTY_MINUTES, standardDutyMinutes);
+    const completedDutyMinutes2 = regularDutyMinutes2;
     return {
       status: rawStatus === "MISSED PUNCH OUT" ? "MISSED PUNCH OUT" : "AUTO CLOSED",
       state: "OUTSIDE",
@@ -7686,13 +7787,18 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       otLabel: "00:00",
       scheduledPunchIn: defaultStart,
       scheduledStartDisplay,
+      scheduledPunchOut: defaultEnd,
+      scheduledEndDisplay,
       earlyArrivalMinutes: storedEarlyArrival,
       provisionalEarlyOtMinutes: 0,
       earlyOtMinutes: 0,
       postShiftOtMinutes: 0,
       totalOtMinutes: 0,
       earlyOtFinalized: false,
-      isEarlyPunch: storedEarlyArrival > 0
+      isEarlyPunch: storedEarlyArrival > 0,
+      otCapApplied: false,
+      reconciledFromAutoClose: false,
+      punchOutSchedule
     };
   }
   if (isAttendanceRecordOpen(record)) {
@@ -7713,13 +7819,18 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       otLabel: "00:00",
       scheduledPunchIn: defaultStart,
       scheduledStartDisplay,
+      scheduledPunchOut: defaultEnd,
+      scheduledEndDisplay,
       earlyArrivalMinutes: storedEarlyArrival,
       provisionalEarlyOtMinutes: computedProvisionalEarlyOt,
       earlyOtMinutes: 0,
       postShiftOtMinutes: 0,
       totalOtMinutes: 0,
       earlyOtFinalized: false,
-      isEarlyPunch: storedEarlyArrival > 0
+      isEarlyPunch: storedEarlyArrival > 0,
+      otCapApplied: false,
+      reconciledFromAutoClose,
+      punchOutSchedule
     };
   }
   const firstInIso = record.firstPunchIn || record.punchIn;
@@ -7729,11 +7840,21 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
   const isOptionARecord = record.earlyPunchPolicy === EARLY_PUNCH_POLICY_ID || typeof record.earlyOtMinutes === "number" || typeof record.postShiftOtMinutes === "number";
   if (isOptionARecord) {
     let earlyArrivalMinutes = storedEarlyArrival;
-    let earlyOtMinutes = Math.max(0, Math.floor(Number(record.earlyOtMinutes || 0) || 0));
-    let postShiftOtMinutes = Math.max(0, Math.floor(Number(record.postShiftOtMinutes || 0) || 0));
-    let completedDutyMinutes2 = Math.max(0, Math.floor(Number(record.totalDutyMinutes || 0) || 0));
-    let regularDutyMinutes2 = Math.max(0, Math.floor(Number(record.regularDutyMinutes || 0) || 0));
-    let overtimeMinutes2 = earlyOtMinutes + postShiftOtMinutes;
+    let earlyOtMinutes = Math.min(Math.max(0, Math.floor(Number(record.earlyOtMinutes || 0) || 0)), MAX_TOTAL_OT_MINUTES);
+    let postShiftOtMinutes = Math.min(
+      Math.max(0, Math.floor(Number(record.postShiftOtMinutes || 0) || 0)),
+      Math.max(0, MAX_TOTAL_OT_MINUTES - earlyOtMinutes)
+    );
+    let regularDutyMinutes2 = Math.min(
+      Math.max(0, Math.floor(Number(record.regularDutyMinutes || 0) || 0)),
+      MAX_REGULAR_DUTY_MINUTES
+    );
+    let overtimeMinutes2 = Math.min(earlyOtMinutes + postShiftOtMinutes, MAX_TOTAL_OT_MINUTES);
+    let completedDutyMinutes2 = Math.min(
+      Math.max(0, Math.floor(Number(record.totalDutyMinutes || 0) || 0)),
+      MAX_CREDITED_TOTAL_MINUTES
+    );
+    let otCapApplied = Boolean(record.otCapApplied);
     const scheduledStartIso = record.scheduledPunchInIso || (record.shiftDate ? resolveShiftScheduleBounds(record.shiftDate, record).scheduledStartIso : void 0);
     if (scheduledStartIso && firstInIso && lastOutIso && Number.isFinite(firstInMs) && Number.isFinite(lastOutMs)) {
       const evaluated = evaluateOptionAPunchOut({
@@ -7748,8 +7869,9 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       overtimeMinutes2 = evaluated.overtimeMinutes;
       regularDutyMinutes2 = evaluated.regularDutyMinutes;
       completedDutyMinutes2 = evaluated.totalDutyMinutes;
+      otCapApplied = evaluated.otCapApplied;
     } else if (overtimeMinutes2 === 0 && typeof record.overtimeMinutes === "number") {
-      overtimeMinutes2 = Math.max(0, Math.floor(record.overtimeMinutes));
+      overtimeMinutes2 = Math.min(Math.max(0, Math.floor(record.overtimeMinutes)), MAX_TOTAL_OT_MINUTES);
     }
     const status2 = classifyCompletedDutyStatus(completedDutyMinutes2, standardDutyMinutes);
     return {
@@ -7764,28 +7886,35 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       otLabel: formatOtBadge(overtimeMinutes2),
       scheduledPunchIn: defaultStart,
       scheduledStartDisplay,
+      scheduledPunchOut: defaultEnd,
+      scheduledEndDisplay,
       earlyArrivalMinutes,
-      provisionalEarlyOtMinutes: earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES ? earlyArrivalMinutes : 0,
+      provisionalEarlyOtMinutes: earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES ? Math.min(earlyArrivalMinutes, MAX_TOTAL_OT_MINUTES) : 0,
       earlyOtMinutes,
       postShiftOtMinutes,
       totalOtMinutes: overtimeMinutes2,
       earlyOtFinalized: true,
-      isEarlyPunch: earlyArrivalMinutes > 0
+      isEarlyPunch: earlyArrivalMinutes > 0,
+      otCapApplied,
+      reconciledFromAutoClose,
+      punchOutSchedule
     };
   }
-  let completedDutyMinutes = 0;
+  let rawCompleted = 0;
   if (typeof record.totalDutyMinutes === "number" && Number.isFinite(record.totalDutyMinutes) && record.totalDutyMinutes > 0) {
-    completedDutyMinutes = Math.floor(record.totalDutyMinutes);
+    rawCompleted = Math.floor(record.totalDutyMinutes);
   } else if (Number.isFinite(firstInMs) && Number.isFinite(lastOutMs) && lastOutMs >= firstInMs) {
-    completedDutyMinutes = Math.floor((lastOutMs - firstInMs) / 6e4);
+    rawCompleted = Math.floor((lastOutMs - firstInMs) / 6e4);
   } else if (typeof record.regularDutyMinutes === "number" || typeof record.overtimeMinutes === "number") {
-    completedDutyMinutes = Math.max(
+    rawCompleted = Math.max(
       0,
       Math.floor(Number(record.regularDutyMinutes || 0) + Number(record.overtimeMinutes || 0))
     );
   }
-  const regularDutyMinutes = Math.min(completedDutyMinutes, standardDutyMinutes);
-  const overtimeMinutes = completedDutyMinutes > standardDutyMinutes ? completedDutyMinutes - standardDutyMinutes : 0;
+  const regularDutyMinutes = Math.min(rawCompleted, MAX_REGULAR_DUTY_MINUTES, standardDutyMinutes);
+  const rawOt = rawCompleted > regularDutyMinutes ? rawCompleted - regularDutyMinutes : 0;
+  const overtimeMinutes = Math.min(rawOt, MAX_TOTAL_OT_MINUTES);
+  const completedDutyMinutes = Math.min(regularDutyMinutes + overtimeMinutes, MAX_CREDITED_TOTAL_MINUTES);
   const status = classifyCompletedDutyStatus(completedDutyMinutes, standardDutyMinutes);
   return {
     status,
@@ -7799,13 +7928,18 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
     otLabel: formatOtBadge(overtimeMinutes),
     scheduledPunchIn: defaultStart,
     scheduledStartDisplay,
+    scheduledPunchOut: defaultEnd,
+    scheduledEndDisplay,
     earlyArrivalMinutes: 0,
     provisionalEarlyOtMinutes: 0,
     earlyOtMinutes: 0,
     postShiftOtMinutes: overtimeMinutes,
     totalOtMinutes: overtimeMinutes,
     earlyOtFinalized: true,
-    isEarlyPunch: false
+    isEarlyPunch: false,
+    otCapApplied: rawOt > MAX_TOTAL_OT_MINUTES || rawCompleted > MAX_CREDITED_TOTAL_MINUTES,
+    reconciledFromAutoClose,
+    punchOutSchedule
   };
 }
 
@@ -8516,6 +8650,7 @@ function registerAttendanceRoutes(app, deps) {
           const qrVerificationMode = token ? "TOKEN_VERIFIED" : "UNTOKENIZED_EMPLOYEE";
           const txStartMs = performance.now();
           const punchRes = await executePunchForVerifiedEmployee({
+            req,
             employee,
             caller,
             now,
@@ -8852,6 +8987,7 @@ function registerAttendanceRoutes(app, deps) {
           }
           const txStartMs = performance.now();
           const result = await executePunchForVerifiedEmployee({
+            req,
             employee,
             caller,
             now,
@@ -8995,6 +9131,7 @@ function registerAttendanceRoutes(app, deps) {
   });
   async function executePunchForVerifiedEmployee(params) {
     const {
+      req,
       employee,
       caller,
       now,
@@ -9013,32 +9150,53 @@ function registerAttendanceRoutes(app, deps) {
     const yesterdayKey = getYesterdayKolkataDateKey(now);
     const currentMins = kolkata.totalMinutes;
     const existingRecords = candidateSnap.docs.map((d) => d.data()).sort((a, b) => new Date(b.punchIn).getTime() - new Date(a.punchIn).getTime());
+    const isNightRecord = (r) => r.shiftId === "NIGHT" || String(r.shiftNameSnapshot || "").toUpperCase().includes("NIGHT");
+    const isOpenRecord = (r) => r.currentState === "INSIDE" || !r.actualPunchOut && r.punchOutType === "NONE";
+    const isAutoClosedReconcilableRecord = (r) => r.punchOutType === "AUTO" && r.autoClosed === true && !r.actualPunchOut && r.reconciledFromAutoClose !== true;
+    const todayRecords = existingRecords.filter((r) => r.shiftDate === todayKey);
+    const yesterdayNight = existingRecords.find(
+      (r) => r.shiftDate === yesterdayKey && isNightRecord(r)
+    );
+    const isWithinNightContinuationWindow = Boolean(
+      yesterdayNight && currentMins < 18 * 60 && now.getTime() >= new Date(yesterdayNight.firstPunchIn || yesterdayNight.punchIn).getTime()
+    );
     let activeRecord = null;
-    if (currentMins < 540) {
-      const yesterdayNight = existingRecords.find(
-        (r) => r.shiftDate === yesterdayKey && (r.shiftId === "NIGHT" || String(r.shiftNameSnapshot || "").toUpperCase().includes("NIGHT"))
-      );
-      if (yesterdayNight) {
-        const isYesterdayNightOpen = yesterdayNight.currentState === "INSIDE" || !yesterdayNight.actualPunchOut && yesterdayNight.punchOutType === "NONE";
+    if (scannerType === "OUT") {
+      const todayOpen = todayRecords.find(isOpenRecord);
+      if (todayOpen) {
+        activeRecord = todayOpen;
+      } else if (yesterdayNight && isOpenRecord(yesterdayNight) && isWithinNightContinuationWindow) {
+        activeRecord = yesterdayNight;
+      } else {
+        const todayAutoClosed = todayRecords.find(isAutoClosedReconcilableRecord);
+        if (todayAutoClosed) {
+          activeRecord = todayAutoClosed;
+        } else if (todayRecords.length === 0 && yesterdayNight && isAutoClosedReconcilableRecord(yesterdayNight) && isWithinNightContinuationWindow) {
+          activeRecord = yesterdayNight;
+        } else if (todayRecords.length > 0) {
+          activeRecord = todayRecords[0];
+        } else if (yesterdayNight && isWithinNightContinuationWindow) {
+          activeRecord = yesterdayNight;
+        }
+      }
+    } else {
+      if (yesterdayNight && isWithinNightContinuationWindow) {
+        const isYesterdayNightOpen = isOpenRecord(yesterdayNight);
         if (isYesterdayNightOpen || currentMins < 360) {
           activeRecord = yesterdayNight;
         }
       }
-    }
-    if (!activeRecord) {
-      const todayOpenRecord = existingRecords.find(
-        (r) => r.shiftDate === todayKey && (r.currentState === "INSIDE" || !r.actualPunchOut && r.punchOutType === "NONE")
-      );
-      if (todayOpenRecord) {
-        activeRecord = todayOpenRecord;
-      } else if (scannerType === "OUT") {
-        activeRecord = existingRecords.find((r) => r.shiftDate === todayKey) || null;
-      } else {
-        const expectedShiftMatch = identifyShiftForPunchIn(shifts, now);
-        const expectedShiftId = expectedShiftMatch?.shift?.id;
-        activeRecord = existingRecords.find(
-          (r) => r.shiftDate === todayKey && (!expectedShiftId || r.shiftId === expectedShiftId)
-        ) || null;
+      if (!activeRecord) {
+        const todayOpenRecord = todayRecords.find(isOpenRecord);
+        if (todayOpenRecord) {
+          activeRecord = todayOpenRecord;
+        } else {
+          const expectedShiftMatch = identifyShiftForPunchIn(shifts, now);
+          const expectedShiftId = expectedShiftMatch?.shift?.id;
+          activeRecord = todayRecords.find(
+            (r) => !expectedShiftId || r.shiftId === expectedShiftId
+          ) || null;
+        }
       }
     }
     if (!scannerType) {
@@ -9156,6 +9314,19 @@ function registerAttendanceRoutes(app, deps) {
           };
         }
         const shift3 = shiftsMap.get(txRes2.record.shiftId) || shifts[0];
+        const reentryBounds = resolveShiftScheduleBounds(txRes2.record.shiftDate || todayKey, {
+          ...shift3,
+          shiftId: txRes2.record.shiftId,
+          shiftNameSnapshot: txRes2.record.shiftNameSnapshot,
+          scheduledPunchIn: txRes2.record.scheduledPunchIn || shift3?.startTime,
+          scheduledPunchOut: txRes2.record.scheduledPunchOut || shift3?.endTime
+        });
+        const reentrySchedule = computeExpectedPunchOutTimes({
+          firstInIso: txRes2.record.firstPunchIn || txRes2.record.punchIn,
+          scheduledStartIso: txRes2.record.scheduledPunchInIso || reentryBounds.scheduledStartIso,
+          scheduledEndIso: txRes2.record.scheduledPunchOutIso || reentryBounds.scheduledEndIso,
+          standardDutyMinutes: STANDARD_DUTY_MINUTES
+        });
         return {
           httpStatus: 200,
           body: {
@@ -9166,6 +9337,7 @@ function registerAttendanceRoutes(app, deps) {
             employee,
             attendance: txRes2.record,
             shift: shift3,
+            punchOutSchedule: reentrySchedule || void 0,
             message: `Punch In Successfully Recorded (Re-entry #${txRes2.record.punches.length}).`,
             time: timeDisplay,
             punchCount: txRes2.record.punches.length
@@ -9315,6 +9487,12 @@ function registerAttendanceRoutes(app, deps) {
           }
         };
       }
+      const firstInSchedule = computeExpectedPunchOutTimes({
+        firstInIso: newAttendanceRecord.firstPunchIn,
+        scheduledStartIso: scheduleBounds.scheduledStartIso,
+        scheduledEndIso: scheduleBounds.scheduledEndIso,
+        standardDutyMinutes: STANDARD_DUTY_MINUTES
+      });
       return {
         httpStatus: 200,
         body: {
@@ -9325,6 +9503,7 @@ function registerAttendanceRoutes(app, deps) {
           employee,
           attendance: newAttendanceRecord,
           shift: shift2,
+          punchOutSchedule: firstInSchedule || void 0,
           message: isLate ? `First Punch In Recorded for ${shift2.name} (Marked LATE).` : earlyEval.provisionalEarlyOtMinutes > 0 ? `First Punch In Recorded for ${shift2.name} (Early ${formatMinutes(earlyEval.earlyArrivalMinutes)} \u2022 Provisional Early OT).` : earlyEval.earlyArrivalMinutes > 0 ? `First Punch In Recorded for ${shift2.name} (Early ${formatMinutes(earlyEval.earlyArrivalMinutes)} \u2022 <60m: 0 Early OT).` : `First Punch In Recorded for ${shift2.name}.`,
           time: timeDisplay,
           punchCount: 1
@@ -9361,15 +9540,23 @@ function registerAttendanceRoutes(app, deps) {
     const txOutRes = await db.runTransaction(async (tx) => {
       const snap = await tx.get(docRef);
       const currentData = snap.exists ? snap.data() : activeRecord;
+      if (String(currentData.employeeId || "").toUpperCase() !== String(employee.employeeId || "").toUpperCase()) {
+        return { kind: "EMPLOYEE_MISMATCH", record: currentData };
+      }
       const currentState = currentData.currentState || (currentData.actualPunchOut || currentData.punchOutType === "ACTUAL" ? "OUTSIDE" : "INSIDE");
-      if (currentState === "OUTSIDE") {
+      const isAutoClosedReconcilable = currentData.punchOutType === "AUTO" && currentData.autoClosed === true && !currentData.actualPunchOut && currentData.reconciledFromAutoClose !== true;
+      if (currentState === "OUTSIDE" && !isAutoClosedReconcilable) {
         return { kind: "CONSECUTIVE_OUT", record: currentData };
       }
-      const lastPunchTime = Array.isArray(currentData.punches) && currentData.punches.length > 0 ? new Date(currentData.punches[currentData.punches.length - 1].timestamp).getTime() : new Date(currentData.updatedAt || currentData.punchIn).getTime();
-      if (Math.abs(now.getTime() - lastPunchTime) < 3e3) {
+      const firstInIso = currentData.firstPunchIn || currentData.punchIn;
+      const firstInMs = new Date(firstInIso).getTime();
+      if (!Number.isFinite(firstInMs) || now.getTime() < firstInMs) {
+        return { kind: "INVALID_TIME", record: currentData };
+      }
+      const lastEmployeePunchTime = Array.isArray(currentData.punches) && currentData.punches.length > 0 ? new Date(currentData.punches[currentData.punches.length - 1].timestamp).getTime() : firstInMs;
+      if (!isAutoClosedReconcilable && Math.abs(now.getTime() - lastEmployeePunchTime) < 3e3) {
         return { kind: "BOUNCE", record: currentData };
       }
-      const firstInIso = currentData.firstPunchIn || currentData.punchIn;
       const recordShift = shiftsMap.get(currentData.shiftId) || shifts[0];
       const bounds = resolveShiftScheduleBounds(currentData.shiftDate || todayKey, {
         ...recordShift,
@@ -9410,13 +9597,18 @@ function registerAttendanceRoutes(app, deps) {
         overtimeMinutes,
         earlyOtMinutes: otEval.earlyOtMinutes,
         postShiftOtMinutes: otEval.postShiftOtMinutes,
-        status: "VALID_OUT",
+        reconciledFromAutoClose: isAutoClosedReconcilable,
+        previousPunchOutType: isAutoClosedReconcilable ? "AUTO" : "NONE",
+        previousAutoCloseEventId: isAutoClosedReconcilable ? currentData.autoCloseEventId || null : null,
+        status: isAutoClosedReconcilable ? "RECONCILED_ACTUAL_OUT" : "VALID_OUT",
         recordedByUid: caller.uid,
         recordedByLoginId: caller.loginId
       };
       const existingPunches = Array.isArray(currentData.punches) ? currentData.punches : [];
       const updatedAttendance = {
         ...currentData,
+        firstPunchIn: firstInIso,
+        punchIn: currentData.punchIn || firstInIso,
         scheduledPunchIn: currentData.scheduledPunchIn || bounds.startTime,
         scheduledPunchInIso: scheduledStartIso,
         scheduledPunchOut: currentData.scheduledPunchOut || bounds.endTime,
@@ -9438,9 +9630,16 @@ function registerAttendanceRoutes(app, deps) {
         totalOtMinutes: otEval.totalOtMinutes,
         earlyOtFinalized: true,
         earlyPunchPolicy: EARLY_PUNCH_POLICY_ID,
+        otCapApplied: otEval.otCapApplied,
         attendanceStatus: computedStatus,
         missedPunchOut: false,
         autoClosed: false,
+        ...isAutoClosedReconcilable ? {
+          reconciledFromAutoClose: true,
+          reconciledAt: now.toISOString(),
+          reconciledByUid: caller.uid,
+          reconciledByLoginId: caller.loginId
+        } : {},
         updatedByUid: caller.uid,
         updatedByLoginId: caller.loginId,
         updatedAt: now.toISOString()
@@ -9458,15 +9657,32 @@ function registerAttendanceRoutes(app, deps) {
         qrVerificationMode,
         performedByUid: caller.uid,
         performedByLoginId: caller.loginId,
-        message: `Punch Out recorded (${computedStatus}). Duty: ${formatMinutes(regularDutyMinutes)}, Early OT: ${formatMinutes(otEval.earlyOtMinutes)}, Post OT: ${formatMinutes(otEval.postShiftOtMinutes)}, Total OT: ${formatMinutes(overtimeMinutes)}. Total: ${formatMinutes(totalDutyMinutes)}.`
+        message: isAutoClosedReconcilable ? `Actual Punch Out reconciled from provisional AUTO CLOSED (${computedStatus}). Duty: ${formatMinutes(regularDutyMinutes)}, Early OT: ${formatMinutes(otEval.earlyOtMinutes)}, Post OT: ${formatMinutes(otEval.postShiftOtMinutes)}, Total OT: ${formatMinutes(overtimeMinutes)}. Total: ${formatMinutes(totalDutyMinutes)}.` : `Punch Out recorded (${computedStatus}). Duty: ${formatMinutes(regularDutyMinutes)}, Early OT: ${formatMinutes(otEval.earlyOtMinutes)}, Post OT: ${formatMinutes(otEval.postShiftOtMinutes)}, Total OT: ${formatMinutes(overtimeMinutes)}. Total: ${formatMinutes(totalDutyMinutes)}.`
       });
       return {
         kind: "RECORDED",
         record: updatedAttendance,
         regularDutyMinutes,
-        overtimeMinutes
+        overtimeMinutes,
+        reconciledFromAutoClose: isAutoClosedReconcilable,
+        previousAutoCloseEffective: currentData.autoCloseEffectivePunchOut || currentData.effectivePunchOut || null,
+        scheduledStartIso,
+        scheduledEndIso
       };
     });
+    if (txOutRes.kind === "EMPLOYEE_MISMATCH" || txOutRes.kind === "INVALID_TIME") {
+      return {
+        httpStatus: 400,
+        body: {
+          success: false,
+          action: "REJECTED",
+          scannerType: "OUT",
+          employee,
+          message: txOutRes.kind === "EMPLOYEE_MISMATCH" ? "Punch Out rejected: Attendance record does not match scanned employee." : "Punch Out rejected: Punch-Out timestamp cannot be earlier than Punch-In.",
+          time: timeDisplay
+        }
+      };
+    }
     if (txOutRes.kind === "CONSECUTIVE_OUT") {
       await writePunchLog({
         employeeId: employee.employeeId,
@@ -9509,7 +9725,31 @@ function registerAttendanceRoutes(app, deps) {
         }
       };
     }
+    if (txOutRes.reconciledFromAutoClose) {
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: "RECONCILE_AUTO_CLOSED_PUNCH_OUT",
+        category: "ATTENDANCE",
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        employeeId: employee.employeeId,
+        targetType: "ATTENDANCE",
+        targetId: txOutRes.record.id,
+        oldValue: `AUTO CLOSED (Effective Out: ${txOutRes.previousAutoCloseEffective || "Scheduled End"}, OT: 00:00)`,
+        newValue: `ACTUAL (${txOutRes.record.attendanceStatus}, Out: ${txOutRes.record.actualPunchOut}, Duty: ${formatMinutes(txOutRes.record.totalDutyMinutes)}, OT: ${formatMinutes(txOutRes.overtimeMinutes)})`,
+        actionSource: scannerDevice === "MANUAL" ? "MANUAL_SCANNER_RECONCILIATION" : "QR_SCANNER_RECONCILIATION",
+        reason: "Genuine actual Punch-Out received after provisional shift auto-close",
+        captureGeo: false
+      });
+    }
     const shift = shiftsMap.get(txOutRes.record.shiftId) || shifts[0];
+    const outSchedule = computeExpectedPunchOutTimes({
+      firstInIso: txOutRes.record.firstPunchIn || txOutRes.record.punchIn,
+      scheduledStartIso: txOutRes.scheduledStartIso,
+      scheduledEndIso: txOutRes.scheduledEndIso,
+      standardDutyMinutes: STANDARD_DUTY_MINUTES
+    });
     return {
       httpStatus: 200,
       body: {
@@ -9517,10 +9757,12 @@ function registerAttendanceRoutes(app, deps) {
         action: "PUNCH_OUT",
         scannerType: "OUT",
         currentState: "OUTSIDE",
+        reconciledFromAutoClose: txOutRes.reconciledFromAutoClose,
         employee,
         attendance: txOutRes.record,
         shift,
-        message: "Punch Out Successfully Recorded.",
+        punchOutSchedule: outSchedule || void 0,
+        message: txOutRes.reconciledFromAutoClose ? "Actual Punch Out Recorded (Reconciled from Auto-Close)." : "Punch Out Successfully Recorded.",
         time: timeDisplay,
         dutyFormatted: formatMinutes(txOutRes.regularDutyMinutes),
         otFormatted: formatMinutes(txOutRes.overtimeMinutes),
@@ -9579,42 +9821,84 @@ function registerAttendanceRoutes(app, deps) {
           break;
         }
         const record = docSnap.data();
-        if (record.actualPunchOut || record.punchOutType !== "NONE") continue;
+        if (record.actualPunchOut || record.punchOutType !== "NONE" || record.autoClosed === true) continue;
         const shift = shiftsMap.get(record.shiftId);
         if (!shift) continue;
-        const scheduledEndIso = getShiftScheduledEndIso(record.shiftDate, shift);
+        const scheduledEndIso = record.scheduledPunchOutIso || getShiftScheduledEndIso(record.shiftDate, shift);
         const scheduledEndDate = new Date(scheduledEndIso);
-        if (now.getTime() > scheduledEndDate.getTime()) {
-          const scheduledDuration = shift.scheduledDurationMinutes || settings.scheduledDurationMinutes || 510;
+        if (now.getTime() >= scheduledEndDate.getTime()) {
+          const scheduledDuration = Math.min(
+            shift.scheduledDurationMinutes || settings.scheduledDurationMinutes || STANDARD_DUTY_MINUTES,
+            MAX_REGULAR_DUTY_MINUTES
+          );
           const docRef = db.collection("attendance").doc(record.id);
-          const updatedRecord = await db.runTransaction(async (tx) => {
-            const freshSnap = await tx.get(docRef);
-            if (!freshSnap.exists) return null;
-            const fresh = freshSnap.data();
-            if (fresh.actualPunchOut || fresh.punchOutType !== "NONE") return null;
-            const next = {
-              ...fresh,
-              actualPunchOut: null,
-              lastPunchOut: null,
-              effectivePunchOut: scheduledEndIso,
-              punchOutType: "AUTO",
-              currentState: "OUTSIDE",
-              attendanceStatus: "AUTO CLOSED",
-              missedPunchOut: true,
-              autoClosed: true,
-              totalDutyMinutes: scheduledDuration,
-              regularDutyMinutes: scheduledDuration,
-              overtimeMinutes: 0,
-              // Zero OT on auto-closed shifts
-              earlyOtMinutes: 0,
-              postShiftOtMinutes: 0,
-              totalOtMinutes: 0,
-              earlyOtFinalized: false,
-              updatedAt: now.toISOString()
-            };
-            tx.set(docRef, next);
-            return next;
-          });
+          const autoEventId = `pe_auto_${Date.now()}_${crypto4.randomBytes(3).toString("hex")}`;
+          const autoDisplayTime = getKolkataTimeParts(scheduledEndDate).timeWithSeconds;
+          const updatedRecord = await withEmployeeScanLock(
+            record.employeeId,
+            () => db.runTransaction(async (tx) => {
+              const freshSnap = await tx.get(docRef);
+              if (!freshSnap.exists) return null;
+              const fresh = freshSnap.data();
+              if (fresh.actualPunchOut || fresh.punchOutType !== "NONE" || fresh.autoClosed === true || fresh.currentState === "OUTSIDE") {
+                return null;
+              }
+              const autoCloseEvent = {
+                id: autoEventId,
+                employeeId: fresh.employeeId,
+                employeeName: fresh.employeeNameSnapshot || "",
+                eventType: "OUT",
+                timestamp: now.toISOString(),
+                effectivePunchOut: scheduledEndIso,
+                displayTime: autoDisplayTime,
+                shiftDate: fresh.shiftDate,
+                shiftId: fresh.shiftId,
+                shiftName: fresh.shiftNameSnapshot || shift.name,
+                floor: fresh.floorIdSnapshot || "",
+                section: fresh.sectionIdSnapshot || "",
+                department: fresh.departmentIdSnapshot || "",
+                scannerType: "OUT",
+                scannerDevice: "SYSTEM_AUTO",
+                dutyDurationMinutes: scheduledDuration,
+                overtimeMinutes: 0,
+                earlyOtMinutes: 0,
+                postShiftOtMinutes: 0,
+                status: "AUTO_CLOSE",
+                recordedByUid: caller.uid,
+                recordedByLoginId: caller.loginId
+              };
+              const next = {
+                ...fresh,
+                firstPunchIn: fresh.firstPunchIn || fresh.punchIn,
+                punchIn: fresh.punchIn || fresh.firstPunchIn,
+                scheduledPunchOutIso: scheduledEndIso,
+                actualPunchOut: null,
+                lastPunchOut: null,
+                effectivePunchOut: scheduledEndIso,
+                punchOutType: "AUTO",
+                currentState: "OUTSIDE",
+                attendanceStatus: "AUTO CLOSED",
+                missedPunchOut: true,
+                autoClosed: true,
+                autoClosedAt: now.toISOString(),
+                autoCloseEventId: autoEventId,
+                autoCloseEffectivePunchOut: scheduledEndIso,
+                totalDutyMinutes: scheduledDuration,
+                regularDutyMinutes: scheduledDuration,
+                overtimeMinutes: 0,
+                // Strictly zero OT on auto-closed shifts
+                earlyOtMinutes: 0,
+                postShiftOtMinutes: 0,
+                totalOtMinutes: 0,
+                earlyOtFinalized: false,
+                otCapApplied: false,
+                updatedAt: now.toISOString()
+              };
+              tx.set(docRef, next);
+              tx.set(db.collection("punch_events").doc(autoEventId), autoCloseEvent);
+              return next;
+            })
+          );
           if (updatedRecord) {
             closedRecords.push(updatedRecord);
             await Promise.all([
@@ -9627,7 +9911,7 @@ function registerAttendanceRoutes(app, deps) {
                 scannerDevice: "SYSTEM_AUTO",
                 performedByUid: caller.uid,
                 performedByLoginId: caller.loginId,
-                message: `Auto-closed at scheduled shift end (${shift.endTime}). Status: AUTO CLOSED. OT: 00:00.`
+                message: `Provisional auto-close at scheduled shift end (${shift.endTime}). Status: AUTO CLOSED. OT: 00:00.`
               }),
               recordEnterpriseAuditEvent(db, {
                 req,
@@ -9641,7 +9925,7 @@ function registerAttendanceRoutes(app, deps) {
                 targetId: record.id,
                 newValue: `Auto-closed at ${scheduledEndIso}, Duty: ${formatMinutes(scheduledDuration)}, OT: 00:00`,
                 actionSource: "SYSTEM_SCHEDULER",
-                reason: "Employee missed scanning Punch Out at scheduled shift closing",
+                reason: "Provisional auto-close at scheduled shift end (reconcilable by genuine Punch-Out)",
                 captureGeo: false
               })
             ]);
@@ -9721,14 +10005,17 @@ function registerAttendanceRoutes(app, deps) {
           if (Number.isNaN(outTime)) {
             throw new Error("INVALID_PUNCH_OUT");
           }
+          let otCapApplied = Boolean(current.otCapApplied);
           if (punchOutType === "AUTO") {
-            totalDutyMinutes = Math.max(0, Math.floor((outTime - inTime) / (60 * 1e3)));
-            actualPresenceMinutes = totalDutyMinutes;
-            regularDutyMinutes = Math.min(totalDutyMinutes, STANDARD_DUTY_MINUTES);
+            const rawPresence = Math.max(0, Math.floor((outTime - inTime) / (60 * 1e3)));
+            actualPresenceMinutes = rawPresence;
+            regularDutyMinutes = Math.min(rawPresence, MAX_REGULAR_DUTY_MINUTES);
+            totalDutyMinutes = regularDutyMinutes;
             overtimeMinutes = 0;
             earlyOtMinutes = 0;
             postShiftOtMinutes = 0;
             earlyOtFinalized = false;
+            otCapApplied = false;
           } else {
             const otEval = evaluateOptionAPunchOut({
               firstInIso,
@@ -9746,8 +10033,55 @@ function registerAttendanceRoutes(app, deps) {
             earlyOtMinutes = otEval.earlyOtMinutes;
             postShiftOtMinutes = otEval.postShiftOtMinutes;
             earlyOtFinalized = true;
+            otCapApplied = otEval.otCapApplied;
           }
+          const autoClassifySet2 = /* @__PURE__ */ new Set([
+            "COMPLETED",
+            "COMPLETED + OT",
+            "HALF DAY",
+            "SHORT LEAVE",
+            "PRESENT"
+          ]);
+          const finalAttendanceStatus2 = punchOutType === "ACTUAL" && actualPunchOut && autoClassifySet2.has(attendanceStatus) ? classifyCompletedDutyStatus(totalDutyMinutes, STANDARD_DUTY_MINUTES) : attendanceStatus;
+          const updatedFields2 = {
+            actualPunchOut: punchOutType === "AUTO" ? null : actualPunchOut,
+            lastPunchOut: punchOutType === "AUTO" ? null : actualPunchOut,
+            effectivePunchOut: actualPunchOut || current.effectivePunchOut || null,
+            punchOutType,
+            currentState: actualPunchOut ? "OUTSIDE" : current.currentState || "OUTSIDE",
+            attendanceStatus: finalAttendanceStatus2,
+            autoClosed: punchOutType === "AUTO",
+            missedPunchOut: punchOutType === "AUTO" || finalAttendanceStatus2 === "MISSED PUNCH OUT",
+            scheduledPunchIn: current.scheduledPunchIn || bounds.startTime,
+            scheduledPunchInIso: scheduledStartIso,
+            scheduledPunchOut: current.scheduledPunchOut || bounds.endTime,
+            scheduledPunchOutIso: current.scheduledPunchOutIso || bounds.scheduledEndIso,
+            actualPresenceMinutes,
+            totalDutyMinutes,
+            regularDutyMinutes,
+            overtimeMinutes,
+            earlyArrivalMinutes,
+            provisionalEarlyOtMinutes,
+            earlyOtMinutes,
+            postShiftOtMinutes,
+            totalOtMinutes: overtimeMinutes,
+            earlyOtFinalized,
+            otCapApplied,
+            earlyPunchPolicy: EARLY_PUNCH_POLICY_ID,
+            correctionReason: reason.trim(),
+            correctedBy: caller.loginId,
+            correctedByUid: caller.uid,
+            updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+          };
+          tx.update(docRef, updatedFields2);
+          return {
+            notFound: false,
+            current,
+            updated: { ...current, ...updatedFields2 }
+          };
         } else if (punchOutType === "AUTO") {
+          regularDutyMinutes = Math.min(regularDutyMinutes || STANDARD_DUTY_MINUTES, MAX_REGULAR_DUTY_MINUTES);
+          totalDutyMinutes = regularDutyMinutes;
           overtimeMinutes = 0;
           earlyOtMinutes = 0;
           postShiftOtMinutes = 0;
@@ -9762,12 +10096,14 @@ function registerAttendanceRoutes(app, deps) {
         ]);
         const finalAttendanceStatus = punchOutType === "ACTUAL" && actualPunchOut && autoClassifySet.has(attendanceStatus) ? classifyCompletedDutyStatus(totalDutyMinutes, STANDARD_DUTY_MINUTES) : attendanceStatus;
         const updatedFields = {
-          actualPunchOut: actualPunchOut || current.actualPunchOut || null,
-          lastPunchOut: actualPunchOut || current.lastPunchOut || null,
+          actualPunchOut: punchOutType === "AUTO" ? null : actualPunchOut || current.actualPunchOut || null,
+          lastPunchOut: punchOutType === "AUTO" ? null : actualPunchOut || current.lastPunchOut || null,
           effectivePunchOut: actualPunchOut || current.effectivePunchOut || null,
           punchOutType,
           currentState: actualPunchOut ? "OUTSIDE" : current.currentState || "OUTSIDE",
           attendanceStatus: finalAttendanceStatus,
+          autoClosed: punchOutType === "AUTO",
+          missedPunchOut: punchOutType === "AUTO" || finalAttendanceStatus === "MISSED PUNCH OUT",
           scheduledPunchIn: current.scheduledPunchIn || bounds.startTime,
           scheduledPunchInIso: scheduledStartIso,
           scheduledPunchOut: current.scheduledPunchOut || bounds.endTime,
@@ -9782,6 +10118,7 @@ function registerAttendanceRoutes(app, deps) {
           postShiftOtMinutes,
           totalOtMinutes: overtimeMinutes,
           earlyOtFinalized,
+          otCapApplied: Boolean(current.otCapApplied),
           earlyPunchPolicy: EARLY_PUNCH_POLICY_ID,
           correctionReason: reason.trim(),
           correctedBy: caller.loginId,
@@ -11010,6 +11347,1290 @@ function registerMasterRoutes(app, deps) {
   });
 }
 
+// serverCompanyWifi.ts
+import crypto6 from "crypto";
+import { z as z6 } from "zod";
+
+// src/utils/companyWifiUtils.ts
+var COMPANY_WIFI_DENIED_MESSAGE = "Access Denied: Please connect to an authorized Company Wi-Fi network.";
+var COMPANY_WIFI_DENIED_CODE = "COMPANY_WIFI_ACCESS_DENIED";
+function normalizeIpString(raw) {
+  if (typeof raw !== "string") return "";
+  let clean = raw.trim();
+  if (!clean) return "";
+  if (clean.startsWith("[")) {
+    const closeIdx = clean.indexOf("]");
+    if (closeIdx > 1) {
+      clean = clean.slice(1, closeIdx);
+    }
+  }
+  if (/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(clean)) {
+    clean = clean.split(":")[0];
+  }
+  const zoneIdx = clean.indexOf("%");
+  if (zoneIdx > 0) {
+    clean = clean.slice(0, zoneIdx);
+  }
+  if (/^::ffff:\d{1,3}(\.\d{1,3}){3}$/i.test(clean)) {
+    clean = clean.replace(/^::ffff:/i, "");
+  }
+  return clean.toLowerCase();
+}
+function parseIpv4ToBigInt(ip) {
+  const parts = ip.split(".");
+  if (parts.length !== 4) return null;
+  let value = 0n;
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return null;
+    if (part.length > 1 && part.startsWith("0")) return null;
+    const num = Number(part);
+    if (!Number.isInteger(num) || num < 0 || num > 255) return null;
+    value = value << 8n | BigInt(num);
+  }
+  return value;
+}
+function bigIntToIpv4(value) {
+  const a = Number(value >> 24n & 0xffn);
+  const b = Number(value >> 16n & 0xffn);
+  const c = Number(value >> 8n & 0xffn);
+  const d = Number(value & 0xffn);
+  return `${a}.${b}.${c}.${d}`;
+}
+function parseIpv6ToBigInt(ip) {
+  const clean = ip.toLowerCase();
+  if (!clean.includes(":")) return null;
+  let working = clean;
+  const lastColon = working.lastIndexOf(":");
+  const tail = working.slice(lastColon + 1);
+  if (tail.includes(".")) {
+    const v4 = parseIpv4ToBigInt(tail);
+    if (v4 === null) return null;
+    const hi = Number(v4 >> 16n & 0xffffn).toString(16);
+    const lo = Number(v4 & 0xffffn).toString(16);
+    working = `${working.slice(0, lastColon)}:${hi}:${lo}`;
+  }
+  const doubleColonParts = working.split("::");
+  if (doubleColonParts.length > 2) return null;
+  const left = doubleColonParts[0] ? doubleColonParts[0].split(":") : [];
+  const right = doubleColonParts.length === 2 && doubleColonParts[1] ? doubleColonParts[1].split(":") : [];
+  const missing = doubleColonParts.length === 2 ? 8 - (left.length + right.length) : 8 - left.length;
+  if (doubleColonParts.length === 2 ? missing < 1 : missing !== 0) {
+    return null;
+  }
+  const groups = doubleColonParts.length === 2 ? [...left, ...Array(missing).fill("0"), ...right] : left;
+  if (groups.length !== 8) return null;
+  let value = 0n;
+  for (const g of groups) {
+    if (!/^[0-9a-f]{1,4}$/i.test(g)) return null;
+    value = value << 16n | BigInt(parseInt(g, 16));
+  }
+  return value;
+}
+function parseIpOrCidr(rawInput) {
+  const trimmed = String(rawInput || "").trim();
+  if (!trimmed) {
+    return {
+      valid: false,
+      normalized: "",
+      publicIp: "",
+      cidrRange: "",
+      version: "ipv4",
+      isCidr: false,
+      prefixLength: 32,
+      networkInt: 0n,
+      error: "Public IP address or CIDR range is required."
+    };
+  }
+  const slashParts = trimmed.split("/");
+  if (slashParts.length > 2) {
+    return {
+      valid: false,
+      normalized: "",
+      publicIp: "",
+      cidrRange: "",
+      version: "ipv4",
+      isCidr: false,
+      prefixLength: 32,
+      networkInt: 0n,
+      error: "Invalid CIDR format."
+    };
+  }
+  const ipPart = normalizeIpString(slashParts[0]);
+  const hasPrefix = slashParts.length === 2;
+  const v4 = parseIpv4ToBigInt(ipPart);
+  if (v4 !== null) {
+    let prefix = 32;
+    if (hasPrefix) {
+      if (!/^\d{1,2}$/.test(slashParts[1])) {
+        return {
+          valid: false,
+          normalized: "",
+          publicIp: "",
+          cidrRange: "",
+          version: "ipv4",
+          isCidr: true,
+          prefixLength: 32,
+          networkInt: 0n,
+          error: "IPv4 CIDR prefix must be between 0 and 32."
+        };
+      }
+      prefix = Number(slashParts[1]);
+      if (prefix < 0 || prefix > 32) {
+        return {
+          valid: false,
+          normalized: "",
+          publicIp: "",
+          cidrRange: "",
+          version: "ipv4",
+          isCidr: true,
+          prefixLength: 32,
+          networkInt: 0n,
+          error: "IPv4 CIDR prefix must be between 0 and 32."
+        };
+      }
+    }
+    const shift = BigInt(32 - prefix);
+    const maskedInt = prefix === 0 ? 0n : v4 >> shift << shift;
+    const baseIp = hasPrefix ? bigIntToIpv4(maskedInt) : ipPart;
+    return {
+      valid: true,
+      normalized: hasPrefix ? `${baseIp}/${prefix}` : ipPart,
+      publicIp: baseIp,
+      cidrRange: hasPrefix ? `${baseIp}/${prefix}` : "",
+      version: "ipv4",
+      isCidr: hasPrefix,
+      prefixLength: prefix,
+      networkInt: maskedInt
+    };
+  }
+  const v6 = parseIpv6ToBigInt(ipPart);
+  if (v6 !== null) {
+    let prefix = 128;
+    if (hasPrefix) {
+      if (!/^\d{1,3}$/.test(slashParts[1])) {
+        return {
+          valid: false,
+          normalized: "",
+          publicIp: "",
+          cidrRange: "",
+          version: "ipv6",
+          isCidr: true,
+          prefixLength: 128,
+          networkInt: 0n,
+          error: "IPv6 CIDR prefix must be between 0 and 128."
+        };
+      }
+      prefix = Number(slashParts[1]);
+      if (prefix < 0 || prefix > 128) {
+        return {
+          valid: false,
+          normalized: "",
+          publicIp: "",
+          cidrRange: "",
+          version: "ipv6",
+          isCidr: true,
+          prefixLength: 128,
+          networkInt: 0n,
+          error: "IPv6 CIDR prefix must be between 0 and 128."
+        };
+      }
+    }
+    const shift = BigInt(128 - prefix);
+    const maskedInt = prefix === 0 ? 0n : v6 >> shift << shift;
+    return {
+      valid: true,
+      normalized: hasPrefix ? `${ipPart}/${prefix}` : ipPart,
+      publicIp: ipPart,
+      cidrRange: hasPrefix ? `${ipPart}/${prefix}` : "",
+      version: "ipv6",
+      isCidr: hasPrefix,
+      prefixLength: prefix,
+      networkInt: maskedInt
+    };
+  }
+  return {
+    valid: false,
+    normalized: "",
+    publicIp: "",
+    cidrRange: "",
+    version: "ipv4",
+    isCidr: false,
+    prefixLength: 32,
+    networkInt: 0n,
+    error: "Must be a valid public IPv4, IPv6, or CIDR range (e.g., 203.0.113.10 or 203.0.113.0/24)."
+  };
+}
+function ipMatchesCidrOrExact(clientIpRaw, allowEntryRaw) {
+  const clientIp = normalizeIpString(clientIpRaw);
+  if (!clientIp) return false;
+  const parsedEntry = parseIpOrCidr(allowEntryRaw);
+  if (!parsedEntry.valid) return false;
+  if (parsedEntry.version === "ipv4") {
+    const clientV4 = parseIpv4ToBigInt(clientIp);
+    if (clientV4 === null) return false;
+    if (parsedEntry.prefixLength === 0) return true;
+    const shift2 = BigInt(32 - parsedEntry.prefixLength);
+    return clientV4 >> shift2 === parsedEntry.networkInt >> shift2;
+  }
+  const clientV6 = parseIpv6ToBigInt(clientIp);
+  if (clientV6 === null) return false;
+  if (parsedEntry.prefixLength === 0) return true;
+  const shift = BigInt(128 - parsedEntry.prefixLength);
+  return clientV6 >> shift === parsedEntry.networkInt >> shift;
+}
+var NON_PUBLIC_IPV4_RANGES = [
+  "0.0.0.0/8",
+  "10.0.0.0/8",
+  "100.64.0.0/10",
+  "127.0.0.0/8",
+  "169.254.0.0/16",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "224.0.0.0/4",
+  "240.0.0.0/4"
+].map((cidr) => {
+  const p = parseIpOrCidr(cidr);
+  const hostMask = (1n << BigInt(32 - p.prefixLength)) - 1n;
+  return {
+    start: p.networkInt,
+    end: p.networkInt | hostMask,
+    label: cidr
+  };
+});
+var NON_PUBLIC_IPV6_RANGES = [
+  "::/128",
+  "::1/128",
+  "fc00::/7",
+  "fe80::/10",
+  "ff00::/8"
+].map((cidr) => {
+  const p = parseIpOrCidr(cidr);
+  const hostMask = (1n << BigInt(128 - p.prefixLength)) - 1n;
+  return {
+    start: p.networkInt,
+    end: p.networkInt | hostMask,
+    label: cidr
+  };
+});
+function isPrivateOrNonPublicIp(rawIp) {
+  const ip = normalizeIpString(rawIp);
+  if (!ip || ip === "unavailable" || ip === "unknown") return true;
+  const parsed = parseIpOrCidr(ip);
+  if (!parsed.valid || parsed.isCidr) return true;
+  const ranges = parsed.version === "ipv4" ? NON_PUBLIC_IPV4_RANGES : NON_PUBLIC_IPV6_RANGES;
+  return ranges.some((r) => parsed.networkInt >= r.start && parsed.networkInt <= r.end);
+}
+function validatePublicCompanyWifiIpOrCidr(rawInput) {
+  const parsed = parseIpOrCidr(rawInput);
+  if (!parsed.valid) {
+    return parsed;
+  }
+  if (parsed.version === "ipv4") {
+    if (parsed.isCidr && parsed.prefixLength < 16) {
+      return {
+        ...parsed,
+        valid: false,
+        error: "IPv4 CIDR range is too broad. Minimum prefix length is /16 (e.g., 203.0.113.0/24)."
+      };
+    }
+    const hostMask2 = (1n << BigInt(32 - parsed.prefixLength)) - 1n;
+    const rangeStart2 = parsed.networkInt;
+    const rangeEnd2 = parsed.networkInt | hostMask2;
+    const overlapping2 = NON_PUBLIC_IPV4_RANGES.find(
+      (r) => rangeStart2 <= r.end && rangeEnd2 >= r.start
+    );
+    if (overlapping2) {
+      return {
+        ...parsed,
+        valid: false,
+        error: `Private, loopback, or reserved IP ranges (${overlapping2.label}) are not allowed. Enter a routable Public IP or CIDR.`
+      };
+    }
+    return parsed;
+  }
+  if (parsed.isCidr && parsed.prefixLength < 32) {
+    return {
+      ...parsed,
+      valid: false,
+      error: "IPv6 CIDR range is too broad. Minimum prefix length is /32."
+    };
+  }
+  const hostMask = (1n << BigInt(128 - parsed.prefixLength)) - 1n;
+  const rangeStart = parsed.networkInt;
+  const rangeEnd = parsed.networkInt | hostMask;
+  const overlapping = NON_PUBLIC_IPV6_RANGES.find(
+    (r) => rangeStart <= r.end && rangeEnd >= r.start
+  );
+  if (overlapping) {
+    return {
+      ...parsed,
+      valid: false,
+      error: `Private, loopback, or reserved IPv6 ranges (${overlapping.label}) are not allowed. Enter a routable Public IPv6 or CIDR.`
+    };
+  }
+  return parsed;
+}
+function getNetworkMatchTarget(network) {
+  const cidr = String(network.cidrRange || "").trim();
+  return cidr || String(network.publicIp || "").trim();
+}
+function ipMatchesCompanyWifiNetwork(observedIp, network) {
+  if (network.status !== "Active") return false;
+  const target = getNetworkMatchTarget(network);
+  if (!target) return false;
+  return ipMatchesCidrOrExact(observedIp, target);
+}
+
+// serverCompanyWifi.ts
+var COL_WIFI_NETWORKS = "company_wifi_networks";
+var COL_WIFI_POLICIES = "company_wifi_access_policies";
+var COL_WIFI_SETTINGS = "company_wifi_settings";
+var COL_WIFI_LOGS = "company_wifi_access_logs";
+var SETTINGS_DOC_ID = "global";
+var MANAGED_ROLE_IDS = ["admin", "user"];
+var DEFAULT_WIFI_SETTINGS = {
+  enforcementEnabled: false,
+  // Strictly OFF initially so existing accounts are never accidentally blocked
+  trustedProxyHops: 1,
+  policyVersion: 1,
+  updatedAt: "",
+  updatedBy: "system"
+};
+function defaultRolePolicy(roleId) {
+  return {
+    roleId,
+    allowedNetworkIds: [],
+    accessMode: "RESTRICTED",
+    updatedAt: "",
+    updatedBy: "system"
+  };
+}
+function parseHeaderIpList(headerVal) {
+  if (!headerVal) return [];
+  const joined = Array.isArray(headerVal) ? headerVal.join(",") : headerVal;
+  return joined.split(",").map((part) => normalizeIpString(part)).filter((ip) => {
+    if (!ip) return false;
+    const p = parseIpOrCidr(ip);
+    return p.valid && !p.isCidr;
+  });
+}
+function extractAuthoritativePublicIp(req, trustedProxyHops = 1) {
+  const safeHops = Math.max(0, Math.min(5, Math.floor(Number(trustedProxyHops) || 1)));
+  const vercelIps = parseHeaderIpList(req.headers["x-vercel-forwarded-for"]);
+  if (vercelIps.length > 0 && safeHops > 0) {
+    const ip = vercelIps[vercelIps.length - 1];
+    return { ip, isPublic: !isPrivateOrNonPublicIp(ip), source: "x-vercel-forwarded-for" };
+  }
+  const xffIps = parseHeaderIpList(req.headers["x-forwarded-for"]);
+  if (xffIps.length > 0 && safeHops > 0) {
+    const idx = Math.max(0, xffIps.length - safeHops);
+    const ip = xffIps[idx];
+    return { ip, isPublic: !isPrivateOrNonPublicIp(ip), source: "x-forwarded-for:trusted-hop" };
+  }
+  const directCandidate = normalizeIpString(req.socket?.remoteAddress || req.ip || "");
+  if (directCandidate) {
+    const parsed = parseIpOrCidr(directCandidate);
+    if (parsed.valid && !parsed.isCidr) {
+      return {
+        ip: directCandidate,
+        isPublic: !isPrivateOrNonPublicIp(directCandidate),
+        source: "socket"
+      };
+    }
+  }
+  return { ip: "unavailable", isPublic: false, source: "unavailable" };
+}
+var wifiCacheMap = /* @__PURE__ */ new WeakMap();
+function getWifiCache(db) {
+  let entry = wifiCacheMap.get(db);
+  if (!entry) {
+    entry = { settingsLoadedAtMs: 0 };
+    wifiCacheMap.set(db, entry);
+  }
+  return entry;
+}
+function invalidateCompanyWifiCache(db) {
+  const entry = getWifiCache(db);
+  entry.settingsLoadedAtMs = 0;
+  entry.settings = void 0;
+  entry.bundle = void 0;
+}
+function normalizeSettingsDoc(raw) {
+  const d = raw || {};
+  return {
+    enforcementEnabled: Boolean(d.enforcementEnabled),
+    trustedProxyHops: typeof d.trustedProxyHops === "number" && Number.isFinite(d.trustedProxyHops) ? Math.max(0, Math.min(5, Math.floor(d.trustedProxyHops))) : 1,
+    policyVersion: typeof d.policyVersion === "number" && Number.isFinite(d.policyVersion) ? Math.max(1, Math.floor(d.policyVersion)) : 1,
+    updatedAt: typeof d.updatedAt === "string" ? d.updatedAt : "",
+    updatedBy: typeof d.updatedBy === "string" ? d.updatedBy : "system"
+  };
+}
+function normalizeNetworkDoc(id, raw) {
+  const d = raw || {};
+  const publicIp = String(d.publicIp || "").trim();
+  const cidrRange = String(d.cidrRange || "").trim();
+  const parsed = parseIpOrCidr(cidrRange || publicIp);
+  return {
+    networkId: String(d.networkId || id),
+    networkName: String(d.networkName || "Unnamed Wi-Fi").trim(),
+    publicIp: parsed.valid ? parsed.publicIp : publicIp,
+    cidrRange: parsed.valid && parsed.isCidr ? parsed.cidrRange : cidrRange,
+    ipVersion: d.ipVersion === "ipv6" || parsed.valid && parsed.version === "ipv6" ? "ipv6" : "ipv4",
+    status: d.status === "Inactive" ? "Inactive" : "Active",
+    createdAt: typeof d.createdAt === "string" ? d.createdAt : "",
+    updatedAt: typeof d.updatedAt === "string" ? d.updatedAt : "",
+    createdBy: typeof d.createdBy === "string" ? d.createdBy : "system",
+    updatedBy: typeof d.updatedBy === "string" ? d.updatedBy : "system"
+  };
+}
+function normalizePolicyDoc(roleId, raw) {
+  if (!raw) return defaultRolePolicy(roleId);
+  const accessMode = String(raw.accessMode || "").toUpperCase() === "UNRESTRICTED" ? "UNRESTRICTED" : "RESTRICTED";
+  const allowedNetworkIds = Array.isArray(raw.allowedNetworkIds) ? Array.from(
+    new Set(
+      raw.allowedNetworkIds.map((v) => String(v || "").trim()).filter(Boolean)
+    )
+  ) : [];
+  return {
+    roleId,
+    allowedNetworkIds,
+    accessMode,
+    updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : "",
+    updatedBy: typeof raw.updatedBy === "string" ? raw.updatedBy : "system"
+  };
+}
+async function loadWifiSettings(db, opts) {
+  const nowMs = opts?.nowMs ?? Date.now();
+  const cache = getWifiCache(db);
+  if (!opts?.forceFresh && cache.settings && !cache.settings.enforcementEnabled && nowMs - cache.settingsLoadedAtMs < 3e3) {
+    return cache.settings;
+  }
+  const snap = await db.collection(COL_WIFI_SETTINGS).doc(SETTINGS_DOC_ID).get();
+  const settings = snap.exists ? normalizeSettingsDoc(snap.data()) : { ...DEFAULT_WIFI_SETTINGS };
+  cache.settings = settings;
+  cache.settingsLoadedAtMs = nowMs;
+  return settings;
+}
+async function loadWifiBundle(db, settings, opts) {
+  const nowMs = opts?.nowMs ?? Date.now();
+  const cache = getWifiCache(db);
+  if (!opts?.forceFresh && cache.bundle && cache.bundle.policyVersion === settings.policyVersion && nowMs - cache.bundle.loadedAtMs < 3e4) {
+    return cache.bundle;
+  }
+  const [netsSnap, adminPolicySnap, userPolicySnap] = await Promise.all([
+    db.collection(COL_WIFI_NETWORKS).get(),
+    db.collection(COL_WIFI_POLICIES).doc("admin").get(),
+    db.collection(COL_WIFI_POLICIES).doc("user").get()
+  ]);
+  const networks = netsSnap.docs.map((doc) => normalizeNetworkDoc(doc.id, doc.data())).sort((a, b) => a.networkName.localeCompare(b.networkName));
+  const policies = {
+    admin: adminPolicySnap.exists ? normalizePolicyDoc("admin", adminPolicySnap.data()) : defaultRolePolicy("admin"),
+    user: userPolicySnap.exists ? normalizePolicyDoc("user", userPolicySnap.data()) : defaultRolePolicy("user")
+  };
+  const bundle = {
+    policyVersion: settings.policyVersion,
+    networks,
+    policies,
+    loadedAtMs: nowMs
+  };
+  cache.bundle = bundle;
+  return bundle;
+}
+async function bumpPolicyVersion(db, actorLabel, nowIso, patch) {
+  const ref = db.collection(COL_WIFI_SETTINGS).doc(SETTINGS_DOC_ID);
+  const snap = await ref.get();
+  const current = snap.exists ? normalizeSettingsDoc(snap.data()) : { ...DEFAULT_WIFI_SETTINGS };
+  const next = {
+    enforcementEnabled: patch?.enforcementEnabled !== void 0 ? Boolean(patch.enforcementEnabled) : current.enforcementEnabled,
+    trustedProxyHops: patch?.trustedProxyHops !== void 0 ? Math.max(0, Math.min(5, Math.floor(patch.trustedProxyHops))) : current.trustedProxyHops,
+    policyVersion: current.policyVersion + 1,
+    updatedAt: nowIso,
+    updatedBy: actorLabel
+  };
+  await ref.set(next);
+  invalidateCompanyWifiCache(db);
+  return next;
+}
+async function writeWifiAccessLog(db, entry) {
+  const id = `wlog_${Date.now()}_${crypto6.randomBytes(3).toString("hex")}`;
+  const doc = {
+    id,
+    actorUid: String(entry.actorUid || "unknown"),
+    actorLoginId: String(entry.actorLoginId || "unknown"),
+    actorRole: String(entry.actorRole || "UNKNOWN").toUpperCase(),
+    eventType: entry.eventType,
+    observedIp: String(entry.observedIp || "unavailable"),
+    networkId: entry.networkId || null,
+    networkName: entry.networkName || null,
+    targetRole: entry.targetRole || null,
+    detail: entry.detail ? String(entry.detail).slice(0, 500) : "",
+    timestamp: entry.timestamp,
+    result: entry.result
+  };
+  try {
+    await db.collection(COL_WIFI_LOGS).doc(id).set(doc);
+  } catch (err) {
+    console.warn("[CompanyWifi] Failed to persist access log:", err);
+  }
+  return doc;
+}
+async function enforceCompanyWifiAccess(db, req, caller, opts) {
+  const roleId = normalizeRoleValue(caller.role);
+  if (roleId === "super_admin") {
+    const observed2 = extractAuthoritativePublicIp(req, 1);
+    return {
+      allowed: true,
+      enforcementEnabled: false,
+      bypassReason: "SUPER_ADMIN",
+      observedIp: observed2.ip,
+      observedIpIsPublic: observed2.isPublic,
+      matchedNetwork: null
+    };
+  }
+  const nowMs = opts?.nowMs ?? Date.now();
+  const settings = await loadWifiSettings(db, { nowMs });
+  const observed = extractAuthoritativePublicIp(req, settings.trustedProxyHops);
+  if (!settings.enforcementEnabled) {
+    return {
+      allowed: true,
+      enforcementEnabled: false,
+      bypassReason: "ENFORCEMENT_OFF",
+      observedIp: observed.ip,
+      observedIpIsPublic: observed.isPublic,
+      matchedNetwork: null
+    };
+  }
+  const bundle = await loadWifiBundle(db, settings, { nowMs });
+  const rolePolicy = roleId === "admin" ? bundle.policies.admin : roleId === "user" ? bundle.policies.user : (
+    // Any non-super-admin custom role defaults to secure deny-by-default unless explicitly unrestricted
+    defaultRolePolicy("user")
+  );
+  if (rolePolicy.accessMode === "UNRESTRICTED") {
+    return {
+      allowed: true,
+      enforcementEnabled: true,
+      bypassReason: "ROLE_UNRESTRICTED",
+      observedIp: observed.ip,
+      observedIpIsPublic: observed.isPublic,
+      matchedNetwork: null
+    };
+  }
+  const networksById = new Map(bundle.networks.map((n) => [n.networkId, n]));
+  const activeAllowedNetworks = rolePolicy.allowedNetworkIds.map((id) => networksById.get(id)).filter((net) => Boolean(net && net.status === "Active"));
+  const matchedNetwork = observed.isPublic && activeAllowedNetworks.length > 0 ? activeAllowedNetworks.find((net) => ipMatchesCompanyWifiNetwork(observed.ip, net)) || null : null;
+  if (matchedNetwork) {
+    return {
+      allowed: true,
+      enforcementEnabled: true,
+      bypassReason: null,
+      observedIp: observed.ip,
+      observedIpIsPublic: observed.isPublic,
+      matchedNetwork
+    };
+  }
+  if (!opts?.skipBlockLog) {
+    const nowIso = new Date(nowMs).toISOString();
+    const reasonDetail = activeAllowedNetworks.length === 0 ? `Role "${roleId.toUpperCase()}" has no active Company Wi-Fi networks assigned (deny-by-default).` : !observed.isPublic ? `Observed IP "${observed.ip}" is not a valid public IP.` : `Observed IP "${observed.ip}" is not in allowed Company Wi-Fi networks for role "${roleId.toUpperCase()}".`;
+    await writeWifiAccessLog(db, {
+      actorUid: caller.uid,
+      actorLoginId: caller.loginId,
+      actorRole: roleId.toUpperCase(),
+      eventType: "ACCESS_BLOCKED",
+      observedIp: observed.ip,
+      networkId: null,
+      networkName: null,
+      targetRole: roleId,
+      detail: `${reasonDetail} (${req.method} ${req.path})`,
+      timestamp: nowIso,
+      result: "Blocked"
+    });
+  }
+  return {
+    allowed: false,
+    enforcementEnabled: true,
+    bypassReason: null,
+    observedIp: observed.ip,
+    observedIpIsPublic: observed.isPublic,
+    matchedNetwork: null,
+    httpStatus: 403,
+    safeErrorPayload: {
+      success: false,
+      code: COMPANY_WIFI_DENIED_CODE,
+      error: COMPANY_WIFI_DENIED_MESSAGE
+    }
+  };
+}
+var NetworkCreateSchema = z6.object({
+  networkName: z6.string().trim().min(2, "Company Wi-Fi name must be at least 2 characters.").max(80, "Company Wi-Fi name must be 80 characters or fewer."),
+  ipOrCidr: z6.string().trim().min(3, "Public IP address or CIDR range is required.").max(64),
+  status: z6.enum(["Active", "Inactive"]).default("Active")
+});
+var NetworkUpdateSchema = z6.object({
+  networkName: z6.string().trim().min(2, "Company Wi-Fi name must be at least 2 characters.").max(80, "Company Wi-Fi name must be 80 characters or fewer.").optional(),
+  ipOrCidr: z6.string().trim().min(3).max(64).optional(),
+  status: z6.enum(["Active", "Inactive"]).optional()
+});
+var NetworkStatusSchema = z6.object({
+  status: z6.enum(["Active", "Inactive"])
+});
+var RolePolicyUpdateSchema = z6.object({
+  accessMode: z6.enum(["RESTRICTED", "UNRESTRICTED"]),
+  allowedNetworkIds: z6.array(z6.string().trim().min(1).max(128)).max(200)
+});
+var SettingsUpdateSchema = z6.object({
+  enforcementEnabled: z6.boolean(),
+  confirmEnable: z6.boolean().optional(),
+  trustedProxyHops: z6.number().int().min(0).max(5).optional()
+});
+function registerCompanyWifiRoutes(app, deps) {
+  const { db, requireVerifiedCaller } = deps;
+  const getNowMs = deps.nowProvider || (() => Date.now());
+  const requireSuperAdmin = (req, res, actionLabel) => requireVerifiedCaller(req, res, ["super_admin"], actionLabel, { skipWifiCheck: true });
+  app.get("/api/company-wifi/check", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        "*",
+        "Check Company Wi-Fi Access",
+        { skipWifiCheck: true }
+      );
+      if (!caller) return;
+      const outcome = await enforceCompanyWifiAccess(db, req, caller, {
+        nowMs: getNowMs(),
+        skipBlockLog: req.query.dry === "1"
+      });
+      if (!outcome.allowed) {
+        return res.status(403).json({
+          success: false,
+          allowed: false,
+          enforcementEnabled: true,
+          role: caller.role,
+          code: COMPANY_WIFI_DENIED_CODE,
+          error: COMPANY_WIFI_DENIED_MESSAGE
+        });
+      }
+      return res.json({
+        success: true,
+        allowed: true,
+        enforcementEnabled: outcome.enforcementEnabled,
+        role: caller.role,
+        bypassReason: outcome.bypassReason || null,
+        matchedNetworkName: outcome.matchedNetwork?.networkName || null
+      });
+    } catch (err) {
+      console.error("[CompanyWifi] Check error:", err);
+      return res.status(500).json({
+        success: false,
+        error: "Failed to verify Company Wi-Fi access status."
+      });
+    }
+  });
+  app.get("/api/company-wifi/dashboard", async (req, res) => {
+    try {
+      const caller = await requireSuperAdmin(req, res, "View Company Wi-Fi Access Dashboard");
+      if (!caller) return;
+      const nowMs = getNowMs();
+      const settings = await loadWifiSettings(db, { forceFresh: true, nowMs });
+      const bundle = await loadWifiBundle(db, settings, { forceFresh: true, nowMs });
+      const observed = extractAuthoritativePublicIp(req, settings.trustedProxyHops);
+      const activeNetworks = bundle.networks.filter((n) => n.status === "Active");
+      const activeIds = new Set(activeNetworks.map((n) => n.networkId));
+      const adminPolicy = bundle.policies.admin;
+      const userPolicy = bundle.policies.user;
+      const adminAllowedCount = adminPolicy.allowedNetworkIds.filter((id) => activeIds.has(id)).length;
+      const userAllowedCount = userPolicy.allowedNetworkIds.filter((id) => activeIds.has(id)).length;
+      const matchedNetwork = observed.isPublic ? activeNetworks.find((n) => ipMatchesCompanyWifiNetwork(observed.ip, n)) || null : null;
+      const timestamps = [
+        settings.updatedAt,
+        adminPolicy.updatedAt,
+        userPolicy.updatedAt,
+        ...bundle.networks.map((n) => n.updatedAt)
+      ].filter(Boolean);
+      const lastPolicyUpdate = timestamps.length > 0 ? timestamps.sort().reverse()[0] : null;
+      return res.json({
+        success: true,
+        settings,
+        summary: {
+          enforcementEnabled: settings.enforcementEnabled,
+          totalNetworks: bundle.networks.length,
+          activeNetworks: activeNetworks.length,
+          adminAllowedCount,
+          userAllowedCount,
+          currentObservedIp: observed.ip,
+          currentObservedIpIsPublic: observed.isPublic,
+          currentNetworkMatched: Boolean(matchedNetwork),
+          currentMatchedNetworkId: matchedNetwork?.networkId || null,
+          currentMatchedNetworkName: matchedNetwork?.networkName || null,
+          lastPolicyUpdate
+        },
+        networks: bundle.networks,
+        policies: {
+          admin: adminPolicy,
+          user: userPolicy
+        }
+      });
+    } catch (err) {
+      console.error("[CompanyWifi] Dashboard error:", err);
+      return res.status(500).json({
+        success: false,
+        error: "Failed to load Company Wi-Fi Access Control dashboard."
+      });
+    }
+  });
+  app.get("/api/company-wifi/networks", async (req, res) => {
+    try {
+      const caller = await requireSuperAdmin(req, res, "List Company Wi-Fi Networks");
+      if (!caller) return;
+      const nowMs = getNowMs();
+      const settings = await loadWifiSettings(db, { forceFresh: true, nowMs });
+      const bundle = await loadWifiBundle(db, settings, { forceFresh: true, nowMs });
+      return res.json({ success: true, networks: bundle.networks });
+    } catch (err) {
+      console.error("[CompanyWifi] List networks error:", err);
+      return res.status(500).json({ success: false, error: "Failed to load Company Wi-Fi networks." });
+    }
+  });
+  app.post("/api/company-wifi/networks", async (req, res) => {
+    try {
+      const caller = await requireSuperAdmin(req, res, "Add Company Wi-Fi Network");
+      if (!caller) return;
+      const parsedBody = NetworkCreateSchema.safeParse(req.body || {});
+      if (!parsedBody.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsedBody.error.issues[0]?.message || "Invalid Company Wi-Fi network payload."
+        });
+      }
+      const ipValidation = validatePublicCompanyWifiIpOrCidr(parsedBody.data.ipOrCidr);
+      if (!ipValidation.valid) {
+        return res.status(400).json({
+          success: false,
+          error: ipValidation.error || "Invalid Public IP or CIDR range."
+        });
+      }
+      const nowMs = getNowMs();
+      const nowIso = new Date(nowMs).toISOString();
+      const settings = await loadWifiSettings(db, { forceFresh: true, nowMs });
+      const observed = extractAuthoritativePublicIp(req, settings.trustedProxyHops);
+      const existingSnap = await db.collection(COL_WIFI_NETWORKS).get();
+      const existingList = existingSnap.docs.map((d) => normalizeNetworkDoc(d.id, d.data()));
+      const duplicateTarget = existingList.find(
+        (n) => getNetworkMatchTarget(n).toLowerCase() === ipValidation.normalized.toLowerCase()
+      );
+      if (duplicateTarget) {
+        return res.status(409).json({
+          success: false,
+          error: `Public IP/CIDR "${ipValidation.normalized}" is already registered as "${duplicateTarget.networkName}".`
+        });
+      }
+      const networkId = `wifi_${nowMs}_${crypto6.randomBytes(3).toString("hex")}`;
+      const newNetwork = {
+        networkId,
+        networkName: parsedBody.data.networkName,
+        publicIp: ipValidation.publicIp,
+        cidrRange: ipValidation.cidrRange,
+        ipVersion: ipValidation.version,
+        status: parsedBody.data.status,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        createdBy: caller.uid,
+        updatedBy: caller.uid
+      };
+      await db.collection(COL_WIFI_NETWORKS).doc(networkId).set(newNetwork);
+      await bumpPolicyVersion(db, caller.loginId, nowIso);
+      await Promise.all([
+        writeWifiAccessLog(db, {
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: "SUPER_ADMIN",
+          eventType: "NETWORK_ADDED",
+          observedIp: observed.ip,
+          networkId,
+          networkName: newNetwork.networkName,
+          detail: `Added Company Wi-Fi "${newNetwork.networkName}" (${ipValidation.normalized}, ${newNetwork.status}).`,
+          timestamp: nowIso,
+          result: "Updated"
+        }),
+        recordEnterpriseAuditEvent(db, {
+          req,
+          action: "company_wifi_network_added",
+          category: "SECURITY",
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: "SUPER_ADMIN",
+          targetType: "COMPANY_WIFI_NETWORK",
+          targetId: networkId,
+          newValue: `${newNetwork.networkName} (${ipValidation.normalized})`,
+          actionSource: "COMPANY_WIFI_CONTROL",
+          description: `Added Company Wi-Fi "${newNetwork.networkName}" (${ipValidation.normalized}).`
+        })
+      ]);
+      return res.status(201).json({ success: true, network: newNetwork });
+    } catch (err) {
+      console.error("[CompanyWifi] Create network error:", err);
+      return res.status(500).json({ success: false, error: "Failed to add Company Wi-Fi network." });
+    }
+  });
+  app.put("/api/company-wifi/networks/:networkId", async (req, res) => {
+    try {
+      const caller = await requireSuperAdmin(req, res, "Update Company Wi-Fi Network");
+      if (!caller) return;
+      const networkId = String(req.params.networkId || "").trim();
+      if (!networkId || !/^[a-zA-Z0-9_-]{3,128}$/.test(networkId)) {
+        return res.status(400).json({ success: false, error: "Invalid network ID." });
+      }
+      const parsedBody = NetworkUpdateSchema.safeParse(req.body || {});
+      if (!parsedBody.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsedBody.error.issues[0]?.message || "Invalid update payload."
+        });
+      }
+      const docRef = db.collection(COL_WIFI_NETWORKS).doc(networkId);
+      const snap = await docRef.get();
+      if (!snap.exists) {
+        return res.status(404).json({ success: false, error: "Company Wi-Fi network not found." });
+      }
+      const current = normalizeNetworkDoc(networkId, snap.data());
+      let nextPublicIp = current.publicIp;
+      let nextCidrRange = current.cidrRange;
+      let nextIpVersion = current.ipVersion;
+      if (parsedBody.data.ipOrCidr !== void 0) {
+        const ipValidation = validatePublicCompanyWifiIpOrCidr(parsedBody.data.ipOrCidr);
+        if (!ipValidation.valid) {
+          return res.status(400).json({
+            success: false,
+            error: ipValidation.error || "Invalid Public IP or CIDR range."
+          });
+        }
+        const existingSnap = await db.collection(COL_WIFI_NETWORKS).get();
+        const duplicateTarget = existingSnap.docs.map((d) => normalizeNetworkDoc(d.id, d.data())).find(
+          (n) => n.networkId !== networkId && getNetworkMatchTarget(n).toLowerCase() === ipValidation.normalized.toLowerCase()
+        );
+        if (duplicateTarget) {
+          return res.status(409).json({
+            success: false,
+            error: `Public IP/CIDR "${ipValidation.normalized}" is already registered as "${duplicateTarget.networkName}".`
+          });
+        }
+        nextPublicIp = ipValidation.publicIp;
+        nextCidrRange = ipValidation.cidrRange;
+        nextIpVersion = ipValidation.version;
+      }
+      const nowMs = getNowMs();
+      const nowIso = new Date(nowMs).toISOString();
+      const settings = await loadWifiSettings(db, { forceFresh: true, nowMs });
+      const observed = extractAuthoritativePublicIp(req, settings.trustedProxyHops);
+      const updated = {
+        ...current,
+        networkName: parsedBody.data.networkName ?? current.networkName,
+        publicIp: nextPublicIp,
+        cidrRange: nextCidrRange,
+        ipVersion: nextIpVersion,
+        status: parsedBody.data.status ?? current.status,
+        updatedAt: nowIso,
+        updatedBy: caller.uid
+      };
+      await docRef.set(updated);
+      await bumpPolicyVersion(db, caller.loginId, nowIso);
+      await Promise.all([
+        writeWifiAccessLog(db, {
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: "SUPER_ADMIN",
+          eventType: "NETWORK_UPDATED",
+          observedIp: observed.ip,
+          networkId,
+          networkName: updated.networkName,
+          detail: `Updated Company Wi-Fi "${updated.networkName}" (${getNetworkMatchTarget(updated)}, ${updated.status}).`,
+          timestamp: nowIso,
+          result: "Updated"
+        }),
+        recordEnterpriseAuditEvent(db, {
+          req,
+          action: "company_wifi_network_updated",
+          category: "SECURITY",
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: "SUPER_ADMIN",
+          targetType: "COMPANY_WIFI_NETWORK",
+          targetId: networkId,
+          oldValue: `${current.networkName} (${getNetworkMatchTarget(current)}, ${current.status})`,
+          newValue: `${updated.networkName} (${getNetworkMatchTarget(updated)}, ${updated.status})`,
+          actionSource: "COMPANY_WIFI_CONTROL",
+          description: `Updated Company Wi-Fi "${updated.networkName}".`
+        })
+      ]);
+      return res.json({ success: true, network: updated });
+    } catch (err) {
+      console.error("[CompanyWifi] Update network error:", err);
+      return res.status(500).json({ success: false, error: "Failed to update Company Wi-Fi network." });
+    }
+  });
+  app.patch("/api/company-wifi/networks/:networkId/status", async (req, res) => {
+    try {
+      const caller = await requireSuperAdmin(req, res, "Toggle Company Wi-Fi Status");
+      if (!caller) return;
+      const networkId = String(req.params.networkId || "").trim();
+      if (!networkId || !/^[a-zA-Z0-9_-]{3,128}$/.test(networkId)) {
+        return res.status(400).json({ success: false, error: "Invalid network ID." });
+      }
+      const parsedBody = NetworkStatusSchema.safeParse(req.body || {});
+      if (!parsedBody.success) {
+        return res.status(400).json({ success: false, error: "Status must be Active or Inactive." });
+      }
+      const docRef = db.collection(COL_WIFI_NETWORKS).doc(networkId);
+      const snap = await docRef.get();
+      if (!snap.exists) {
+        return res.status(404).json({ success: false, error: "Company Wi-Fi network not found." });
+      }
+      const current = normalizeNetworkDoc(networkId, snap.data());
+      const nowMs = getNowMs();
+      const nowIso = new Date(nowMs).toISOString();
+      const settings = await loadWifiSettings(db, { forceFresh: true, nowMs });
+      const observed = extractAuthoritativePublicIp(req, settings.trustedProxyHops);
+      const updated = {
+        ...current,
+        status: parsedBody.data.status,
+        updatedAt: nowIso,
+        updatedBy: caller.uid
+      };
+      await docRef.set(updated);
+      await bumpPolicyVersion(db, caller.loginId, nowIso);
+      await writeWifiAccessLog(db, {
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: "SUPER_ADMIN",
+        eventType: "NETWORK_STATUS_CHANGED",
+        observedIp: observed.ip,
+        networkId,
+        networkName: updated.networkName,
+        detail: `Changed "${updated.networkName}" status from ${current.status} to ${updated.status}.`,
+        timestamp: nowIso,
+        result: "Updated"
+      });
+      return res.json({ success: true, network: updated });
+    } catch (err) {
+      console.error("[CompanyWifi] Status toggle error:", err);
+      return res.status(500).json({ success: false, error: "Failed to update network status." });
+    }
+  });
+  app.delete("/api/company-wifi/networks/:networkId", async (req, res) => {
+    try {
+      const caller = await requireSuperAdmin(req, res, "Delete Company Wi-Fi Network");
+      if (!caller) return;
+      const networkId = String(req.params.networkId || "").trim();
+      if (!networkId || !/^[a-zA-Z0-9_-]{3,128}$/.test(networkId)) {
+        return res.status(400).json({ success: false, error: "Invalid network ID." });
+      }
+      const docRef = db.collection(COL_WIFI_NETWORKS).doc(networkId);
+      const snap = await docRef.get();
+      if (!snap.exists) {
+        return res.status(404).json({ success: false, error: "Company Wi-Fi network not found." });
+      }
+      const existing = normalizeNetworkDoc(networkId, snap.data());
+      const nowMs = getNowMs();
+      const nowIso = new Date(nowMs).toISOString();
+      const settings = await loadWifiSettings(db, { forceFresh: true, nowMs });
+      const observed = extractAuthoritativePublicIp(req, settings.trustedProxyHops);
+      await docRef.delete();
+      for (const roleId of MANAGED_ROLE_IDS) {
+        const polRef = db.collection(COL_WIFI_POLICIES).doc(roleId);
+        const polSnap = await polRef.get();
+        if (polSnap.exists) {
+          const pol = normalizePolicyDoc(roleId, polSnap.data());
+          if (pol.allowedNetworkIds.includes(networkId)) {
+            await polRef.set({
+              ...pol,
+              allowedNetworkIds: pol.allowedNetworkIds.filter((id) => id !== networkId),
+              updatedAt: nowIso,
+              updatedBy: caller.uid
+            });
+          }
+        }
+      }
+      await bumpPolicyVersion(db, caller.loginId, nowIso);
+      await Promise.all([
+        writeWifiAccessLog(db, {
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: "SUPER_ADMIN",
+          eventType: "NETWORK_DELETED",
+          observedIp: observed.ip,
+          networkId,
+          networkName: existing.networkName,
+          detail: `Deleted Company Wi-Fi "${existing.networkName}" (${getNetworkMatchTarget(existing)}).`,
+          timestamp: nowIso,
+          result: "Updated"
+        }),
+        recordEnterpriseAuditEvent(db, {
+          req,
+          action: "company_wifi_network_deleted",
+          category: "SECURITY",
+          severity: "WARNING",
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: "SUPER_ADMIN",
+          targetType: "COMPANY_WIFI_NETWORK",
+          targetId: networkId,
+          oldValue: `${existing.networkName} (${getNetworkMatchTarget(existing)})`,
+          actionSource: "COMPANY_WIFI_CONTROL",
+          description: `Deleted Company Wi-Fi "${existing.networkName}".`
+        })
+      ]);
+      return res.json({ success: true, deletedNetworkId: networkId });
+    } catch (err) {
+      console.error("[CompanyWifi] Delete network error:", err);
+      return res.status(500).json({ success: false, error: "Failed to delete Company Wi-Fi network." });
+    }
+  });
+  app.put("/api/company-wifi/policies/:roleId", async (req, res) => {
+    try {
+      const caller = await requireSuperAdmin(req, res, "Update Role Company Wi-Fi Policy");
+      if (!caller) return;
+      const rawRoleId = normalizeRoleValue(req.params.roleId);
+      if (rawRoleId === "super_admin") {
+        return res.status(400).json({
+          success: false,
+          error: "SUPER_ADMIN is permanently unrestricted and cannot be assigned Company Wi-Fi restrictions."
+        });
+      }
+      if (rawRoleId !== "admin" && rawRoleId !== "user") {
+        return res.status(400).json({
+          success: false,
+          error: "Only ADMIN and USER roles can be configured in Company Wi-Fi Access Control."
+        });
+      }
+      const parsedBody = RolePolicyUpdateSchema.safeParse(req.body || {});
+      if (!parsedBody.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsedBody.error.issues[0]?.message || "Invalid role policy payload."
+        });
+      }
+      const nowMs = getNowMs();
+      const nowIso = new Date(nowMs).toISOString();
+      const settings = await loadWifiSettings(db, { forceFresh: true, nowMs });
+      const observed = extractAuthoritativePublicIp(req, settings.trustedProxyHops);
+      const netsSnap = await db.collection(COL_WIFI_NETWORKS).get();
+      const existingNetMap = new Map(
+        netsSnap.docs.map((d) => {
+          const n = normalizeNetworkDoc(d.id, d.data());
+          return [n.networkId, n];
+        })
+      );
+      const dedupIds = Array.from(new Set(parsedBody.data.allowedNetworkIds));
+      const unknownIds = dedupIds.filter((id) => !existingNetMap.has(id));
+      if (unknownIds.length > 0) {
+        return res.status(400).json({
+          success: false,
+          error: `Unknown Company Wi-Fi network ID(s): ${unknownIds.join(", ")}.`
+        });
+      }
+      const policyRef = db.collection(COL_WIFI_POLICIES).doc(rawRoleId);
+      const prevSnap = await policyRef.get();
+      const prevPolicy = prevSnap.exists ? normalizePolicyDoc(rawRoleId, prevSnap.data()) : defaultRolePolicy(rawRoleId);
+      const nextPolicy = {
+        roleId: rawRoleId,
+        allowedNetworkIds: dedupIds,
+        accessMode: parsedBody.data.accessMode,
+        updatedAt: nowIso,
+        updatedBy: caller.uid
+      };
+      await policyRef.set(nextPolicy);
+      await bumpPolicyVersion(db, caller.loginId, nowIso);
+      const allowedNames = dedupIds.map((id) => existingNetMap.get(id)?.networkName || id).join(", ");
+      await Promise.all([
+        writeWifiAccessLog(db, {
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: "SUPER_ADMIN",
+          eventType: "POLICY_UPDATED",
+          observedIp: observed.ip,
+          networkId: null,
+          targetRole: rawRoleId,
+          detail: `Updated ${rawRoleId.toUpperCase()} policy: mode=${nextPolicy.accessMode}, allowed=[${allowedNames || "none"}].`,
+          timestamp: nowIso,
+          result: "Updated"
+        }),
+        recordEnterpriseAuditEvent(db, {
+          req,
+          action: "company_wifi_policy_updated",
+          category: "SECURITY",
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: "SUPER_ADMIN",
+          targetType: "COMPANY_WIFI_POLICY",
+          targetId: rawRoleId,
+          oldValue: `${prevPolicy.accessMode} (${prevPolicy.allowedNetworkIds.length} network(s))`,
+          newValue: `${nextPolicy.accessMode} (${nextPolicy.allowedNetworkIds.length} network(s))`,
+          actionSource: "COMPANY_WIFI_CONTROL",
+          description: `Updated Company Wi-Fi access policy for ${rawRoleId.toUpperCase()}.`
+        })
+      ]);
+      return res.json({ success: true, policy: nextPolicy });
+    } catch (err) {
+      console.error("[CompanyWifi] Update role policy error:", err);
+      return res.status(500).json({ success: false, error: "Failed to save role Wi-Fi policy." });
+    }
+  });
+  app.put("/api/company-wifi/settings", async (req, res) => {
+    try {
+      const caller = await requireSuperAdmin(req, res, "Update Company Wi-Fi Enforcement Settings");
+      if (!caller) return;
+      const parsedBody = SettingsUpdateSchema.safeParse(req.body || {});
+      if (!parsedBody.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsedBody.error.issues[0]?.message || "Invalid settings payload."
+        });
+      }
+      const nowMs = getNowMs();
+      const nowIso = new Date(nowMs).toISOString();
+      const current = await loadWifiSettings(db, { forceFresh: true, nowMs });
+      if (parsedBody.data.enforcementEnabled && !current.enforcementEnabled && !parsedBody.data.confirmEnable) {
+        return res.status(400).json({
+          success: false,
+          error: "Explicit confirmation is required before enabling Company Wi-Fi Access Control enforcement."
+        });
+      }
+      const nextSettings = await bumpPolicyVersion(db, caller.loginId, nowIso, {
+        enforcementEnabled: parsedBody.data.enforcementEnabled,
+        trustedProxyHops: parsedBody.data.trustedProxyHops
+      });
+      const observed = extractAuthoritativePublicIp(req, nextSettings.trustedProxyHops);
+      const eventType = nextSettings.enforcementEnabled ? "ENFORCEMENT_ENABLED" : "ENFORCEMENT_DISABLED";
+      await Promise.all([
+        writeWifiAccessLog(db, {
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: "SUPER_ADMIN",
+          eventType,
+          observedIp: observed.ip,
+          networkId: null,
+          detail: `Global Company Wi-Fi enforcement set to ${nextSettings.enforcementEnabled ? "ON" : "OFF"}.`,
+          timestamp: nowIso,
+          result: "Updated"
+        }),
+        recordEnterpriseAuditEvent(db, {
+          req,
+          action: nextSettings.enforcementEnabled ? "company_wifi_enforcement_enabled" : "company_wifi_enforcement_disabled",
+          category: "SECURITY",
+          severity: "WARNING",
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: "SUPER_ADMIN",
+          targetType: "COMPANY_WIFI_SETTINGS",
+          targetId: SETTINGS_DOC_ID,
+          oldValue: `enforcementEnabled=${current.enforcementEnabled}`,
+          newValue: `enforcementEnabled=${nextSettings.enforcementEnabled}`,
+          actionSource: "COMPANY_WIFI_CONTROL",
+          description: `Company Wi-Fi Access Control enforcement turned ${nextSettings.enforcementEnabled ? "ON" : "OFF"}.`
+        })
+      ]);
+      return res.json({ success: true, settings: nextSettings });
+    } catch (err) {
+      console.error("[CompanyWifi] Update settings error:", err);
+      return res.status(500).json({ success: false, error: "Failed to update Company Wi-Fi settings." });
+    }
+  });
+  app.post("/api/company-wifi/emergency-disable", async (req, res) => {
+    try {
+      const caller = await requireSuperAdmin(req, res, "Emergency Disable Company Wi-Fi Enforcement");
+      if (!caller) return;
+      const nowMs = getNowMs();
+      const nowIso = new Date(nowMs).toISOString();
+      const nextSettings = await bumpPolicyVersion(db, caller.loginId, nowIso, {
+        enforcementEnabled: false
+      });
+      const observed = extractAuthoritativePublicIp(req, nextSettings.trustedProxyHops);
+      await Promise.all([
+        writeWifiAccessLog(db, {
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: "SUPER_ADMIN",
+          eventType: "EMERGENCY_DISABLED",
+          observedIp: observed.ip,
+          networkId: null,
+          detail: "Super Admin triggered Emergency Disable for Company Wi-Fi Access Control.",
+          timestamp: nowIso,
+          result: "Updated"
+        }),
+        recordEnterpriseAuditEvent(db, {
+          req,
+          action: "company_wifi_emergency_disable",
+          category: "SECURITY",
+          severity: "CRITICAL",
+          actorUid: caller.uid,
+          actorLoginId: caller.loginId,
+          actorRole: "SUPER_ADMIN",
+          targetType: "COMPANY_WIFI_SETTINGS",
+          targetId: SETTINGS_DOC_ID,
+          newValue: "enforcementEnabled=false",
+          actionSource: "COMPANY_WIFI_EMERGENCY_RECOVERY",
+          description: "Super Admin disabled Company Wi-Fi enforcement via Emergency Recovery."
+        })
+      ]);
+      return res.json({
+        success: true,
+        settings: nextSettings,
+        message: "Company Wi-Fi enforcement has been disabled immediately."
+      });
+    } catch (err) {
+      console.error("[CompanyWifi] Emergency disable error:", err);
+      return res.status(500).json({ success: false, error: "Failed to disable enforcement." });
+    }
+  });
+  app.get("/api/company-wifi/logs", async (req, res) => {
+    try {
+      const caller = await requireSuperAdmin(req, res, "View Company Wi-Fi Access Logs");
+      if (!caller) return;
+      const eventTypeFilter = String(req.query.eventType || "").trim().toUpperCase();
+      const resultFilter = String(req.query.result || "").trim().toLowerCase();
+      const searchFilter = String(req.query.search || "").trim().toLowerCase();
+      const limit = Math.max(1, Math.min(200, parseInt(String(req.query.limit || "100"), 10) || 100));
+      const snap = await db.collection(COL_WIFI_LOGS).get();
+      let logs = snap.docs.map((d) => {
+        const data = d.data() || {};
+        return {
+          id: String(data.id || d.id),
+          actorUid: String(data.actorUid || "unknown"),
+          actorLoginId: String(data.actorLoginId || "unknown"),
+          actorRole: String(data.actorRole || "UNKNOWN"),
+          eventType: data.eventType || "ACCESS_BLOCKED",
+          observedIp: String(data.observedIp || "unavailable"),
+          networkId: data.networkId || null,
+          networkName: data.networkName || null,
+          targetRole: data.targetRole || null,
+          detail: String(data.detail || ""),
+          timestamp: String(data.timestamp || ""),
+          result: data.result || "Updated"
+        };
+      }).sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+      if (eventTypeFilter && eventTypeFilter !== "ALL") {
+        logs = logs.filter((l) => l.eventType === eventTypeFilter);
+      }
+      if (resultFilter && resultFilter !== "all") {
+        logs = logs.filter((l) => l.result.toLowerCase() === resultFilter);
+      }
+      if (searchFilter) {
+        logs = logs.filter(
+          (l) => l.actorLoginId.toLowerCase().includes(searchFilter) || l.actorUid.toLowerCase().includes(searchFilter) || l.observedIp.toLowerCase().includes(searchFilter) || (l.networkName || "").toLowerCase().includes(searchFilter) || (l.detail || "").toLowerCase().includes(searchFilter)
+        );
+      }
+      return res.json({
+        success: true,
+        total: logs.length,
+        logs: logs.slice(0, limit)
+      });
+    } catch (err) {
+      console.error("[CompanyWifi] Logs error:", err);
+      return res.status(500).json({ success: false, error: "Failed to load Company Wi-Fi access history." });
+    }
+  });
+}
+
 // src/config/dashboardCardsConfig.ts
 var DASHBOARD_CARDS = [
   {
@@ -11272,19 +12893,19 @@ function resolveDashboardVisibility(params) {
 
 // server.ts
 function hashPassword(password) {
-  const salt = crypto6.randomBytes(16).toString("hex");
-  const hash = crypto6.scryptSync(password, salt, 64).toString("hex");
+  const salt = crypto7.randomBytes(16).toString("hex");
+  const hash = crypto7.scryptSync(password, salt, 64).toString("hex");
   return `${salt}:${hash}`;
 }
 function verifyPassword(password, storedHash) {
   if (!storedHash || !storedHash.includes(":")) return false;
   const [salt, expectedHash] = storedHash.split(":");
   if (!salt || !expectedHash) return false;
-  const actualHash = crypto6.scryptSync(password, salt, 64).toString("hex");
+  const actualHash = crypto7.scryptSync(password, salt, 64).toString("hex");
   const actualBuf = Buffer.from(actualHash, "hex");
   const expectedBuf = Buffer.from(expectedHash, "hex");
   if (actualBuf.length !== expectedBuf.length) return false;
-  return crypto6.timingSafeEqual(actualBuf, expectedBuf);
+  return crypto7.timingSafeEqual(actualBuf, expectedBuf);
 }
 async function syncExistingFirebaseAuthPassword(email, targetUid, newPassword, knownCurrentPassword) {
   if (typeof knownCurrentPassword !== "string" || knownCurrentPassword.length === 0) {
@@ -11350,17 +12971,17 @@ async function syncExistingFirebaseAuthPassword(email, targetUid, newPassword, k
     return { success: false, error: err?.message || "Firebase Auth sync error." };
   }
 }
-var VerifySessionInputSchema = z6.object({
-  loginId: z6.string().trim().min(1).max(64).optional(),
-  userId: z6.string().trim().min(1).max(128).optional()
+var VerifySessionInputSchema = z7.object({
+  loginId: z7.string().trim().min(1).max(64).optional(),
+  userId: z7.string().trim().min(1).max(128).optional()
 });
-var AdminSetPasswordInputSchema = z6.object({
-  targetLoginId: z6.string().trim().min(1, "targetLoginId is required.").max(64),
-  newPassword: z6.string().min(6, "Password must be at least 6 characters.").max(128),
-  mustChangePassword: z6.boolean().optional(),
-  unlockAccount: z6.boolean().optional(),
-  revokeSessions: z6.boolean().optional(),
-  currentTargetPassword: z6.string().optional()
+var AdminSetPasswordInputSchema = z7.object({
+  targetLoginId: z7.string().trim().min(1, "targetLoginId is required.").max(64),
+  newPassword: z7.string().min(6, "Password must be at least 6 characters.").max(128),
+  mustChangePassword: z7.boolean().optional(),
+  unlockAccount: z7.boolean().optional(),
+  revokeSessions: z7.boolean().optional(),
+  currentTargetPassword: z7.string().optional()
 });
 var RESERVED_CUSTOM_ROLE_ALIASES = /* @__PURE__ */ new Set([
   "superadmin",
@@ -11369,66 +12990,66 @@ var RESERVED_CUSTOM_ROLE_ALIASES = /* @__PURE__ */ new Set([
   "system",
   "super_admin_root"
 ]);
-var DynamicRoleIdSchema = z6.string().trim().min(2, "Role ID must be at least 2 characters.").max(64, "Role ID must be 64 characters or fewer.").transform((val) => deriveStrictRoleId(val)).refine((val) => VALID_ROLE_ID_REGEX.test(val), {
+var DynamicRoleIdSchema = z7.string().trim().min(2, "Role ID must be at least 2 characters.").max(64, "Role ID must be 64 characters or fewer.").transform((val) => deriveStrictRoleId(val)).refine((val) => VALID_ROLE_ID_REGEX.test(val), {
   message: "Role ID must start with a letter and contain only lowercase letters, numbers, or underscores."
 });
-var RoleDefinitionInputSchema = z6.object({
-  roleId: z6.string().trim().max(64).optional(),
-  roleName: z6.string().trim().min(2, "Role name must be at least 2 characters.").max(48, "Role name must be 48 characters or fewer."),
-  description: z6.string().trim().min(3, "Role description must be at least 3 characters.").max(500, "Role description must be 500 characters or fewer."),
-  isActive: z6.boolean().default(true),
-  defaultPermissions: z6.record(
-    z6.string(),
-    z6.object({
-      view: z6.boolean().optional(),
-      add: z6.boolean().optional(),
-      edit: z6.boolean().optional(),
-      delete: z6.boolean().optional()
+var RoleDefinitionInputSchema = z7.object({
+  roleId: z7.string().trim().max(64).optional(),
+  roleName: z7.string().trim().min(2, "Role name must be at least 2 characters.").max(48, "Role name must be 48 characters or fewer."),
+  description: z7.string().trim().min(3, "Role description must be at least 3 characters.").max(500, "Role description must be 500 characters or fewer."),
+  isActive: z7.boolean().default(true),
+  defaultPermissions: z7.record(
+    z7.string(),
+    z7.object({
+      view: z7.boolean().optional(),
+      add: z7.boolean().optional(),
+      edit: z7.boolean().optional(),
+      delete: z7.boolean().optional()
     })
   ).optional()
 });
-var CreateUserInputSchema = z6.object({
-  callerLoginId: z6.string().trim().min(1).max(64).optional(),
-  loginId: z6.string().trim().min(2, "Login ID must be at least 2 characters.").max(64).regex(/^[a-zA-Z0-9_.-]+$/, "Login ID can only contain letters, numbers, hyphens, underscores, and dots."),
-  name: z6.string().trim().min(1, "Name is required.").max(128),
-  email: z6.string().trim().email("Valid email is required.").max(128),
+var CreateUserInputSchema = z7.object({
+  callerLoginId: z7.string().trim().min(1).max(64).optional(),
+  loginId: z7.string().trim().min(2, "Login ID must be at least 2 characters.").max(64).regex(/^[a-zA-Z0-9_.-]+$/, "Login ID can only contain letters, numbers, hyphens, underscores, and dots."),
+  name: z7.string().trim().min(1, "Name is required.").max(128),
+  email: z7.string().trim().email("Valid email is required.").max(128),
   role: DynamicRoleIdSchema,
-  password: z6.string().min(6, "Password must be at least 6 characters.").max(128),
-  modulesAllowed: z6.array(z6.string().max(64)).optional(),
-  status: z6.enum(["Active", "Inactive"]).default("Active"),
-  mustChangePassword: z6.boolean().optional()
+  password: z7.string().min(6, "Password must be at least 6 characters.").max(128),
+  modulesAllowed: z7.array(z7.string().max(64)).optional(),
+  status: z7.enum(["Active", "Inactive"]).default("Active"),
+  mustChangePassword: z7.boolean().optional()
 });
-var DeleteUserInputSchema = z6.object({
-  callerLoginId: z6.string().trim().min(1).max(64).optional(),
-  targetId: z6.string().trim().min(1).max(128).optional(),
-  targetLoginId: z6.string().trim().min(1).max(64).optional()
+var DeleteUserInputSchema = z7.object({
+  callerLoginId: z7.string().trim().min(1).max(64).optional(),
+  targetId: z7.string().trim().min(1).max(128).optional(),
+  targetLoginId: z7.string().trim().min(1).max(64).optional()
 });
-var SetUserPermissionsInputSchema = z6.object({
-  callerLoginId: z6.string().trim().min(1).max(64).optional(),
-  targetId: z6.string().trim().min(1).max(128),
+var SetUserPermissionsInputSchema = z7.object({
+  callerLoginId: z7.string().trim().min(1).max(64).optional(),
+  targetId: z7.string().trim().min(1).max(128),
   role: DynamicRoleIdSchema.optional(),
-  status: z6.enum(["Active", "Inactive"]).optional(),
-  modulesAllowed: z6.array(z6.string().max(64)).optional(),
-  permissions: z6.record(
-    z6.string(),
-    z6.object({
-      view: z6.boolean().optional(),
-      add: z6.boolean().optional(),
-      edit: z6.boolean().optional(),
-      delete: z6.boolean().optional()
+  status: z7.enum(["Active", "Inactive"]).optional(),
+  modulesAllowed: z7.array(z7.string().max(64)).optional(),
+  permissions: z7.record(
+    z7.string(),
+    z7.object({
+      view: z7.boolean().optional(),
+      add: z7.boolean().optional(),
+      edit: z7.boolean().optional(),
+      delete: z7.boolean().optional()
     })
   ).optional()
 });
-var RolePermissionsInputSchema = z6.object({
-  callerLoginId: z6.string().trim().min(1).max(64).optional(),
+var RolePermissionsInputSchema = z7.object({
+  callerLoginId: z7.string().trim().min(1).max(64).optional(),
   roleId: DynamicRoleIdSchema,
-  modulePermissions: z6.record(
-    z6.string(),
-    z6.object({
-      view: z6.boolean().optional(),
-      add: z6.boolean().optional(),
-      edit: z6.boolean().optional(),
-      delete: z6.boolean().optional()
+  modulePermissions: z7.record(
+    z7.string(),
+    z7.object({
+      view: z7.boolean().optional(),
+      add: z7.boolean().optional(),
+      edit: z7.boolean().optional(),
+      delete: z7.boolean().optional()
     })
   )
 });
@@ -11504,6 +13125,7 @@ var DEFAULT_ROLE_PERMISSIONS = {
     user_rights: { view: true, add: true, edit: true, delete: true },
     audit_logs: { view: true, add: true, edit: true, delete: true },
     security_management: { view: true, add: true, edit: true, delete: true },
+    company_wifi_access: { view: true, add: true, edit: true, delete: true },
     system_performance: { view: true, add: true, edit: true, delete: true },
     settings: { view: true, add: true, edit: true, delete: true },
     ...Object.fromEntries(
@@ -11531,6 +13153,7 @@ var DEFAULT_ROLE_PERMISSIONS = {
     user_rights: { view: false, add: false, edit: false, delete: false },
     audit_logs: { view: false, add: false, edit: false, delete: false },
     security_management: { view: false, add: false, edit: false, delete: false },
+    company_wifi_access: { view: false, add: false, edit: false, delete: false },
     system_performance: { view: false, add: false, edit: false, delete: false },
     settings: { view: false, add: false, edit: false, delete: false }
   },
@@ -11552,6 +13175,7 @@ var DEFAULT_ROLE_PERMISSIONS = {
     user_rights: { view: false, add: false, edit: false, delete: false },
     audit_logs: { view: false, add: false, edit: false, delete: false },
     security_management: { view: false, add: false, edit: false, delete: false },
+    company_wifi_access: { view: false, add: false, edit: false, delete: false },
     system_performance: { view: false, add: false, edit: false, delete: false },
     settings: { view: false, add: false, edit: false, delete: false }
   }
@@ -11560,6 +13184,7 @@ var RESTRICTED_SUPER_ADMIN_MODULES = /* @__PURE__ */ new Set([
   "user_rights",
   "audit_logs",
   "security_management",
+  "company_wifi_access",
   "system_performance"
 ]);
 var SCANNER_CAPABILITY_KEYS = /* @__PURE__ */ new Set([
@@ -11721,7 +13346,7 @@ async function seedInitialAccounts(db) {
       const userRef = db.collection("user_roles").doc(docId);
       const snap = await userRef.get();
       if (!snap.exists) {
-        const randomInitialHash = hashPassword(crypto6.randomBytes(24).toString("hex"));
+        const randomInitialHash = hashPassword(crypto7.randomBytes(24).toString("hex"));
         await userRef.set({
           id: docId,
           loginId: acc.loginId,
@@ -11903,7 +13528,11 @@ function createApp(options = {}) {
         origin: permitted ? normalizeAllowedOrigin(rawOrigin) || false : false,
         credentials: permitted,
         methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allowedHeaders: ["Content-Type", "Authorization", "X-Correlation-ID"],
+        allowedHeaders: [
+          "Content-Type",
+          "Authorization",
+          "X-Correlation-ID"
+        ],
         exposedHeaders: ["X-Correlation-ID", "X-Server-Process-Ms", "X-Payload-Bytes", "Server-Timing"],
         optionsSuccessStatus: 204
       });
@@ -12102,6 +13731,21 @@ function createApp(options = {}) {
         });
         return null;
       }
+      if (caller.role !== "super_admin" && !options2?.skipWifiCheck) {
+        const wifiResult = await enforceCompanyWifiAccess(adminDb, req, caller, {
+          nowMs: getNowMs()
+        });
+        if (!wifiResult.allowed) {
+          res.status(wifiResult.httpStatus || 403).json(
+            wifiResult.safeErrorPayload || {
+              success: false,
+              code: "COMPANY_WIFI_ACCESS_DENIED",
+              error: "Access Denied: Please connect to an authorized Company Wi-Fi network."
+            }
+          );
+          return null;
+        }
+      }
       return caller;
     } catch (err) {
       if (noteRuntimeFirestoreError(err)) {
@@ -12207,6 +13851,11 @@ function createApp(options = {}) {
     projectId,
     databaseId,
     credentialMode
+  });
+  registerCompanyWifiRoutes(app, {
+    db: adminDb,
+    requireVerifiedCaller,
+    nowProvider: getNowMs
   });
   app.post("/api/auth/verify-session", async (req, res) => {
     try {
@@ -12526,7 +14175,7 @@ function createApp(options = {}) {
           },
           details: `Password reset by Super Admin "${cleanCallerId}" for "${cleanTargetId}" (${targetRole}, UID: ${targetUid}, email: ${matchedFirebaseEmail}). Force next login change: ${forceChange}.`
         });
-        const resetLogId = `reset_${Date.now()}_${crypto6.randomBytes(3).toString("hex")}`;
+        const resetLogId = `reset_${Date.now()}_${crypto7.randomBytes(3).toString("hex")}`;
         await adminDb.collection("password_reset_logs").doc(resetLogId).set({
           id: resetLogId,
           targetLoginId: cleanTargetId,
@@ -13190,10 +14839,10 @@ function createApp(options = {}) {
       return res.status(500).json({ success: false, error: err?.message || "Failed to update user permissions." });
     }
   });
-  const BulkUserStatusInputSchema = z6.object({
-    userIds: z6.array(z6.string().trim().min(1)).min(1, "Select at least one user account.").max(200),
-    status: z6.enum(["Active", "Inactive"]),
-    confirmed: z6.literal(true, {
+  const BulkUserStatusInputSchema = z7.object({
+    userIds: z7.array(z7.string().trim().min(1)).min(1, "Select at least one user account.").max(200),
+    status: z7.enum(["Active", "Inactive"]),
+    confirmed: z7.literal(true, {
       message: "Explicit confirmation is required for bulk user status updates."
     })
   });
