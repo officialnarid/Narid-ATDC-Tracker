@@ -17,9 +17,9 @@ import {
   Building,
   X,
   FileSearch,
+  Shield,
   ShieldAlert,
-  Activity,
-  Wifi
+  Activity
 } from 'lucide-react';
 import { UserRoleRecord } from '../types';
 import { isModuleAllowedForUser } from '../services/authService';
@@ -82,12 +82,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
 }) => {
   // Check if one of the organization submodules is currently active
   const isOrgChildActive = currentTab === 'floors' || currentTab === 'sections' || currentTab === 'departments';
-  const isSecurityAccessChildActive = currentTab === 'company_wifi_access';
 
   // Expand state for Organization Management parent menu
   // Default to expanded if one of its children is currently active
   const [isOrgExpanded, setIsOrgExpanded] = useState<boolean>(() => isOrgChildActive);
-  const [isSecurityAccessExpanded, setIsSecurityAccessExpanded] = useState<boolean>(() => isSecurityAccessChildActive);
 
   // Keep parent expanded whenever an organization sub-module is selected or navigated to
   useEffect(() => {
@@ -95,12 +93,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
       setIsOrgExpanded(true);
     }
   }, [isOrgChildActive]);
-
-  useEffect(() => {
-    if (isSecurityAccessChildActive) {
-      setIsSecurityAccessExpanded(true);
-    }
-  }, [isSecurityAccessChildActive]);
 
   // Submenu configuration for Organization Management
   const orgSubItems: OrgSubmenuItem[] = [
@@ -133,6 +125,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: 'audit_logs', label: 'Audit Logs & Security', icon: FileSearch },
     { id: 'security_management', label: 'Security & Lockouts', icon: ShieldAlert },
     { id: 'system_performance', label: 'System Performance', icon: Activity },
+    { id: 'company_wifi_access', label: 'Network Security', icon: Shield },
   ];
 
   const isSuperAdmin =
@@ -144,7 +137,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
     item.id === 'audit_logs' ||
     item.id === 'security_management' ||
     item.id === 'user_rights' ||
-    item.id === 'system_performance'
+    item.id === 'system_performance' ||
+    item.id === 'company_wifi_access'
       ? isSuperAdmin && isModuleAllowedForUser(currentUserRole, item.id)
       : isModuleAllowedForUser(currentUserRole, item.id)
   );
@@ -308,51 +302,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
           {/* Bottom navigation items */}
           {allowedBottomItems.map(item => renderSingleItem(item))}
-
-          {/* Super Admin Exclusive: Security & Access -> Company Wi-Fi Access Control */}
-          {isSuperAdmin && isModuleAllowedForUser(currentUserRole, 'company_wifi_access') && (
-            <div className="space-y-0.5 pt-0.5">
-              <button
-                type="button"
-                onClick={() => setIsSecurityAccessExpanded(prev => !prev)}
-                className={`w-full flex items-center justify-between px-3 py-2 rounded text-left transition-colors text-[13px] font-medium group cursor-pointer ${
-                  isSecurityAccessChildActive
-                    ? 'text-white bg-slate-800/70 font-semibold border-l-2 border-blue-500 pl-[10px]'
-                    : 'text-slate-300 hover:bg-slate-800/60 hover:text-white'
-                }`}
-                title="Toggle Security & Access menu"
-              >
-                <div className="flex items-center gap-2.5 min-w-0">
-                  <ShieldCheck className={`w-4 h-4 shrink-0 transition-colors ${isSecurityAccessChildActive ? 'text-blue-400' : 'text-slate-400 group-hover:text-slate-200'}`} />
-                  <span className="truncate">Security &amp; Access</span>
-                </div>
-                <ChevronDown
-                  className={`w-4 h-4 shrink-0 text-slate-400 transition-transform duration-200 ${
-                    isSecurityAccessExpanded ? 'rotate-0 text-slate-300' : '-rotate-90 text-slate-500'
-                  }`}
-                />
-              </button>
-
-              {isSecurityAccessExpanded && (
-                <div className="pl-3.5 pr-1 py-1 space-y-0.5 border-l border-slate-700/60 ml-4.5 my-0.5">
-                  <button
-                    type="button"
-                    onClick={() => handleItemClick('company_wifi_access')}
-                    onMouseEnter={() => onPrefetchTab?.('company_wifi_access')}
-                    onFocus={() => onPrefetchTab?.('company_wifi_access')}
-                    className={`w-full flex items-center gap-2.5 px-3 py-1.5 rounded text-left transition-colors text-[12.5px] cursor-pointer ${
-                      currentTab === 'company_wifi_access'
-                        ? 'bg-blue-600 text-white font-semibold shadow-xs'
-                        : 'text-slate-400 hover:bg-slate-800/70 hover:text-white font-medium'
-                    }`}
-                  >
-                    <Wifi className={`w-3.5 h-3.5 shrink-0 ${currentTab === 'company_wifi_access' ? 'text-white' : 'text-slate-400'}`} />
-                    <span className="truncate">Company Wi-Fi Access Control</span>
-                  </button>
-                </div>
-              )}
-            </div>
-          )}
         </nav>
 
         {/* Logged in User Bar & Logout */}
