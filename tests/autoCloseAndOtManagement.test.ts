@@ -422,7 +422,7 @@ describe('NARID ATDC Auto-Close, Actual Punch-Out Reconciliation & OT Cap Manage
     expect(autoRes.status).toBe(200);
     expect(autoRes.body.closedCount).toBe(2);
 
-    // AC007 punches out at 09:30 AM on 2026-11-23 -> reconciles 2026-11-22 NIGHT shift (510 regular + 210 post OT = 720)
+    // AC007 punches out at 09:30 AM on 2026-11-23 -> reconciles 2026-11-22 NIGHT shift (420m regular 21:30->04:30 + 210m capped post OT = 630m total)
     vi.setSystemTime(new Date('2026-11-23T09:30:00+05:30'));
     const out7 = await request(app)
       .post('/api/attendance/scan')
@@ -433,9 +433,9 @@ describe('NARID ATDC Auto-Close, Actual Punch-Out Reconciliation & OT Cap Manage
     expect(out7.body.attendance.id).toBe('att_AC007_2026-11-22_NIGHT');
     expect(out7.body.attendance.shiftDate).toBe('2026-11-22');
     expect(out7.body.attendance.shiftId).toBe('NIGHT');
-    expect(out7.body.attendance.regularDutyMinutes).toBe(510);
+    expect(out7.body.attendance.regularDutyMinutes).toBe(420);
     expect(out7.body.attendance.overtimeMinutes).toBe(210);
-    expect(out7.body.attendance.totalDutyMinutes).toBe(720);
+    expect(out7.body.attendance.totalDutyMinutes).toBe(630);
 
     // AC008 punches out at 10:15 AM on 2026-11-23 -> reconciles 2026-11-22 NIGHT shift (capped at 210m OT / 720m total; real 10:15 AM timestamp preserved)
     vi.setSystemTime(new Date('2026-11-23T10:15:00+05:30'));

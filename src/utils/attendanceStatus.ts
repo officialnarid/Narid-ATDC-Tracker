@@ -33,6 +33,8 @@ export interface ResolvedAttendanceMetrics {
   state: 'INSIDE' | 'OUTSIDE';
   isOpen: boolean;
   isLate: boolean;
+  isCurrentlyAutoClosed: boolean;
+  punchOutTypeResolved: 'ACTUAL' | 'AUTO' | 'NONE';
   completedDutyMinutes: number;
   regularDutyMinutes: number;
   overtimeMinutes: number;
@@ -42,6 +44,16 @@ export interface ResolvedAttendanceMetrics {
   scheduledStartDisplay: string;
   scheduledPunchOut: string;
   scheduledEndDisplay: string;
+  actualPunchOutIso: string | null;
+  actualPunchOutDisplay: string;
+  autoCloseEffectiveIso: string | null;
+  autoCloseTimeDisplay: string;
+  autoClosedAtIso: string | null;
+  autoCloseRecordedAtDisplay: string;
+  historicalAutoCloseEffectiveIso: string | null;
+  historicalAutoCloseTimeDisplay: string;
+  historicalAutoClosedAtIso: string | null;
+  historicalAutoCloseRecordedAtDisplay: string;
   earlyArrivalMinutes: number;
   provisionalEarlyOtMinutes: number;
   earlyOtMinutes: number;
@@ -54,11 +66,15 @@ export interface ResolvedAttendanceMetrics {
   punchOutSchedule: PunchOutScheduleMetrics | null;
 }
 
-const KOLKATA_TIME_12H_FORMATTER = new Intl.DateTimeFormat('en-IN', {
+const KOLKATA_PARTS_FORMATTER = new Intl.DateTimeFormat('en-IN', {
   timeZone: 'Asia/Kolkata',
+  year: 'numeric',
+  month: 'short',
+  day: '2-digit',
   hour: '2-digit',
   minute: '2-digit',
-  hour12: true,
+  second: '2-digit',
+  hour12: false,
 });
 
 const NON_WORKING_STATUSES = new Set([
@@ -73,16 +89,17 @@ const NON_WORKING_STATUSES = new Set([
 /**
  * Classifies closed-shift completed working minutes according to NARID duty rules:
  * - < 270 mins (< 4h 30m): SHORT LEAVE
- * - == 270 mins (4h 30m): HALF DAY
- * - > 270 && < 510 mins: HALF DAY
- * - == 510 mins (8h 30m): COMPLETED
- * - > 510 mins: COMPLETED + OT
+ * - 270..509 mins (4h 30m .. 8h 29m): HALF DAY
+ * - == 510 mins (8h 30m) with 0 OT: COMPLETED
+ * - >= 510 mins with OT > 0 (or > 510 mins): COMPLETED + OT
  */
 export function classifyCompletedDutyStatus(
   completedDutyMinutes: number,
-  standardDutyMinutes: number = STANDARD_DUTY_MINUTES
+  standardDutyMinutes: number = STANDARD_DUTY_MINUTES,
+  overtimeMinutes: number = 0
 ): DutyClassifiedStatus {
   const safeMinutes = Math.max(0, Math.floor(Number.isFinite(completedDutyMinutes) ? completedDutyMinutes : 0));
+  const safeOt = Math.max(0, Math.floor(Number.isFinite(overtimeMinutes) ? overtimeMinutes : 0));
   const safeStandard = Math.max(
     1,
     Math.min(
@@ -97,10 +114,10 @@ export function classifyCompletedDutyStatus(
   if (safeMinutes < safeStandard) {
     return 'HALF DAY';
   }
-  if (safeMinutes === safeStandard) {
-    return 'COMPLETED';
+  if (safeMinutes > safeStandard || safeOt > 0) {
+    return 'COMPLETED + OT';
   }
-  return 'COMPLETED + OT';
+  return 'COMPLETED';
 }
 
 export function formatDurationClock(mins: number): string {
@@ -127,11 +144,53 @@ export function formatShiftTimeClock12h(timeStr: string | null | undefined): str
   return `${String(h12).padStart(2, '0')}:${String(rawM).padStart(2, '0')} ${ampm}`;
 }
 
+function extractKolkataDateTimeParts(dt: Date): {
+  day: string;
+  month: string;
+  year: string;
+  hours24: number;
+  minutes: string;
+  seconds: string;
+} {
+  const parts = KOLKATA_PARTS_FORMATTER.formatToParts(dt);
+  const map: Record<string, string> = {};
+  for (const p of parts) {
+    map[p.type] = p.value;
+  }
+  let hours24 = parseInt(map.hour || '0', 10);
+  if (hours24 === 24) hours24 = 0;
+  return {
+    day: String(map.day || '01').padStart(2, '0'),
+    month: String(map.month || 'Jan'),
+    year: String(map.year || '1970'),
+    hours24,
+    minutes: String(map.minute || '00').padStart(2, '0'),
+    seconds: String(map.second || '00').padStart(2, '0'),
+  };
+}
+
 export function formatIsoTimeKolkata12h(isoString: string | null | undefined): string {
   if (!isoString) return '--:--';
   const dt = new Date(isoString);
   if (Number.isNaN(dt.getTime())) return '--:--';
-  return KOLKATA_TIME_12H_FORMATTER.format(dt).toUpperCase();
+  const p = extractKolkataDateTimeParts(dt);
+  const h12 = p.hours24 % 12 || 12;
+  const ampm = p.hours24 >= 12 ? 'PM' : 'AM';
+  return `${String(h12).padStart(2, '0')}:${p.minutes} ${ampm}`;
+}
+
+/**
+ * Formats an ISO timestamp strictly in Asia/Kolkata (IST) with calendar date and 12-hour clock,
+ * e.g. "23 Nov 2026, 04:30:05 AM IST". Returns "N/A" if missing or invalid (never fabricates timestamps).
+ */
+export function formatIsoDateTimeKolkata12h(isoString: string | null | undefined): string {
+  if (!isoString) return 'N/A';
+  const dt = new Date(isoString);
+  if (Number.isNaN(dt.getTime())) return 'N/A';
+  const p = extractKolkataDateTimeParts(dt);
+  const h12 = p.hours24 % 12 || 12;
+  const ampm = p.hours24 >= 12 ? 'PM' : 'AM';
+  return `${p.day} ${p.month} ${p.year}, ${String(h12).padStart(2, '0')}:${p.minutes}:${p.seconds} ${ampm} IST`;
 }
 
 export function getNextCalendarDateKey(dateKey: string): string {
@@ -308,16 +367,101 @@ export function evaluateEarlyPunchOnPunchIn(params: {
 }
 
 /**
- * Option A Finalized Punch Out / Correction Evaluation with Strict Duty & OT Caps:
+ * Authoritative Auto-Close Duty Calculation (Single Source of Truth):
+ * - Effective Punch-Out = Scheduled Shift End.
+ * - Regular Duty = actual eligible elapsed minutes from max(actualPunchIn, scheduledShiftStart)
+ *   up to Scheduled Shift End, capped at MAX_REGULAR_DUTY_MINUTES (510 mins = 08:30 hours).
+ * - Never automatically assigns 510 minutes to every employee.
+ * - OT is strictly zero while no genuine actual Punch-Out exists.
+ */
+export function evaluateAutoCloseDuty(params: {
+  firstInIso: string;
+  scheduledStartIso?: string;
+  scheduledEndIso: string;
+  standardDutyMinutes?: number;
+}): {
+  actualPresenceMinutes: number;
+  earlyArrivalMinutes: number;
+  regularDutyMinutes: number;
+  overtimeMinutes: 0;
+  earlyOtMinutes: 0;
+  postShiftOtMinutes: 0;
+  totalOtMinutes: 0;
+  totalDutyMinutes: number;
+  attendanceStatus: 'AUTO CLOSED';
+  earlyOtFinalized: false;
+  otCapApplied: false;
+} {
+  const standardDutyMinutes = Math.max(
+    1,
+    Math.min(
+      MAX_REGULAR_DUTY_MINUTES,
+      Math.floor(Number.isFinite(params.standardDutyMinutes) ? Number(params.standardDutyMinutes) : STANDARD_DUTY_MINUTES)
+    )
+  );
+  const firstInMs = new Date(params.firstInIso).getTime();
+  const scheduledEndMs = new Date(params.scheduledEndIso).getTime();
+  const scheduledStartMs = params.scheduledStartIso ? new Date(params.scheduledStartIso).getTime() : NaN;
+
+  if (!Number.isFinite(firstInMs) || !Number.isFinite(scheduledEndMs) || scheduledEndMs <= firstInMs) {
+    return {
+      actualPresenceMinutes: 0,
+      earlyArrivalMinutes: 0,
+      regularDutyMinutes: 0,
+      overtimeMinutes: 0,
+      earlyOtMinutes: 0,
+      postShiftOtMinutes: 0,
+      totalOtMinutes: 0,
+      totalDutyMinutes: 0,
+      attendanceStatus: 'AUTO CLOSED',
+      earlyOtFinalized: false,
+      otCapApplied: false,
+    };
+  }
+
+  const actualPresenceMinutes = Math.max(0, Math.floor((scheduledEndMs - firstInMs) / 60000));
+  const earlyArrivalMinutes =
+    Number.isFinite(scheduledStartMs) && firstInMs < scheduledStartMs
+      ? Math.max(0, Math.floor((scheduledStartMs - firstInMs) / 60000))
+      : 0;
+
+  const regularStartMs =
+    Number.isFinite(scheduledStartMs) && firstInMs < scheduledStartMs ? scheduledStartMs : firstInMs;
+  const rawRegularDutyMinutes =
+    scheduledEndMs > regularStartMs ? Math.floor((scheduledEndMs - regularStartMs) / 60000) : 0;
+  const regularDutyMinutes = Math.min(rawRegularDutyMinutes, MAX_REGULAR_DUTY_MINUTES, standardDutyMinutes);
+
+  return {
+    actualPresenceMinutes,
+    earlyArrivalMinutes,
+    regularDutyMinutes,
+    overtimeMinutes: 0,
+    earlyOtMinutes: 0,
+    postShiftOtMinutes: 0,
+    totalOtMinutes: 0,
+    totalDutyMinutes: regularDutyMinutes,
+    attendanceStatus: 'AUTO CLOSED',
+    earlyOtFinalized: false,
+    otCapApplied: false,
+  };
+}
+
+/**
+ * Option A Finalized Actual Punch-Out / Reconciliation / Correction Evaluation:
+ * Uses Scheduled Shift Start and Scheduled Shift End as exact non-overlapping boundaries:
  * - Max Regular Duty = 510 mins (08:30 hours)
  * - Max Total OT = 210 mins (03:30 hours)
  * - Max Credited Total Working Time = 720 mins (12:00 hours)
  *
- * Strictly separates non-overlapping intervals:
- * 1. Early Arrival interval: [firstIn, scheduledStart] -> Eligible Early OT iff >= 60m AND regular duty completed (capped to 210m).
- * 2. Regular Duty + Post-Shift interval: [max(firstIn, scheduledStart), lastOut] -> 510m regular + excess as Post-shift OT (capped to remaining OT budget).
+ * Non-overlapping intervals:
+ * 1. Early Arrival interval: [firstIn, scheduledStart]
+ *    -> Eligible Early OT iff >= 60m AND required full regular duty (510m) is completed.
+ * 2. Regular Duty interval: [max(firstIn, scheduledStart), min(lastOut, scheduledEnd)]
+ *    -> Actual eligible time from Punch-In up to Scheduled Shift End (max 510m).
+ * 3. Post-Shift OT interval: [max(firstIn, scheduledEnd), lastOut]
+ *    -> Eligible time after Scheduled Shift End up to genuine Actual Punch-Out (0 if lastOut <= scheduledEnd).
  * Total OT = min(earlyOtMinutes + postShiftOtMinutes, 210).
- * Total Credited Duty = min(regularDutyMinutes + totalOtMinutes, 720).
+ * Total Working Time = min(regularDutyMinutes + totalOtMinutes, 720).
  */
 export function evaluateOptionAPunchOut(params: {
   firstInIso: string;
@@ -350,6 +494,12 @@ export function evaluateOptionAPunchOut(params: {
   const firstInMs = new Date(params.firstInIso).getTime();
   const lastOutMs = new Date(params.lastOutIso).getTime();
   const scheduledStartMs = new Date(params.scheduledStartIso).getTime();
+  const parsedScheduledEndMs = params.scheduledEndIso ? new Date(params.scheduledEndIso).getTime() : NaN;
+  const scheduledEndMs = Number.isFinite(parsedScheduledEndMs)
+    ? parsedScheduledEndMs
+    : Number.isFinite(scheduledStartMs)
+      ? scheduledStartMs + standardDutyMinutes * 60000
+      : NaN;
 
   if (!Number.isFinite(firstInMs) || !Number.isFinite(lastOutMs) || lastOutMs < firstInMs) {
     return {
@@ -378,62 +528,129 @@ export function evaluateOptionAPunchOut(params: {
     earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES ? earlyArrivalMinutes : 0;
   const provisionalEarlyOtMinutes = Math.min(rawEarlyOtMinutes, MAX_TOTAL_OT_MINUTES);
 
-  const shiftAnchorMs =
+  // Regular Duty boundary: [max(firstIn, scheduledStart), min(lastOut, scheduledEnd)]
+  const regularStartMs =
     Number.isFinite(scheduledStartMs) && firstInMs < scheduledStartMs ? scheduledStartMs : firstInMs;
-  const fromShiftStartMinutes = Math.max(0, Math.floor((lastOutMs - shiftAnchorMs) / 60000));
+  const regularEndMs =
+    Number.isFinite(scheduledEndMs) ? Math.min(lastOutMs, scheduledEndMs) : lastOutMs;
+  const rawRegularDutyMinutes =
+    regularEndMs > regularStartMs ? Math.floor((regularEndMs - regularStartMs) / 60000) : 0;
+  const regularDutyMinutes = Math.min(rawRegularDutyMinutes, MAX_REGULAR_DUTY_MINUTES, standardDutyMinutes);
 
-  if (fromShiftStartMinutes >= standardDutyMinutes) {
-    const regularDutyMinutes = Math.min(fromShiftStartMinutes, MAX_REGULAR_DUTY_MINUTES, standardDutyMinutes);
-    const rawPostShiftOtMinutes = Math.max(0, fromShiftStartMinutes - standardDutyMinutes);
-
-    // Apply 210-minute total OT cap: Early OT first (never exceeding 210m), Post-Shift OT uses remaining budget
-    const earlyOtMinutes = Math.min(rawEarlyOtMinutes, MAX_TOTAL_OT_MINUTES);
-    const remainingOtBudget = Math.max(0, MAX_TOTAL_OT_MINUTES - earlyOtMinutes);
-    const postShiftOtMinutes = Math.min(rawPostShiftOtMinutes, remainingOtBudget);
-    const totalOtMinutes = Math.min(earlyOtMinutes + postShiftOtMinutes, MAX_TOTAL_OT_MINUTES);
-    const overtimeMinutes = totalOtMinutes;
-    const totalDutyMinutes = Math.min(regularDutyMinutes + totalOtMinutes, MAX_CREDITED_TOTAL_MINUTES);
-    const otCapApplied =
-      rawEarlyOtMinutes + rawPostShiftOtMinutes > MAX_TOTAL_OT_MINUTES ||
-      regularDutyMinutes + rawEarlyOtMinutes + rawPostShiftOtMinutes > MAX_CREDITED_TOTAL_MINUTES;
-
-    return {
-      actualPresenceMinutes,
-      earlyArrivalMinutes,
-      provisionalEarlyOtMinutes,
-      earlyOtMinutes,
-      postShiftOtMinutes,
-      overtimeMinutes,
-      totalOtMinutes,
-      regularDutyMinutes,
-      totalDutyMinutes,
-      otCapApplied,
-      attendanceStatus: overtimeMinutes > 0 ? 'COMPLETED + OT' : 'COMPLETED',
-      earlyOtFinalized: true,
-      earlyPunchPolicy: EARLY_PUNCH_POLICY_ID,
-    };
+  // Post-Shift OT boundary: [max(firstIn, scheduledEnd), lastOut] (only when genuine actual Punch-Out is after Scheduled Shift End)
+  let rawPostShiftOtMinutes = 0;
+  if (Number.isFinite(scheduledEndMs)) {
+    const postShiftStartMs = Math.max(firstInMs, scheduledEndMs);
+    if (lastOutMs > postShiftStartMs) {
+      rawPostShiftOtMinutes = Math.floor((lastOutMs - postShiftStartMs) / 60000);
+    }
+  } else {
+    const elapsedFromAnchor = Math.max(0, Math.floor((lastOutMs - regularStartMs) / 60000));
+    rawPostShiftOtMinutes = Math.max(0, elapsedFromAnchor - standardDutyMinutes);
   }
 
-  // Did not complete full scheduled duty duration: forfeit Early OT and preserve Half Day / Short Leave classification
-  const countedDuty = Math.min(
-    earlyArrivalMinutes > 0 ? fromShiftStartMinutes : actualPresenceMinutes,
-    MAX_REGULAR_DUTY_MINUTES
+  // Early OT qualifies ONLY when required full regular duty (510m) is completed
+  const eligibleEarlyOtRaw = regularDutyMinutes >= standardDutyMinutes ? rawEarlyOtMinutes : 0;
+
+  // Apply 210-minute combined OT cap and 720-minute maximum credited working time cap
+  const earlyOtMinutes = Math.min(eligibleEarlyOtRaw, MAX_TOTAL_OT_MINUTES);
+  const remainingOtBudget = Math.max(0, MAX_TOTAL_OT_MINUTES - earlyOtMinutes);
+  const postShiftOtMinutes = Math.min(rawPostShiftOtMinutes, remainingOtBudget);
+  const totalOtMinutes = Math.min(earlyOtMinutes + postShiftOtMinutes, MAX_TOTAL_OT_MINUTES);
+  const overtimeMinutes = totalOtMinutes;
+  const totalDutyMinutes = Math.min(regularDutyMinutes + totalOtMinutes, MAX_CREDITED_TOTAL_MINUTES);
+  const otCapApplied =
+    eligibleEarlyOtRaw + rawPostShiftOtMinutes > MAX_TOTAL_OT_MINUTES ||
+    regularDutyMinutes + eligibleEarlyOtRaw + rawPostShiftOtMinutes > MAX_CREDITED_TOTAL_MINUTES;
+
+  const attendanceStatus = classifyCompletedDutyStatus(
+    totalDutyMinutes,
+    standardDutyMinutes,
+    overtimeMinutes
   );
-  const attendanceStatus = classifyCompletedDutyStatus(countedDuty, standardDutyMinutes);
+
   return {
     actualPresenceMinutes,
     earlyArrivalMinutes,
     provisionalEarlyOtMinutes,
-    earlyOtMinutes: 0,
-    postShiftOtMinutes: 0,
-    overtimeMinutes: 0,
-    totalOtMinutes: 0,
-    regularDutyMinutes: countedDuty,
-    totalDutyMinutes: countedDuty,
-    otCapApplied: false,
+    earlyOtMinutes,
+    postShiftOtMinutes,
+    overtimeMinutes,
+    totalOtMinutes,
+    regularDutyMinutes,
+    totalDutyMinutes,
+    otCapApplied,
     attendanceStatus,
     earlyOtFinalized: true,
     earlyPunchPolicy: EARLY_PUNCH_POLICY_ID,
+  };
+}
+
+export interface AttendanceDiscrepancyReport {
+  hasDiscrepancy: boolean;
+  recordId: string;
+  employeeId: string;
+  shiftDate: string;
+  shiftId: string;
+  punchOutType: string;
+  storedRegularDutyMinutes: number;
+  expectedRegularDutyMinutes: number;
+  storedOvertimeMinutes: number;
+  expectedOvertimeMinutes: number;
+  storedTotalDutyMinutes: number;
+  expectedTotalDutyMinutes: number;
+  reason: string | null;
+}
+
+/**
+ * Pure, read-only diagnostic check that detects discrepancies between stored historical
+ * Duty/OT values and genuine timestamp-based calculations without modifying any records.
+ */
+export function detectAttendanceCalculationDiscrepancy(
+  record: Record<string, any>,
+  standardDutyMinutes: number = STANDARD_DUTY_MINUTES
+): AttendanceDiscrepancyReport {
+  const storedRegular = Math.max(0, Math.floor(Number(record?.regularDutyMinutes ?? 0) || 0));
+  const storedOt = Math.max(0, Math.floor(Number(record?.overtimeMinutes ?? 0) || 0));
+  const storedTotal = Math.max(0, Math.floor(Number(record?.totalDutyMinutes ?? 0) || 0));
+  const resolved = resolveAttendanceMetrics(record, Date.now(), standardDutyMinutes);
+
+  const regularDiff = storedRegular !== resolved.regularDutyMinutes;
+  const otDiff = storedOt !== resolved.overtimeMinutes;
+  const totalDiff = storedTotal !== resolved.completedDutyMinutes;
+  const hasDiscrepancy = !resolved.isOpen && (regularDiff || otDiff || totalDiff);
+
+  const reasons: string[] = [];
+  if (regularDiff) {
+    reasons.push(
+      `Regular Duty mismatch (stored ${formatDurationClock(storedRegular)} vs timestamp-derived ${formatDurationClock(resolved.regularDutyMinutes)})`
+    );
+  }
+  if (otDiff) {
+    reasons.push(
+      `OT mismatch (stored ${formatDurationClock(storedOt)} vs timestamp-derived ${formatDurationClock(resolved.overtimeMinutes)})`
+    );
+  }
+  if (totalDiff) {
+    reasons.push(
+      `Total Working Time mismatch (stored ${formatDurationClock(storedTotal)} vs timestamp-derived ${formatDurationClock(resolved.completedDutyMinutes)})`
+    );
+  }
+
+  return {
+    hasDiscrepancy,
+    recordId: String(record?.id || ''),
+    employeeId: String(record?.employeeId || ''),
+    shiftDate: String(record?.shiftDate || ''),
+    shiftId: String(record?.shiftId || ''),
+    punchOutType: resolved.punchOutTypeResolved,
+    storedRegularDutyMinutes: storedRegular,
+    expectedRegularDutyMinutes: resolved.regularDutyMinutes,
+    storedOvertimeMinutes: storedOt,
+    expectedOvertimeMinutes: resolved.overtimeMinutes,
+    storedTotalDutyMinutes: storedTotal,
+    expectedTotalDutyMinutes: resolved.completedDutyMinutes,
+    reason: hasDiscrepancy ? reasons.join('; ') : null,
   };
 }
 
@@ -487,6 +704,8 @@ export function resolveAttendanceMetrics(
       state: 'OUTSIDE',
       isOpen: false,
       isLate: false,
+      isCurrentlyAutoClosed: false,
+      punchOutTypeResolved: 'NONE',
       completedDutyMinutes: 0,
       regularDutyMinutes: 0,
       overtimeMinutes: 0,
@@ -496,6 +715,16 @@ export function resolveAttendanceMetrics(
       scheduledStartDisplay,
       scheduledPunchOut: defaultEnd,
       scheduledEndDisplay,
+      actualPunchOutIso: null,
+      actualPunchOutDisplay: 'N/A',
+      autoCloseEffectiveIso: null,
+      autoCloseTimeDisplay: 'N/A',
+      autoClosedAtIso: null,
+      autoCloseRecordedAtDisplay: 'N/A',
+      historicalAutoCloseEffectiveIso: null,
+      historicalAutoCloseTimeDisplay: 'N/A',
+      historicalAutoClosedAtIso: null,
+      historicalAutoCloseRecordedAtDisplay: 'N/A',
       earlyArrivalMinutes: 0,
       provisionalEarlyOtMinutes: 0,
       earlyOtMinutes: 0,
@@ -512,6 +741,28 @@ export function resolveAttendanceMetrics(
   const rawStatus = String(record.attendanceStatus || '').trim().toUpperCase();
   const isLate = isAttendanceLate(record);
   const reconciledFromAutoClose = Boolean(record.reconciledFromAutoClose);
+
+  // Preserved historical Auto-Close metadata (for audit/timeline inspection after reconciliation)
+  const storedHistoricalAutoCloseEffectiveIso =
+    typeof record.autoCloseEffectivePunchOut === 'string' && record.autoCloseEffectivePunchOut.trim()
+      ? record.autoCloseEffectivePunchOut.trim()
+      : null;
+  const storedHistoricalAutoClosedAtIso =
+    typeof record.autoClosedAt === 'string' && record.autoClosedAt.trim()
+      ? record.autoClosedAt.trim()
+      : null;
+  const historicalAutoCloseEffectiveIso = reconciledFromAutoClose
+    ? storedHistoricalAutoCloseEffectiveIso
+    : null;
+  const historicalAutoCloseTimeDisplay = historicalAutoCloseEffectiveIso
+    ? formatIsoTimeKolkata12h(historicalAutoCloseEffectiveIso)
+    : 'N/A';
+  const historicalAutoClosedAtIso = reconciledFromAutoClose
+    ? storedHistoricalAutoClosedAtIso
+    : null;
+  const historicalAutoCloseRecordedAtDisplay = historicalAutoClosedAtIso
+    ? formatIsoDateTimeKolkata12h(historicalAutoClosedAtIso)
+    : 'N/A';
 
   // Compute expected Punch-Out schedule when first punch-in & shift schedule are known
   const firstInForSchedule = record.firstPunchIn || record.punchIn;
@@ -539,6 +790,8 @@ export function resolveAttendanceMetrics(
       state: 'OUTSIDE',
       isOpen: false,
       isLate: false,
+      isCurrentlyAutoClosed: false,
+      punchOutTypeResolved: 'NONE',
       completedDutyMinutes: 0,
       regularDutyMinutes: 0,
       overtimeMinutes: 0,
@@ -548,6 +801,16 @@ export function resolveAttendanceMetrics(
       scheduledStartDisplay,
       scheduledPunchOut: defaultEnd,
       scheduledEndDisplay,
+      actualPunchOutIso: null,
+      actualPunchOutDisplay: 'N/A',
+      autoCloseEffectiveIso: null,
+      autoCloseTimeDisplay: 'N/A',
+      autoClosedAtIso: null,
+      autoCloseRecordedAtDisplay: 'N/A',
+      historicalAutoCloseEffectiveIso: null,
+      historicalAutoCloseTimeDisplay: 'N/A',
+      historicalAutoClosedAtIso: null,
+      historicalAutoCloseRecordedAtDisplay: 'N/A',
       earlyArrivalMinutes: 0,
       provisionalEarlyOtMinutes: 0,
       earlyOtMinutes: 0,
@@ -573,25 +836,72 @@ export function resolveAttendanceMetrics(
   const reenteredInside =
     String(record.currentState || '').toUpperCase() === 'INSIDE' &&
     String(record.punchOutType || '').toUpperCase() === 'NONE';
+  const hasActualPunchOut = Boolean(record.actualPunchOut || record.lastPunchOut);
+  const isReconciledActual =
+    String(record.punchOutType || '').toUpperCase() === 'ACTUAL' &&
+    hasActualPunchOut &&
+    record.autoClosed !== true;
+
   if (
     !reenteredInside &&
+    !isReconciledActual &&
     (record.autoClosed === true ||
       String(record.punchOutType || '').toUpperCase() === 'AUTO' ||
       rawStatus === 'AUTO CLOSED' ||
       rawStatus === 'MISSED PUNCH OUT' ||
       record.missedPunchOut === true)
   ) {
-    const rawCompleted = Math.max(
-      0,
-      Math.floor(Number(record.totalDutyMinutes ?? record.regularDutyMinutes ?? 0) || 0)
-    );
-    const regularDutyMinutes = Math.min(rawCompleted, MAX_REGULAR_DUTY_MINUTES, standardDutyMinutes);
+    // Strictly use stored auto-close effective timestamp & processing timestamp; NEVER fabricate fake values for legacy records
+    const autoCloseEffectiveIso =
+      (typeof record.autoCloseEffectivePunchOut === 'string' && record.autoCloseEffectivePunchOut.trim())
+        ? record.autoCloseEffectivePunchOut.trim()
+        : (typeof record.effectivePunchOut === 'string' && record.effectivePunchOut.trim())
+          ? record.effectivePunchOut.trim()
+          : null;
+    const autoCloseTimeDisplay = autoCloseEffectiveIso
+      ? formatIsoTimeKolkata12h(autoCloseEffectiveIso)
+      : 'N/A';
+    const autoClosedAtIso = storedHistoricalAutoClosedAtIso;
+    const autoCloseRecordedAtDisplay = autoClosedAtIso
+      ? formatIsoDateTimeKolkata12h(autoClosedAtIso)
+      : 'N/A';
+
+    // Always compute genuine elapsed Regular Duty from actual Punch-In up to Scheduled Shift End when timestamps exist,
+    // never blindly assuming 510 minutes (fixes late-arrival & cross-midnight Night Shift Auto-Close records without DB mutation).
+    const boundsForAuto = record.shiftDate ? resolveShiftScheduleBounds(record.shiftDate, record) : null;
+    const schedStartIsoForAuto = record.scheduledPunchInIso || boundsForAuto?.scheduledStartIso;
+    const effectiveEndIsoForCalc =
+      autoCloseEffectiveIso || record.scheduledPunchOutIso || boundsForAuto?.scheduledEndIso || null;
+
+    let regularDutyMinutes = 0;
+    let resolvedEarlyArrival = storedEarlyArrival;
+    if (firstInForSchedule && effectiveEndIsoForCalc) {
+      const autoEval = evaluateAutoCloseDuty({
+        firstInIso: firstInForSchedule,
+        scheduledStartIso: schedStartIsoForAuto,
+        scheduledEndIso: effectiveEndIsoForCalc,
+        standardDutyMinutes,
+      });
+      regularDutyMinutes = autoEval.regularDutyMinutes;
+      if (resolvedEarlyArrival === 0 && autoEval.earlyArrivalMinutes > 0) {
+        resolvedEarlyArrival = autoEval.earlyArrivalMinutes;
+      }
+    } else {
+      const rawCompleted = Math.max(
+        0,
+        Math.floor(Number(record.regularDutyMinutes ?? record.totalDutyMinutes ?? 0) || 0)
+      );
+      regularDutyMinutes = Math.min(rawCompleted, MAX_REGULAR_DUTY_MINUTES, standardDutyMinutes);
+    }
     const completedDutyMinutes = regularDutyMinutes;
+
     return {
       status: rawStatus === 'MISSED PUNCH OUT' ? 'MISSED PUNCH OUT' : 'AUTO CLOSED',
       state: 'OUTSIDE',
       isOpen: false,
       isLate,
+      isCurrentlyAutoClosed: true,
+      punchOutTypeResolved: 'AUTO',
       completedDutyMinutes,
       regularDutyMinutes,
       overtimeMinutes: 0, // Strictly zero OT on auto-closed / missed punch out
@@ -601,13 +911,23 @@ export function resolveAttendanceMetrics(
       scheduledStartDisplay,
       scheduledPunchOut: defaultEnd,
       scheduledEndDisplay,
-      earlyArrivalMinutes: storedEarlyArrival,
+      actualPunchOutIso: null,
+      actualPunchOutDisplay: 'N/A',
+      autoCloseEffectiveIso,
+      autoCloseTimeDisplay,
+      autoClosedAtIso,
+      autoCloseRecordedAtDisplay,
+      historicalAutoCloseEffectiveIso: null,
+      historicalAutoCloseTimeDisplay: 'N/A',
+      historicalAutoClosedAtIso: null,
+      historicalAutoCloseRecordedAtDisplay: 'N/A',
+      earlyArrivalMinutes: resolvedEarlyArrival,
       provisionalEarlyOtMinutes: 0,
       earlyOtMinutes: 0,
       postShiftOtMinutes: 0,
       totalOtMinutes: 0,
       earlyOtFinalized: false,
-      isEarlyPunch: storedEarlyArrival > 0,
+      isEarlyPunch: resolvedEarlyArrival > 0,
       otCapApplied: false,
       reconciledFromAutoClose: false,
       punchOutSchedule,
@@ -628,6 +948,8 @@ export function resolveAttendanceMetrics(
       state: 'INSIDE',
       isOpen: true,
       isLate,
+      isCurrentlyAutoClosed: false,
+      punchOutTypeResolved: 'NONE',
       completedDutyMinutes: 0, // Never count open shift as finalized completed duty
       regularDutyMinutes: 0,
       overtimeMinutes: 0, // Never finalize OT on open shift
@@ -637,6 +959,16 @@ export function resolveAttendanceMetrics(
       scheduledStartDisplay,
       scheduledPunchOut: defaultEnd,
       scheduledEndDisplay,
+      actualPunchOutIso: null,
+      actualPunchOutDisplay: 'In Progress',
+      autoCloseEffectiveIso: null,
+      autoCloseTimeDisplay: 'N/A',
+      autoClosedAtIso: null,
+      autoCloseRecordedAtDisplay: 'N/A',
+      historicalAutoCloseEffectiveIso,
+      historicalAutoCloseTimeDisplay,
+      historicalAutoClosedAtIso,
+      historicalAutoCloseRecordedAtDisplay,
       earlyArrivalMinutes: storedEarlyArrival,
       provisionalEarlyOtMinutes: computedProvisionalEarlyOt,
       earlyOtMinutes: 0,
@@ -650,9 +982,15 @@ export function resolveAttendanceMetrics(
     };
   }
 
-  // 4. Closed shift with valid Actual Punch Out
+  // 4. Closed shift with valid Actual Punch Out (including records reconciled from provisional AUTO CLOSED)
   const firstInIso = record.firstPunchIn || record.punchIn;
-  const lastOutIso = record.lastPunchOut || record.actualPunchOut || record.effectivePunchOut;
+  const actualPunchOutIso: string | null = record.lastPunchOut || record.actualPunchOut || null;
+  const lastOutIso = actualPunchOutIso || record.effectivePunchOut;
+  const actualPunchOutDisplay = actualPunchOutIso
+    ? formatIsoTimeKolkata12h(actualPunchOutIso)
+    : lastOutIso
+      ? formatIsoTimeKolkata12h(lastOutIso)
+      : 'N/A';
   const firstInMs = firstInIso ? new Date(firstInIso).getTime() : NaN;
   const lastOutMs = lastOutIso ? new Date(lastOutIso).getTime() : NaN;
 
@@ -679,15 +1017,16 @@ export function resolveAttendanceMetrics(
     );
     let otCapApplied = Boolean(record.otCapApplied);
 
-    const scheduledStartIso =
-      record.scheduledPunchInIso ||
-      (record.shiftDate ? resolveShiftScheduleBounds(record.shiftDate, record).scheduledStartIso : undefined);
+    const boundsForActual = record.shiftDate ? resolveShiftScheduleBounds(record.shiftDate, record) : null;
+    const scheduledStartIso = record.scheduledPunchInIso || boundsForActual?.scheduledStartIso;
+    const scheduledEndIso = record.scheduledPunchOutIso || boundsForActual?.scheduledEndIso;
 
     if (scheduledStartIso && firstInIso && lastOutIso && Number.isFinite(firstInMs) && Number.isFinite(lastOutMs)) {
       const evaluated = evaluateOptionAPunchOut({
         firstInIso,
         lastOutIso,
         scheduledStartIso,
+        scheduledEndIso,
         standardDutyMinutes,
       });
       earlyArrivalMinutes = evaluated.earlyArrivalMinutes;
@@ -701,12 +1040,14 @@ export function resolveAttendanceMetrics(
       overtimeMinutes = Math.min(Math.max(0, Math.floor(record.overtimeMinutes)), MAX_TOTAL_OT_MINUTES);
     }
 
-    const status = classifyCompletedDutyStatus(completedDutyMinutes, standardDutyMinutes);
+    const status = classifyCompletedDutyStatus(completedDutyMinutes, standardDutyMinutes, overtimeMinutes);
     return {
       status,
       state: 'OUTSIDE',
       isOpen: false,
       isLate,
+      isCurrentlyAutoClosed: false,
+      punchOutTypeResolved: 'ACTUAL',
       completedDutyMinutes,
       regularDutyMinutes,
       overtimeMinutes,
@@ -716,6 +1057,16 @@ export function resolveAttendanceMetrics(
       scheduledStartDisplay,
       scheduledPunchOut: defaultEnd,
       scheduledEndDisplay,
+      actualPunchOutIso: actualPunchOutIso || lastOutIso || null,
+      actualPunchOutDisplay,
+      autoCloseEffectiveIso: null,
+      autoCloseTimeDisplay: 'N/A',
+      autoClosedAtIso: null,
+      autoCloseRecordedAtDisplay: 'N/A',
+      historicalAutoCloseEffectiveIso,
+      historicalAutoCloseTimeDisplay,
+      historicalAutoClosedAtIso,
+      historicalAutoCloseRecordedAtDisplay,
       earlyArrivalMinutes,
       provisionalEarlyOtMinutes:
         earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES
@@ -763,6 +1114,8 @@ export function resolveAttendanceMetrics(
     state: 'OUTSIDE',
     isOpen: false,
     isLate,
+    isCurrentlyAutoClosed: false,
+    punchOutTypeResolved: 'ACTUAL',
     completedDutyMinutes,
     regularDutyMinutes,
     overtimeMinutes,
@@ -772,6 +1125,16 @@ export function resolveAttendanceMetrics(
     scheduledStartDisplay,
     scheduledPunchOut: defaultEnd,
     scheduledEndDisplay,
+    actualPunchOutIso: actualPunchOutIso || lastOutIso || null,
+    actualPunchOutDisplay,
+    autoCloseEffectiveIso: null,
+    autoCloseTimeDisplay: 'N/A',
+    autoClosedAtIso: null,
+    autoCloseRecordedAtDisplay: 'N/A',
+    historicalAutoCloseEffectiveIso,
+    historicalAutoCloseTimeDisplay,
+    historicalAutoClosedAtIso,
+    historicalAutoCloseRecordedAtDisplay,
     earlyArrivalMinutes: 0,
     provisionalEarlyOtMinutes: 0,
     earlyOtMinutes: 0,

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { getSafeErrorText } from '../services/errorHandlingService';
 import { 
   ScanLine, 
   Camera, 
@@ -706,7 +707,10 @@ export const Scanner: React.FC<ScannerProps> = ({
       }
     } catch (err: any) {
       const safeErrMsg = sanitizeQrErrorMessage(
-        String(err?.message || 'System error processing Punch In.'),
+        getSafeErrorText(err, {
+          moduleName: 'Attendance Scanner',
+          endpoint: '/api/attendance/scan',
+        }),
         clean
       );
       console.error('Punch In Error:', safeErrMsg);
@@ -714,9 +718,7 @@ export const Scanner: React.FC<ScannerProps> = ({
         success: false,
         action: 'REJECTED',
         scannerType: 'IN',
-        message: safeErrMsg.includes('timed out') || safeErrMsg.includes('Unable to reach')
-          ? `Network interrupted: ${safeErrMsg}`
-          : safeErrMsg,
+        message: safeErrMsg,
         time: new Date().toLocaleTimeString(),
       };
       setLastInResult(fallback);
@@ -861,7 +863,10 @@ export const Scanner: React.FC<ScannerProps> = ({
       }
     } catch (err: any) {
       const safeErrMsg = sanitizeQrErrorMessage(
-        String(err?.message || 'System error processing Punch Out.'),
+        getSafeErrorText(err, {
+          moduleName: 'Attendance Scanner',
+          endpoint: '/api/attendance/scan',
+        }),
         clean
       );
       console.error('Punch Out Error:', safeErrMsg);
@@ -869,9 +874,7 @@ export const Scanner: React.FC<ScannerProps> = ({
         success: false,
         action: 'REJECTED',
         scannerType: 'OUT',
-        message: safeErrMsg.includes('timed out') || safeErrMsg.includes('Unable to reach')
-          ? `Network interrupted: ${safeErrMsg}`
-          : safeErrMsg,
+        message: safeErrMsg,
         time: new Date().toLocaleTimeString(),
       };
       setLastOutResult(fallback);
@@ -960,14 +963,15 @@ export const Scanner: React.FC<ScannerProps> = ({
       }
     } catch (err: any) {
       console.error('Manual Punch In Error:', err);
-      const msg = String(err?.message || 'System error processing manual Punch In.');
+      const msg = getSafeErrorText(err, {
+        moduleName: 'Attendance Scanner',
+        endpoint: '/api/attendance/manual',
+      });
       const fallback: ScanResult = {
         success: false,
         action: 'REJECTED',
         scannerType: 'IN',
-        message: msg.includes('timed out') || msg.includes('Unable to reach')
-          ? `Network interrupted: ${msg}`
-          : msg,
+        message: msg,
         time: new Date().toLocaleTimeString(),
       };
       setLastInResult(fallback);
@@ -1044,14 +1048,15 @@ export const Scanner: React.FC<ScannerProps> = ({
       }
     } catch (err: any) {
       console.error('Manual Punch Out Error:', err);
-      const msg = String(err?.message || 'System error processing manual Punch Out.');
+      const msg = getSafeErrorText(err, {
+        moduleName: 'Attendance Scanner',
+        endpoint: '/api/attendance/manual',
+      });
       const fallback: ScanResult = {
         success: false,
         action: 'REJECTED',
         scannerType: 'OUT',
-        message: msg.includes('timed out') || msg.includes('Unable to reach')
-          ? `Network interrupted: ${msg}`
-          : msg,
+        message: msg,
         time: new Date().toLocaleTimeString(),
       };
       setLastOutResult(fallback);

@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { getSafeErrorText, handleAppError } from '../services/errorHandlingService';
 import { Network, Plus, Edit2, CheckCircle, XCircle, X, FileSpreadsheet, Download } from 'lucide-react';
 import { Section, Floor, UserRoleRecord } from '../types';
 import { saveSection } from '../services/masterService';
@@ -73,7 +74,7 @@ export const SectionManagement: React.FC<SectionManagementProps> = ({
       setIsModalOpen(false);
       onRefresh();
     } catch (err: any) {
-      alert(`Error saving section: ${err.message}`);
+      handleAppError(err, { moduleName: 'Section Management', endpoint: '/api/masters/sections', notifyGlobalToast: true });
     } finally {
       setIsSaving(false);
     }
@@ -85,7 +86,7 @@ export const SectionManagement: React.FC<SectionManagementProps> = ({
       await saveSection({ ...sec, status: nextStatus });
       onRefresh();
     } catch (err: any) {
-      alert(`Error toggling section: ${err.message}`);
+      handleAppError(err, { moduleName: 'Section Management', endpoint: '/api/masters/sections', notifyGlobalToast: true });
     }
   };
 
@@ -121,7 +122,11 @@ export const SectionManagement: React.FC<SectionManagementProps> = ({
       setBulkSummary({ type: 'success', title: `Exported ${out.rowCount} Sections`, message: `Downloaded "${out.fileName}".`, savedCount: out.rowCount });
       bulk.clearSelection();
     } catch (err: any) {
-      setBulkSummary({ type: 'error', title: 'Export Failed', message: err?.message || 'Unable to export sections.' });
+      setBulkSummary({
+        type: 'error',
+        title: 'Export Failed',
+        message: getSafeErrorText(err, { moduleName: 'Section Management', forcedErrorCode: 'FILE-002' }),
+      });
     } finally {
       setBulkProgress(null);
       setIsBulkBusy(false);
@@ -146,7 +151,11 @@ export const SectionManagement: React.FC<SectionManagementProps> = ({
       bulk.clearSelection();
       onRefresh();
     } catch (err: any) {
-      setBulkSummary({ type: 'error', title: 'Bulk Status Update Failed', message: err?.message || 'Permission or server error.' });
+      setBulkSummary({
+        type: 'error',
+        title: 'Bulk Status Update Failed',
+        message: getSafeErrorText(err, { moduleName: 'Section Management', endpoint: '/api/masters/sections/bulk' }),
+      });
     } finally {
       setBulkProgress(null);
       setIsBulkBusy(false);

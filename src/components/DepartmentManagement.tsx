@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { getSafeErrorText, handleAppError } from '../services/errorHandlingService';
 import { Building2, Plus, Edit2, CheckCircle, XCircle, X, FileSpreadsheet, Download } from 'lucide-react';
 import { Department, UserRoleRecord } from '../types';
 import { saveDepartment } from '../services/masterService';
@@ -69,7 +70,7 @@ export const DepartmentManagement: React.FC<DepartmentManagementProps> = ({
       setIsModalOpen(false);
       onRefresh();
     } catch (err: any) {
-      alert(`Error saving department: ${err.message}`);
+      handleAppError(err, { moduleName: 'Department Management', endpoint: '/api/masters/departments', notifyGlobalToast: true });
     } finally {
       setIsSaving(false);
     }
@@ -81,7 +82,7 @@ export const DepartmentManagement: React.FC<DepartmentManagementProps> = ({
       await saveDepartment({ ...dept, status: nextStatus });
       onRefresh();
     } catch (err: any) {
-      alert(`Error toggling department: ${err.message}`);
+      handleAppError(err, { moduleName: 'Department Management', endpoint: '/api/masters/departments', notifyGlobalToast: true });
     }
   };
 
@@ -117,7 +118,11 @@ export const DepartmentManagement: React.FC<DepartmentManagementProps> = ({
       setBulkSummary({ type: 'success', title: `Exported ${out.rowCount} Departments`, message: `Downloaded "${out.fileName}".`, savedCount: out.rowCount });
       bulk.clearSelection();
     } catch (err: any) {
-      setBulkSummary({ type: 'error', title: 'Export Failed', message: err?.message || 'Unable to export departments.' });
+      setBulkSummary({
+        type: 'error',
+        title: 'Export Failed',
+        message: getSafeErrorText(err, { moduleName: 'Department Management', forcedErrorCode: 'FILE-002' }),
+      });
     } finally {
       setBulkProgress(null);
       setIsBulkBusy(false);
@@ -142,7 +147,11 @@ export const DepartmentManagement: React.FC<DepartmentManagementProps> = ({
       bulk.clearSelection();
       onRefresh();
     } catch (err: any) {
-      setBulkSummary({ type: 'error', title: 'Bulk Status Update Failed', message: err?.message || 'Permission or server error.' });
+      setBulkSummary({
+        type: 'error',
+        title: 'Bulk Status Update Failed',
+        message: getSafeErrorText(err, { moduleName: 'Department Management', endpoint: '/api/masters/departments/bulk' }),
+      });
     } finally {
       setBulkProgress(null);
       setIsBulkBusy(false);

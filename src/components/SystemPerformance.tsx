@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { getSafeErrorText } from '../services/errorHandlingService';
 import {
   Activity,
   Server,
@@ -713,7 +714,9 @@ export const SystemPerformance: React.FC<SystemPerformanceProps> = ({ initialDat
         setData(res);
         setThresholdDraft(res.thresholds);
       } catch (err: any) {
-        setErrorMessage(err?.message || 'Unable to load live system telemetry.');
+        setErrorMessage(
+          getSafeErrorText(err, { moduleName: 'System Performance', endpoint: '/api/monitoring/overview' })
+        );
       } finally {
         setIsLoading(false);
         setIsRefreshing(false);
@@ -747,7 +750,9 @@ export const SystemPerformance: React.FC<SystemPerformanceProps> = ({ initialDat
       );
       await loadMonitoringData(true);
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Live health probe failed.');
+      setErrorMessage(
+        getSafeErrorText(err, { moduleName: 'System Performance', endpoint: '/api/monitoring/health-probe' })
+      );
     } finally {
       setIsProbing(false);
     }
@@ -764,7 +769,9 @@ export const SystemPerformance: React.FC<SystemPerformanceProps> = ({ initialDat
       setActionBanner(`Alert "${groupKey}" updated (${action}).`);
       await loadMonitoringData(true);
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Failed to update alert status.');
+      setErrorMessage(
+        getSafeErrorText(err, { moduleName: 'System Performance', endpoint: '/api/monitoring/alerts' })
+      );
     } finally {
       setBusyAlertKey(null);
     }
@@ -781,7 +788,9 @@ export const SystemPerformance: React.FC<SystemPerformanceProps> = ({ initialDat
       setActionBanner('Alert thresholds and telemetry retention updated.');
       await loadMonitoringData(true);
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Failed to save monitoring thresholds.');
+      setErrorMessage(
+        getSafeErrorText(err, { moduleName: 'System Performance', endpoint: '/api/monitoring/thresholds' })
+      );
     } finally {
       setIsSavingThresholds(false);
     }
@@ -807,7 +816,9 @@ export const SystemPerformance: React.FC<SystemPerformanceProps> = ({ initialDat
       );
       await loadMonitoringData(true);
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Network probe burst failed.');
+      setErrorMessage(
+        getSafeErrorText(err, { moduleName: 'System Performance', endpoint: '/api/network/ping' })
+      );
     } finally {
       setIsProbingNetwork(false);
     }
@@ -824,7 +835,9 @@ export const SystemPerformance: React.FC<SystemPerformanceProps> = ({ initialDat
       );
       await loadMonitoringData(true);
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Controlled speed test failed.');
+      setErrorMessage(
+        getSafeErrorText(err, { moduleName: 'System Performance', endpoint: '/api/network/speedtest' })
+      );
     } finally {
       setIsRunningSpeedTest(false);
     }

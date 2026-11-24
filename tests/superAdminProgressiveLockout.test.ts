@@ -970,7 +970,13 @@ describe('Canonical Super Admin Progressive Temporary Lockout Policy', () => {
           'POST /api/auth/login',
           { preferSameOriginInPreview: true, noRetryOnNetworkError: true }
         )
-      ).rejects.toThrow('Unable to reach local Preview backend for POST /api/auth/login');
+      ).rejects.toMatchObject({
+        name: 'ApiRequestError',
+        status: 0,
+        errorCode: 'NET-001',
+        isNetworkFetchFailure: true,
+        technicalDetail: expect.stringContaining('POST /api/auth/login'),
+      });
       expect(netErrCalls).toEqual(['/api/auth/login']);
     } finally {
       (globalThis as any).window = prevWindow;
@@ -1060,7 +1066,10 @@ describe('Canonical Super Admin Progressive Temporary Lockout Policy', () => {
     const parsedSpa = await safeParseJsonResponse(spaHtml200, 'POST /api/auth/login');
     expect(parsedSpa.ok).toBe(false);
     expect(parsedSpa.isHtmlOrNonJson).toBe(true);
-    expect(parsedSpa.errorMessage).toContain('index.html');
+    expect(parsedSpa.errorCode).toBe('API-001');
+    expect(parsedSpa.errorMessage).toContain('API-001');
+    expect(parsedSpa.errorMessage).not.toContain('index.html');
+    expect(parsedSpa.technicalDetail).toContain('SPA HTML');
 
     const cookieCheckHtml200 = new Response('<!doctype html><html><head><title>Cookie check</title></head><body>Checking cookies</body></html>', {
       status: 200,
@@ -1069,7 +1078,9 @@ describe('Canonical Super Admin Progressive Temporary Lockout Policy', () => {
     const parsedCookie = await safeParseJsonResponse(cookieCheckHtml200, 'POST /api/auth/login');
     expect(parsedCookie.ok).toBe(false);
     expect(parsedCookie.isHtmlOrNonJson).toBe(true);
-    expect(parsedCookie.errorMessage).toContain('session authentication check');
+    expect(parsedCookie.errorCode).toBe('AUTH-001');
+    expect(parsedCookie.errorMessage).toContain('AUTH-001');
+    expect(parsedCookie.technicalDetail).toContain('authentication bridge HTML');
 
     const warmupHtml200 = new Response('<!doctype html><html><head><title>Starting Server...</title></head><body>Warming up</body></html>', {
       status: 200,
@@ -1078,7 +1089,9 @@ describe('Canonical Super Admin Progressive Temporary Lockout Policy', () => {
     const parsedWarmup = await safeParseJsonResponse(warmupHtml200, 'POST /api/auth/login');
     expect(parsedWarmup.ok).toBe(false);
     expect(parsedWarmup.isHtmlOrNonJson).toBe(true);
-    expect(parsedWarmup.errorMessage).toContain('warmup HTML');
+    expect(parsedWarmup.errorCode).toBe('NET-001');
+    expect(parsedWarmup.errorMessage).toContain('NET-001');
+    expect(parsedWarmup.technicalDetail).toContain('warmup HTML');
 
     // loginWithLoginIdAndPassword rejects HTTP 200 HTML cleanly without treating it as authenticated
     const prevWindow = (globalThis as any).window;

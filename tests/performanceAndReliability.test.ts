@@ -231,7 +231,8 @@ describe('Performance, Reliability, Caching & Scalability Benchmarks (Scenarios 
     expect(resB.status).toBe(200);
     expect(resB.body.action).toBe('PUNCH_OUT');
     expect(resB.body.attendance.totalDutyMinutes).toBe(540);
-    expect(resB.body.attendance.overtimeMinutes).toBe(30);
+    expect(resB.body.attendance.regularDutyMinutes).toBe(508);
+    expect(resB.body.attendance.overtimeMinutes).toBe(32);
     expect(warmMsB).toBeLessThan(700);
 
     // Scenario C: Manual Punch IN
@@ -265,7 +266,8 @@ describe('Performance, Reliability, Caching & Scalability Benchmarks (Scenarios 
     expect(resD.status).toBe(200);
     expect(resD.body.action).toBe('PUNCH_OUT');
     expect(resD.body.attendance.totalDutyMinutes).toBe(510);
-    expect(resD.body.attendance.overtimeMinutes).toBe(0);
+    expect(resD.body.attendance.regularDutyMinutes).toBe(505);
+    expect(resD.body.attendance.overtimeMinutes).toBe(5);
     expect(warmMsD).toBeLessThan(700);
 
     // Scenario E: Token tamper, missing token, unknown ID, inactive employee all reject quickly

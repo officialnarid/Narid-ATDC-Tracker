@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { getSafeErrorText } from '../services/errorHandlingService';
 import { 
   QrCode, 
   Printer, 
@@ -291,7 +292,7 @@ export const QrManagement: React.FC<QrManagementProps> = ({
       setBulkSummary({
         type: 'error',
         title: 'QR ZIP Download Failed',
-        message: err?.message || 'Unable to package QR Identity Cards into ZIP.',
+        message: getSafeErrorText(err, { moduleName: 'QR Management', forcedErrorCode: 'QR-001' }),
       });
     } finally {
       setBulkProgress(null);

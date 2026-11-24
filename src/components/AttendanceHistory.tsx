@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import { getSafeErrorText, handleAppError } from '../services/errorHandlingService';
 import { 
   History, 
   Search, 
@@ -30,7 +31,12 @@ import {
   getKolkataTimeParts,
   getNextDateKey
 } from '../services/attendanceService';
-import { exportTableToExcel } from '../services/exportService';
+import { exportTableToExcel, exportTableToCsv } from '../services/exportService';
+import {
+  ATTENDANCE_HISTORY_EXPORT_COLUMNS,
+  buildAttendanceHistoryExportRows,
+  computeAttendanceReportSummary,
+} from '../utils/attendanceReportBuilder';
 import {
   evaluateOptionAPunchOut,
   formatDurationClock,
@@ -124,7 +130,9 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
       recordPerfMetric('background_refresh_ms', stopTimer());
     } catch (err: any) {
       console.error('Error fetching attendance history:', err);
-      setFetchError(err?.message || 'Unable to load attendance history records.');
+      setFetchError(
+        getSafeErrorText(err, { moduleName: 'Attendance History', dbOperationCategory: 'read' })
+      );
     } finally {
       setLoading(false);
       setIsRefreshing(false);
@@ -173,7 +181,12 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
     e.preventDefault();
     if (!correctingRecord) return;
     if (!correctionReason.trim()) {
-      alert('Mandatory reason required for attendance correction.');
+      handleAppError('Mandatory reason required for attendance correction.', {
+        moduleName: 'Attendance History',
+        forcedErrorCode: 'VAL-001',
+        reportToBackend: false,
+        notifyGlobalToast: true,
+      });
       return;
     }
 
@@ -201,7 +214,11 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
       setCorrectingRecord(null);
       await fetchRecords();
     } catch (err: any) {
-      alert(`Correction failed: ${err.message}`);
+      handleAppError(err, {
+        moduleName: 'Attendance History',
+        endpoint: '/api/attendance/correct',
+        notifyGlobalToast: true,
+      });
     } finally {
       setIsSubmittingCorrection(false);
     }
@@ -239,63 +256,32 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
   }, [records, startDate, endDate, searchEmp, filterFloor, filterDept, filterShift, filterStatus, filterPunchOutType, nowMs]);
 
   const buildAttendanceExportRows = (sourceRecords: AttendanceRecord[]) =>
-    sourceRecords.map(r => {
-      const m = resolveAttendanceMetrics(r, nowMs);
-      return {
-        employeeId: r.employeeId,
-        name: r.employeeNameSnapshot,
-        type: r.employeeTypeSnapshot,
-        floor: r.floorIdSnapshot,
-        section: r.sectionIdSnapshot,
-        department: r.departmentIdSnapshot,
-        shift: r.shiftNameSnapshot,
-        shiftDate: r.shiftDate,
-        state: m.state,
-        scheduledShiftStart: m.scheduledStartDisplay,
-        punchIn: formatTimeDisplay(r.firstPunchIn || r.punchIn),
-        earlyArrival: m.earlyArrivalMinutes > 0 ? formatDurationClock(m.earlyArrivalMinutes) : '00:00',
-        punchOut: m.isOpen ? 'In Progress' : formatTimeDisplay(r.lastPunchOut || r.actualPunchOut || r.effectivePunchOut),
-        punchOutType: r.punchOutType,
-        dutyHours: m.isOpen
-          ? `00:00 Hours (In Progress: ${formatDurationClock(m.accumulatedDutyMinutes)})`
-          : formatMinutes(m.completedDutyMinutes),
-        earlyOt: m.isOpen
-          ? (m.provisionalEarlyOtMinutes > 0 ? `${formatDurationClock(m.provisionalEarlyOtMinutes)} (Provisional)` : '00:00')
-          : formatDurationClock(m.earlyOtMinutes),
-        postShiftOt: m.isOpen ? '00:00' : formatDurationClock(m.postShiftOtMinutes),
-        otHours: !m.isOpen && m.overtimeMinutes > 0 ? `${formatDurationClock(m.overtimeMinutes)} OT` : '00:00',
-        status: m.status,
-      };
-    });
+    buildAttendanceHistoryExportRows(sourceRecords, nowMs);
 
-  const ATTENDANCE_EXPORT_COLUMNS = [
-    { header: 'Employee ID', key: 'employeeId' },
-    { header: 'Employee Name', key: 'name' },
-    { header: 'Type', key: 'type' },
-    { header: 'Line', key: 'floor' },
-    { header: 'Section', key: 'section' },
-    { header: 'Department', key: 'department' },
-    { header: 'Shift', key: 'shift' },
-    { header: 'Shift Date', key: 'shiftDate' },
-    { header: 'State', key: 'state' },
-    { header: 'Scheduled Shift Start', key: 'scheduledShiftStart' },
-    { header: 'Actual Punch In', key: 'punchIn' },
-    { header: 'Early Arrival Duration', key: 'earlyArrival' },
-    { header: 'Last Out', key: 'punchOut' },
-    { header: 'Punch Out Type', key: 'punchOutType' },
-    { header: 'Completed Duty', key: 'dutyHours' },
-    { header: 'Early OT', key: 'earlyOt' },
-    { header: 'Post-shift OT', key: 'postShiftOt' },
-    { header: 'Total OT', key: 'otHours' },
-    { header: 'Attendance Status', key: 'status' },
-  ];
+  const ATTENDANCE_EXPORT_COLUMNS = ATTENDANCE_HISTORY_EXPORT_COLUMNS;
 
-  const handleExportExcel = () => {
+  const handleExportExcel = async () => {
     const exportData = buildAttendanceExportRows(filteredRecords);
-    exportTableToExcel(
+    const periodLabel = `${startDate} to ${endDate}`;
+    await exportTableToExcel(
       exportData,
       ATTENDANCE_EXPORT_COLUMNS,
-      `Attendance_History_${startDate}_to_${endDate}`
+      `NARID_Attendance_History_${startDate}_to_${endDate}`,
+      {
+        reportTitle: 'Attendance History Report',
+        periodLabel,
+        sheetName: 'Attendance History',
+        summary: computeAttendanceReportSummary(exportData),
+      }
+    );
+  };
+
+  const handleExportCsv = () => {
+    const exportData = buildAttendanceExportRows(filteredRecords);
+    exportTableToCsv(
+      exportData,
+      ATTENDANCE_EXPORT_COLUMNS,
+      `NARID_Attendance_History_${startDate}_to_${endDate}`
     );
   };
 
@@ -330,7 +316,7 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
       const out = await fn(
         rows,
         ATTENDANCE_EXPORT_COLUMNS,
-        `Attendance_History_Selected_${startDate}_to_${endDate}`,
+        `NARID_Attendance_History_Selected_${startDate}_to_${endDate}`,
         {
           onProgress: (completed, total) =>
             setBulkProgress({
@@ -341,6 +327,10 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
           auditTargetType: 'ATTENDANCE_HISTORY',
           auditSource: 'ATTENDANCE_HISTORY',
           auditDescription: `Bulk exported ${rows.length} selected attendance records (${format.toUpperCase()}).`,
+          reportTitle: 'Attendance History Report (Selected)',
+          periodLabel: `${startDate} to ${endDate}`,
+          sheetName: 'Attendance History',
+          summary: computeAttendanceReportSummary(rows),
         }
       );
       setBulkSummary({
@@ -354,7 +344,7 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
       setBulkSummary({
         type: 'error',
         title: 'Bulk Export Failed',
-        message: err?.message || 'Unable to export selected attendance records.',
+        message: getSafeErrorText(err, { moduleName: 'Attendance History', forcedErrorCode: 'FILE-002' }),
       });
     } finally {
       setBulkProgress(null);
@@ -407,8 +397,18 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
             <span>Refresh</span>
           </button>
           <button
+            type="button"
+            onClick={handleExportCsv}
+            disabled={filteredRecords.length === 0}
+            className="bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium text-xs px-3 py-2 rounded border border-slate-300 flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50"
+          >
+            <Download className="w-3.5 h-3.5" />
+            <span>Download CSV</span>
+          </button>
+          <button
             onClick={handleExportExcel}
-            className="bg-emerald-600 hover:bg-emerald-700 text-white font-medium text-xs px-4 py-2 rounded flex items-center gap-2 shadow-sm transition cursor-pointer"
+            disabled={filteredRecords.length === 0}
+            className="bg-emerald-600 hover:bg-emerald-700 text-white font-medium text-xs px-4 py-2 rounded flex items-center gap-2 shadow-sm transition cursor-pointer disabled:opacity-50"
           >
             <FileSpreadsheet className="w-4 h-4" />
             <span>Export to Excel</span>
@@ -560,25 +560,29 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
                 <th className="py-3 px-3.5">Line / Dept</th>
                 <th className="py-3 px-3.5">Shift &amp; Date</th>
                 <th className="py-3 px-3.5">State</th>
-                <th className="py-3 px-3.5">Scheduled Start</th>
-                <th className="py-3 px-3.5">Actual Punch In</th>
-                <th className="py-3 px-3.5">Early Arrival</th>
-                <th className="py-3 px-3.5">Last Out</th>
-                <th className="py-3 px-3.5">Punches</th>
-                <th className="py-3 px-3.5">Regular Duty</th>
-                <th className="py-3 px-3.5">Early OT</th>
-                <th className="py-3 px-3.5">Post-shift OT</th>
-                <th className="py-3 px-3.5">Total OT</th>
-                <th className="py-3 px-3.5">Status</th>
-                <th className="py-3 px-3.5 text-right">Actions</th>
+                <th className="py-3 px-3.5 whitespace-nowrap">Scheduled Start</th>
+                <th className="py-3 px-3.5 whitespace-nowrap">Scheduled End</th>
+                <th className="py-3 px-3.5 whitespace-nowrap">Actual Punch In</th>
+                <th className="py-3 px-3.5 whitespace-nowrap">Early Arrival</th>
+                <th className="py-3 px-3.5 whitespace-nowrap">Actual Punch-Out</th>
+                <th className="py-3 px-3.5 whitespace-nowrap text-purple-800">Auto-Close Time</th>
+                <th className="py-3 px-3.5 whitespace-nowrap text-purple-800">Auto-Close Recorded At</th>
+                <th className="py-3 px-3.5 whitespace-nowrap">Out Type</th>
+                <th className="py-3 px-3.5 whitespace-nowrap">Punches</th>
+                <th className="py-3 px-3.5 whitespace-nowrap">Regular Duty</th>
+                <th className="py-3 px-3.5 whitespace-nowrap">Early OT</th>
+                <th className="py-3 px-3.5 whitespace-nowrap">Post-shift OT</th>
+                <th className="py-3 px-3.5 whitespace-nowrap">Total OT</th>
+                <th className="py-3 px-3.5 whitespace-nowrap">Status</th>
+                <th className="py-3 px-3.5 text-right whitespace-nowrap">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {loading && records.length === 0 ? (
-                <TableSkeletonRows rows={8} cols={17} />
+                <TableSkeletonRows rows={8} cols={21} />
               ) : filteredRecords.length === 0 ? (
                 <tr>
-                  <td colSpan={17} className="py-8 text-center text-slate-400">
+                  <td colSpan={21} className="py-8 text-center text-slate-400">
                     No attendance records found for the selected filters.
                   </td>
                 </tr>
@@ -600,12 +604,12 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
                           className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
                         />
                       </td>
-                      <td className="py-3 px-3.5 font-mono font-bold text-slate-900">{rec.employeeId}</td>
-                      <td className="py-3 px-3.5 font-semibold text-slate-800">{rec.employeeNameSnapshot}</td>
-                      <td className="py-3 px-3.5 text-slate-600">
+                      <td className="py-3 px-3.5 font-mono font-bold text-slate-900 whitespace-nowrap">{rec.employeeId}</td>
+                      <td className="py-3 px-3.5 font-semibold text-slate-800 whitespace-nowrap">{rec.employeeNameSnapshot}</td>
+                      <td className="py-3 px-3.5 text-slate-600 whitespace-nowrap">
                         {rec.floorIdSnapshot} • {rec.departmentIdSnapshot}
                       </td>
-                      <td className="py-3 px-3.5">
+                      <td className="py-3 px-3.5 whitespace-nowrap">
                         <span className="font-semibold text-slate-800 block">{rec.shiftNameSnapshot}</span>
                         <span className="text-[10px] text-slate-400 font-mono">{rec.shiftDate}</span>
                       </td>
@@ -622,6 +626,9 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
                       <td className="py-3 px-3.5 font-mono text-slate-700 whitespace-nowrap">
                         {metrics.scheduledStartDisplay}
                       </td>
+                      <td className="py-3 px-3.5 font-mono text-slate-700 whitespace-nowrap">
+                        {metrics.scheduledEndDisplay}
+                      </td>
                       <td className="py-3 px-3.5 font-mono text-emerald-700 font-semibold whitespace-nowrap">
                         {formatTimeDisplay(rec.firstPunchIn || rec.punchIn)}
                       </td>
@@ -635,13 +642,38 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
                         )}
                       </td>
                       <td className="py-3 px-3.5 font-mono font-semibold whitespace-nowrap">
-                        {!metrics.isOpen && (rec.lastPunchOut || rec.actualPunchOut) ? (
-                          <span className="text-blue-700">{formatTimeDisplay(rec.lastPunchOut || rec.actualPunchOut)}</span>
-                        ) : !metrics.isOpen && rec.punchOutType === 'AUTO' ? (
-                          <span className="text-orange-700">{formatTimeDisplay(rec.effectivePunchOut)} (Auto)</span>
-                        ) : (
+                        {metrics.isOpen ? (
                           <span className="text-sky-700">In Progress</span>
+                        ) : metrics.actualPunchOutIso ? (
+                          <span className="text-blue-700">{metrics.actualPunchOutDisplay}</span>
+                        ) : (
+                          <span className="text-slate-400">N/A</span>
                         )}
+                      </td>
+                      <td className="py-3 px-3.5 font-mono whitespace-nowrap">
+                        {metrics.isCurrentlyAutoClosed ? (
+                          <span className="font-bold text-purple-700">{metrics.autoCloseTimeDisplay}</span>
+                        ) : (
+                          <span className="text-slate-400">N/A</span>
+                        )}
+                      </td>
+                      <td className="py-3 px-3.5 font-mono text-[11px] whitespace-nowrap">
+                        {metrics.isCurrentlyAutoClosed && metrics.autoCloseRecordedAtDisplay !== 'N/A' ? (
+                          <span className="text-slate-700">{metrics.autoCloseRecordedAtDisplay}</span>
+                        ) : (
+                          <span className="text-slate-400">N/A</span>
+                        )}
+                      </td>
+                      <td className="py-3 px-3.5 whitespace-nowrap">
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                          metrics.punchOutTypeResolved === 'AUTO'
+                            ? 'bg-purple-100 text-purple-800 border border-purple-200'
+                            : metrics.punchOutTypeResolved === 'ACTUAL'
+                              ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                              : 'bg-slate-100 text-slate-600 border border-slate-200'
+                        }`}>
+                          {metrics.punchOutTypeResolved}
+                        </span>
                       </td>
                       <td className="py-3 px-3.5">
                         <button
@@ -653,10 +685,10 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
                           <span>{punchCount} Event{punchCount !== 1 ? 's' : ''}</span>
                         </button>
                       </td>
-                      <td className="py-3 px-3.5 font-mono whitespace-nowrap">
+                      <td className="py-3 px-3.5 font-mono whitespace-nowrap tabular-nums">
                         {metrics.isOpen ? (
                           <div>
-                            <span className="font-bold text-slate-400 block">00:00 Hours</span>
+                            <span className="font-bold text-slate-400 block">00:00</span>
                             <span className="text-[10px] font-semibold text-sky-700 block">
                               Elapsed: {formatDurationClock(metrics.accumulatedDutyMinutes)}
                             </span>
@@ -664,13 +696,11 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
                         ) : (
                           <div>
                             <span className="font-bold text-slate-800 block">
-                              {formatDurationClock(metrics.completedDutyMinutes)} Hours
+                              {formatDurationClock(metrics.regularDutyMinutes)}
                             </span>
-                            {metrics.overtimeMinutes > 0 && (
-                              <span className="text-[10px] text-slate-500 block">
-                                Std: {formatDurationClock(metrics.regularDutyMinutes)}
-                              </span>
-                            )}
+                            <span className="text-[10px] text-slate-500 block">
+                              Total: {formatDurationClock(metrics.completedDutyMinutes)}
+                            </span>
                           </div>
                         )}
                       </td>
@@ -958,23 +988,45 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
                     </span>
                   </div>
                   <div>
-                    <span className="text-[10px] text-slate-400 font-semibold uppercase block">Actual Punch In</span>
+                    <span className="text-[10px] text-slate-400 font-semibold uppercase block">Scheduled Shift End</span>
+                    <span className="font-mono font-bold text-slate-700">
+                      {modalMetrics.scheduledEndDisplay}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-slate-400 font-semibold uppercase block">Actual Punch-In</span>
                     <span className="font-mono font-bold text-emerald-700">
                       {formatTimeDisplay(viewingPunchesRecord.firstPunchIn || viewingPunchesRecord.punchIn)}
                     </span>
                   </div>
                   <div>
-                    <span className="text-[10px] text-slate-400 font-semibold uppercase block">Early Arrival Duration</span>
-                    <span className="font-mono font-bold text-sky-700">
-                      {formatDurationClock(modalMetrics.earlyArrivalMinutes)}
+                    <span className="text-[10px] text-slate-400 font-semibold uppercase block">Actual Punch-Out</span>
+                    <span className="font-mono font-bold text-blue-700">
+                      {modalMetrics.actualPunchOutDisplay}
                     </span>
                   </div>
                   <div>
-                    <span className="text-[10px] text-slate-400 font-semibold uppercase block">Official Last Out</span>
-                    <span className="font-mono font-bold text-blue-700">
-                      {modalMetrics.isOpen
-                        ? 'In Progress'
-                        : formatTimeDisplay(viewingPunchesRecord.lastPunchOut || viewingPunchesRecord.actualPunchOut || viewingPunchesRecord.effectivePunchOut)}
+                    <span className="text-[10px] text-purple-600 font-semibold uppercase block">Auto-Close Time</span>
+                    <span className={`font-mono font-bold ${modalMetrics.isCurrentlyAutoClosed ? 'text-purple-700' : 'text-slate-400'}`}>
+                      {modalMetrics.autoCloseTimeDisplay}
+                    </span>
+                  </div>
+                  <div className="col-span-2">
+                    <span className="text-[10px] text-purple-600 font-semibold uppercase block">Auto-Close Recorded At</span>
+                    <span className={`font-mono text-[11px] font-semibold ${modalMetrics.isCurrentlyAutoClosed && modalMetrics.autoCloseRecordedAtDisplay !== 'N/A' ? 'text-slate-800' : 'text-slate-400'}`}>
+                      {modalMetrics.autoCloseRecordedAtDisplay}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-slate-400 font-semibold uppercase block">Punch-Out Type</span>
+                    <span className="font-mono font-bold text-slate-800">
+                      {modalMetrics.punchOutTypeResolved}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-slate-400 font-semibold uppercase block">Early Arrival</span>
+                    <span className="font-mono font-bold text-sky-700">
+                      {formatDurationClock(modalMetrics.earlyArrivalMinutes)}
                     </span>
                   </div>
                   <div>
@@ -994,22 +1046,27 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
                     </span>
                   </div>
                   <div>
-                    <span className="text-[10px] text-slate-400 font-semibold uppercase block">Total OT</span>
-                    <span className="font-mono font-bold text-indigo-700">
-                      {!modalMetrics.isOpen && modalMetrics.overtimeMinutes > 0 ? modalMetrics.otLabel : '00:00'}
-                    </span>
-                  </div>
-                  <div>
                     <span className="text-[10px] text-slate-400 font-semibold uppercase block">Status</span>
                     <span className={`inline-block mt-0.5 px-2 py-0.5 rounded text-[10px] font-bold ${getAttendanceStatusBadgeClasses(modalMetrics.status)}`}>
                       {modalMetrics.status}
                     </span>
                     {modalMetrics.reconciledFromAutoClose && (
                       <span className="block text-[9px] font-semibold text-indigo-700 mt-0.5">
-                        Reconciled from Auto-Close
+                        Reconciled to ACTUAL
                       </span>
                     )}
                   </div>
+                  {modalMetrics.reconciledFromAutoClose && (
+                    <div className="col-span-2 sm:col-span-4 bg-indigo-50 border border-indigo-200 rounded-lg p-2.5 text-[11px] text-indigo-950">
+                      <div className="font-bold text-indigo-900">
+                        Preserved Historical Auto-Close Audit Event
+                      </div>
+                      <div className="mt-0.5 text-indigo-800 flex flex-wrap gap-x-4 gap-y-0.5 font-mono text-[10px]">
+                        <span>Prior Auto-Close Time: <strong>{modalMetrics.historicalAutoCloseTimeDisplay}</strong></span>
+                        <span>Recorded At: <strong>{modalMetrics.historicalAutoCloseRecordedAtDisplay}</strong></span>
+                      </div>
+                    </div>
+                  )}
                   {modalMetrics.punchOutSchedule && (
                     <div className="col-span-2 sm:col-span-4 pt-2.5 mt-1 border-t border-slate-200 grid grid-cols-2 sm:grid-cols-3 gap-2">
                       <div>
@@ -1133,6 +1190,35 @@ export const AttendanceHistory: React.FC<AttendanceHistoryProps> = ({
                   )}
                 </div>
               )}
+              {(() => {
+                const timelineMetrics = resolveAttendanceMetrics(viewingPunchesRecord, nowMs);
+                if (!timelineMetrics.isCurrentlyAutoClosed) return null;
+                return (
+                  <div className="p-3 rounded-xl border bg-purple-50/70 border-purple-200 text-purple-950 flex items-center justify-between text-xs">
+                    <div className="flex items-center gap-3">
+                      <div className="w-7 h-7 rounded-lg bg-purple-600 text-white flex items-center justify-center font-bold text-[10px]">
+                        AUTO
+                      </div>
+                      <div>
+                        <div className="font-bold text-purple-800 flex items-center gap-1">
+                          <Clock className="w-3.5 h-3.5" /> PROVISIONAL AUTO-CLOSE
+                        </div>
+                        <div className="text-[11px] text-purple-700 mt-0.5">
+                          Recorded At: {timelineMetrics.autoCloseRecordedAtDisplay}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <div className="font-mono font-bold text-sm text-purple-900">
+                        {timelineMetrics.autoCloseTimeDisplay}
+                      </div>
+                      <div className="text-[10px] text-purple-600 font-semibold">
+                        Scheduled Shift End
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
 
             {/* Modal Footer */}

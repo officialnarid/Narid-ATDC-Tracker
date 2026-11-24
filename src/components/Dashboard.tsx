@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import { getSafeErrorText } from '../services/errorHandlingService';
 import { 
   Users, 
   UserCheck, 
@@ -13,6 +14,8 @@ import {
   AlertTriangle, 
   CheckCircle2, 
   ChevronRight, 
+  ChevronDown,
+  Search,
   X, 
   FileSpreadsheet, 
   RefreshCw,
@@ -39,6 +42,12 @@ import {
   getAttendanceStatusBadgeClasses,
   resolveAttendanceMetrics,
 } from '../utils/attendanceStatus';
+import {
+  PRIMARY_ATTENDANCE_REPORT_COLUMNS,
+  buildStandardAttendanceRow,
+  computeAttendanceReportSummary,
+} from '../utils/attendanceReportBuilder';
+import { downloadPremiumExcelWorkbook } from '../utils/excelReportExporter';
 import { 
   DashboardCardId, 
   DashboardSectionId,
@@ -112,6 +121,9 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
   // Drilldown modal state
   const [drilldownTitle, setDrilldownTitle] = useState<string | null>(null);
+  const [drilldownCardId, setDrilldownCardId] = useState<string | null>(null);
+  const [drilldownSearch, setDrilldownSearch] = useState<string>('');
+  const [expandedAutoCloseRowId, setExpandedAutoCloseRowId] = useState<string | null>(null);
   const [drilldownEmployees, setDrilldownEmployees] = useState<{
     employee: Employee;
     attendance?: AttendanceRecord;
@@ -168,7 +180,12 @@ export const Dashboard: React.FC<DashboardProps> = ({
       setLoading(false);
     }, (err) => {
       console.error('[Dashboard] Real-time attendance error:', err);
-      setAttendanceError(err?.message || 'Unable to synchronize attendance stream.');
+      setAttendanceError(
+        getSafeErrorText(err, {
+          moduleName: 'Dashboard',
+          dbOperationCategory: 'read',
+        })
+      );
       setLoading(false);
     });
 
@@ -281,11 +298,15 @@ export const Dashboard: React.FC<DashboardProps> = ({
       if (a.currentState === 'OUTSIDE' || !!a.actualPunchOut || a.punchOutType === 'ACTUAL') {
         currentlyOutsideCount++;
       }
-      if (a.punchOutType === 'AUTO' || a.autoClosed) autoClosedCount++;
-      if (a.missedPunchOut || a.attendanceStatus === 'MISSED PUNCH OUT' || a.punchOutType === 'AUTO') {
+      const resolved = resolveAttendanceMetrics(a);
+      if (resolved.isCurrentlyAutoClosed) autoClosedCount++;
+      if (
+        resolved.isCurrentlyAutoClosed ||
+        (a.missedPunchOut && a.punchOutType !== 'ACTUAL') ||
+        a.attendanceStatus === 'MISSED PUNCH OUT'
+      ) {
         missedPunchOutCount++;
       }
-      const resolved = resolveAttendanceMetrics(a);
       if (!resolved.isOpen) {
         totalDutyMinutes += resolved.completedDutyMinutes;
         totalOtMinutes += resolved.overtimeMinutes;
@@ -426,6 +447,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
       .filter(item => filterFn(item.employee, item.attendance));
 
     setDrilldownTitle(title);
+    setDrilldownCardId(source.type === 'card' ? source.cardId : source.sectionId);
     setDrilldownEmployees(list);
   };
 
@@ -586,7 +608,13 @@ export const Dashboard: React.FC<DashboardProps> = ({
         return (
           <div 
             key="auto_closed"
-            onClick={() => handleOpenDrilldown({ type: 'card', cardId: 'auto_closed' }, 'Auto-Closed Attendance', (emp, att) => att?.punchOutType === 'AUTO' || !!att?.autoClosed)}
+            onClick={() =>
+              handleOpenDrilldown(
+                { type: 'card', cardId: 'auto_closed' },
+                'Auto-Closed Attendance',
+                (emp, att) => !!att && resolveAttendanceMetrics(att).isCurrentlyAutoClosed
+              )
+            }
             className="bg-purple-50/50 p-3.5 rounded-xl border border-purple-200 shadow-2xs hover:border-purple-400 cursor-pointer transition"
           >
             <div className="text-[11px] font-semibold text-purple-800 uppercase">Auto Closed</div>
@@ -599,7 +627,17 @@ export const Dashboard: React.FC<DashboardProps> = ({
         return (
           <div 
             key="missed_punch_out"
-            onClick={() => handleOpenDrilldown({ type: 'card', cardId: 'missed_punch_out' }, 'Missed Punch Out', (emp, att) => !!att?.missedPunchOut || att?.attendanceStatus === 'MISSED PUNCH OUT')}
+            onClick={() =>
+              handleOpenDrilldown(
+                { type: 'card', cardId: 'missed_punch_out' },
+                'Missed Punch Out',
+                (emp, att) =>
+                  !!att &&
+                  (resolveAttendanceMetrics(att).isCurrentlyAutoClosed ||
+                    (!!att.missedPunchOut && att.punchOutType !== 'ACTUAL') ||
+                    att.attendanceStatus === 'MISSED PUNCH OUT')
+              )
+            }
             className="bg-orange-50/50 p-3.5 rounded-xl border border-orange-200 shadow-2xs hover:border-orange-400 cursor-pointer transition"
           >
             <div className="text-[11px] font-semibold text-orange-800 uppercase">Missed Punch Out</div>
@@ -1118,16 +1156,273 @@ export const Dashboard: React.FC<DashboardProps> = ({
       })()}
 
       {/* DRILLDOWN MODAL */}
-      {drilldownTitle && (
+      {drilldownTitle && (() => {
+        const isAutoClosePopup =
+          drilldownCardId === 'auto_closed' || drilldownCardId === 'missed_punch_out';
+        const q = drilldownSearch.trim().toLowerCase();
+        const visibleDrilldownEmployees = q
+          ? drilldownEmployees.filter(({ employee }) =>
+              employee.employeeId.toLowerCase().includes(q) ||
+              employee.employeeName.toLowerCase().includes(q) ||
+              employee.floor.toLowerCase().includes(q) ||
+              employee.department.toLowerCase().includes(q)
+            )
+          : drilldownEmployees;
+
+        const closeDrilldown = () => {
+          setDrilldownTitle(null);
+          setDrilldownCardId(null);
+          setDrilldownSearch('');
+          setExpandedAutoCloseRowId(null);
+        };
+
+        const handleExportAutoClosePopupExcel = async () => {
+          const attendanceList = visibleDrilldownEmployees
+            .map((item) => item.attendance)
+            .filter((rec): rec is AttendanceRecord => Boolean(rec));
+          if (attendanceList.length === 0) return;
+          const exportRows = attendanceList.map((rec) => buildStandardAttendanceRow(rec));
+          const summary = computeAttendanceReportSummary(exportRows);
+          await downloadPremiumExcelWorkbook({
+            rows: exportRows,
+            columns: PRIMARY_ATTENDANCE_REPORT_COLUMNS,
+            fileName: `NARID_Auto_Closed_Attendance_${selectedDate}`,
+            reportTitle: 'Auto-Closed Attendance Report',
+            periodLabel: selectedDate,
+            sheetName: 'Auto-Closed Attendance',
+            summary,
+          });
+        };
+
+        if (isAutoClosePopup) {
+          return (
+            <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-5">
+              <div className="bg-white rounded-xl max-w-[96vw] xl:max-w-[1440px] w-full max-h-[88vh] flex flex-col shadow-2xl border border-slate-200 overflow-hidden">
+                {/* Enterprise Modal Header */}
+                <div className="px-5 py-4 bg-white border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <div className="flex items-center gap-2.5">
+                      <h3 className="text-base font-bold text-slate-900 tracking-tight">
+                        {drilldownTitle}
+                      </h3>
+                      <span className="px-2 py-0.5 rounded text-[11px] font-semibold bg-amber-50 text-amber-800 border border-amber-200 tabular-nums">
+                        {visibleDrilldownEmployees.length} of {drilldownEmployees.length}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      Actual working duration up to Scheduled Shift End • Asia/Kolkata (IST) • Click any row for shift details
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="relative">
+                      <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                      <input
+                        type="text"
+                        value={drilldownSearch}
+                        onChange={(e) => setDrilldownSearch(e.target.value)}
+                        placeholder="Search ID, name, line, dept..."
+                        aria-label="Search auto-closed attendance records"
+                        className="pl-8 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded-md text-slate-800 w-56 focus:outline-hidden focus:ring-2 focus:ring-slate-900/15 focus:border-slate-400"
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleExportAutoClosePopupExcel}
+                      disabled={visibleDrilldownEmployees.length === 0}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold transition cursor-pointer disabled:opacity-50"
+                    >
+                      <FileSpreadsheet className="w-3.5 h-3.5" />
+                      <span>Export Excel</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={closeDrilldown}
+                      aria-label="Close Auto-Closed Attendance popup"
+                      className="p-1.5 rounded-md hover:bg-slate-100 text-slate-500 hover:text-slate-800 cursor-pointer transition"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Clean 14-Primary-Column Enterprise Table */}
+                <div className="flex-1 overflow-auto">
+                  <table className="w-full text-left text-xs border-collapse">
+                    <thead className="bg-[#1B365D] text-white uppercase text-[11px] font-semibold tracking-wide sticky top-0 z-10">
+                      <tr>
+                        <th className="py-3 pl-3 pr-1 w-7" aria-label="Expand details" />
+                        <th className="py-3 px-3 whitespace-nowrap">Employee ID</th>
+                        <th className="py-3 px-3 whitespace-nowrap">Name</th>
+                        <th className="py-3 px-3 whitespace-nowrap">Line</th>
+                        <th className="py-3 px-3 whitespace-nowrap">Department</th>
+                        <th className="py-3 px-3 whitespace-nowrap text-center">Scheduled Shift Start</th>
+                        <th className="py-3 px-3 whitespace-nowrap text-center">Scheduled Shift End</th>
+                        <th className="py-3 px-3 whitespace-nowrap text-center">Actual Punch-In</th>
+                        <th className="py-3 px-3 whitespace-nowrap text-center">Actual Punch-Out</th>
+                        <th className="py-3 px-3 whitespace-nowrap text-center">Auto-Close Time</th>
+                        <th className="py-3 px-3 whitespace-nowrap text-center">Auto-Close Recorded At</th>
+                        <th className="py-3 px-3 whitespace-nowrap text-center">Attendance Status</th>
+                        <th className="py-3 px-3 whitespace-nowrap text-right">Duty Hours</th>
+                        <th className="py-3 px-3 whitespace-nowrap text-right">OT Hours</th>
+                        <th className="py-3 px-3 whitespace-nowrap text-right">Total Working Hours</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-200/80">
+                      {visibleDrilldownEmployees.length === 0 ? (
+                        <tr>
+                          <td colSpan={15} className="py-10 text-center text-slate-400">
+                            No matching auto-closed attendance records found.
+                          </td>
+                        </tr>
+                      ) : (
+                        visibleDrilldownEmployees.map(({ employee, attendance, status }, idx) => {
+                          const resolved = attendance ? resolveAttendanceMetrics(attendance) : null;
+                          const rowKey = attendance?.id || employee.employeeId;
+                          const isExpanded = expandedAutoCloseRowId === rowKey;
+                          const dutyStr = resolved ? formatDurationClock(resolved.isOpen ? 0 : resolved.regularDutyMinutes) : '00:00';
+                          const otStr = resolved ? formatDurationClock(resolved.isOpen ? 0 : resolved.overtimeMinutes) : '00:00';
+                          const totalWorkingStr = resolved ? formatDurationClock(resolved.isOpen ? 0 : resolved.completedDutyMinutes) : '00:00';
+                          const actualOutStr = resolved && resolved.actualPunchOutIso ? resolved.actualPunchOutDisplay : 'N/A';
+
+                          return (
+                            <React.Fragment key={rowKey}>
+                              <tr
+                                onClick={() => setExpandedAutoCloseRowId(isExpanded ? null : rowKey)}
+                                className={`${idx % 2 === 1 ? 'bg-slate-50/70' : 'bg-white'} hover:bg-blue-50/50 transition cursor-pointer`}
+                              >
+                                <td className="py-2.5 pl-3 pr-1 text-slate-400">
+                                  {isExpanded ? (
+                                    <ChevronDown className="w-3.5 h-3.5 text-slate-700" />
+                                  ) : (
+                                    <ChevronRight className="w-3.5 h-3.5" />
+                                  )}
+                                </td>
+                                <td className="py-2.5 px-3 font-mono font-bold text-slate-900 whitespace-nowrap tabular-nums">
+                                  {employee.employeeId}
+                                </td>
+                                <td className="py-2.5 px-3 font-medium text-slate-900 whitespace-nowrap">
+                                  {employee.employeeName}
+                                </td>
+                                <td className="py-2.5 px-3 text-slate-700 whitespace-nowrap">
+                                  {attendance?.floorIdSnapshot || employee.floor}
+                                </td>
+                                <td className="py-2.5 px-3 text-slate-700 whitespace-nowrap">
+                                  {attendance?.departmentIdSnapshot || employee.department}
+                                </td>
+                                <td className="py-2.5 px-3 font-mono text-slate-600 text-center whitespace-nowrap tabular-nums">
+                                  {resolved ? resolved.scheduledStartDisplay : 'N/A'}
+                                </td>
+                                <td className="py-2.5 px-3 font-mono text-slate-600 text-center whitespace-nowrap tabular-nums">
+                                  {resolved ? resolved.scheduledEndDisplay : 'N/A'}
+                                </td>
+                                <td className="py-2.5 px-3 font-mono font-semibold text-emerald-700 text-center whitespace-nowrap tabular-nums">
+                                  {attendance ? formatTimeDisplay(attendance.firstPunchIn || attendance.punchIn) : 'N/A'}
+                                </td>
+                                <td className="py-2.5 px-3 font-mono text-center whitespace-nowrap tabular-nums">
+                                  {actualOutStr === 'N/A' ? (
+                                    <span className="text-slate-400">N/A</span>
+                                  ) : (
+                                    <span className="font-semibold text-blue-700">{actualOutStr}</span>
+                                  )}
+                                </td>
+                                <td className="py-2.5 px-3 font-mono font-bold text-amber-800 text-center whitespace-nowrap tabular-nums">
+                                  {resolved ? resolved.autoCloseTimeDisplay : 'N/A'}
+                                </td>
+                                <td className="py-2.5 px-3 font-mono text-[11px] text-slate-600 text-center whitespace-nowrap tabular-nums">
+                                  {resolved ? resolved.autoCloseRecordedAtDisplay : 'N/A'}
+                                </td>
+                                <td className="py-2.5 px-3 text-center whitespace-nowrap">
+                                  <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wide ${getAttendanceStatusBadgeClasses(resolved?.status || status)}`}>
+                                    {resolved?.status || status}
+                                  </span>
+                                </td>
+                                <td className="py-2.5 px-3 font-mono font-semibold text-slate-800 text-right whitespace-nowrap tabular-nums">
+                                  {dutyStr}
+                                </td>
+                                <td className="py-2.5 px-3 font-mono text-right whitespace-nowrap tabular-nums">
+                                  <span className={otStr !== '00:00' ? 'font-bold text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded' : 'text-slate-400'}>
+                                    {otStr}
+                                  </span>
+                                </td>
+                                <td className="py-2.5 px-3 font-mono font-bold text-slate-900 text-right whitespace-nowrap tabular-nums">
+                                  {totalWorkingStr}
+                                </td>
+                              </tr>
+                              {isExpanded && attendance && resolved && (
+                                <tr className="bg-slate-50 border-b border-slate-200">
+                                  <td colSpan={15} className="px-8 py-3">
+                                    <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-[11px] text-slate-600">
+                                      <div>
+                                        <span className="text-slate-400 uppercase font-semibold mr-1.5">Attendance Date:</span>
+                                        <span className="font-mono font-semibold text-slate-800">{attendance.shiftDate}</span>
+                                      </div>
+                                      <div>
+                                        <span className="text-slate-400 uppercase font-semibold mr-1.5">Shift:</span>
+                                        <span className="font-semibold text-slate-800">{attendance.shiftNameSnapshot}</span>
+                                      </div>
+                                      <div>
+                                        <span className="text-slate-400 uppercase font-semibold mr-1.5">Section:</span>
+                                        <span className="font-semibold text-slate-800">{attendance.sectionIdSnapshot}</span>
+                                      </div>
+                                      <div>
+                                        <span className="text-slate-400 uppercase font-semibold mr-1.5">Punch-Out Type:</span>
+                                        <span className="font-mono font-semibold text-amber-800">{resolved.punchOutTypeResolved}</span>
+                                      </div>
+                                      <div>
+                                        <span className="text-slate-400 uppercase font-semibold mr-1.5">Early Arrival:</span>
+                                        <span className="font-mono font-semibold text-slate-800">
+                                          {formatDurationClock(resolved.earlyArrivalMinutes)}
+                                        </span>
+                                      </div>
+                                      {attendance.autoCloseEventId && (
+                                        <div>
+                                          <span className="text-slate-400 uppercase font-semibold mr-1.5">Audit Event:</span>
+                                          <span className="font-mono text-slate-700">{attendance.autoCloseEventId}</span>
+                                        </div>
+                                      )}
+                                    </div>
+                                  </td>
+                                </tr>
+                              )}
+                            </React.Fragment>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Footer */}
+                <div className="px-5 py-3 border-t border-slate-200 bg-slate-50 flex items-center justify-between text-xs text-slate-500">
+                  <span>
+                    Provisional auto-close records automatically reconcile when an employee performs a genuine Punch-Out.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={closeDrilldown}
+                    className="bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs px-4 py-1.5 rounded-md font-semibold cursor-pointer transition"
+                  >
+                    Close
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        }
+
+        return (
         <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-xl max-w-6xl w-full max-h-[85vh] flex flex-col shadow-2xl border border-slate-200">
+          <div className="bg-white rounded-xl max-w-7xl w-full max-h-[85vh] flex flex-col shadow-2xl border border-slate-200">
             <div className="p-4 border-b border-slate-200 flex items-center justify-between">
               <div>
                 <h3 className="text-base font-bold text-slate-900">{drilldownTitle}</h3>
-                <p className="text-xs text-slate-500">Showing {drilldownEmployees.length} employees</p>
+                <p className="text-xs text-slate-500">
+                  Showing {drilldownEmployees.length} employee{drilldownEmployees.length === 1 ? '' : 's'}
+                </p>
               </div>
               <button
-                onClick={() => setDrilldownTitle(null)}
+                onClick={closeDrilldown}
                 className="p-1 rounded hover:bg-slate-100 text-slate-500 cursor-pointer"
               >
                 <X className="w-5 h-5" />
@@ -1136,129 +1431,170 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
             <div className="p-4 flex-1 overflow-y-auto overflow-x-auto">
               <table className="w-full text-left text-xs">
-                <thead className="bg-slate-50 text-slate-600 uppercase font-semibold border-y border-slate-200">
+                <thead className="bg-slate-50 text-slate-600 uppercase font-semibold border-y border-slate-200 sticky top-0">
                   <tr>
-                    <th className="py-2 px-3">Emp ID</th>
-                    <th className="py-2 px-3">Name</th>
-                    <th className="py-2 px-3">Line / Dept</th>
-                    <th className="py-2 px-3">Scheduled Start</th>
-                    <th className="py-2 px-3">Actual Punch In</th>
-                    <th className="py-2 px-3">Early Arrival</th>
-                    <th className="py-2 px-3">Status</th>
-                    {canShowOtHours && (
-                      <>
-                        <th className="py-2 px-3 text-right">Early OT</th>
-                        <th className="py-2 px-3 text-right">Post-shift OT</th>
-                      </>
+                    <th className="py-2 px-3 whitespace-nowrap">Emp ID</th>
+                    <th className="py-2 px-3 whitespace-nowrap">Name</th>
+                    <th className="py-2 px-3 whitespace-nowrap">Line / Dept</th>
+                    <th className="py-2 px-3 whitespace-nowrap">Shift</th>
+                    <th className="py-2 px-3 whitespace-nowrap">Scheduled Shift Start</th>
+                    <th className="py-2 px-3 whitespace-nowrap">Scheduled Shift End</th>
+                    <th className="py-2 px-3 whitespace-nowrap">Actual Punch-In</th>
+                    <th className="py-2 px-3 whitespace-nowrap">Punch-Out / Auto-Close</th>
+                    <th className="py-2 px-3 whitespace-nowrap">Early Arrival</th>
+                    <th className="py-2 px-3 whitespace-nowrap">Attendance Status</th>
+                    {canShowDutyHours && (
+                      <th className="py-2 px-3 text-right whitespace-nowrap">Duty Hours</th>
                     )}
-                    <th className="py-2 px-3 text-right">
-                      {canShowDutyHours && canShowOtHours
-                        ? 'Duty / Total OT'
-                        : canShowDutyHours
-                          ? 'Duty'
-                          : canShowOtHours
-                            ? 'Total OT'
-                            : 'Attendance'}
-                    </th>
+                    {canShowOtHours && (
+                      <th className="py-2 px-3 text-right whitespace-nowrap">OT Hours</th>
+                    )}
+                    {canShowDutyHours && (
+                      <th className="py-2 px-3 text-right whitespace-nowrap">Total Working Hours</th>
+                    )}
+                    {!canShowDutyHours && !canShowOtHours && (
+                      <th className="py-2 px-3 text-right whitespace-nowrap">Attendance</th>
+                    )}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {drilldownEmployees.map(({ employee, attendance, status }) => {
+                  {drilldownEmployees.length === 0 ? (
+                    <tr>
+                      <td colSpan={14} className="py-8 text-center text-slate-400">
+                        No matching employees for this view.
+                      </td>
+                    </tr>
+                  ) : (
+                  drilldownEmployees.map(({ employee, attendance, status }) => {
                     const resolved = attendance ? resolveAttendanceMetrics(attendance) : null;
                     return (
                       <tr key={employee.employeeId} className="hover:bg-slate-50">
-                        <td className="py-2 px-3 font-mono font-bold text-slate-800">{employee.employeeId}</td>
-                        <td className="py-2 px-3 font-medium text-slate-900">{employee.employeeName}</td>
-                        <td className="py-2 px-3 text-slate-600">{employee.floor} • {employee.department}</td>
+                        <td className="py-2 px-3 font-mono font-bold text-slate-800 whitespace-nowrap">{employee.employeeId}</td>
+                        <td className="py-2 px-3 font-medium text-slate-900 whitespace-nowrap">{employee.employeeName}</td>
+                        <td className="py-2 px-3 text-slate-600 whitespace-nowrap">{employee.floor} • {employee.department}</td>
+                        <td className="py-2 px-3 text-slate-700 whitespace-nowrap">
+                          {attendance ? (
+                            <div>
+                              <span className="font-semibold block">{attendance.shiftNameSnapshot}</span>
+                              <span className="text-[10px] font-mono text-slate-400">{attendance.shiftDate}</span>
+                            </div>
+                          ) : (
+                            <span className="text-slate-400">--</span>
+                          )}
+                        </td>
                         <td className="py-2 px-3 font-mono text-slate-600 whitespace-nowrap">
                           {attendance && resolved ? resolved.scheduledStartDisplay : '--'}
+                        </td>
+                        <td className="py-2 px-3 font-mono text-slate-600 whitespace-nowrap">
+                          {attendance && resolved ? resolved.scheduledEndDisplay : '--'}
                         </td>
                         <td className="py-2 px-3 font-mono text-emerald-700 font-semibold whitespace-nowrap">
                           {attendance ? formatTimeDisplay(attendance.firstPunchIn || attendance.punchIn) : '--'}
                         </td>
-                        <td className="py-2 px-3 font-mono text-sky-700 whitespace-nowrap">
-                          {attendance && resolved
-                            ? (resolved.earlyArrivalMinutes > 0 ? formatDurationClock(resolved.earlyArrivalMinutes) : '00:00')
-                            : '--'}
-                        </td>
-                        <td className="py-2 px-3">
-                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${getAttendanceStatusBadgeClasses(status)}`}>
-                            {status}
-                          </span>
-                        </td>
-                        {canShowOtHours && (
-                          <>
-                            <td className="py-2 px-3 text-right font-mono text-[11px] whitespace-nowrap">
-                              {attendance && resolved ? (
-                                resolved.isOpen ? (
-                                  resolved.provisionalEarlyOtMinutes > 0 ? (
-                                    <span className="text-amber-700 font-semibold">
-                                      {formatDurationClock(resolved.provisionalEarlyOtMinutes)} (Provisional)
-                                    </span>
-                                  ) : (
-                                    <span className="text-slate-400">00:00</span>
-                                  )
-                                ) : resolved.earlyOtMinutes > 0 ? (
-                                  <span className="text-emerald-700 font-bold">
-                                    {formatDurationClock(resolved.earlyOtMinutes)}
-                                  </span>
-                                ) : (
-                                  <span className="text-slate-400">00:00</span>
-                                )
-                              ) : (
-                                <span className="text-slate-400">--</span>
-                              )}
-                            </td>
-                            <td className="py-2 px-3 text-right font-mono text-[11px] whitespace-nowrap">
-                              {attendance && resolved ? (
-                                !resolved.isOpen && resolved.postShiftOtMinutes > 0 ? (
-                                  <span className="text-indigo-700 font-bold">
-                                    {formatDurationClock(resolved.postShiftOtMinutes)}
-                                  </span>
-                                ) : (
-                                  <span className="text-slate-400">00:00</span>
-                                )
-                              ) : (
-                                <span className="text-slate-400">--</span>
-                              )}
-                            </td>
-                          </>
-                        )}
-                        <td className="py-2 px-3 text-right font-mono text-[11px] whitespace-nowrap">
+                        <td className="py-2 px-3 font-mono whitespace-nowrap">
                           {attendance && resolved ? (
                             resolved.isOpen ? (
-                              <span className="text-sky-700">
-                                {canShowDutyHours ? `In Progress (${formatDurationClock(resolved.accumulatedDutyMinutes)})` : 'INSIDE'}
-                              </span>
-                            ) : (
-                              <span>
-                                {canShowDutyHours && (
-                                  <span>{formatDurationClock(resolved.completedDutyMinutes)}h</span>
-                                )}
-                                {canShowOtHours && resolved.overtimeMinutes > 0 && (
-                                  <span className={`text-indigo-700 font-bold ${canShowDutyHours ? 'ml-1.5' : ''}`}>
-                                    ({resolved.otLabel})
+                              <span className="text-sky-700 font-semibold">In Progress</span>
+                            ) : resolved.isCurrentlyAutoClosed ? (
+                              <div className="flex flex-col">
+                                <span className="font-bold text-amber-800">
+                                  {resolved.autoCloseTimeDisplay} (Auto)
+                                </span>
+                                {resolved.autoCloseRecordedAtDisplay !== 'N/A' && (
+                                  <span className="text-[10px] text-slate-500">
+                                    Rec: {resolved.autoCloseRecordedAtDisplay}
                                   </span>
                                 )}
-                                {!canShowDutyHours && (!canShowOtHours || resolved.overtimeMinutes <= 0) && (
-                                  <span className="text-slate-400">Recorded</span>
-                                )}
+                              </div>
+                            ) : (
+                              <span className="font-semibold text-blue-700">
+                                {resolved.actualPunchOutDisplay}
+                                <span className="ml-1 text-[10px] font-sans text-emerald-700">(ACTUAL)</span>
                               </span>
                             )
                           ) : (
                             <span className="text-slate-400">--</span>
                           )}
                         </td>
+                        <td className="py-2 px-3 font-mono text-sky-700 whitespace-nowrap">
+                          {attendance && resolved
+                            ? (resolved.earlyArrivalMinutes > 0 ? formatDurationClock(resolved.earlyArrivalMinutes) : '00:00')
+                            : '--'}
+                        </td>
+                        <td className="py-2 px-3 whitespace-nowrap">
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${getAttendanceStatusBadgeClasses(status)}`}>
+                            {status}
+                          </span>
+                        </td>
+                        {canShowDutyHours && (
+                          <td className="py-2 px-3 text-right font-mono text-[11px] whitespace-nowrap tabular-nums">
+                            {attendance && resolved ? (
+                              resolved.isOpen ? (
+                                <span className="text-sky-700">
+                                  00:00 ({formatDurationClock(resolved.accumulatedDutyMinutes)} elapsed)
+                                </span>
+                              ) : (
+                                <span className="font-semibold text-slate-800">
+                                  {formatDurationClock(resolved.regularDutyMinutes)}
+                                </span>
+                              )
+                            ) : (
+                              <span className="text-slate-400">--</span>
+                            )}
+                          </td>
+                        )}
+                        {canShowOtHours && (
+                          <td className="py-2 px-3 text-right font-mono text-[11px] whitespace-nowrap tabular-nums">
+                            {attendance && resolved ? (
+                              !resolved.isOpen && resolved.overtimeMinutes > 0 ? (
+                                <span className="text-indigo-700 font-bold">{formatDurationClock(resolved.overtimeMinutes)}</span>
+                              ) : (
+                                <span className="text-slate-400">00:00</span>
+                              )
+                            ) : (
+                              <span className="text-slate-400">--</span>
+                            )}
+                          </td>
+                        )}
+                        {canShowDutyHours && (
+                          <td className="py-2 px-3 text-right font-mono text-[11px] whitespace-nowrap tabular-nums">
+                            {attendance && resolved ? (
+                              resolved.isOpen ? (
+                                <span className="text-slate-400">00:00</span>
+                              ) : (
+                                <span className="font-bold text-slate-900">
+                                  {formatDurationClock(resolved.completedDutyMinutes)}
+                                </span>
+                              )
+                            ) : (
+                              <span className="text-slate-400">--</span>
+                            )}
+                          </td>
+                        )}
+                        {!canShowDutyHours && !canShowOtHours && (
+                          <td className="py-2 px-3 text-right font-mono text-[11px] whitespace-nowrap">
+                            {attendance && resolved ? (
+                              resolved.isOpen ? (
+                                <span className="text-sky-700">INSIDE</span>
+                              ) : (
+                                <span className="text-slate-400">Recorded</span>
+                              )
+                            ) : (
+                              <span className="text-slate-400">--</span>
+                            )}
+                          </td>
+                        )}
                       </tr>
                     );
-                  })}
+                  })
+                  )}
                 </tbody>
               </table>
             </div>
 
             <div className="p-3 border-t border-slate-200 bg-slate-50 flex justify-end">
               <button
-                onClick={() => setDrilldownTitle(null)}
+                onClick={closeDrilldown}
                 className="bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs px-4 py-2 rounded font-medium cursor-pointer"
               >
                 Close
@@ -1266,7 +1602,8 @@ export const Dashboard: React.FC<DashboardProps> = ({
             </div>
           </div>
         </div>
-      )}
+        );
+      })()}
     </div>
   );
 };

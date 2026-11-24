@@ -20,6 +20,7 @@ import {
   classifyCompletedDutyStatus,
   computeExpectedPunchOutTimes,
   EARLY_PUNCH_POLICY_ID,
+  evaluateAutoCloseDuty,
   evaluateEarlyPunchOnPunchIn,
   evaluateOptionAPunchOut,
   MAX_REGULAR_DUTY_MINUTES,
@@ -2365,17 +2366,26 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
         const shift = shiftsMap.get(record.shiftId);
         if (!shift) continue;
 
-        const scheduledEndIso = record.scheduledPunchOutIso || getShiftScheduledEndIso(record.shiftDate, shift);
+        const bounds = resolveShiftScheduleBounds(record.shiftDate, {
+          ...shift,
+          shiftId: record.shiftId,
+          shiftNameSnapshot: record.shiftNameSnapshot,
+          scheduledPunchIn: record.scheduledPunchIn || shift.startTime,
+          scheduledPunchOut: record.scheduledPunchOut || shift.endTime,
+        });
+        const scheduledStartIso = record.scheduledPunchInIso || bounds.scheduledStartIso;
+        const scheduledEndIso = record.scheduledPunchOutIso || bounds.scheduledEndIso;
         const scheduledEndDate = new Date(scheduledEndIso);
 
         if (now.getTime() >= scheduledEndDate.getTime()) {
-          const scheduledDuration = Math.min(
+          const maxShiftRegularDuration = Math.min(
             shift.scheduledDurationMinutes || settings.scheduledDurationMinutes || STANDARD_DUTY_MINUTES,
             MAX_REGULAR_DUTY_MINUTES
           );
           const docRef = db.collection('attendance').doc(record.id);
           const autoEventId = `pe_auto_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
           const autoDisplayTime = getKolkataTimeParts(scheduledEndDate).timeWithSeconds;
+          const autoCloseRecordedAtIso = now.toISOString();
 
           const updatedRecord = await withEmployeeScanLock(record.employeeId, () =>
             db.runTransaction(async (tx) => {
@@ -2392,12 +2402,21 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                 return null;
               }
 
+              const freshFirstInIso = fresh.firstPunchIn || fresh.punchIn;
+              const freshScheduledStartIso = fresh.scheduledPunchInIso || scheduledStartIso;
+              const autoDutyEval = evaluateAutoCloseDuty({
+                firstInIso: freshFirstInIso,
+                scheduledStartIso: freshScheduledStartIso,
+                scheduledEndIso,
+                standardDutyMinutes: maxShiftRegularDuration,
+              });
+
               const autoCloseEvent = {
                 id: autoEventId,
                 employeeId: fresh.employeeId,
                 employeeName: fresh.employeeNameSnapshot || '',
                 eventType: 'OUT',
-                timestamp: now.toISOString(),
+                timestamp: autoCloseRecordedAtIso,
                 effectivePunchOut: scheduledEndIso,
                 displayTime: autoDisplayTime,
                 shiftDate: fresh.shiftDate,
@@ -2408,7 +2427,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                 department: fresh.departmentIdSnapshot || '',
                 scannerType: 'OUT',
                 scannerDevice: 'SYSTEM_AUTO',
-                dutyDurationMinutes: scheduledDuration,
+                dutyDurationMinutes: autoDutyEval.regularDutyMinutes,
                 overtimeMinutes: 0,
                 earlyOtMinutes: 0,
                 postShiftOtMinutes: 0,
@@ -2419,8 +2438,11 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
 
               const next = {
                 ...fresh,
-                firstPunchIn: fresh.firstPunchIn || fresh.punchIn,
-                punchIn: fresh.punchIn || fresh.firstPunchIn,
+                firstPunchIn: freshFirstInIso,
+                punchIn: fresh.punchIn || freshFirstInIso,
+                scheduledPunchIn: fresh.scheduledPunchIn || bounds.startTime,
+                scheduledPunchInIso: freshScheduledStartIso,
+                scheduledPunchOut: fresh.scheduledPunchOut || bounds.endTime,
                 scheduledPunchOutIso: scheduledEndIso,
                 actualPunchOut: null,
                 lastPunchOut: null,
@@ -2430,18 +2452,19 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                 attendanceStatus: 'AUTO CLOSED',
                 missedPunchOut: true,
                 autoClosed: true,
-                autoClosedAt: now.toISOString(),
+                autoClosedAt: autoCloseRecordedAtIso,
                 autoCloseEventId: autoEventId,
                 autoCloseEffectivePunchOut: scheduledEndIso,
-                totalDutyMinutes: scheduledDuration,
-                regularDutyMinutes: scheduledDuration,
+                actualPresenceMinutes: autoDutyEval.actualPresenceMinutes,
+                totalDutyMinutes: autoDutyEval.totalDutyMinutes,
+                regularDutyMinutes: autoDutyEval.regularDutyMinutes,
                 overtimeMinutes: 0, // Strictly zero OT on auto-closed shifts
                 earlyOtMinutes: 0,
                 postShiftOtMinutes: 0,
                 totalOtMinutes: 0,
                 earlyOtFinalized: false,
                 otCapApplied: false,
-                updatedAt: now.toISOString(),
+                updatedAt: autoCloseRecordedAtIso,
               };
               tx.set(docRef, next);
               tx.set(db.collection('punch_events').doc(autoEventId), autoCloseEvent);
@@ -2461,7 +2484,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                 scannerDevice: 'SYSTEM_AUTO',
                 performedByUid: caller.uid,
                 performedByLoginId: caller.loginId,
-                message: `Provisional auto-close at scheduled shift end (${shift.endTime}). Status: AUTO CLOSED. OT: 00:00.`,
+                message: `Provisional auto-close at scheduled shift end (${shift.endTime}). Duty: ${formatMinutes(updatedRecord.regularDutyMinutes)}, Status: AUTO CLOSED. OT: 00:00.`,
               }),
               recordEnterpriseAuditEvent(db, {
                 req,
@@ -2473,7 +2496,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                 employeeId: record.employeeId,
                 targetType: 'ATTENDANCE',
                 targetId: record.id,
-                newValue: `Auto-closed at ${scheduledEndIso}, Duty: ${formatMinutes(scheduledDuration)}, OT: 00:00`,
+                newValue: `Auto-closed at ${scheduledEndIso}, Duty: ${formatMinutes(updatedRecord.regularDutyMinutes)}, OT: 00:00`,
                 actionSource: 'SYSTEM_SCHEDULER',
                 reason: 'Provisional auto-close at scheduled shift end (reconcilable by genuine Punch-Out)',
                 captureGeo: false,
@@ -2568,10 +2591,15 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           }
           let otCapApplied = Boolean(current.otCapApplied);
           if (punchOutType === 'AUTO') {
-            const rawPresence = Math.max(0, Math.floor((outTime - inTime) / (60 * 1000)));
-            actualPresenceMinutes = rawPresence;
-            regularDutyMinutes = Math.min(rawPresence, MAX_REGULAR_DUTY_MINUTES);
-            totalDutyMinutes = regularDutyMinutes;
+            const autoEval = evaluateAutoCloseDuty({
+              firstInIso,
+              scheduledStartIso,
+              scheduledEndIso: actualPunchOut || current.scheduledPunchOutIso || bounds.scheduledEndIso,
+              standardDutyMinutes: STANDARD_DUTY_MINUTES,
+            });
+            actualPresenceMinutes = autoEval.actualPresenceMinutes;
+            regularDutyMinutes = autoEval.regularDutyMinutes;
+            totalDutyMinutes = autoEval.totalDutyMinutes;
             overtimeMinutes = 0;
             earlyOtMinutes = 0;
             postShiftOtMinutes = 0;
@@ -2606,7 +2634,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
           ]);
           const finalAttendanceStatus =
             punchOutType === 'ACTUAL' && actualPunchOut && autoClassifySet.has(attendanceStatus)
-              ? classifyCompletedDutyStatus(totalDutyMinutes, STANDARD_DUTY_MINUTES)
+              ? classifyCompletedDutyStatus(totalDutyMinutes, STANDARD_DUTY_MINUTES, overtimeMinutes)
               : attendanceStatus;
 
           const updatedFields = {

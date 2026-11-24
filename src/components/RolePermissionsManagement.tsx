@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { getSafeErrorText } from '../services/errorHandlingService';
 import { 
   ShieldCheck, 
   CheckCircle2, 
@@ -366,7 +367,7 @@ export const RolePermissionsManagement: React.FC<RolePermissionsManagementProps>
       console.error('[RolePermissionsManagement] Save failed:', err);
       setStatusMessage({
         type: 'error',
-        text: err.message || 'Failed to update role permissions. Please try again.',
+        text: getSafeErrorText(err, { moduleName: 'Role Permissions', endpoint: '/api/admin/role-permissions' }),
       });
     } finally {
       setIsSaving(false);

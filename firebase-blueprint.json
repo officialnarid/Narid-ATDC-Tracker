@@ -437,6 +437,28 @@
         "result": { "type": "string", "enum": ["Allowed", "Blocked", "Updated"] }
       },
       "required": ["id", "actorUid", "actorRole", "eventType", "observedIp", "timestamp", "result"]
+    },
+    "TechnicalErrorLog": {
+      "title": "TechnicalErrorLog",
+      "description": "Protected server-authoritative technical diagnostic and Request ID traceability log",
+      "type": "object",
+      "properties": {
+        "errorId": { "type": "string", "maxLength": 128 },
+        "errorCode": { "type": "string", "maxLength": 32 },
+        "category": { "type": "string", "maxLength": 64 },
+        "severity": { "type": "string", "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"] },
+        "timestampUtc": { "type": "string", "format": "date-time" },
+        "timestampIst": { "type": "string", "maxLength": 64 },
+        "requestId": { "type": "string", "maxLength": 64 },
+        "errorEventId": { "type": "string", "maxLength": 64 },
+        "moduleName": { "type": "string", "maxLength": 80 },
+        "apiEndpoint": { "type": "string", "maxLength": 160 },
+        "httpStatus": { "type": "number" },
+        "rootCauseConfidence": { "type": "string", "enum": ["CONFIRMED", "SUSPECTED", "UNKNOWN"] },
+        "occurrenceCount": { "type": "number" },
+        "resolutionStatus": { "type": "string", "enum": ["OPEN", "INVESTIGATING", "RESOLVED"] }
+      },
+      "required": ["errorId", "errorCode", "category", "timestampUtc", "timestampIst", "resolutionStatus"]
     }
   },
   "firestore": {
@@ -543,6 +565,10 @@
     "/company_wifi_access_logs/{logId}": {
       "schema": "CompanyWifiAccessLog",
       "description": "Audit logs for Company Wi-Fi policy changes and blocked access attempts"
+    },
+    "/technical_error_logs/{errorId}": {
+      "schema": "TechnicalErrorLog",
+      "description": "Protected Admin technical diagnostic logs and Request ID traceability records"
     }
   }
 }

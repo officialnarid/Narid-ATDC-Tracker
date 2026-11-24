@@ -6,10 +6,15 @@ export interface Employee {
   employeeName: string;
   employeeType: EmployeeType;
   section: string; // e.g. MI, SMT, FATP, STORE
+  sectionId?: string;
   department: string; // e.g. Production, Quality, Store, PPC, R&D, Others
+  departmentId?: string;
   line?: string; // Production Line: MI-01, MI-02, FATP-STB, FATP-ITR, SMT-01
+  lineId?: string;
   floor: string; // Production Line identifier
+  floorId?: string;
   designation: string;
+  designationId?: string;
   qrCodeToken: string;
   employeeStatus: EmployeeStatus;
   createdAt: string;

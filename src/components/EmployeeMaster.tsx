@@ -1,4 +1,5 @@
 import React, { useState, useMemo } from 'react';
+import { getSafeErrorText, handleAppError } from '../services/errorHandlingService';
 import { 
   Users, 
   UserPlus, 
@@ -185,7 +186,7 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
       setIsFormOpen(false);
       onRefresh();
     } catch (err: any) {
-      setFormError(err.message || 'Failed to save employee.');
+      setFormError(getSafeErrorText(err, { moduleName: 'Employee Master', endpoint: '/api/employees' }));
     } finally {
       setIsSaving(false);
     }
@@ -197,7 +198,11 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
       await toggleEmployeeStatus(emp.employeeId, nextStatus);
       onRefresh();
     } catch (err: any) {
-      alert(`Error updating status: ${err.message}`);
+      handleAppError(err, {
+        moduleName: 'Employee Master',
+        endpoint: '/api/employees/status',
+        notifyGlobalToast: true,
+      });
     }
   };
 
@@ -220,7 +225,11 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
       setIsFormOpen(false);
       onRefresh();
     } catch (err: any) {
-      alert(`Failed to delete employee: ${err.message}`);
+      handleAppError(err, {
+        moduleName: 'Employee Master',
+        endpoint: '/api/employees/delete',
+        notifyGlobalToast: true,
+      });
     } finally {
       setIsDeleting(false);
     }
@@ -236,7 +245,12 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
         await handleOpenBadge({ ...viewEmployee, qrCodeToken: newToken });
       }
     } catch (err: any) {
-      alert(`Error regenerating token: ${err.message}`);
+      handleAppError(err, {
+        moduleName: 'Employee Master',
+        endpoint: '/api/employees/regenerate-qr',
+        forcedErrorCode: 'QR-001',
+        notifyGlobalToast: true,
+      });
     }
   };
 
@@ -352,7 +366,7 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
       setBulkSummary({
         type: 'error',
         title: 'Bulk Export Failed',
-        message: err?.message || 'Unable to export selected employees.',
+        message: getSafeErrorText(err, { moduleName: 'Employee Master', forcedErrorCode: 'FILE-002' }),
       });
     } finally {
       setBulkProgress(null);
@@ -423,7 +437,7 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
       setBulkSummary({
         type: 'error',
         title: 'Bulk QR ZIP Failed',
-        message: err?.message || 'Unable to package Employee QR Identity Cards.',
+        message: getSafeErrorText(err, { moduleName: 'Employee Master', forcedErrorCode: 'QR-001' }),
       });
     } finally {
       setBulkProgress(null);
@@ -532,7 +546,7 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
       setBulkSummary({
         type: 'error',
         title: `Bulk ${action} Blocked`,
-        message: err?.message || 'Permission or validation error while processing bulk action.',
+        message: getSafeErrorText(err, { moduleName: 'Employee Master', endpoint: '/api/employees/bulk' }),
       });
     } finally {
       setBulkProgress(null);

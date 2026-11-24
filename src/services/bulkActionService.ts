@@ -7,6 +7,8 @@ import {
 } from '../utils/qrIdentityCard';
 import { createZipBlob, ZipEntryInput } from '../utils/zipBuilder';
 import { reportUiActivity } from '../utils/perfMonitor';
+import { downloadPremiumExcelWorkbook } from '../utils/excelReportExporter';
+import type { AttendanceReportSummary } from '../utils/attendanceReportBuilder';
 
 export interface BulkExportColumn {
   header: string;
@@ -18,6 +20,10 @@ export interface BulkExportOptions {
   auditTargetType?: string;
   auditSource?: string;
   auditDescription?: string;
+  reportTitle?: string;
+  periodLabel?: string;
+  sheetName?: string;
+  summary?: AttendanceReportSummary | null;
 }
 
 export function buildTimestampSuffix(date = new Date()): string {
@@ -56,27 +62,25 @@ export async function exportChunkedToExcel(
     throw new Error('Select at least one record before exporting.');
   }
 
-  const XLSX = await import('xlsx');
   const CHUNK_SIZE = 250;
-  const wsData: any[][] = [columns.map((c) => c.header)];
-
   for (let i = 0; i < rows.length; i += CHUNK_SIZE) {
-    const slice = rows.slice(i, i + CHUNK_SIZE);
-    for (const r of slice) {
-      wsData.push(columns.map((c) => r[c.key] ?? ''));
-    }
-    options.onProgress?.(Math.min(rows.length, i + slice.length), rows.length);
+    const sliceLen = Math.min(CHUNK_SIZE, rows.length - i);
+    options.onProgress?.(Math.min(rows.length, i + sliceLen), rows.length);
     if (i + CHUNK_SIZE < rows.length) {
       await yieldToMainThread();
     }
   }
 
-  const ws = XLSX.utils.aoa_to_sheet(wsData);
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, 'Export');
-
   const fileName = `${filePrefix}_${buildTimestampSuffix()}`;
-  XLSX.writeFile(wb, `${fileName}.xlsx`);
+  await downloadPremiumExcelWorkbook({
+    rows,
+    columns,
+    fileName,
+    reportTitle: options.reportTitle || filePrefix.replace(/_/g, ' '),
+    periodLabel: options.periodLabel,
+    sheetName: options.sheetName || options.reportTitle || 'Export',
+    summary: options.summary,
+  });
 
   if (options.auditTargetType) {
     sendServerAuditEvent({

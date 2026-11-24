@@ -238,7 +238,7 @@ describe('Duty-Based Attendance Status Classification & Edge-Case Accuracy', () 
     expect(nightIn.body.attendance.isLate).toBe(true);
     expect(nightIn.body.attendance.arrivalStatus).toBe('LATE');
 
-    // Punch out next morning at 05:00 => 8h30m (510 mins) -> COMPLETED
+    // Punch out next morning at 05:00 => 480m regular (20:30 -> 04:30) + 30m post-shift OT (04:30 -> 05:00) = 510m total -> COMPLETED + OT
     const nightOut = await request(app)
       .post('/api/attendance/scan')
       .set('Authorization', `Bearer ${adminToken}`)
@@ -249,9 +249,10 @@ describe('Duty-Based Attendance Status Classification & Edge-Case Accuracy', () 
       });
     expect(nightOut.status).toBe(200);
     expect(nightOut.body.attendance.shiftDate).toBe('2026-11-18');
+    expect(nightOut.body.attendance.regularDutyMinutes).toBe(480);
+    expect(nightOut.body.attendance.overtimeMinutes).toBe(30);
     expect(nightOut.body.attendance.totalDutyMinutes).toBe(510);
-    expect(nightOut.body.attendance.overtimeMinutes).toBe(0);
-    expect(nightOut.body.attendance.attendanceStatus).toBe('COMPLETED');
+    expect(nightOut.body.attendance.attendanceStatus).toBe('COMPLETED + OT');
     expect(nightOut.body.attendance.isLate).toBe(true);
   });
 

@@ -23,6 +23,7 @@ import {
   ShieldCheck,
   Filter,
   RotateCcw,
+  Bug,
 } from 'lucide-react';
 import { AuditDeletionRecord, AuditLog, LoginHistoryEntry, UserRoleRecord } from '../types';
 import {
@@ -47,12 +48,19 @@ import {
   SelectAllCheckbox,
 } from './BulkActionBar';
 import { exportChunkedToCsv, exportChunkedToExcel } from '../services/bulkActionService';
+import { TechnicalErrorLogs } from './TechnicalErrorLogs';
+import { getSafeErrorText } from '../services/errorHandlingService';
 
 interface AuditLogsManagementProps {
   currentUserRole: UserRoleRecord;
 }
 
-type SubTab = 'trail' | 'login_history' | 'retention_queue' | 'deletion_ledger';
+type SubTab =
+  | 'trail'
+  | 'login_history'
+  | 'retention_queue'
+  | 'deletion_ledger'
+  | 'technical_errors';
 
 const EMPTY_KPIS: AuditKpis = {
   totalLogs: 0,
@@ -95,9 +103,11 @@ function formatJsonPreview(raw?: string): string {
 }
 
 export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ currentUserRole }) => {
-  const isSuperAdmin = currentUserRole?.role?.toUpperCase() === 'SUPER_ADMIN';
+  const normalizedRole = currentUserRole?.role?.toUpperCase() || '';
+  const isSuperAdmin = normalizedRole === 'SUPER_ADMIN';
+  const isAuthorizedAdmin = normalizedRole === 'ADMIN';
 
-  const [subTab, setSubTab] = useState<SubTab>('trail');
+  const [subTab, setSubTab] = useState<SubTab>(isSuperAdmin ? 'trail' : 'technical_errors');
   const [banner, setBanner] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Audit Trail State
@@ -221,7 +231,11 @@ export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ curren
       setBulkSummary({ type: 'success', title: `Exported ${out.rowCount} Audit Logs`, message: `Downloaded "${out.fileName}".`, savedCount: out.rowCount });
       logsBulk.clearSelection();
     } catch (err: any) {
-      setBulkSummary({ type: 'error', title: 'Audit Export Failed', message: err?.message || 'Unable to export selected logs.' });
+      setBulkSummary({
+        type: 'error',
+        title: 'Audit Export Failed',
+        message: getSafeErrorText(err, { moduleName: 'Audit Logs', forcedErrorCode: 'FILE-002' }),
+      });
     } finally {
       setBulkProgress(null);
     }
@@ -264,7 +278,11 @@ export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ curren
       setBulkSummary({ type: 'success', title: `Exported ${out.rowCount} Login Events`, message: `Downloaded "${out.fileName}".`, savedCount: out.rowCount });
       loginHistoryBulk.clearSelection();
     } catch (err: any) {
-      setBulkSummary({ type: 'error', title: 'Login History Export Failed', message: err?.message || 'Unable to export selected events.' });
+      setBulkSummary({
+        type: 'error',
+        title: 'Login History Export Failed',
+        message: getSafeErrorText(err, { moduleName: 'Audit Logs', forcedErrorCode: 'FILE-002' }),
+      });
     } finally {
       setBulkProgress(null);
     }
@@ -289,7 +307,7 @@ export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ curren
       setAvailableActions(res.facets.actions);
       setAvailableActors(res.facets.actors);
     } catch (err: any) {
-      showBanner('error', err.message || 'Failed to load enterprise audit logs.');
+      showBanner('error', getSafeErrorText(err, { moduleName: 'Audit Logs' }));
     } finally {
       setIsLoadingLogs(false);
     }
@@ -302,7 +320,7 @@ export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ curren
       const entries = await fetchLoginHistory(loginFilters);
       setLoginHistory(entries);
     } catch (err: any) {
-      showBanner('error', err.message || 'Failed to load login history.');
+      showBanner('error', getSafeErrorText(err, { moduleName: 'Audit Logs' }));
     } finally {
       setIsLoadingLoginHistory(false);
     }
@@ -315,7 +333,7 @@ export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ curren
       const data = await fetchAuditDeletions();
       setDeletions(data);
     } catch (err: any) {
-      showBanner('error', err.message || 'Failed to load permanent deletion ledger.');
+      showBanner('error', getSafeErrorText(err, { moduleName: 'Audit Logs' }));
     } finally {
       setIsLoadingDeletions(false);
     }
@@ -373,7 +391,7 @@ export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ curren
         subTab === 'retention_queue' ? { ...filters, lifecycle: 'pending_review' } : filters
       );
     } catch (err: any) {
-      showBanner('error', err.message || 'Failed to update importance status.');
+      showBanner('error', getSafeErrorText(err, { moduleName: 'Audit Logs' }));
     } finally {
       setActionBusyId(null);
     }
@@ -388,7 +406,7 @@ export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ curren
         subTab === 'retention_queue' ? { ...filters, lifecycle: 'pending_review' } : filters
       );
     } catch (err: any) {
-      showBanner('error', err.message || 'Failed to archive audit log.');
+      showBanner('error', getSafeErrorText(err, { moduleName: 'Audit Logs' }));
     } finally {
       setActionBusyId(null);
     }
@@ -405,7 +423,7 @@ export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ curren
       const review = await reviewAuditLogDependencies(log.id);
       setDependencyReview(review);
     } catch (err: any) {
-      showBanner('error', err.message || 'Failed to run dependency review.');
+      showBanner('error', getSafeErrorText(err, { moduleName: 'Audit Logs' }));
       setDeleteTargetLog(null);
     } finally {
       setIsLoadingReview(false);
@@ -442,7 +460,7 @@ export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ curren
         subTab === 'retention_queue' ? { ...filters, lifecycle: 'pending_review' } : filters
       );
     } catch (err: any) {
-      showBanner('error', err.message || 'Controlled deletion blocked.');
+      showBanner('error', getSafeErrorText(err, { moduleName: 'Audit Logs' }));
     } finally {
       setIsDeletingLog(false);
     }
@@ -505,16 +523,37 @@ export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ curren
     });
   };
 
-  if (!isSuperAdmin) {
+  if (!isSuperAdmin && !isAuthorizedAdmin) {
     return (
       <div className="p-8 bg-slate-50 min-h-full flex items-center justify-center">
         <div className="bg-white border border-red-200 rounded-xl p-6 max-w-md text-center space-y-2 shadow-xs">
           <ShieldAlert className="w-8 h-8 text-red-600 mx-auto" />
-          <h3 className="text-sm font-bold text-slate-900">Super Admin Authorization Required</h3>
+          <h3 className="text-sm font-bold text-slate-900">Administrator Authorization Required</h3>
           <p className="text-xs text-slate-500">
-            Access to Enterprise Audit Logs, IP/Geo Telemetry, and Controlled Retention Governance is strictly limited to Super Admin accounts.
+            Access to Audit Logs and Technical Error Diagnostics is restricted to Super Admin or explicitly authorized Admin accounts.
           </p>
         </div>
+      </div>
+    );
+  }
+
+  if (!isSuperAdmin && isAuthorizedAdmin) {
+    return (
+      <div className="p-6 bg-slate-50 min-h-full flex flex-col gap-5">
+        <div className="bg-[#0a192f] text-white p-5 rounded-xl border border-slate-800 shadow-xs flex items-start gap-3.5">
+          <div className="w-10 h-10 rounded-lg bg-red-500/20 border border-red-400/40 text-red-300 flex items-center justify-center shrink-0">
+            <Bug className="w-5 h-5" />
+          </div>
+          <div>
+            <h2 className="text-lg font-bold tracking-tight text-white">
+              AUDIT LOGS & SECURITY — TECHNICAL ERROR LOGS
+            </h2>
+            <p className="text-xs text-slate-400 mt-1">
+              Authorized Administrator Diagnostic Console & Request ID Trace Lookup
+            </p>
+          </div>
+        </div>
+        <TechnicalErrorLogs />
       </div>
     );
   }
@@ -682,7 +721,25 @@ export const AuditLogsManagement: React.FC<AuditLogsManagementProps> = ({ curren
             {kpis.permanentDeletionsCount}
           </span>
         </button>
+
+        <button
+          type="button"
+          onClick={() => handleSubTabChange('technical_errors')}
+          className={`px-3.5 py-2.5 text-xs font-bold border-b-2 transition flex items-center gap-1.5 shrink-0 cursor-pointer ${
+            subTab === 'technical_errors'
+              ? 'border-red-600 text-red-700'
+              : 'border-transparent text-slate-500 hover:text-slate-800'
+          }`}
+        >
+          <Bug className="w-4 h-4" />
+          <span>Technical Error Logs</span>
+        </button>
       </div>
+
+      {/* ================================================================= */}
+      {/* TAB 5: TECHNICAL ERROR LOGS & REQUEST ID DIAGNOSTICS              */}
+      {/* ================================================================= */}
+      {subTab === 'technical_errors' && <TechnicalErrorLogs />}
 
       {/* ================================================================= */}
       {/* TAB 1 & TAB 3: AUDIT TRAIL & RETENTION REVIEW QUEUE               */}

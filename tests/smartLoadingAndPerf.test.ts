@@ -260,7 +260,13 @@ describe('Phase 2 & 3 — Bounded Network Timeout & No Blind Write Retry', () =>
         'POST /api/attendance/scan',
         { timeoutMs: 25, noRetryOnNetworkError: false }
       )
-    ).rejects.toThrow(/Request timed out for POST \/api\/attendance\/scan/i);
+    ).rejects.toMatchObject({
+      name: 'ApiRequestError',
+      status: 408,
+      errorCode: 'NET-002',
+      isTimeout: true,
+      technicalDetail: expect.stringMatching(/timed out.*POST \/api\/attendance\/scan/i),
+    });
 
     // CRITICAL: Must NEVER blindly retry a timed-out attendance write request
     expect(fetchCalls).toBe(1);

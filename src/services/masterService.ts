@@ -22,6 +22,10 @@ import {
 } from '../types';
 import { sendServerAuditEvent, getAuthHeaders } from './auditService';
 import { apiFetchJson } from '../config/api';
+import {
+  findCaseInsensitiveMasterDuplicate,
+  normalizeWhitespaceAndUnicode,
+} from '../utils/excelMasterNormalizer';
 
 export const DEFAULT_SETTINGS: SystemSetting = {
   id: 'global',
@@ -246,15 +250,24 @@ export async function getFloors(): Promise<Floor[]> {
 }
 
 export async function saveFloor(floor: Floor): Promise<void> {
+  const cleanName = normalizeWhitespaceAndUnicode(floor.name);
+  const existing = await getFloors();
+  const duplicate = findCaseInsensitiveMasterDuplicate(cleanName, floor.id, existing);
+  if (duplicate) {
+    throw new Error(
+      `A Production Line named "${duplicate.name}" already exists. Case-variant duplicates are not allowed.`
+    );
+  }
+  const normalizedFloor: Floor = { ...floor, name: cleanName };
   try {
-    await setDoc(doc(db, 'floors', floor.id), floor);
+    await setDoc(doc(db, 'floors', normalizedFloor.id), normalizedFloor);
     await recordAuditLog({
       action: 'SAVE_FLOOR',
-      newValue: floor.name,
+      newValue: normalizedFloor.name,
       actionSource: 'FLOOR_MANAGEMENT',
     });
   } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, `floors/${floor.id}`);
+    handleFirestoreError(error, OperationType.WRITE, `floors/${normalizedFloor.id}`);
   }
 }
 
@@ -269,15 +282,24 @@ export async function getSections(): Promise<Section[]> {
 }
 
 export async function saveSection(section: Section): Promise<void> {
+  const cleanName = normalizeWhitespaceAndUnicode(section.name);
+  const existing = await getSections();
+  const duplicate = findCaseInsensitiveMasterDuplicate(cleanName, section.id, existing);
+  if (duplicate) {
+    throw new Error(
+      `A Section named "${duplicate.name}" already exists. Case-variant duplicates are not allowed.`
+    );
+  }
+  const normalizedSection: Section = { ...section, name: cleanName };
   try {
-    await setDoc(doc(db, 'sections', section.id), section);
+    await setDoc(doc(db, 'sections', normalizedSection.id), normalizedSection);
     await recordAuditLog({
       action: 'SAVE_SECTION',
-      newValue: section.name,
+      newValue: normalizedSection.name,
       actionSource: 'SECTION_MANAGEMENT',
     });
   } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, `sections/${section.id}`);
+    handleFirestoreError(error, OperationType.WRITE, `sections/${normalizedSection.id}`);
   }
 }
 
@@ -292,15 +314,24 @@ export async function getDepartments(): Promise<Department[]> {
 }
 
 export async function saveDepartment(dept: Department): Promise<void> {
+  const cleanName = normalizeWhitespaceAndUnicode(dept.name);
+  const existing = await getDepartments();
+  const duplicate = findCaseInsensitiveMasterDuplicate(cleanName, dept.id, existing);
+  if (duplicate) {
+    throw new Error(
+      `A Department named "${duplicate.name}" already exists. Case-variant duplicates are not allowed.`
+    );
+  }
+  const normalizedDept: Department = { ...dept, name: cleanName };
   try {
-    await setDoc(doc(db, 'departments', dept.id), dept);
+    await setDoc(doc(db, 'departments', normalizedDept.id), normalizedDept);
     await recordAuditLog({
       action: 'SAVE_DEPARTMENT',
-      newValue: dept.name,
+      newValue: normalizedDept.name,
       actionSource: 'DEPARTMENT_MANAGEMENT',
     });
   } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, `departments/${dept.id}`);
+    handleFirestoreError(error, OperationType.WRITE, `departments/${normalizedDept.id}`);
   }
 }
 

@@ -90,6 +90,12 @@ describe('Firestore Security Rules (Strict Zero-Trust UID RBAC)', () => {
     }
   });
 
+  it('blocks direct client writes to technical_error_logs and restricts reads to Super Admin', () => {
+    const block = extractMatchBlock('technical_error_logs');
+    expect(block).toMatch(/allow\s+(?:read|list,\s*get|get,\s*list):\s*if\s+isSuperAdmin\(\);/);
+    expect(block).toMatch(/allow\s+create,\s*update,\s*delete:\s*if\s+false;/);
+  });
+
   it('supports future dynamic roles via active-role and role_permissions helpers without unapproved hardcoded future roles', () => {
     expect(rulesContent).toContain('function callerRoleId()');
     expect(rulesContent).toContain('function isRoleActive()');

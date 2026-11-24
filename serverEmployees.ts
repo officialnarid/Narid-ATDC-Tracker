@@ -16,6 +16,23 @@ import {
   recordErrorTelemetry,
 } from './serverMonitoring.ts';
 
+import {
+  type AmbiguousMasterConflict,
+  type MasterFieldKey,
+  type MasterRecordOption,
+  CANONICAL_EMPLOYEE_STATUSES,
+  CANONICAL_EMPLOYEE_TYPES,
+  DEFAULT_CANONICAL_DEPARTMENTS,
+  DEFAULT_CANONICAL_FLOORS,
+  DEFAULT_CANONICAL_SECTIONS,
+  MASTER_FIELD_LABELS,
+  buildMasterLookupIndex,
+  buildUnambiguousDesignationMapFromEmployees,
+  matchCanonicalMasterValue,
+  normalizeMasterLookupKey,
+  normalizeWhitespaceAndUnicode,
+} from './src/utils/excelMasterNormalizer.ts';
+
 export const EMPLOYEE_ID_PATTERN = /^[A-Za-z0-9_.\-]+$/;
 export const EMPLOYEE_BULK_BATCH_SIZE = 400; // Strictly below Firestore's 500 writes/batch limit
 
@@ -33,13 +50,20 @@ const BulkImportRowSchema = z.object({
     .string()
     .trim()
     .min(1, 'Employee Name is required.')
-    .max(200, 'Employee Name must be 200 characters or fewer.'),
-  employeeType: z.enum(['Permanent', 'Staff', 'Offroll']),
-  section: z.string().trim().min(1, 'Section is required.').max(100),
-  department: z.string().trim().min(1, 'Department is required.').max(100),
-  floor: z.string().trim().min(1, 'Production Line is required.').max(100),
-  designation: z.string().trim().min(1).max(120).default('Operator'),
-  employeeStatus: z.enum(['Active', 'Inactive']),
+    .max(200, 'Employee Name must be 200 characters or fewer.')
+    .optional(),
+  employeeType: z.string().trim().min(1).max(60).optional(),
+  section: z.string().trim().min(1, 'Section is required.').max(100).optional(),
+  sectionId: z.string().trim().min(1).max(128).optional(),
+  department: z.string().trim().min(1, 'Department is required.').max(100).optional(),
+  departmentId: z.string().trim().min(1).max(128).optional(),
+  floor: z.string().trim().min(1, 'Production Line is required.').max(100).optional(),
+  floorId: z.string().trim().min(1).max(128).optional(),
+  line: z.string().trim().min(1).max(100).optional(),
+  lineId: z.string().trim().min(1).max(128).optional(),
+  designation: z.string().trim().min(1).max(120).optional(),
+  designationId: z.string().trim().min(1).max(128).optional(),
+  employeeStatus: z.string().trim().min(1).max(60).optional(),
   rowNumber: z.number().int().positive().optional(),
 });
 
@@ -302,11 +326,57 @@ export function registerEmployeeRoutes(app: express.Express, deps: EmployeeRoute
         });
       }
 
-      // Fetch current existing employees from Firestore once via Admin SDK
-      const existingSnap = await db.collection('employees').get();
+      // Fetch existing employees and authoritative master collections in parallel via Admin SDK
+      const [existingSnap, floorsSnap, sectionsSnap, departmentsSnap, designationsSnap] =
+        await Promise.all([
+          db.collection('employees').get(),
+          db.collection('floors').get(),
+          db.collection('sections').get(),
+          db.collection('departments').get(),
+          db.collection('designations').get(),
+        ]);
+
+      const extractMasterRecords = (
+        snap: { docs: Array<{ id: string; data: () => Record<string, any> | undefined }> },
+        fallback: MasterRecordOption[]
+      ): MasterRecordOption[] => {
+        if (!snap.docs || snap.docs.length === 0) return fallback;
+        return snap.docs
+          .map((d) => {
+            const data = d.data() || {};
+            return {
+              id: String(data.id || d.id),
+              name: String(data.name || ''),
+              code: data.code ? String(data.code) : undefined,
+              status: data.status ? String(data.status) : undefined,
+            };
+          })
+          .filter((item) => Boolean(item.name.trim()));
+      };
+
+      const floorMasterRecords = extractMasterRecords(floorsSnap, DEFAULT_CANONICAL_FLOORS);
+      const sectionMasterRecords = extractMasterRecords(sectionsSnap, DEFAULT_CANONICAL_SECTIONS);
+      const departmentMasterRecords = extractMasterRecords(
+        departmentsSnap,
+        DEFAULT_CANONICAL_DEPARTMENTS
+      );
+      const designationMasterRecords = extractMasterRecords(designationsSnap, []);
+
+      const typeIndex = buildMasterLookupIndex(CANONICAL_EMPLOYEE_TYPES);
+      const statusIndex = buildMasterLookupIndex(CANONICAL_EMPLOYEE_STATUSES);
+      const floorIndex = buildMasterLookupIndex(floorMasterRecords);
+      const sectionIndex = buildMasterLookupIndex(sectionMasterRecords);
+      const departmentIndex = buildMasterLookupIndex(departmentMasterRecords);
+      const designationIndex =
+        designationMasterRecords.length > 0
+          ? buildMasterLookupIndex(designationMasterRecords)
+          : null;
+
       const existingByUpperId = new Map<string, { docId: string; data: Record<string, any> }>();
+      const existingEmployeesList: Array<{ designation?: string | null }> = [];
       for (const d of existingSnap.docs) {
         const data = d.data() || {};
+        existingEmployeesList.push({ designation: data.designation });
         const key = String(data.employeeId || d.id).trim().toUpperCase();
         if (key) {
           existingByUpperId.set(key, { docId: d.id, data });
@@ -316,6 +386,9 @@ export function registerEmployeeRoutes(app: express.Express, deps: EmployeeRoute
           existingByUpperId.set(docIdUpper, { docId: d.id, data });
         }
       }
+      const employeeDesignationMap = !designationIndex
+        ? buildUnambiguousDesignationMapFromEmployees(existingEmployeesList)
+        : null;
 
       const now = new Date().toISOString();
       interface PreparedOp {
@@ -328,52 +401,230 @@ export function registerEmployeeRoutes(app: express.Express, deps: EmployeeRoute
 
       const operations: PreparedOp[] = [];
       const skippedIds: string[] = [];
+      const validationErrors: Array<{
+        employeeId: string;
+        rowNumber?: number;
+        code: 'AMBIGUOUS_MASTER_MATCH' | 'INVALID_MASTER_VALUE' | 'MASTER_ID_MISMATCH' | 'VALIDATION_ERROR';
+        error: string;
+      }> = [];
+      const ambiguities: AmbiguousMasterConflict[] = [];
+      let normalizedCount = 0;
+      let normalizedFieldsCount = 0;
 
       for (const row of rows) {
         const cleanId = row.employeeId.trim().toUpperCase();
-        const cleanName = row.employeeName.trim().toUpperCase();
-        const cleanSection = row.section.trim();
-        const cleanDepartment = row.department.trim();
-        const cleanFloor = row.floor.trim();
-        const cleanDesignation = (row.designation || 'Operator').trim();
-
         const existing = existingByUpperId.get(cleanId);
+        const isUpdate = Boolean(existing);
+
+        const rowErrors: Array<{
+          code: 'AMBIGUOUS_MASTER_MATCH' | 'INVALID_MASTER_VALUE' | 'MASTER_ID_MISMATCH' | 'VALIDATION_ERROR';
+          error: string;
+        }> = [];
+        let rowWasNormalized = false;
+
+        // Preserve free-text Employee Name capitalization (NFC + trim + collapse repeated whitespace)
+        const providedName =
+          row.employeeName !== undefined ? normalizeWhitespaceAndUnicode(row.employeeName) : undefined;
+        if (!isUpdate && !providedName) {
+          rowErrors.push({ code: 'VALIDATION_ERROR', error: 'Employee Name is required for new employee.' });
+        }
+
+        const resolveBackendMaster = (
+          field: MasterFieldKey,
+          rawVal: string | undefined,
+          clientMasterId: string | undefined,
+          index: ReturnType<typeof buildMasterLookupIndex>,
+          requiredForNew: boolean
+        ): { provided: boolean; canonical?: string; masterId?: string | null } => {
+          if (rawVal === undefined) {
+            if (!isUpdate && requiredForNew) {
+              rowErrors.push({
+                code: 'VALIDATION_ERROR',
+                error: `${MASTER_FIELD_LABELS[field]} is required for new employee.`,
+              });
+            }
+            return { provided: false };
+          }
+
+          const match = matchCanonicalMasterValue(rawVal, index);
+          if (match.status === 'AMBIGUOUS') {
+            const list = match.ambiguousCandidates.map((c) => `"${c.name}" (${c.id})`).join(', ');
+            rowErrors.push({
+              code: 'AMBIGUOUS_MASTER_MATCH',
+              error: `Ambiguous ${MASTER_FIELD_LABELS[field]} "${match.trimmedValue}": matches multiple existing master records (${list}). Resolve duplicate master records before importing.`,
+            });
+            ambiguities.push({
+              field,
+              fieldLabel: MASTER_FIELD_LABELS[field],
+              excelValue: match.originalValue,
+              rowNumbers: row.rowNumber ? [row.rowNumber] : [],
+              candidates: match.ambiguousCandidates,
+            });
+            return { provided: true };
+          }
+
+          if (match.status === 'UNMATCHED' || !match.canonicalValue) {
+            rowErrors.push({
+              code: 'INVALID_MASTER_VALUE',
+              error: `Invalid ${MASTER_FIELD_LABELS[field]} "${match.trimmedValue}". Must match an existing website master record.`,
+            });
+            return { provided: true };
+          }
+
+          // Validate client-provided master ID against server-resolved canonical master ID
+          if (
+            clientMasterId !== undefined &&
+            match.masterId !== null &&
+            clientMasterId.trim() !== match.masterId
+          ) {
+            rowErrors.push({
+              code: 'MASTER_ID_MISMATCH',
+              error: `${MASTER_FIELD_LABELS[field]} ID "${clientMasterId}" does not match canonical master record "${match.canonicalValue}" (${match.masterId}).`,
+            });
+            return { provided: true };
+          }
+
+          if (match.wasNormalized) {
+            rowWasNormalized = true;
+            normalizedFieldsCount += 1;
+          }
+
+          return {
+            provided: true,
+            canonical: match.canonicalValue,
+            masterId: match.masterId,
+          };
+        };
+
+        const rawFloorInput = row.floor ?? row.line;
+        const clientFloorId = row.floorId ?? row.lineId;
+
+        const resType = resolveBackendMaster('employeeType', row.employeeType, undefined, typeIndex, true);
+        const resStatus = resolveBackendMaster('employeeStatus', row.employeeStatus, undefined, statusIndex, true);
+        const resSection = resolveBackendMaster('section', row.section, row.sectionId, sectionIndex, true);
+        const resDepartment = resolveBackendMaster('department', row.department, row.departmentId, departmentIndex, true);
+        const resFloor = resolveBackendMaster('floor', rawFloorInput, clientFloorId, floorIndex, true);
+
+        let resDesignation: { provided: boolean; canonical?: string; masterId?: string | null };
+        if (designationIndex) {
+          resDesignation = resolveBackendMaster(
+            'designation',
+            row.designation ?? (!isUpdate ? 'Operator' : undefined),
+            row.designationId,
+            designationIndex,
+            false
+          );
+        } else if (row.designation !== undefined) {
+          const trimmedDesig = normalizeWhitespaceAndUnicode(row.designation);
+          const mappedDesig = employeeDesignationMap?.get(normalizeMasterLookupKey(trimmedDesig));
+          const finalDesig = mappedDesig || trimmedDesig || 'Operator';
+          if (finalDesig !== row.designation) {
+            rowWasNormalized = true;
+            normalizedFieldsCount += 1;
+          }
+          resDesignation = { provided: true, canonical: finalDesig, masterId: null };
+        } else if (!isUpdate) {
+          resDesignation = { provided: true, canonical: 'Operator', masterId: null };
+        } else {
+          resDesignation = { provided: false };
+        }
+
+        if (rowErrors.length > 0) {
+          const primaryCode = rowErrors.some((e) => e.code === 'AMBIGUOUS_MASTER_MATCH')
+            ? 'AMBIGUOUS_MASTER_MATCH'
+            : rowErrors[0].code;
+          validationErrors.push({
+            employeeId: cleanId,
+            rowNumber: row.rowNumber,
+            code: primaryCode,
+            error: rowErrors.map((e) => e.error).join(' | '),
+          });
+          continue;
+        }
+
+        if (rowWasNormalized) {
+          normalizedCount += 1;
+        }
+
         if (!existing) {
+          const newPayload: Record<string, any> = {
+            employeeId: cleanId,
+            employeeName: providedName!,
+            employeeType: resType.canonical!,
+            section: resSection.canonical!,
+            department: resDepartment.canonical!,
+            floor: resFloor.canonical!,
+            designation: resDesignation.canonical || 'Operator',
+            qrCodeToken: generateServerQrToken(cleanId),
+            employeeStatus: resStatus.canonical!,
+            createdAt: now,
+            updatedAt: now,
+          };
+          if (resSection.masterId) newPayload.sectionId = resSection.masterId;
+          if (resDepartment.masterId) newPayload.departmentId = resDepartment.masterId;
+          if (resFloor.masterId) {
+            newPayload.floorId = resFloor.masterId;
+            newPayload.lineId = resFloor.masterId;
+          }
+          if (resDesignation.masterId) newPayload.designationId = resDesignation.masterId;
+
           operations.push({
             actionType: 'NEW',
             employeeId: cleanId,
             rowNumber: row.rowNumber,
             ref: db.collection('employees').doc(cleanId),
-            payload: {
-              employeeId: cleanId,
-              employeeName: cleanName,
-              employeeType: row.employeeType,
-              section: cleanSection,
-              department: cleanDepartment,
-              floor: cleanFloor,
-              designation: cleanDesignation,
-              qrCodeToken: generateServerQrToken(cleanId),
-              employeeStatus: row.employeeStatus,
-              createdAt: now,
-              updatedAt: now,
-            },
+            payload: newPayload,
           });
           continue;
         }
 
+        // EXISTING EMPLOYEE UPDATE: strictly preserve omitted fields, Employee ID, QR token, createdAt, and unrelated data
         const prev = existing.data;
+        const nextName = providedName !== undefined ? providedName : String(prev.employeeName || '');
+        const nextType = resType.provided ? resType.canonical! : String(prev.employeeType || '');
+        const nextSection = resSection.provided ? resSection.canonical! : String(prev.section || '');
+        const nextDepartment = resDepartment.provided ? resDepartment.canonical! : String(prev.department || '');
+        const nextFloor = resFloor.provided ? resFloor.canonical! : String(prev.floor || '');
+        const nextDesignation = resDesignation.provided ? resDesignation.canonical! : String(prev.designation || '');
+        const nextStatus = resStatus.provided ? resStatus.canonical! : String(prev.employeeStatus || '');
+
         const hasChanged =
-          String(prev.employeeName || '').trim().toUpperCase() !== cleanName ||
-          String(prev.employeeType || '') !== row.employeeType ||
-          String(prev.section || '').trim() !== cleanSection ||
-          String(prev.department || '').trim() !== cleanDepartment ||
-          String(prev.floor || '').trim() !== cleanFloor ||
-          String(prev.designation || '').trim() !== cleanDesignation ||
-          String(prev.employeeStatus || '') !== row.employeeStatus;
+          normalizeWhitespaceAndUnicode(prev.employeeName) !== nextName ||
+          String(prev.employeeType || '') !== nextType ||
+          String(prev.section || '').trim() !== nextSection ||
+          String(prev.department || '').trim() !== nextDepartment ||
+          String(prev.floor || '').trim() !== nextFloor ||
+          String(prev.designation || '').trim() !== nextDesignation ||
+          String(prev.employeeStatus || '') !== nextStatus;
 
         if (!hasChanged) {
           skippedIds.push(cleanId);
           continue;
+        }
+
+        const updatedPayload: Record<string, any> = {
+          ...prev,
+          // Preserve canonical existing Employee ID, QR security token, and historical creation date
+          employeeId: String(prev.employeeId || cleanId),
+          employeeName: nextName,
+          employeeType: nextType,
+          section: nextSection,
+          department: nextDepartment,
+          floor: nextFloor,
+          designation: nextDesignation,
+          qrCodeToken: prev.qrCodeToken || generateServerQrToken(cleanId),
+          employeeStatus: nextStatus,
+          createdAt: prev.createdAt || now,
+          updatedAt: now,
+        };
+        if (resSection.provided && resSection.masterId) updatedPayload.sectionId = resSection.masterId;
+        if (resDepartment.provided && resDepartment.masterId) updatedPayload.departmentId = resDepartment.masterId;
+        if (resFloor.provided && resFloor.masterId) {
+          updatedPayload.floorId = resFloor.masterId;
+          updatedPayload.lineId = resFloor.masterId;
+        }
+        if (resDesignation.provided && resDesignation.masterId) {
+          updatedPayload.designationId = resDesignation.masterId;
         }
 
         operations.push({
@@ -381,21 +632,37 @@ export function registerEmployeeRoutes(app: express.Express, deps: EmployeeRoute
           employeeId: cleanId,
           rowNumber: row.rowNumber,
           ref: db.collection('employees').doc(existing.docId),
-          payload: {
-            ...prev,
-            employeeId: cleanId,
-            employeeName: cleanName,
-            employeeType: row.employeeType,
-            section: cleanSection,
-            department: cleanDepartment,
-            floor: cleanFloor,
-            designation: cleanDesignation,
-            // Strictly preserve existing QR code token and historical creation timestamp
-            qrCodeToken: prev.qrCodeToken || generateServerQrToken(cleanId),
-            employeeStatus: row.employeeStatus,
-            createdAt: prev.createdAt || now,
-            updatedAt: now,
-          },
+          payload: updatedPayload,
+        });
+      }
+
+      if (validationErrors.length > 0) {
+        const hasAmbiguity = validationErrors.some((e) => e.code === 'AMBIGUOUS_MASTER_MATCH');
+        const hasIdMismatch = validationErrors.some((e) => e.code === 'MASTER_ID_MISMATCH');
+        const primaryCode = hasAmbiguity
+          ? 'AMBIGUOUS_MASTER_MATCH'
+          : hasIdMismatch
+          ? 'MASTER_ID_MISMATCH'
+          : validationErrors[0].code;
+
+        return res.status(400).json({
+          success: false,
+          code: primaryCode,
+          category: 'VALIDATION',
+          error: validationErrors[0].error,
+          partialCommit: false,
+          savedCount: 0,
+          insertedCount: 0,
+          updatedCount: 0,
+          skippedCount: 0,
+          failedCount: validationErrors.length,
+          committedIds: [],
+          failedRows: validationErrors.map((e) => ({
+            employeeId: e.employeeId,
+            rowNumber: e.rowNumber,
+            error: e.error,
+          })),
+          ambiguities,
         });
       }
 
@@ -592,6 +859,8 @@ export function registerEmployeeRoutes(app: express.Express, deps: EmployeeRoute
         updatedCount: updatedIds.length,
         skippedCount: skippedIds.length,
         failedCount: 0,
+        normalizedCount,
+        normalizedFieldsCount,
         committedIds,
         insertedIds,
         updatedIds,

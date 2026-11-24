@@ -61,6 +61,8 @@ import {
   COMPANY_WIFI_DENIED_CODE,
   COMPANY_WIFI_DENIED_MESSAGE,
 } from './utils/companyWifiUtils';
+import { GlobalErrorToastStack } from './components/SafeErrorBanner';
+import { getSafeErrorText, handleAppError } from './services/errorHandlingService';
 
 // Secondary Modules (code-split via resilient lazyWithRetry + moduleRegistry prefetching)
 const EmployeeMaster = lazyWithRetry(() => import('./components/EmployeeMaster'), m => m.EmployeeMaster, 'employees');
@@ -255,7 +257,12 @@ export default function App() {
       recordPerfMetric('background_refresh_ms', stopTimer());
     } catch (err: any) {
       console.error('Failed to load initial data:', err);
-      setMasterDataError(err?.message || 'Unable to load production master data.');
+      setMasterDataError(
+        getSafeErrorText(err, {
+          moduleName: 'Master Data',
+          endpoint: '/api/masters',
+        })
+      );
     } finally {
       setIsLoadingMasterData(false);
     }
@@ -276,7 +283,7 @@ export default function App() {
     }
   }, [isAuthChecking]);
 
-  // Global frontend error monitoring + periodic telemetry ingestion flush (authenticated only)
+  // Global frontend error monitoring + centralized diagnostic capture + periodic telemetry flush (authenticated only)
   useEffect(() => {
     if (!currentUser || !currentUserRole) return;
     const stopErrors = installGlobalErrorMonitoring(
@@ -284,10 +291,40 @@ export default function App() {
     );
     const stopFlush = startClientTelemetryFlushLoop(15_000);
     const stopNetworkProbes = startBackgroundNetworkMonitoring(30_000);
+
+    const onWindowError = (event: ErrorEvent) => {
+      try {
+        handleAppError(event.error || event.message || 'Unhandled frontend runtime error', {
+          moduleName: TAB_TO_MODULE_NAME[currentTabRef.current] || currentTabRef.current || 'Application',
+          reportToBackend: true,
+          notifyGlobalToast: false,
+        });
+      } catch {
+        // Non-fatal
+      }
+    };
+
+    const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+      try {
+        handleAppError(event.reason || 'Unhandled promise rejection', {
+          moduleName: TAB_TO_MODULE_NAME[currentTabRef.current] || currentTabRef.current || 'Application',
+          reportToBackend: true,
+          notifyGlobalToast: false,
+        });
+      } catch {
+        // Non-fatal
+      }
+    };
+
+    window.addEventListener('error', onWindowError);
+    window.addEventListener('unhandledrejection', onUnhandledRejection);
+
     return () => {
       stopErrors();
       stopFlush();
       stopNetworkProbes();
+      window.removeEventListener('error', onWindowError);
+      window.removeEventListener('unhandledrejection', onUnhandledRejection);
     };
   }, [currentUser, currentUserRole]);
 
@@ -833,7 +870,8 @@ export default function App() {
               )}
 
               {currentTab === 'audit_logs' && isModuleAllowedForUser(currentUserRole, 'audit_logs') && (
-                currentUserRole.role?.toUpperCase() === 'SUPER_ADMIN' ? (
+                (currentUserRole.role?.toUpperCase() === 'SUPER_ADMIN' ||
+                  currentUserRole.role?.toUpperCase() === 'ADMIN') ? (
                   <AuditLogsManagement currentUserRole={currentUserRole} />
                 ) : (
                   <UnauthorizedAccess
@@ -885,6 +923,7 @@ export default function App() {
           )}
         </main>
       </div>
+      <GlobalErrorToastStack />
     </div>
   );
 }

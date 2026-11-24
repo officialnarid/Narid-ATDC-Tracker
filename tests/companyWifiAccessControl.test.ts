@@ -488,11 +488,16 @@ describe('Company Wi-Fi Access Control (Full Replacement Suite)', () => {
       .set('X-Forwarded-For', UNAUTHORIZED_IP);
 
     expect(blocked.status).toBe(403);
-    expect(blocked.body).toEqual({
-      success: false,
-      code: COMPANY_WIFI_DENIED_CODE,
-      error: COMPANY_WIFI_DENIED_MESSAGE,
-    });
+    expect(blocked.headers['x-request-id']).toMatch(/^REQ-\d{8}-[A-Z0-9]{12}$/);
+    expect(blocked.body).toEqual(
+      expect.objectContaining({
+        success: false,
+        code: COMPANY_WIFI_DENIED_CODE,
+        error: COMPANY_WIFI_DENIED_MESSAGE,
+        requestId: blocked.headers['x-request-id'],
+        errorCode: 'PERM-001',
+      })
+    );
 
     const serialized = JSON.stringify(blocked.body);
     expect(serialized).not.toContain(PLANT1_IP);

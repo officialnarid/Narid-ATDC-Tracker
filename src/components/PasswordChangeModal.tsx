@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { UserRoleRecord } from '../types';
 import { changeInitialPassword } from '../services/authService';
+import { getSafeErrorText } from '../services/errorHandlingService';
 
 interface PasswordChangeModalProps {
   userProfile: UserRoleRecord;
@@ -73,8 +74,13 @@ export const PasswordChangeModal: React.FC<PasswordChangeModalProps> = ({
       };
       onPasswordChanged(updatedProfile);
     } catch (err: any) {
-      console.error('Password change error:', err?.message || 'Password update failed');
-      setErrorMessage(err?.message || 'Failed to update password. Please try again.');
+      console.error('Password change error:', err?.code || 'Password update failed');
+      setErrorMessage(
+        getSafeErrorText(err, {
+          moduleName: 'Password Security',
+          endpoint: '/api/auth/change-password',
+        })
+      );
     } finally {
       setIsLoading(false);
     }

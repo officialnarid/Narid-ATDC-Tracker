@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { getSafeErrorText } from '../services/errorHandlingService';
 import {
   Clock,
   Plus,
@@ -80,7 +81,7 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({
         failedLoginAlertThreshold: s.failedLoginAlertThreshold ?? 5,
       });
     } catch (err: any) {
-      setConfigError(err?.message || 'Failed to load attendance configuration.');
+      setConfigError(getSafeErrorText(err, { moduleName: 'Shift Management', endpoint: '/api/settings' }));
     } finally {
       setConfigLoading(false);
     }
@@ -104,7 +105,7 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({
       onRefresh();
       await loadAttendanceConfig();
     } catch (err: any) {
-      setConfigError(`Failed to save settings: ${err?.message || 'Unknown error'}`);
+      setConfigError(getSafeErrorText(err, { moduleName: 'Shift Management', endpoint: '/api/settings' }));
     } finally {
       setIsSavingConfig(false);
     }
@@ -164,7 +165,7 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({
       setIsModalOpen(false);
       onRefresh();
     } catch (err: any) {
-      setActionError(`Error saving shift: ${err.message}`);
+      setActionError(getSafeErrorText(err, { moduleName: 'Shift Management', endpoint: '/api/masters/shifts' }));
     } finally {
       setIsSaving(false);
     }
@@ -178,7 +179,7 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({
       await saveShift({ ...shift, status: nextStatus });
       onRefresh();
     } catch (err: any) {
-      setActionError(`Error toggling shift: ${err.message}`);
+      setActionError(getSafeErrorText(err, { moduleName: 'Shift Management', endpoint: '/api/masters/shifts' }));
     } finally {
       setTogglingShiftId(null);
     }
@@ -248,7 +249,7 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({
       setBulkSummary({
         type: 'error',
         title: 'Shift Export Failed',
-        message: err?.message || 'Unable to export selected shifts.',
+        message: getSafeErrorText(err, { moduleName: 'Shift Management', forcedErrorCode: 'FILE-002' }),
       });
     } finally {
       setBulkProgress(null);
@@ -306,7 +307,7 @@ export const ShiftManagement: React.FC<ShiftManagementProps> = ({
       setBulkSummary({
         type: 'error',
         title: 'Shift Bulk Update Blocked',
-        message: err?.message || 'Failed to update shift status.',
+        message: getSafeErrorText(err, { moduleName: 'Shift Management', endpoint: '/api/masters/shifts/bulk' }),
       });
     } finally {
       setBulkProgress(null);

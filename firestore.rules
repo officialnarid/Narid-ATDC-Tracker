@@ -308,6 +308,12 @@ service cloud.firestore {
       allow create, update, delete: if false; // Strictly Firebase Admin SDK only
     }
 
+    // 19. Centralized Technical Error & Request Traceability Logs (Admin SDK Only Writes)
+    match /technical_error_logs/{errorId} {
+      allow list, get: if isSuperAdmin();
+      allow create, update, delete: if false; // Strictly Firebase Admin SDK only
+    }
+
     // Default catch-all deny
     match /{document=**} {
       allow read, write: if false;

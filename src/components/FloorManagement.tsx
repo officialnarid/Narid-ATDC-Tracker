@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { getSafeErrorText, handleAppError } from '../services/errorHandlingService';
 import { Layers, Plus, Edit2, CheckCircle, XCircle, X, FileSpreadsheet, Download } from 'lucide-react';
 import { Floor, UserRoleRecord } from '../types';
 import { saveFloor } from '../services/masterService';
@@ -71,7 +72,7 @@ export const FloorManagement: React.FC<FloorManagementProps> = ({
       setIsModalOpen(false);
       onRefresh();
     } catch (err: any) {
-      alert(`Error saving line: ${err.message}`);
+      handleAppError(err, { moduleName: 'Line Management', endpoint: '/api/masters/floors', notifyGlobalToast: true });
     } finally {
       setIsSaving(false);
     }
@@ -83,7 +84,7 @@ export const FloorManagement: React.FC<FloorManagementProps> = ({
       await saveFloor({ ...fl, status: nextStatus });
       onRefresh();
     } catch (err: any) {
-      alert(`Error toggling line: ${err.message}`);
+      handleAppError(err, { moduleName: 'Line Management', endpoint: '/api/masters/floors', notifyGlobalToast: true });
     }
   };
 
@@ -120,7 +121,11 @@ export const FloorManagement: React.FC<FloorManagementProps> = ({
       setBulkSummary({ type: 'success', title: `Exported ${out.rowCount} Lines`, message: `Downloaded "${out.fileName}".`, savedCount: out.rowCount });
       bulk.clearSelection();
     } catch (err: any) {
-      setBulkSummary({ type: 'error', title: 'Export Failed', message: err?.message || 'Unable to export lines.' });
+      setBulkSummary({
+        type: 'error',
+        title: 'Export Failed',
+        message: getSafeErrorText(err, { moduleName: 'Line Management', forcedErrorCode: 'FILE-002' }),
+      });
     } finally {
       setBulkProgress(null);
       setIsBulkBusy(false);
@@ -145,7 +150,11 @@ export const FloorManagement: React.FC<FloorManagementProps> = ({
       bulk.clearSelection();
       onRefresh();
     } catch (err: any) {
-      setBulkSummary({ type: 'error', title: 'Bulk Status Update Failed', message: err?.message || 'Permission or server error.' });
+      setBulkSummary({
+        type: 'error',
+        title: 'Bulk Status Update Failed',
+        message: getSafeErrorText(err, { moduleName: 'Line Management', endpoint: '/api/masters/floors/bulk' }),
+      });
     } finally {
       setBulkProgress(null);
       setIsBulkBusy(false);

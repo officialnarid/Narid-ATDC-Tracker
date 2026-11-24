@@ -3,8 +3,8 @@ import express from "express";
 import cors from "cors";
 import fs2 from "fs";
 import path2 from "path";
-import crypto7 from "crypto";
-import { z as z7 } from "zod";
+import crypto8 from "crypto";
+import { z as z8 } from "zod";
 
 // serverFirebaseAdmin.ts
 import fs from "fs";
@@ -7430,11 +7430,15 @@ var MAX_CREDITED_TOTAL_MINUTES = 720;
 var HALF_DAY_MIN_MINUTES = 270;
 var EARLY_OT_THRESHOLD_MINUTES = 60;
 var EARLY_PUNCH_POLICY_ID = "OPTION_A_60M";
-var KOLKATA_TIME_12H_FORMATTER = new Intl.DateTimeFormat("en-IN", {
+var KOLKATA_PARTS_FORMATTER = new Intl.DateTimeFormat("en-IN", {
   timeZone: "Asia/Kolkata",
+  year: "numeric",
+  month: "short",
+  day: "2-digit",
   hour: "2-digit",
   minute: "2-digit",
-  hour12: true
+  second: "2-digit",
+  hour12: false
 });
 var NON_WORKING_STATUSES = /* @__PURE__ */ new Set([
   "ABSENT",
@@ -7444,8 +7448,9 @@ var NON_WORKING_STATUSES = /* @__PURE__ */ new Set([
   "WEEKLY OFF",
   "HOLIDAY"
 ]);
-function classifyCompletedDutyStatus(completedDutyMinutes, standardDutyMinutes = STANDARD_DUTY_MINUTES) {
+function classifyCompletedDutyStatus(completedDutyMinutes, standardDutyMinutes = STANDARD_DUTY_MINUTES, overtimeMinutes = 0) {
   const safeMinutes = Math.max(0, Math.floor(Number.isFinite(completedDutyMinutes) ? completedDutyMinutes : 0));
+  const safeOt = Math.max(0, Math.floor(Number.isFinite(overtimeMinutes) ? overtimeMinutes : 0));
   const safeStandard = Math.max(
     1,
     Math.min(
@@ -7459,10 +7464,10 @@ function classifyCompletedDutyStatus(completedDutyMinutes, standardDutyMinutes =
   if (safeMinutes < safeStandard) {
     return "HALF DAY";
   }
-  if (safeMinutes === safeStandard) {
-    return "COMPLETED";
+  if (safeMinutes > safeStandard || safeOt > 0) {
+    return "COMPLETED + OT";
   }
-  return "COMPLETED + OT";
+  return "COMPLETED";
 }
 function formatDurationClock(mins) {
   const safe = Math.max(0, Math.floor(Number.isFinite(mins) ? mins : 0));
@@ -7485,11 +7490,40 @@ function formatShiftTimeClock12h(timeStr) {
   const ampm = h24 >= 12 ? "PM" : "AM";
   return `${String(h12).padStart(2, "0")}:${String(rawM).padStart(2, "0")} ${ampm}`;
 }
+function extractKolkataDateTimeParts(dt) {
+  const parts = KOLKATA_PARTS_FORMATTER.formatToParts(dt);
+  const map = {};
+  for (const p of parts) {
+    map[p.type] = p.value;
+  }
+  let hours24 = parseInt(map.hour || "0", 10);
+  if (hours24 === 24) hours24 = 0;
+  return {
+    day: String(map.day || "01").padStart(2, "0"),
+    month: String(map.month || "Jan"),
+    year: String(map.year || "1970"),
+    hours24,
+    minutes: String(map.minute || "00").padStart(2, "0"),
+    seconds: String(map.second || "00").padStart(2, "0")
+  };
+}
 function formatIsoTimeKolkata12h(isoString) {
   if (!isoString) return "--:--";
   const dt = new Date(isoString);
   if (Number.isNaN(dt.getTime())) return "--:--";
-  return KOLKATA_TIME_12H_FORMATTER.format(dt).toUpperCase();
+  const p = extractKolkataDateTimeParts(dt);
+  const h12 = p.hours24 % 12 || 12;
+  const ampm = p.hours24 >= 12 ? "PM" : "AM";
+  return `${String(h12).padStart(2, "0")}:${p.minutes} ${ampm}`;
+}
+function formatIsoDateTimeKolkata12h(isoString) {
+  if (!isoString) return "N/A";
+  const dt = new Date(isoString);
+  if (Number.isNaN(dt.getTime())) return "N/A";
+  const p = extractKolkataDateTimeParts(dt);
+  const h12 = p.hours24 % 12 || 12;
+  const ampm = p.hours24 >= 12 ? "PM" : "AM";
+  return `${p.day} ${p.month} ${p.year}, ${String(h12).padStart(2, "0")}:${p.minutes}:${p.seconds} ${ampm} IST`;
 }
 function getNextCalendarDateKey(dateKey) {
   const [y, m, d] = String(dateKey || "1970-01-01").split("-").map(Number);
@@ -7581,6 +7615,51 @@ function evaluateEarlyPunchOnPunchIn(params) {
     earlyPunchPolicy: EARLY_PUNCH_POLICY_ID
   };
 }
+function evaluateAutoCloseDuty(params) {
+  const standardDutyMinutes = Math.max(
+    1,
+    Math.min(
+      MAX_REGULAR_DUTY_MINUTES,
+      Math.floor(Number.isFinite(params.standardDutyMinutes) ? Number(params.standardDutyMinutes) : STANDARD_DUTY_MINUTES)
+    )
+  );
+  const firstInMs = new Date(params.firstInIso).getTime();
+  const scheduledEndMs = new Date(params.scheduledEndIso).getTime();
+  const scheduledStartMs = params.scheduledStartIso ? new Date(params.scheduledStartIso).getTime() : NaN;
+  if (!Number.isFinite(firstInMs) || !Number.isFinite(scheduledEndMs) || scheduledEndMs <= firstInMs) {
+    return {
+      actualPresenceMinutes: 0,
+      earlyArrivalMinutes: 0,
+      regularDutyMinutes: 0,
+      overtimeMinutes: 0,
+      earlyOtMinutes: 0,
+      postShiftOtMinutes: 0,
+      totalOtMinutes: 0,
+      totalDutyMinutes: 0,
+      attendanceStatus: "AUTO CLOSED",
+      earlyOtFinalized: false,
+      otCapApplied: false
+    };
+  }
+  const actualPresenceMinutes = Math.max(0, Math.floor((scheduledEndMs - firstInMs) / 6e4));
+  const earlyArrivalMinutes = Number.isFinite(scheduledStartMs) && firstInMs < scheduledStartMs ? Math.max(0, Math.floor((scheduledStartMs - firstInMs) / 6e4)) : 0;
+  const regularStartMs = Number.isFinite(scheduledStartMs) && firstInMs < scheduledStartMs ? scheduledStartMs : firstInMs;
+  const rawRegularDutyMinutes = scheduledEndMs > regularStartMs ? Math.floor((scheduledEndMs - regularStartMs) / 6e4) : 0;
+  const regularDutyMinutes = Math.min(rawRegularDutyMinutes, MAX_REGULAR_DUTY_MINUTES, standardDutyMinutes);
+  return {
+    actualPresenceMinutes,
+    earlyArrivalMinutes,
+    regularDutyMinutes,
+    overtimeMinutes: 0,
+    earlyOtMinutes: 0,
+    postShiftOtMinutes: 0,
+    totalOtMinutes: 0,
+    totalDutyMinutes: regularDutyMinutes,
+    attendanceStatus: "AUTO CLOSED",
+    earlyOtFinalized: false,
+    otCapApplied: false
+  };
+}
 function evaluateOptionAPunchOut(params) {
   const standardDutyMinutes = Math.max(
     1,
@@ -7592,6 +7671,8 @@ function evaluateOptionAPunchOut(params) {
   const firstInMs = new Date(params.firstInIso).getTime();
   const lastOutMs = new Date(params.lastOutIso).getTime();
   const scheduledStartMs = new Date(params.scheduledStartIso).getTime();
+  const parsedScheduledEndMs = params.scheduledEndIso ? new Date(params.scheduledEndIso).getTime() : NaN;
+  const scheduledEndMs = Number.isFinite(parsedScheduledEndMs) ? parsedScheduledEndMs : Number.isFinite(scheduledStartMs) ? scheduledStartMs + standardDutyMinutes * 6e4 : NaN;
   if (!Number.isFinite(firstInMs) || !Number.isFinite(lastOutMs) || lastOutMs < firstInMs) {
     return {
       actualPresenceMinutes: 0,
@@ -7613,50 +7694,44 @@ function evaluateOptionAPunchOut(params) {
   const earlyArrivalMinutes = Number.isFinite(scheduledStartMs) && firstInMs < scheduledStartMs ? Math.max(0, Math.floor((scheduledStartMs - firstInMs) / 6e4)) : 0;
   const rawEarlyOtMinutes = earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES ? earlyArrivalMinutes : 0;
   const provisionalEarlyOtMinutes = Math.min(rawEarlyOtMinutes, MAX_TOTAL_OT_MINUTES);
-  const shiftAnchorMs = Number.isFinite(scheduledStartMs) && firstInMs < scheduledStartMs ? scheduledStartMs : firstInMs;
-  const fromShiftStartMinutes = Math.max(0, Math.floor((lastOutMs - shiftAnchorMs) / 6e4));
-  if (fromShiftStartMinutes >= standardDutyMinutes) {
-    const regularDutyMinutes = Math.min(fromShiftStartMinutes, MAX_REGULAR_DUTY_MINUTES, standardDutyMinutes);
-    const rawPostShiftOtMinutes = Math.max(0, fromShiftStartMinutes - standardDutyMinutes);
-    const earlyOtMinutes = Math.min(rawEarlyOtMinutes, MAX_TOTAL_OT_MINUTES);
-    const remainingOtBudget = Math.max(0, MAX_TOTAL_OT_MINUTES - earlyOtMinutes);
-    const postShiftOtMinutes = Math.min(rawPostShiftOtMinutes, remainingOtBudget);
-    const totalOtMinutes = Math.min(earlyOtMinutes + postShiftOtMinutes, MAX_TOTAL_OT_MINUTES);
-    const overtimeMinutes = totalOtMinutes;
-    const totalDutyMinutes = Math.min(regularDutyMinutes + totalOtMinutes, MAX_CREDITED_TOTAL_MINUTES);
-    const otCapApplied = rawEarlyOtMinutes + rawPostShiftOtMinutes > MAX_TOTAL_OT_MINUTES || regularDutyMinutes + rawEarlyOtMinutes + rawPostShiftOtMinutes > MAX_CREDITED_TOTAL_MINUTES;
-    return {
-      actualPresenceMinutes,
-      earlyArrivalMinutes,
-      provisionalEarlyOtMinutes,
-      earlyOtMinutes,
-      postShiftOtMinutes,
-      overtimeMinutes,
-      totalOtMinutes,
-      regularDutyMinutes,
-      totalDutyMinutes,
-      otCapApplied,
-      attendanceStatus: overtimeMinutes > 0 ? "COMPLETED + OT" : "COMPLETED",
-      earlyOtFinalized: true,
-      earlyPunchPolicy: EARLY_PUNCH_POLICY_ID
-    };
+  const regularStartMs = Number.isFinite(scheduledStartMs) && firstInMs < scheduledStartMs ? scheduledStartMs : firstInMs;
+  const regularEndMs = Number.isFinite(scheduledEndMs) ? Math.min(lastOutMs, scheduledEndMs) : lastOutMs;
+  const rawRegularDutyMinutes = regularEndMs > regularStartMs ? Math.floor((regularEndMs - regularStartMs) / 6e4) : 0;
+  const regularDutyMinutes = Math.min(rawRegularDutyMinutes, MAX_REGULAR_DUTY_MINUTES, standardDutyMinutes);
+  let rawPostShiftOtMinutes = 0;
+  if (Number.isFinite(scheduledEndMs)) {
+    const postShiftStartMs = Math.max(firstInMs, scheduledEndMs);
+    if (lastOutMs > postShiftStartMs) {
+      rawPostShiftOtMinutes = Math.floor((lastOutMs - postShiftStartMs) / 6e4);
+    }
+  } else {
+    const elapsedFromAnchor = Math.max(0, Math.floor((lastOutMs - regularStartMs) / 6e4));
+    rawPostShiftOtMinutes = Math.max(0, elapsedFromAnchor - standardDutyMinutes);
   }
-  const countedDuty = Math.min(
-    earlyArrivalMinutes > 0 ? fromShiftStartMinutes : actualPresenceMinutes,
-    MAX_REGULAR_DUTY_MINUTES
+  const eligibleEarlyOtRaw = regularDutyMinutes >= standardDutyMinutes ? rawEarlyOtMinutes : 0;
+  const earlyOtMinutes = Math.min(eligibleEarlyOtRaw, MAX_TOTAL_OT_MINUTES);
+  const remainingOtBudget = Math.max(0, MAX_TOTAL_OT_MINUTES - earlyOtMinutes);
+  const postShiftOtMinutes = Math.min(rawPostShiftOtMinutes, remainingOtBudget);
+  const totalOtMinutes = Math.min(earlyOtMinutes + postShiftOtMinutes, MAX_TOTAL_OT_MINUTES);
+  const overtimeMinutes = totalOtMinutes;
+  const totalDutyMinutes = Math.min(regularDutyMinutes + totalOtMinutes, MAX_CREDITED_TOTAL_MINUTES);
+  const otCapApplied = eligibleEarlyOtRaw + rawPostShiftOtMinutes > MAX_TOTAL_OT_MINUTES || regularDutyMinutes + eligibleEarlyOtRaw + rawPostShiftOtMinutes > MAX_CREDITED_TOTAL_MINUTES;
+  const attendanceStatus = classifyCompletedDutyStatus(
+    totalDutyMinutes,
+    standardDutyMinutes,
+    overtimeMinutes
   );
-  const attendanceStatus = classifyCompletedDutyStatus(countedDuty, standardDutyMinutes);
   return {
     actualPresenceMinutes,
     earlyArrivalMinutes,
     provisionalEarlyOtMinutes,
-    earlyOtMinutes: 0,
-    postShiftOtMinutes: 0,
-    overtimeMinutes: 0,
-    totalOtMinutes: 0,
-    regularDutyMinutes: countedDuty,
-    totalDutyMinutes: countedDuty,
-    otCapApplied: false,
+    earlyOtMinutes,
+    postShiftOtMinutes,
+    overtimeMinutes,
+    totalOtMinutes,
+    regularDutyMinutes,
+    totalDutyMinutes,
+    otCapApplied,
     attendanceStatus,
     earlyOtFinalized: true,
     earlyPunchPolicy: EARLY_PUNCH_POLICY_ID
@@ -7698,6 +7773,8 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       state: "OUTSIDE",
       isOpen: false,
       isLate: false,
+      isCurrentlyAutoClosed: false,
+      punchOutTypeResolved: "NONE",
       completedDutyMinutes: 0,
       regularDutyMinutes: 0,
       overtimeMinutes: 0,
@@ -7707,6 +7784,16 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       scheduledStartDisplay,
       scheduledPunchOut: defaultEnd,
       scheduledEndDisplay,
+      actualPunchOutIso: null,
+      actualPunchOutDisplay: "N/A",
+      autoCloseEffectiveIso: null,
+      autoCloseTimeDisplay: "N/A",
+      autoClosedAtIso: null,
+      autoCloseRecordedAtDisplay: "N/A",
+      historicalAutoCloseEffectiveIso: null,
+      historicalAutoCloseTimeDisplay: "N/A",
+      historicalAutoClosedAtIso: null,
+      historicalAutoCloseRecordedAtDisplay: "N/A",
       earlyArrivalMinutes: 0,
       provisionalEarlyOtMinutes: 0,
       earlyOtMinutes: 0,
@@ -7722,6 +7809,12 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
   const rawStatus = String(record.attendanceStatus || "").trim().toUpperCase();
   const isLate = isAttendanceLate(record);
   const reconciledFromAutoClose = Boolean(record.reconciledFromAutoClose);
+  const storedHistoricalAutoCloseEffectiveIso = typeof record.autoCloseEffectivePunchOut === "string" && record.autoCloseEffectivePunchOut.trim() ? record.autoCloseEffectivePunchOut.trim() : null;
+  const storedHistoricalAutoClosedAtIso = typeof record.autoClosedAt === "string" && record.autoClosedAt.trim() ? record.autoClosedAt.trim() : null;
+  const historicalAutoCloseEffectiveIso = reconciledFromAutoClose ? storedHistoricalAutoCloseEffectiveIso : null;
+  const historicalAutoCloseTimeDisplay = historicalAutoCloseEffectiveIso ? formatIsoTimeKolkata12h(historicalAutoCloseEffectiveIso) : "N/A";
+  const historicalAutoClosedAtIso = reconciledFromAutoClose ? storedHistoricalAutoClosedAtIso : null;
+  const historicalAutoCloseRecordedAtDisplay = historicalAutoClosedAtIso ? formatIsoDateTimeKolkata12h(historicalAutoClosedAtIso) : "N/A";
   const firstInForSchedule = record.firstPunchIn || record.punchIn;
   let punchOutSchedule = null;
   if (firstInForSchedule && (record.scheduledPunchInIso || record.shiftDate)) {
@@ -7743,6 +7836,8 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       state: "OUTSIDE",
       isOpen: false,
       isLate: false,
+      isCurrentlyAutoClosed: false,
+      punchOutTypeResolved: "NONE",
       completedDutyMinutes: 0,
       regularDutyMinutes: 0,
       overtimeMinutes: 0,
@@ -7752,6 +7847,16 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       scheduledStartDisplay,
       scheduledPunchOut: defaultEnd,
       scheduledEndDisplay,
+      actualPunchOutIso: null,
+      actualPunchOutDisplay: "N/A",
+      autoCloseEffectiveIso: null,
+      autoCloseTimeDisplay: "N/A",
+      autoClosedAtIso: null,
+      autoCloseRecordedAtDisplay: "N/A",
+      historicalAutoCloseEffectiveIso: null,
+      historicalAutoCloseTimeDisplay: "N/A",
+      historicalAutoClosedAtIso: null,
+      historicalAutoCloseRecordedAtDisplay: "N/A",
       earlyArrivalMinutes: 0,
       provisionalEarlyOtMinutes: 0,
       earlyOtMinutes: 0,
@@ -7767,18 +7872,44 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
   const storedEarlyArrival = Math.max(0, Math.floor(Number(record.earlyArrivalMinutes || 0) || 0));
   const computedProvisionalEarlyOt = typeof record.provisionalEarlyOtMinutes === "number" && Number.isFinite(record.provisionalEarlyOtMinutes) ? Math.min(Math.max(0, Math.floor(record.provisionalEarlyOtMinutes)), MAX_TOTAL_OT_MINUTES) : storedEarlyArrival >= EARLY_OT_THRESHOLD_MINUTES ? Math.min(storedEarlyArrival, MAX_TOTAL_OT_MINUTES) : 0;
   const reenteredInside = String(record.currentState || "").toUpperCase() === "INSIDE" && String(record.punchOutType || "").toUpperCase() === "NONE";
-  if (!reenteredInside && (record.autoClosed === true || String(record.punchOutType || "").toUpperCase() === "AUTO" || rawStatus === "AUTO CLOSED" || rawStatus === "MISSED PUNCH OUT" || record.missedPunchOut === true)) {
-    const rawCompleted2 = Math.max(
-      0,
-      Math.floor(Number(record.totalDutyMinutes ?? record.regularDutyMinutes ?? 0) || 0)
-    );
-    const regularDutyMinutes2 = Math.min(rawCompleted2, MAX_REGULAR_DUTY_MINUTES, standardDutyMinutes);
+  const hasActualPunchOut = Boolean(record.actualPunchOut || record.lastPunchOut);
+  const isReconciledActual = String(record.punchOutType || "").toUpperCase() === "ACTUAL" && hasActualPunchOut && record.autoClosed !== true;
+  if (!reenteredInside && !isReconciledActual && (record.autoClosed === true || String(record.punchOutType || "").toUpperCase() === "AUTO" || rawStatus === "AUTO CLOSED" || rawStatus === "MISSED PUNCH OUT" || record.missedPunchOut === true)) {
+    const autoCloseEffectiveIso = typeof record.autoCloseEffectivePunchOut === "string" && record.autoCloseEffectivePunchOut.trim() ? record.autoCloseEffectivePunchOut.trim() : typeof record.effectivePunchOut === "string" && record.effectivePunchOut.trim() ? record.effectivePunchOut.trim() : null;
+    const autoCloseTimeDisplay = autoCloseEffectiveIso ? formatIsoTimeKolkata12h(autoCloseEffectiveIso) : "N/A";
+    const autoClosedAtIso = storedHistoricalAutoClosedAtIso;
+    const autoCloseRecordedAtDisplay = autoClosedAtIso ? formatIsoDateTimeKolkata12h(autoClosedAtIso) : "N/A";
+    const boundsForAuto = record.shiftDate ? resolveShiftScheduleBounds(record.shiftDate, record) : null;
+    const schedStartIsoForAuto = record.scheduledPunchInIso || boundsForAuto?.scheduledStartIso;
+    const effectiveEndIsoForCalc = autoCloseEffectiveIso || record.scheduledPunchOutIso || boundsForAuto?.scheduledEndIso || null;
+    let regularDutyMinutes2 = 0;
+    let resolvedEarlyArrival = storedEarlyArrival;
+    if (firstInForSchedule && effectiveEndIsoForCalc) {
+      const autoEval = evaluateAutoCloseDuty({
+        firstInIso: firstInForSchedule,
+        scheduledStartIso: schedStartIsoForAuto,
+        scheduledEndIso: effectiveEndIsoForCalc,
+        standardDutyMinutes
+      });
+      regularDutyMinutes2 = autoEval.regularDutyMinutes;
+      if (resolvedEarlyArrival === 0 && autoEval.earlyArrivalMinutes > 0) {
+        resolvedEarlyArrival = autoEval.earlyArrivalMinutes;
+      }
+    } else {
+      const rawCompleted2 = Math.max(
+        0,
+        Math.floor(Number(record.regularDutyMinutes ?? record.totalDutyMinutes ?? 0) || 0)
+      );
+      regularDutyMinutes2 = Math.min(rawCompleted2, MAX_REGULAR_DUTY_MINUTES, standardDutyMinutes);
+    }
     const completedDutyMinutes2 = regularDutyMinutes2;
     return {
       status: rawStatus === "MISSED PUNCH OUT" ? "MISSED PUNCH OUT" : "AUTO CLOSED",
       state: "OUTSIDE",
       isOpen: false,
       isLate,
+      isCurrentlyAutoClosed: true,
+      punchOutTypeResolved: "AUTO",
       completedDutyMinutes: completedDutyMinutes2,
       regularDutyMinutes: regularDutyMinutes2,
       overtimeMinutes: 0,
@@ -7789,13 +7920,23 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       scheduledStartDisplay,
       scheduledPunchOut: defaultEnd,
       scheduledEndDisplay,
-      earlyArrivalMinutes: storedEarlyArrival,
+      actualPunchOutIso: null,
+      actualPunchOutDisplay: "N/A",
+      autoCloseEffectiveIso,
+      autoCloseTimeDisplay,
+      autoClosedAtIso,
+      autoCloseRecordedAtDisplay,
+      historicalAutoCloseEffectiveIso: null,
+      historicalAutoCloseTimeDisplay: "N/A",
+      historicalAutoClosedAtIso: null,
+      historicalAutoCloseRecordedAtDisplay: "N/A",
+      earlyArrivalMinutes: resolvedEarlyArrival,
       provisionalEarlyOtMinutes: 0,
       earlyOtMinutes: 0,
       postShiftOtMinutes: 0,
       totalOtMinutes: 0,
       earlyOtFinalized: false,
-      isEarlyPunch: storedEarlyArrival > 0,
+      isEarlyPunch: resolvedEarlyArrival > 0,
       otCapApplied: false,
       reconciledFromAutoClose: false,
       punchOutSchedule
@@ -7810,6 +7951,8 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       state: "INSIDE",
       isOpen: true,
       isLate,
+      isCurrentlyAutoClosed: false,
+      punchOutTypeResolved: "NONE",
       completedDutyMinutes: 0,
       // Never count open shift as finalized completed duty
       regularDutyMinutes: 0,
@@ -7821,6 +7964,16 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       scheduledStartDisplay,
       scheduledPunchOut: defaultEnd,
       scheduledEndDisplay,
+      actualPunchOutIso: null,
+      actualPunchOutDisplay: "In Progress",
+      autoCloseEffectiveIso: null,
+      autoCloseTimeDisplay: "N/A",
+      autoClosedAtIso: null,
+      autoCloseRecordedAtDisplay: "N/A",
+      historicalAutoCloseEffectiveIso,
+      historicalAutoCloseTimeDisplay,
+      historicalAutoClosedAtIso,
+      historicalAutoCloseRecordedAtDisplay,
       earlyArrivalMinutes: storedEarlyArrival,
       provisionalEarlyOtMinutes: computedProvisionalEarlyOt,
       earlyOtMinutes: 0,
@@ -7834,7 +7987,9 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
     };
   }
   const firstInIso = record.firstPunchIn || record.punchIn;
-  const lastOutIso = record.lastPunchOut || record.actualPunchOut || record.effectivePunchOut;
+  const actualPunchOutIso = record.lastPunchOut || record.actualPunchOut || null;
+  const lastOutIso = actualPunchOutIso || record.effectivePunchOut;
+  const actualPunchOutDisplay = actualPunchOutIso ? formatIsoTimeKolkata12h(actualPunchOutIso) : lastOutIso ? formatIsoTimeKolkata12h(lastOutIso) : "N/A";
   const firstInMs = firstInIso ? new Date(firstInIso).getTime() : NaN;
   const lastOutMs = lastOutIso ? new Date(lastOutIso).getTime() : NaN;
   const isOptionARecord = record.earlyPunchPolicy === EARLY_PUNCH_POLICY_ID || typeof record.earlyOtMinutes === "number" || typeof record.postShiftOtMinutes === "number";
@@ -7855,12 +8010,15 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       MAX_CREDITED_TOTAL_MINUTES
     );
     let otCapApplied = Boolean(record.otCapApplied);
-    const scheduledStartIso = record.scheduledPunchInIso || (record.shiftDate ? resolveShiftScheduleBounds(record.shiftDate, record).scheduledStartIso : void 0);
+    const boundsForActual = record.shiftDate ? resolveShiftScheduleBounds(record.shiftDate, record) : null;
+    const scheduledStartIso = record.scheduledPunchInIso || boundsForActual?.scheduledStartIso;
+    const scheduledEndIso = record.scheduledPunchOutIso || boundsForActual?.scheduledEndIso;
     if (scheduledStartIso && firstInIso && lastOutIso && Number.isFinite(firstInMs) && Number.isFinite(lastOutMs)) {
       const evaluated = evaluateOptionAPunchOut({
         firstInIso,
         lastOutIso,
         scheduledStartIso,
+        scheduledEndIso,
         standardDutyMinutes
       });
       earlyArrivalMinutes = evaluated.earlyArrivalMinutes;
@@ -7873,12 +8031,14 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
     } else if (overtimeMinutes2 === 0 && typeof record.overtimeMinutes === "number") {
       overtimeMinutes2 = Math.min(Math.max(0, Math.floor(record.overtimeMinutes)), MAX_TOTAL_OT_MINUTES);
     }
-    const status2 = classifyCompletedDutyStatus(completedDutyMinutes2, standardDutyMinutes);
+    const status2 = classifyCompletedDutyStatus(completedDutyMinutes2, standardDutyMinutes, overtimeMinutes2);
     return {
       status: status2,
       state: "OUTSIDE",
       isOpen: false,
       isLate,
+      isCurrentlyAutoClosed: false,
+      punchOutTypeResolved: "ACTUAL",
       completedDutyMinutes: completedDutyMinutes2,
       regularDutyMinutes: regularDutyMinutes2,
       overtimeMinutes: overtimeMinutes2,
@@ -7888,6 +8048,16 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
       scheduledStartDisplay,
       scheduledPunchOut: defaultEnd,
       scheduledEndDisplay,
+      actualPunchOutIso: actualPunchOutIso || lastOutIso || null,
+      actualPunchOutDisplay,
+      autoCloseEffectiveIso: null,
+      autoCloseTimeDisplay: "N/A",
+      autoClosedAtIso: null,
+      autoCloseRecordedAtDisplay: "N/A",
+      historicalAutoCloseEffectiveIso,
+      historicalAutoCloseTimeDisplay,
+      historicalAutoClosedAtIso,
+      historicalAutoCloseRecordedAtDisplay,
       earlyArrivalMinutes,
       provisionalEarlyOtMinutes: earlyArrivalMinutes >= EARLY_OT_THRESHOLD_MINUTES ? Math.min(earlyArrivalMinutes, MAX_TOTAL_OT_MINUTES) : 0,
       earlyOtMinutes,
@@ -7921,6 +8091,8 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
     state: "OUTSIDE",
     isOpen: false,
     isLate,
+    isCurrentlyAutoClosed: false,
+    punchOutTypeResolved: "ACTUAL",
     completedDutyMinutes,
     regularDutyMinutes,
     overtimeMinutes,
@@ -7930,6 +8102,16 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
     scheduledStartDisplay,
     scheduledPunchOut: defaultEnd,
     scheduledEndDisplay,
+    actualPunchOutIso: actualPunchOutIso || lastOutIso || null,
+    actualPunchOutDisplay,
+    autoCloseEffectiveIso: null,
+    autoCloseTimeDisplay: "N/A",
+    autoClosedAtIso: null,
+    autoCloseRecordedAtDisplay: "N/A",
+    historicalAutoCloseEffectiveIso,
+    historicalAutoCloseTimeDisplay,
+    historicalAutoClosedAtIso,
+    historicalAutoCloseRecordedAtDisplay,
     earlyArrivalMinutes: 0,
     provisionalEarlyOtMinutes: 0,
     earlyOtMinutes: 0,
@@ -7944,7 +8126,7 @@ function resolveAttendanceMetrics(record, nowMs = Date.now(), standardDutyMinute
 }
 
 // serverAttendance.ts
-var KOLKATA_PARTS_FORMATTER = new Intl.DateTimeFormat("en-IN", {
+var KOLKATA_PARTS_FORMATTER2 = new Intl.DateTimeFormat("en-IN", {
   timeZone: "Asia/Kolkata",
   year: "numeric",
   month: "2-digit",
@@ -8027,7 +8209,7 @@ function timeStringToMinutes(timeStr) {
   return hh * 60 + (mm || 0);
 }
 function getKolkataTimeParts(date = /* @__PURE__ */ new Date()) {
-  const parts = KOLKATA_PARTS_FORMATTER.formatToParts(date);
+  const parts = KOLKATA_PARTS_FORMATTER2.formatToParts(date);
   const map = {};
   for (const p of parts) {
     map[p.type] = p.value;
@@ -8061,20 +8243,6 @@ function getKolkataTimeParts(date = /* @__PURE__ */ new Date()) {
 function getYesterdayKolkataDateKey(d = /* @__PURE__ */ new Date()) {
   const yesterday = new Date(d.getTime() - 24 * 3600 * 1e3);
   return getKolkataTimeParts(yesterday).dateKey;
-}
-function getNextDateKey(dateKey) {
-  const [y, m, d] = dateKey.split("-").map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, d));
-  dt.setUTCDate(dt.getUTCDate() + 1);
-  const nextY = dt.getUTCFullYear();
-  const nextM = String(dt.getUTCMonth() + 1).padStart(2, "0");
-  const nextD = String(dt.getUTCDate()).padStart(2, "0");
-  return `${nextY}-${nextM}-${nextD}`;
-}
-function getShiftScheduledEndIso(shiftDate, shift) {
-  const targetDateKey = shift.isOvernight ? getNextDateKey(shiftDate) : shiftDate;
-  const [h, m] = String(shift.endTime || "17:30").split(":");
-  return `${targetDateKey}T${h.padStart(2, "0")}:${(m || "00").padStart(2, "0")}:00+05:30`;
 }
 function formatTimeDisplay(isoString) {
   if (!isoString) return "--:--";
@@ -9824,16 +9992,25 @@ function registerAttendanceRoutes(app, deps) {
         if (record.actualPunchOut || record.punchOutType !== "NONE" || record.autoClosed === true) continue;
         const shift = shiftsMap.get(record.shiftId);
         if (!shift) continue;
-        const scheduledEndIso = record.scheduledPunchOutIso || getShiftScheduledEndIso(record.shiftDate, shift);
+        const bounds = resolveShiftScheduleBounds(record.shiftDate, {
+          ...shift,
+          shiftId: record.shiftId,
+          shiftNameSnapshot: record.shiftNameSnapshot,
+          scheduledPunchIn: record.scheduledPunchIn || shift.startTime,
+          scheduledPunchOut: record.scheduledPunchOut || shift.endTime
+        });
+        const scheduledStartIso = record.scheduledPunchInIso || bounds.scheduledStartIso;
+        const scheduledEndIso = record.scheduledPunchOutIso || bounds.scheduledEndIso;
         const scheduledEndDate = new Date(scheduledEndIso);
         if (now.getTime() >= scheduledEndDate.getTime()) {
-          const scheduledDuration = Math.min(
+          const maxShiftRegularDuration = Math.min(
             shift.scheduledDurationMinutes || settings.scheduledDurationMinutes || STANDARD_DUTY_MINUTES,
             MAX_REGULAR_DUTY_MINUTES
           );
           const docRef = db.collection("attendance").doc(record.id);
           const autoEventId = `pe_auto_${Date.now()}_${crypto4.randomBytes(3).toString("hex")}`;
           const autoDisplayTime = getKolkataTimeParts(scheduledEndDate).timeWithSeconds;
+          const autoCloseRecordedAtIso = now.toISOString();
           const updatedRecord = await withEmployeeScanLock(
             record.employeeId,
             () => db.runTransaction(async (tx) => {
@@ -9843,12 +10020,20 @@ function registerAttendanceRoutes(app, deps) {
               if (fresh.actualPunchOut || fresh.punchOutType !== "NONE" || fresh.autoClosed === true || fresh.currentState === "OUTSIDE") {
                 return null;
               }
+              const freshFirstInIso = fresh.firstPunchIn || fresh.punchIn;
+              const freshScheduledStartIso = fresh.scheduledPunchInIso || scheduledStartIso;
+              const autoDutyEval = evaluateAutoCloseDuty({
+                firstInIso: freshFirstInIso,
+                scheduledStartIso: freshScheduledStartIso,
+                scheduledEndIso,
+                standardDutyMinutes: maxShiftRegularDuration
+              });
               const autoCloseEvent = {
                 id: autoEventId,
                 employeeId: fresh.employeeId,
                 employeeName: fresh.employeeNameSnapshot || "",
                 eventType: "OUT",
-                timestamp: now.toISOString(),
+                timestamp: autoCloseRecordedAtIso,
                 effectivePunchOut: scheduledEndIso,
                 displayTime: autoDisplayTime,
                 shiftDate: fresh.shiftDate,
@@ -9859,7 +10044,7 @@ function registerAttendanceRoutes(app, deps) {
                 department: fresh.departmentIdSnapshot || "",
                 scannerType: "OUT",
                 scannerDevice: "SYSTEM_AUTO",
-                dutyDurationMinutes: scheduledDuration,
+                dutyDurationMinutes: autoDutyEval.regularDutyMinutes,
                 overtimeMinutes: 0,
                 earlyOtMinutes: 0,
                 postShiftOtMinutes: 0,
@@ -9869,8 +10054,11 @@ function registerAttendanceRoutes(app, deps) {
               };
               const next = {
                 ...fresh,
-                firstPunchIn: fresh.firstPunchIn || fresh.punchIn,
-                punchIn: fresh.punchIn || fresh.firstPunchIn,
+                firstPunchIn: freshFirstInIso,
+                punchIn: fresh.punchIn || freshFirstInIso,
+                scheduledPunchIn: fresh.scheduledPunchIn || bounds.startTime,
+                scheduledPunchInIso: freshScheduledStartIso,
+                scheduledPunchOut: fresh.scheduledPunchOut || bounds.endTime,
                 scheduledPunchOutIso: scheduledEndIso,
                 actualPunchOut: null,
                 lastPunchOut: null,
@@ -9880,11 +10068,12 @@ function registerAttendanceRoutes(app, deps) {
                 attendanceStatus: "AUTO CLOSED",
                 missedPunchOut: true,
                 autoClosed: true,
-                autoClosedAt: now.toISOString(),
+                autoClosedAt: autoCloseRecordedAtIso,
                 autoCloseEventId: autoEventId,
                 autoCloseEffectivePunchOut: scheduledEndIso,
-                totalDutyMinutes: scheduledDuration,
-                regularDutyMinutes: scheduledDuration,
+                actualPresenceMinutes: autoDutyEval.actualPresenceMinutes,
+                totalDutyMinutes: autoDutyEval.totalDutyMinutes,
+                regularDutyMinutes: autoDutyEval.regularDutyMinutes,
                 overtimeMinutes: 0,
                 // Strictly zero OT on auto-closed shifts
                 earlyOtMinutes: 0,
@@ -9892,7 +10081,7 @@ function registerAttendanceRoutes(app, deps) {
                 totalOtMinutes: 0,
                 earlyOtFinalized: false,
                 otCapApplied: false,
-                updatedAt: now.toISOString()
+                updatedAt: autoCloseRecordedAtIso
               };
               tx.set(docRef, next);
               tx.set(db.collection("punch_events").doc(autoEventId), autoCloseEvent);
@@ -9911,7 +10100,7 @@ function registerAttendanceRoutes(app, deps) {
                 scannerDevice: "SYSTEM_AUTO",
                 performedByUid: caller.uid,
                 performedByLoginId: caller.loginId,
-                message: `Provisional auto-close at scheduled shift end (${shift.endTime}). Status: AUTO CLOSED. OT: 00:00.`
+                message: `Provisional auto-close at scheduled shift end (${shift.endTime}). Duty: ${formatMinutes(updatedRecord.regularDutyMinutes)}, Status: AUTO CLOSED. OT: 00:00.`
               }),
               recordEnterpriseAuditEvent(db, {
                 req,
@@ -9923,7 +10112,7 @@ function registerAttendanceRoutes(app, deps) {
                 employeeId: record.employeeId,
                 targetType: "ATTENDANCE",
                 targetId: record.id,
-                newValue: `Auto-closed at ${scheduledEndIso}, Duty: ${formatMinutes(scheduledDuration)}, OT: 00:00`,
+                newValue: `Auto-closed at ${scheduledEndIso}, Duty: ${formatMinutes(updatedRecord.regularDutyMinutes)}, OT: 00:00`,
                 actionSource: "SYSTEM_SCHEDULER",
                 reason: "Provisional auto-close at scheduled shift end (reconcilable by genuine Punch-Out)",
                 captureGeo: false
@@ -10007,10 +10196,15 @@ function registerAttendanceRoutes(app, deps) {
           }
           let otCapApplied = Boolean(current.otCapApplied);
           if (punchOutType === "AUTO") {
-            const rawPresence = Math.max(0, Math.floor((outTime - inTime) / (60 * 1e3)));
-            actualPresenceMinutes = rawPresence;
-            regularDutyMinutes = Math.min(rawPresence, MAX_REGULAR_DUTY_MINUTES);
-            totalDutyMinutes = regularDutyMinutes;
+            const autoEval = evaluateAutoCloseDuty({
+              firstInIso,
+              scheduledStartIso,
+              scheduledEndIso: actualPunchOut || current.scheduledPunchOutIso || bounds.scheduledEndIso,
+              standardDutyMinutes: STANDARD_DUTY_MINUTES
+            });
+            actualPresenceMinutes = autoEval.actualPresenceMinutes;
+            regularDutyMinutes = autoEval.regularDutyMinutes;
+            totalDutyMinutes = autoEval.totalDutyMinutes;
             overtimeMinutes = 0;
             earlyOtMinutes = 0;
             postShiftOtMinutes = 0;
@@ -10042,7 +10236,7 @@ function registerAttendanceRoutes(app, deps) {
             "SHORT LEAVE",
             "PRESENT"
           ]);
-          const finalAttendanceStatus2 = punchOutType === "ACTUAL" && actualPunchOut && autoClassifySet2.has(attendanceStatus) ? classifyCompletedDutyStatus(totalDutyMinutes, STANDARD_DUTY_MINUTES) : attendanceStatus;
+          const finalAttendanceStatus2 = punchOutType === "ACTUAL" && actualPunchOut && autoClassifySet2.has(attendanceStatus) ? classifyCompletedDutyStatus(totalDutyMinutes, STANDARD_DUTY_MINUTES, overtimeMinutes) : attendanceStatus;
           const updatedFields2 = {
             actualPunchOut: punchOutType === "AUTO" ? null : actualPunchOut,
             lastPunchOut: punchOutType === "AUTO" ? null : actualPunchOut,
@@ -10347,6 +10541,237 @@ function registerAttendanceRoutes(app, deps) {
 // serverEmployees.ts
 import crypto5 from "crypto";
 import { z as z4 } from "zod";
+
+// src/utils/excelMasterNormalizer.ts
+var MASTER_FIELD_LABELS = {
+  department: "Department",
+  section: "Section",
+  floor: "Line / Floor",
+  employeeType: "Employee Type",
+  employeeStatus: "Status",
+  designation: "Designation"
+};
+var CANONICAL_EMPLOYEE_TYPES = [
+  { id: "type_permanent", name: "Permanent", code: "PERMANENT", status: "Active" },
+  { id: "type_staff", name: "Staff", code: "STAFF", status: "Active" },
+  { id: "type_offroll", name: "Offroll", code: "OFFROLL", status: "Active" }
+];
+var CANONICAL_EMPLOYEE_STATUSES = [
+  { id: "status_active", name: "Active", code: "ACTIVE", status: "Active" },
+  { id: "status_inactive", name: "Inactive", code: "INACTIVE", status: "Active" }
+];
+var DEFAULT_CANONICAL_FLOORS = [
+  { id: "line_mi_01", name: "MI-01", code: "MI-01", status: "Active" },
+  { id: "line_mi_02", name: "MI-02", code: "MI-02", status: "Active" },
+  { id: "line_fatp_stb", name: "FATP-STB", code: "FATP-STB", status: "Active" },
+  { id: "line_fatp_itr", name: "FATP-ITR", code: "FATP-ITR", status: "Active" },
+  { id: "line_smt_01", name: "SMT-01", code: "SMT-01", status: "Active" }
+];
+var DEFAULT_CANONICAL_SECTIONS = [
+  { id: "sec_mi", name: "MI", code: "MI", status: "Active" },
+  { id: "sec_smt", name: "SMT", code: "SMT", status: "Active" },
+  { id: "sec_fatp", name: "FATP", code: "FATP", status: "Active" },
+  { id: "sec_store", name: "STORE", code: "STORE", status: "Active" }
+];
+var DEFAULT_CANONICAL_DEPARTMENTS = [
+  { id: "dept_prod", name: "Production", code: "PROD", status: "Active" },
+  { id: "dept_qual", name: "Quality", code: "QC", status: "Active" },
+  { id: "dept_store", name: "Store", code: "STORE", status: "Active" },
+  { id: "dept_ppc", name: "PPC", code: "PPC", status: "Active" },
+  { id: "dept_rd", name: "R&D", code: "RD", status: "Active" },
+  { id: "dept_oth", name: "Others", code: "OTH", status: "Active" }
+];
+function normalizeWhitespaceAndUnicode(raw) {
+  if (raw === null || raw === void 0) return "";
+  return String(raw).normalize("NFC").replace(/[\u00A0\u1680\u2000-\u200B\u202F\u205F\u3000\uFEFF]/g, " ").replace(/\s+/g, " ").trim();
+}
+function normalizeMasterLookupKey(raw) {
+  if (raw === null || raw === void 0) return "";
+  return String(raw).normalize("NFKC").replace(/[\u00A0\u1680\u2000-\u200B\u202F\u205F\u3000\uFEFF]/g, " ").replace(/\s+/g, " ").trim().toLocaleLowerCase("en-US");
+}
+function toMasterRecordOptions(records) {
+  const out = [];
+  const seenExactIds = /* @__PURE__ */ new Set();
+  records.forEach((item, idx) => {
+    if (typeof item === "string") {
+      const cleanName2 = normalizeWhitespaceAndUnicode(item);
+      if (!cleanName2) return;
+      out.push({
+        id: `legacy_${idx}_${cleanName2}`,
+        name: cleanName2
+      });
+      return;
+    }
+    if (!item || typeof item !== "object") return;
+    const cleanName = normalizeWhitespaceAndUnicode(item.name);
+    if (!cleanName) return;
+    const cleanId = String(item.id || `master_${idx}`).trim();
+    if (seenExactIds.has(cleanId)) return;
+    seenExactIds.add(cleanId);
+    out.push({
+      id: cleanId,
+      name: cleanName,
+      code: item.code ? normalizeWhitespaceAndUnicode(item.code) : void 0,
+      status: item.status ? String(item.status) : void 0
+    });
+  });
+  return out;
+}
+function buildMasterLookupIndex(records) {
+  const options = toMasterRecordOptions(records);
+  const byNormalizedName = /* @__PURE__ */ new Map();
+  const byNormalizedCode = /* @__PURE__ */ new Map();
+  for (const opt of options) {
+    const nameKey = normalizeMasterLookupKey(opt.name);
+    if (nameKey) {
+      const bucket = byNormalizedName.get(nameKey);
+      if (bucket) {
+        bucket.push(opt);
+      } else {
+        byNormalizedName.set(nameKey, [opt]);
+      }
+    }
+    if (opt.code) {
+      const codeKey = normalizeMasterLookupKey(opt.code);
+      if (codeKey) {
+        const bucket = byNormalizedCode.get(codeKey);
+        if (bucket) {
+          bucket.push(opt);
+        } else {
+          byNormalizedCode.set(codeKey, [opt]);
+        }
+      }
+    }
+  }
+  return { options, byNormalizedName, byNormalizedCode };
+}
+function matchCanonicalMasterValue(rawInput, indexOrRecords) {
+  const index = Array.isArray(indexOrRecords) ? buildMasterLookupIndex(indexOrRecords) : indexOrRecords;
+  const originalValue = rawInput === null || rawInput === void 0 ? "" : String(rawInput);
+  const trimmedValue = normalizeWhitespaceAndUnicode(originalValue);
+  const lookupKey = normalizeMasterLookupKey(originalValue);
+  if (!lookupKey) {
+    return {
+      status: "UNMATCHED",
+      originalValue,
+      trimmedValue,
+      canonicalValue: null,
+      masterId: null,
+      wasNormalized: false,
+      caseNormalized: false,
+      whitespaceNormalized: originalValue !== trimmedValue,
+      matchedBy: "none",
+      ambiguousCandidates: []
+    };
+  }
+  const nameMatches = index.byNormalizedName.get(lookupKey) || [];
+  if (nameMatches.length > 1) {
+    return {
+      status: "AMBIGUOUS",
+      originalValue,
+      trimmedValue,
+      canonicalValue: null,
+      masterId: null,
+      wasNormalized: false,
+      caseNormalized: false,
+      whitespaceNormalized: originalValue !== trimmedValue,
+      matchedBy: "none",
+      ambiguousCandidates: nameMatches.map((m) => ({
+        id: m.id,
+        name: m.name,
+        code: m.code
+      }))
+    };
+  }
+  if (nameMatches.length === 1) {
+    const matched = nameMatches[0];
+    const whitespaceNormalized = originalValue !== trimmedValue;
+    const caseNormalized = trimmedValue !== matched.name;
+    return {
+      status: "MATCHED",
+      originalValue,
+      trimmedValue,
+      canonicalValue: matched.name,
+      masterId: matched.id.startsWith("legacy_") ? null : matched.id,
+      wasNormalized: whitespaceNormalized || caseNormalized,
+      caseNormalized,
+      whitespaceNormalized,
+      matchedBy: "name",
+      ambiguousCandidates: []
+    };
+  }
+  const codeMatches = index.byNormalizedCode.get(lookupKey) || [];
+  if (codeMatches.length > 1) {
+    return {
+      status: "AMBIGUOUS",
+      originalValue,
+      trimmedValue,
+      canonicalValue: null,
+      masterId: null,
+      wasNormalized: false,
+      caseNormalized: false,
+      whitespaceNormalized: originalValue !== trimmedValue,
+      matchedBy: "none",
+      ambiguousCandidates: codeMatches.map((m) => ({
+        id: m.id,
+        name: m.name,
+        code: m.code
+      }))
+    };
+  }
+  if (codeMatches.length === 1) {
+    const matched = codeMatches[0];
+    const whitespaceNormalized = originalValue !== trimmedValue;
+    const caseNormalized = trimmedValue !== matched.name;
+    return {
+      status: "MATCHED",
+      originalValue,
+      trimmedValue,
+      canonicalValue: matched.name,
+      masterId: matched.id.startsWith("legacy_") ? null : matched.id,
+      wasNormalized: whitespaceNormalized || caseNormalized,
+      caseNormalized,
+      whitespaceNormalized,
+      matchedBy: "code",
+      ambiguousCandidates: []
+    };
+  }
+  return {
+    status: "UNMATCHED",
+    originalValue,
+    trimmedValue,
+    canonicalValue: null,
+    masterId: null,
+    wasNormalized: false,
+    caseNormalized: false,
+    whitespaceNormalized: originalValue !== trimmedValue,
+    matchedBy: "none",
+    ambiguousCandidates: []
+  };
+}
+function buildUnambiguousDesignationMapFromEmployees(employees) {
+  const variantsByKey = /* @__PURE__ */ new Map();
+  for (const emp of employees) {
+    const clean = normalizeWhitespaceAndUnicode(emp.designation);
+    if (!clean) continue;
+    const key = normalizeMasterLookupKey(clean);
+    let set = variantsByKey.get(key);
+    if (!set) {
+      set = /* @__PURE__ */ new Set();
+      variantsByKey.set(key, set);
+    }
+    set.add(clean);
+  }
+  const canonicalMap = /* @__PURE__ */ new Map();
+  for (const [key, variants] of variantsByKey.entries()) {
+    if (variants.size === 1) {
+      canonicalMap.set(key, Array.from(variants)[0]);
+    }
+  }
+  return canonicalMap;
+}
+
+// serverEmployees.ts
 var EMPLOYEE_ID_PATTERN2 = /^[A-Za-z0-9_.\-]+$/;
 var EMPLOYEE_BULK_BATCH_SIZE = 400;
 var BulkImportRowSchema = z4.object({
@@ -10354,13 +10779,19 @@ var BulkImportRowSchema = z4.object({
     EMPLOYEE_ID_PATTERN2,
     "Employee ID may only contain letters, numbers, underscores (_), hyphens (-), and periods (.)."
   ),
-  employeeName: z4.string().trim().min(1, "Employee Name is required.").max(200, "Employee Name must be 200 characters or fewer."),
-  employeeType: z4.enum(["Permanent", "Staff", "Offroll"]),
-  section: z4.string().trim().min(1, "Section is required.").max(100),
-  department: z4.string().trim().min(1, "Department is required.").max(100),
-  floor: z4.string().trim().min(1, "Production Line is required.").max(100),
-  designation: z4.string().trim().min(1).max(120).default("Operator"),
-  employeeStatus: z4.enum(["Active", "Inactive"]),
+  employeeName: z4.string().trim().min(1, "Employee Name is required.").max(200, "Employee Name must be 200 characters or fewer.").optional(),
+  employeeType: z4.string().trim().min(1).max(60).optional(),
+  section: z4.string().trim().min(1, "Section is required.").max(100).optional(),
+  sectionId: z4.string().trim().min(1).max(128).optional(),
+  department: z4.string().trim().min(1, "Department is required.").max(100).optional(),
+  departmentId: z4.string().trim().min(1).max(128).optional(),
+  floor: z4.string().trim().min(1, "Production Line is required.").max(100).optional(),
+  floorId: z4.string().trim().min(1).max(128).optional(),
+  line: z4.string().trim().min(1).max(100).optional(),
+  lineId: z4.string().trim().min(1).max(128).optional(),
+  designation: z4.string().trim().min(1).max(120).optional(),
+  designationId: z4.string().trim().min(1).max(128).optional(),
+  employeeStatus: z4.string().trim().min(1).max(60).optional(),
   rowNumber: z4.number().int().positive().optional()
 });
 var BulkImportRequestSchema = z4.object({
@@ -10545,10 +10976,43 @@ function registerEmployeeRoutes(app, deps) {
           duplicateIds: Array.from(new Set(duplicateIds))
         });
       }
-      const existingSnap = await db.collection("employees").get();
+      const [existingSnap, floorsSnap, sectionsSnap, departmentsSnap, designationsSnap] = await Promise.all([
+        db.collection("employees").get(),
+        db.collection("floors").get(),
+        db.collection("sections").get(),
+        db.collection("departments").get(),
+        db.collection("designations").get()
+      ]);
+      const extractMasterRecords = (snap, fallback) => {
+        if (!snap.docs || snap.docs.length === 0) return fallback;
+        return snap.docs.map((d) => {
+          const data = d.data() || {};
+          return {
+            id: String(data.id || d.id),
+            name: String(data.name || ""),
+            code: data.code ? String(data.code) : void 0,
+            status: data.status ? String(data.status) : void 0
+          };
+        }).filter((item) => Boolean(item.name.trim()));
+      };
+      const floorMasterRecords = extractMasterRecords(floorsSnap, DEFAULT_CANONICAL_FLOORS);
+      const sectionMasterRecords = extractMasterRecords(sectionsSnap, DEFAULT_CANONICAL_SECTIONS);
+      const departmentMasterRecords = extractMasterRecords(
+        departmentsSnap,
+        DEFAULT_CANONICAL_DEPARTMENTS
+      );
+      const designationMasterRecords = extractMasterRecords(designationsSnap, []);
+      const typeIndex = buildMasterLookupIndex(CANONICAL_EMPLOYEE_TYPES);
+      const statusIndex = buildMasterLookupIndex(CANONICAL_EMPLOYEE_STATUSES);
+      const floorIndex = buildMasterLookupIndex(floorMasterRecords);
+      const sectionIndex = buildMasterLookupIndex(sectionMasterRecords);
+      const departmentIndex = buildMasterLookupIndex(departmentMasterRecords);
+      const designationIndex = designationMasterRecords.length > 0 ? buildMasterLookupIndex(designationMasterRecords) : null;
       const existingByUpperId = /* @__PURE__ */ new Map();
+      const existingEmployeesList = [];
       for (const d of existingSnap.docs) {
         const data = d.data() || {};
+        existingEmployeesList.push({ designation: data.designation });
         const key = String(data.employeeId || d.id).trim().toUpperCase();
         if (key) {
           existingByUpperId.set(key, { docId: d.id, data });
@@ -10558,65 +11022,214 @@ function registerEmployeeRoutes(app, deps) {
           existingByUpperId.set(docIdUpper, { docId: d.id, data });
         }
       }
+      const employeeDesignationMap = !designationIndex ? buildUnambiguousDesignationMapFromEmployees(existingEmployeesList) : null;
       const now = (/* @__PURE__ */ new Date()).toISOString();
       const operations = [];
       const skippedIds = [];
+      const validationErrors = [];
+      const ambiguities = [];
+      let normalizedCount = 0;
+      let normalizedFieldsCount = 0;
       for (const row of rows) {
         const cleanId = row.employeeId.trim().toUpperCase();
-        const cleanName = row.employeeName.trim().toUpperCase();
-        const cleanSection = row.section.trim();
-        const cleanDepartment = row.department.trim();
-        const cleanFloor = row.floor.trim();
-        const cleanDesignation = (row.designation || "Operator").trim();
         const existing = existingByUpperId.get(cleanId);
+        const isUpdate = Boolean(existing);
+        const rowErrors = [];
+        let rowWasNormalized = false;
+        const providedName = row.employeeName !== void 0 ? normalizeWhitespaceAndUnicode(row.employeeName) : void 0;
+        if (!isUpdate && !providedName) {
+          rowErrors.push({ code: "VALIDATION_ERROR", error: "Employee Name is required for new employee." });
+        }
+        const resolveBackendMaster = (field, rawVal, clientMasterId, index, requiredForNew) => {
+          if (rawVal === void 0) {
+            if (!isUpdate && requiredForNew) {
+              rowErrors.push({
+                code: "VALIDATION_ERROR",
+                error: `${MASTER_FIELD_LABELS[field]} is required for new employee.`
+              });
+            }
+            return { provided: false };
+          }
+          const match = matchCanonicalMasterValue(rawVal, index);
+          if (match.status === "AMBIGUOUS") {
+            const list = match.ambiguousCandidates.map((c) => `"${c.name}" (${c.id})`).join(", ");
+            rowErrors.push({
+              code: "AMBIGUOUS_MASTER_MATCH",
+              error: `Ambiguous ${MASTER_FIELD_LABELS[field]} "${match.trimmedValue}": matches multiple existing master records (${list}). Resolve duplicate master records before importing.`
+            });
+            ambiguities.push({
+              field,
+              fieldLabel: MASTER_FIELD_LABELS[field],
+              excelValue: match.originalValue,
+              rowNumbers: row.rowNumber ? [row.rowNumber] : [],
+              candidates: match.ambiguousCandidates
+            });
+            return { provided: true };
+          }
+          if (match.status === "UNMATCHED" || !match.canonicalValue) {
+            rowErrors.push({
+              code: "INVALID_MASTER_VALUE",
+              error: `Invalid ${MASTER_FIELD_LABELS[field]} "${match.trimmedValue}". Must match an existing website master record.`
+            });
+            return { provided: true };
+          }
+          if (clientMasterId !== void 0 && match.masterId !== null && clientMasterId.trim() !== match.masterId) {
+            rowErrors.push({
+              code: "MASTER_ID_MISMATCH",
+              error: `${MASTER_FIELD_LABELS[field]} ID "${clientMasterId}" does not match canonical master record "${match.canonicalValue}" (${match.masterId}).`
+            });
+            return { provided: true };
+          }
+          if (match.wasNormalized) {
+            rowWasNormalized = true;
+            normalizedFieldsCount += 1;
+          }
+          return {
+            provided: true,
+            canonical: match.canonicalValue,
+            masterId: match.masterId
+          };
+        };
+        const rawFloorInput = row.floor ?? row.line;
+        const clientFloorId = row.floorId ?? row.lineId;
+        const resType = resolveBackendMaster("employeeType", row.employeeType, void 0, typeIndex, true);
+        const resStatus = resolveBackendMaster("employeeStatus", row.employeeStatus, void 0, statusIndex, true);
+        const resSection = resolveBackendMaster("section", row.section, row.sectionId, sectionIndex, true);
+        const resDepartment = resolveBackendMaster("department", row.department, row.departmentId, departmentIndex, true);
+        const resFloor = resolveBackendMaster("floor", rawFloorInput, clientFloorId, floorIndex, true);
+        let resDesignation;
+        if (designationIndex) {
+          resDesignation = resolveBackendMaster(
+            "designation",
+            row.designation ?? (!isUpdate ? "Operator" : void 0),
+            row.designationId,
+            designationIndex,
+            false
+          );
+        } else if (row.designation !== void 0) {
+          const trimmedDesig = normalizeWhitespaceAndUnicode(row.designation);
+          const mappedDesig = employeeDesignationMap?.get(normalizeMasterLookupKey(trimmedDesig));
+          const finalDesig = mappedDesig || trimmedDesig || "Operator";
+          if (finalDesig !== row.designation) {
+            rowWasNormalized = true;
+            normalizedFieldsCount += 1;
+          }
+          resDesignation = { provided: true, canonical: finalDesig, masterId: null };
+        } else if (!isUpdate) {
+          resDesignation = { provided: true, canonical: "Operator", masterId: null };
+        } else {
+          resDesignation = { provided: false };
+        }
+        if (rowErrors.length > 0) {
+          const primaryCode = rowErrors.some((e) => e.code === "AMBIGUOUS_MASTER_MATCH") ? "AMBIGUOUS_MASTER_MATCH" : rowErrors[0].code;
+          validationErrors.push({
+            employeeId: cleanId,
+            rowNumber: row.rowNumber,
+            code: primaryCode,
+            error: rowErrors.map((e) => e.error).join(" | ")
+          });
+          continue;
+        }
+        if (rowWasNormalized) {
+          normalizedCount += 1;
+        }
         if (!existing) {
+          const newPayload = {
+            employeeId: cleanId,
+            employeeName: providedName,
+            employeeType: resType.canonical,
+            section: resSection.canonical,
+            department: resDepartment.canonical,
+            floor: resFloor.canonical,
+            designation: resDesignation.canonical || "Operator",
+            qrCodeToken: generateServerQrToken(cleanId),
+            employeeStatus: resStatus.canonical,
+            createdAt: now,
+            updatedAt: now
+          };
+          if (resSection.masterId) newPayload.sectionId = resSection.masterId;
+          if (resDepartment.masterId) newPayload.departmentId = resDepartment.masterId;
+          if (resFloor.masterId) {
+            newPayload.floorId = resFloor.masterId;
+            newPayload.lineId = resFloor.masterId;
+          }
+          if (resDesignation.masterId) newPayload.designationId = resDesignation.masterId;
           operations.push({
             actionType: "NEW",
             employeeId: cleanId,
             rowNumber: row.rowNumber,
             ref: db.collection("employees").doc(cleanId),
-            payload: {
-              employeeId: cleanId,
-              employeeName: cleanName,
-              employeeType: row.employeeType,
-              section: cleanSection,
-              department: cleanDepartment,
-              floor: cleanFloor,
-              designation: cleanDesignation,
-              qrCodeToken: generateServerQrToken(cleanId),
-              employeeStatus: row.employeeStatus,
-              createdAt: now,
-              updatedAt: now
-            }
+            payload: newPayload
           });
           continue;
         }
         const prev = existing.data;
-        const hasChanged = String(prev.employeeName || "").trim().toUpperCase() !== cleanName || String(prev.employeeType || "") !== row.employeeType || String(prev.section || "").trim() !== cleanSection || String(prev.department || "").trim() !== cleanDepartment || String(prev.floor || "").trim() !== cleanFloor || String(prev.designation || "").trim() !== cleanDesignation || String(prev.employeeStatus || "") !== row.employeeStatus;
+        const nextName = providedName !== void 0 ? providedName : String(prev.employeeName || "");
+        const nextType = resType.provided ? resType.canonical : String(prev.employeeType || "");
+        const nextSection = resSection.provided ? resSection.canonical : String(prev.section || "");
+        const nextDepartment = resDepartment.provided ? resDepartment.canonical : String(prev.department || "");
+        const nextFloor = resFloor.provided ? resFloor.canonical : String(prev.floor || "");
+        const nextDesignation = resDesignation.provided ? resDesignation.canonical : String(prev.designation || "");
+        const nextStatus = resStatus.provided ? resStatus.canonical : String(prev.employeeStatus || "");
+        const hasChanged = normalizeWhitespaceAndUnicode(prev.employeeName) !== nextName || String(prev.employeeType || "") !== nextType || String(prev.section || "").trim() !== nextSection || String(prev.department || "").trim() !== nextDepartment || String(prev.floor || "").trim() !== nextFloor || String(prev.designation || "").trim() !== nextDesignation || String(prev.employeeStatus || "") !== nextStatus;
         if (!hasChanged) {
           skippedIds.push(cleanId);
           continue;
+        }
+        const updatedPayload = {
+          ...prev,
+          // Preserve canonical existing Employee ID, QR security token, and historical creation date
+          employeeId: String(prev.employeeId || cleanId),
+          employeeName: nextName,
+          employeeType: nextType,
+          section: nextSection,
+          department: nextDepartment,
+          floor: nextFloor,
+          designation: nextDesignation,
+          qrCodeToken: prev.qrCodeToken || generateServerQrToken(cleanId),
+          employeeStatus: nextStatus,
+          createdAt: prev.createdAt || now,
+          updatedAt: now
+        };
+        if (resSection.provided && resSection.masterId) updatedPayload.sectionId = resSection.masterId;
+        if (resDepartment.provided && resDepartment.masterId) updatedPayload.departmentId = resDepartment.masterId;
+        if (resFloor.provided && resFloor.masterId) {
+          updatedPayload.floorId = resFloor.masterId;
+          updatedPayload.lineId = resFloor.masterId;
+        }
+        if (resDesignation.provided && resDesignation.masterId) {
+          updatedPayload.designationId = resDesignation.masterId;
         }
         operations.push({
           actionType: "UPDATE",
           employeeId: cleanId,
           rowNumber: row.rowNumber,
           ref: db.collection("employees").doc(existing.docId),
-          payload: {
-            ...prev,
-            employeeId: cleanId,
-            employeeName: cleanName,
-            employeeType: row.employeeType,
-            section: cleanSection,
-            department: cleanDepartment,
-            floor: cleanFloor,
-            designation: cleanDesignation,
-            // Strictly preserve existing QR code token and historical creation timestamp
-            qrCodeToken: prev.qrCodeToken || generateServerQrToken(cleanId),
-            employeeStatus: row.employeeStatus,
-            createdAt: prev.createdAt || now,
-            updatedAt: now
-          }
+          payload: updatedPayload
+        });
+      }
+      if (validationErrors.length > 0) {
+        const hasAmbiguity = validationErrors.some((e) => e.code === "AMBIGUOUS_MASTER_MATCH");
+        const hasIdMismatch = validationErrors.some((e) => e.code === "MASTER_ID_MISMATCH");
+        const primaryCode = hasAmbiguity ? "AMBIGUOUS_MASTER_MATCH" : hasIdMismatch ? "MASTER_ID_MISMATCH" : validationErrors[0].code;
+        return res.status(400).json({
+          success: false,
+          code: primaryCode,
+          category: "VALIDATION",
+          error: validationErrors[0].error,
+          partialCommit: false,
+          savedCount: 0,
+          insertedCount: 0,
+          updatedCount: 0,
+          skippedCount: 0,
+          failedCount: validationErrors.length,
+          committedIds: [],
+          failedRows: validationErrors.map((e) => ({
+            employeeId: e.employeeId,
+            rowNumber: e.rowNumber,
+            error: e.error
+          })),
+          ambiguities
         });
       }
       const needsInsert = operations.some((op) => op.actionType === "NEW");
@@ -10796,6 +11409,8 @@ function registerEmployeeRoutes(app, deps) {
         updatedCount: updatedIds.length,
         skippedCount: skippedIds.length,
         failedCount: 0,
+        normalizedCount,
+        normalizedFieldsCount,
         committedIds,
         insertedIds,
         updatedIds,
@@ -12631,6 +13246,1195 @@ function registerCompanyWifiRoutes(app, deps) {
   });
 }
 
+// serverDiagnostics.ts
+import crypto7 from "crypto";
+import { z as z7 } from "zod";
+
+// src/utils/errorRegistry.ts
+var ERROR_CODE_REGISTRY = {
+  "NET-001": {
+    code: "NET-001",
+    category: "NETWORK",
+    categoryLabel: "Network Connectivity",
+    userTitle: "Network Issue",
+    defaultAction: "Please check your internet connection and try again.",
+    retryable: true
+  },
+  "NET-002": {
+    code: "NET-002",
+    category: "NETWORK",
+    categoryLabel: "Network Timeout",
+    userTitle: "Connection Timed Out",
+    defaultAction: "The request took too long to complete. Please try again.",
+    retryable: true
+  },
+  "DB-001": {
+    code: "DB-001",
+    category: "DATABASE",
+    categoryLabel: "Database Connectivity",
+    userTitle: "Database Connectivity Issue",
+    defaultAction: "Unable to reach the database right now. Please try again shortly.",
+    retryable: true
+  },
+  "DB-002": {
+    code: "DB-002",
+    category: "DATABASE",
+    categoryLabel: "Database Operation Failed",
+    userTitle: "Data Processing Issue",
+    defaultAction: "Unable to complete the requested operation. Please try again.",
+    retryable: true
+  },
+  "AUTH-001": {
+    code: "AUTH-001",
+    category: "AUTH",
+    categoryLabel: "Authentication Failed",
+    userTitle: "Authentication Failed",
+    defaultAction: "Please check your credentials and try signing in again.",
+    retryable: false,
+    securityCritical: true
+  },
+  "AUTH-002": {
+    code: "AUTH-002",
+    category: "AUTH",
+    categoryLabel: "Session Expired",
+    userTitle: "Session Expired",
+    defaultAction: "Please sign in again to continue.",
+    retryable: false,
+    securityCritical: true
+  },
+  "PERM-001": {
+    code: "PERM-001",
+    category: "PERMISSION",
+    categoryLabel: "Permission Denied",
+    userTitle: "Access Denied",
+    defaultAction: "You do not have permission to perform this action.",
+    retryable: false,
+    securityCritical: true
+  },
+  "API-001": {
+    code: "API-001",
+    category: "API",
+    categoryLabel: "API Request Failed",
+    userTitle: "Service Request Failed",
+    defaultAction: "Unable to complete your request right now. Please try again.",
+    retryable: true
+  },
+  "SYS-001": {
+    code: "SYS-001",
+    category: "SYSTEM",
+    categoryLabel: "Server Unavailable",
+    userTitle: "Service Temporarily Unavailable",
+    defaultAction: "The service is temporarily unavailable. Please try again in a moment.",
+    retryable: true
+  },
+  "FILE-001": {
+    code: "FILE-001",
+    category: "FILE",
+    categoryLabel: "File Upload Failed",
+    userTitle: "File Upload Failed",
+    defaultAction: "Please verify the file format and try uploading again.",
+    retryable: true
+  },
+  "FILE-002": {
+    code: "FILE-002",
+    category: "FILE",
+    categoryLabel: "File Download Failed",
+    userTitle: "File Download Failed",
+    defaultAction: "Unable to generate or download the file. Please try again.",
+    retryable: true
+  },
+  "QR-001": {
+    code: "QR-001",
+    category: "QR",
+    categoryLabel: "QR Scanning Failed",
+    userTitle: "QR Scanning Issue",
+    defaultAction: "Please re-scan the employee QR card and try again.",
+    retryable: true
+  },
+  "ATT-001": {
+    code: "ATT-001",
+    category: "ATTENDANCE",
+    categoryLabel: "Attendance Operation Failed",
+    userTitle: "Attendance Operation Failed",
+    defaultAction: "Unable to record attendance right now. Please verify and try again.",
+    retryable: true
+  },
+  "VAL-001": {
+    code: "VAL-001",
+    category: "VALIDATION",
+    categoryLabel: "Data Validation Failed",
+    userTitle: "Invalid Input",
+    defaultAction: "Please check the entered details and try again.",
+    retryable: false
+  },
+  "SYS-999": {
+    code: "SYS-999",
+    category: "UNKNOWN",
+    categoryLabel: "Unknown Unexpected Error",
+    userTitle: "Something went wrong",
+    defaultAction: "An unexpected issue occurred. Please try again or contact your administrator.",
+    retryable: true
+  }
+};
+function formatUtcAndIstTimestamps(dateInput = /* @__PURE__ */ new Date()) {
+  const date = typeof dateInput === "number" ? new Date(dateInput) : dateInput;
+  const utc = date.toISOString();
+  const istMs = date.getTime() + 330 * 60 * 1e3;
+  const istDate = new Date(istMs);
+  const y = istDate.getUTCFullYear();
+  const m = String(istDate.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(istDate.getUTCDate()).padStart(2, "0");
+  const hh = String(istDate.getUTCHours()).padStart(2, "0");
+  const mm = String(istDate.getUTCMinutes()).padStart(2, "0");
+  const ss = String(istDate.getUTCSeconds()).padStart(2, "0");
+  const ms = String(istDate.getUTCMilliseconds()).padStart(3, "0");
+  return {
+    utc,
+    ist: `${y}-${m}-${d} ${hh}:${mm}:${ss}.${ms} IST`,
+    dateCompactIst: `${y}${m}${d}`
+  };
+}
+function randomHexFromWebOrFallback(byteLen) {
+  const g = globalThis;
+  if (g?.crypto && typeof g.crypto.getRandomValues === "function") {
+    const arr = new Uint8Array(byteLen);
+    g.crypto.getRandomValues(arr);
+    return Array.from(arr).map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+  }
+  if (g?.crypto && typeof g.crypto.randomUUID === "function") {
+    return String(g.crypto.randomUUID()).replace(/-/g, "").slice(0, byteLen * 2).toUpperCase();
+  }
+  let out = "";
+  for (let i = 0; i < byteLen * 2; i++) {
+    out += Math.floor(Math.random() * 16).toString(16);
+  }
+  return out.toUpperCase();
+}
+function generateFrontendErrorEventId(now = /* @__PURE__ */ new Date()) {
+  const { dateCompactIst } = formatUtcAndIstTimestamps(now);
+  return `ERR-${dateCompactIst}-${randomHexFromWebOrFallback(6)}`;
+}
+function isValidReferenceId(val) {
+  if (typeof val !== "string") return false;
+  return /^(?:REQ|ERR)-\d{8}-[A-F0-9]{8,24}$/.test(val.trim());
+}
+var SENSITIVE_KEY_PATTERN2 = /(?:password|passwd|pwd|secret|token|idtoken|refreshtoken|apikey|api_key|privatekey|private_key|authorization|cookie|pin|masterpin|credential|sessionsecret|rawbody|service_account)/i;
+var SECRET_VALUE_PATTERNS = [
+  // Bearer / JWT tokens
+  { pattern: /Bearer\s+[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+/gi, replacement: "Bearer [REDACTED_TOKEN]" },
+  { pattern: /Bearer\s+[A-Za-z0-9\-_.~+/]+=*/gi, replacement: "Bearer [REDACTED_TOKEN]" },
+  { pattern: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, replacement: "[REDACTED_JWT]" },
+  // Google / Firebase API keys & PEM private keys
+  { pattern: /\bAIza[0-9A-Za-z_-]{20,}\b/g, replacement: "[REDACTED_API_KEY]" },
+  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, replacement: "[REDACTED_PRIVATE_KEY]" },
+  // Inline key=value or "key":"value" secret patterns
+  {
+    pattern: /(["']?(?:password|passwd|pwd|pin|masterPin|idToken|refreshToken|token|apiKey|api_key|secret|private_key|authorization|cookie)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,&;}\]]+)/gi,
+    replacement: "$1[REDACTED]"
+  },
+  // URL query parameter secrets (?key=..., &token=...)
+  {
+    pattern: /([?&](?:key|token|idToken|refreshToken|password|secret|pin|auth)=)[^&\s]+/gi,
+    replacement: "$1[REDACTED]"
+  }
+];
+function sanitizeTextForLog(raw, maxLength = 800) {
+  if (raw === null || raw === void 0) return "";
+  let text = typeof raw === "string" ? raw : String(raw);
+  text = text.replace(/\u001b\[[0-9;]*[a-zA-Z]/g, "").replace(/[\r\n\t]+/g, " ").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").replace(/\s{2,}/g, " ").trim();
+  for (const rule of SECRET_VALUE_PATTERNS) {
+    text = text.replace(rule.pattern, rule.replacement);
+  }
+  if (text.length > maxLength) {
+    return `${text.slice(0, maxLength - 3)}...`;
+  }
+  return text;
+}
+function sanitizeDiagnosticObject(input, depth = 0) {
+  if (depth > 4) return "[TRUNCATED]";
+  if (input === null || input === void 0) return null;
+  if (typeof input === "string") return sanitizeTextForLog(input, 400);
+  if (typeof input === "number" || typeof input === "boolean") return input;
+  if (Array.isArray(input)) {
+    return input.slice(0, 20).map((item) => sanitizeDiagnosticObject(item, depth + 1));
+  }
+  if (typeof input === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(input).slice(0, 30)) {
+      if (SENSITIVE_KEY_PATTERN2.test(k)) {
+        out[k] = "[REDACTED]";
+      } else {
+        out[k] = sanitizeDiagnosticObject(v, depth + 1);
+      }
+    }
+    return out;
+  }
+  return sanitizeTextForLog(String(input), 200);
+}
+function containsRawTechnicalLeak(message) {
+  if (!message) return false;
+  const patterns = [
+    /https?:\/\//i,
+    /\/api\/[a-z0-9_/-]+/i,
+    /\bvercel\.app\b/i,
+    /\brun\.app\b/i,
+    /\blocalhost(?::\d+)?\b/i,
+    /\b127\.0\.0\.1\b/i,
+    /\bfirebase(?:error|admin)?\b/i,
+    /\bfirestore\b/i,
+    /\bidentitytoolkit\b/i,
+    /\bpermission_denied\b/i,
+    /\bmissing or insufficient permissions\b/i,
+    /\bfailed to fetch\b/i,
+    /\bnetworkerror\b/i,
+    /\bload failed\b/i,
+    /\btypeerror\b|\bsyntaxerror\b|\breferenceerror\b|\brangeerror\b/i,
+    /\beconnrefused\b|\benotfound\b|\betimedout\b|\beconnreset\b/i,
+    /\bserverless\b|\bvercel\.json\b|\bexpress\b|\bport 3000\b/i,
+    /\bvite_[a-z0-9_]+\b|\bprocess\.env\b|\bfirebase_service_account/i,
+    /\btext\/html\b|\bapplication\/json\b|\bnon-json\b|\bindex\.html\b|\bwarmup\b/i,
+    /<!doctype\s+html/i,
+    /<\/?(?:html|head|body|script|title)\b/i,
+    /\b50[234]\s+(?:bad gateway|service unavailable|gateway timeout)\b|\bbad gateway\b/i,
+    /\bhttp\s+[45]\d\d\b/i,
+    /\bat\s+[A-Za-z0-9_$.]+\s*\([^)]+:\d+:\d+\)/,
+    // Stack frame
+    /\b(?:user_roles|user_uid_index|punch_logs|punch_events|shift_rosters|account_security|audit_logs|technical_error_logs|company_wifi_networks)\b/i,
+    /\bquota exceeded\b|\bresource_exhausted\b|\bdeadline_exceeded\b|\b(?:code=|firestore\/)unavailable\b/i
+  ];
+  return patterns.some((rx) => rx.test(message));
+}
+function detectFirebaseErrorCode(err, rawText) {
+  const anyErr = err;
+  const directCode = String(anyErr?.code || anyErr?.errorInfo?.code || "").toLowerCase();
+  if (directCode) return directCode;
+  const match = rawText.match(/\b((?:auth|firestore|storage|functions)\/[a-z0-9-]+)\b/i);
+  if (match) return match[1].toLowerCase();
+  return "";
+}
+function isFirestoreConnectivitySignal(fbCode, lower, numericCode) {
+  if (fbCode === "unavailable" || fbCode === "firestore/unavailable" || fbCode === "deadline-exceeded" || fbCode === "firestore/deadline-exceeded" || numericCode === 14 || numericCode === 4) {
+    return true;
+  }
+  return /firestore.*(?:unavailable|offline|connection|could not reach|deadline|timeout)/i.test(lower) || /client is offline/i.test(lower) || /firebase_admin_unconfigured/i.test(lower) || /failed to get document because the client is offline/i.test(lower);
+}
+function isFirestoreOperationSignal(fbCode, lower, numericCode) {
+  if (fbCode === "aborted" || fbCode === "firestore/aborted" || fbCode === "failed-precondition" || fbCode === "firestore/failed-precondition" || fbCode === "resource-exhausted" || fbCode === "firestore/resource-exhausted" || fbCode === "data-loss" || fbCode === "firestore/data-loss" || numericCode === 10 || numericCode === 9 || numericCode === 8) {
+    return true;
+  }
+  return /firestore.*(?:permission|transaction|aborted|write|read|index|quota)/i.test(lower) || /missing or insufficient permissions/i.test(lower) || /transaction.*aborted/i.test(lower) || /no document to update/i.test(lower);
+}
+function classifyAndNormalizeError(input) {
+  const errObj = input.error;
+  const rawMessage = String(
+    input.rawMessage || errObj?.technicalMessage || errObj?.technicalDetail || errObj?.message || (typeof input.error === "string" ? input.error : "") || "Unexpected error"
+  );
+  const lower = rawMessage.toLowerCase();
+  const httpStatus = typeof input.httpStatus === "number" ? input.httpStatus : typeof errObj?.status === "number" ? errObj.status : null;
+  const apiCode = String(input.code || errObj?.code || errObj?.errorCode || "").trim();
+  const upperCode = apiCode.toUpperCase();
+  const fbCode = detectFirebaseErrorCode(input.error, rawMessage);
+  const exceptionType = sanitizeTextForLog(
+    errObj?.name || (typeof input.error === "object" && input.error ? input.error.constructor?.name : "Error") || "Error",
+    80
+  );
+  const moduleName = sanitizeTextForLog(input.moduleName || "Application", 80) || "Application";
+  const endpoint = input.endpoint ? sanitizeTextForLog(input.endpoint, 160) : null;
+  const retryCount = Math.max(0, Math.floor(Number(input.retryCount ?? errObj?.retryCount ?? 0) || 0));
+  const backendReqId = isValidReferenceId(input.requestId) ? input.requestId : isValidReferenceId(errObj?.requestId) ? String(errObj.requestId) : null;
+  const existingFrontendId = isValidReferenceId(input.errorEventId) ? input.errorEventId : isValidReferenceId(errObj?.errorEventId) ? String(errObj.errorEventId) : null;
+  const referenceIdSource = backendReqId ? "backend" : "frontend";
+  const errorEventId = backendReqId ? existingFrontendId : existingFrontendId || generateFrontendErrorEventId();
+  const referenceId = backendReqId || errorEventId;
+  const { utc: timestampUtc, ist: timestampIst } = formatUtcAndIstTimestamps();
+  const sanitizedTechnical = sanitizeTextForLog(rawMessage, 900);
+  let errorCode = "SYS-999";
+  let rootCauseConfidence = "UNKNOWN";
+  let rootCauseDetail = "Root cause could not be conclusively established from available error telemetry.";
+  let networkFailureClass = "NONE";
+  let dbFailureClass = "NONE";
+  let dbOperationCategory = input.dbOperationCategory ?? null;
+  let failureStage = backendReqId ? "BACKEND_PROCESSING" : "CLIENT_RUNTIME";
+  if (upperCode in ERROR_CODE_REGISTRY) {
+    errorCode = upperCode;
+  }
+  const looksLikeFetchFail = Boolean(input.isNetworkFetchFailure) || lower.includes("failed to fetch") || lower.includes("networkerror when attempting to fetch") || lower.includes("load failed") || lower.includes("unable to reach") || lower.includes("econnrefused") || lower.includes("enotfound") || lower.includes("net::err_");
+  const looksLikeTimeout = Boolean(input.isTimeout) || errObj?.name === "AbortError" || httpStatus === 408 || httpStatus === 504 || lower.includes("timed out") || lower.includes("timeout") || lower.includes("etimedout");
+  if (input.isOffline === true) {
+    errorCode = "NET-001";
+    networkFailureClass = "INTERNET_DISCONNECTED";
+    rootCauseConfidence = "CONFIRMED";
+    rootCauseDetail = "Browser navigator.onLine reported offline state before request could reach the server.";
+    failureStage = "BEFORE_BACKEND";
+  } else if (looksLikeTimeout && !isFirestoreConnectivitySignal(fbCode, lower, errObj?.code)) {
+    errorCode = "NET-002";
+    networkFailureClass = httpStatus === 504 ? "UPSTREAM_GATEWAY_502_503_504" : "REQUEST_TIMEOUT";
+    rootCauseConfidence = "CONFIRMED";
+    rootCauseDetail = httpStatus === 504 ? "Gateway timeout (HTTP 504) returned while awaiting backend completion." : "Client or network request exceeded the configured timeout threshold.";
+    failureStage = httpStatus === 504 ? "BACKEND_PROCESSING" : "BEFORE_BACKEND";
+  } else if (looksLikeFetchFail && (httpStatus === null || httpStatus === 0)) {
+    errorCode = "NET-001";
+    failureStage = "BEFORE_BACKEND";
+    if (lower.includes("cors") || lower.includes("preflight")) {
+      networkFailureClass = "CORS_OR_PREFLIGHT_FAILURE";
+      rootCauseConfidence = "SUSPECTED";
+      rootCauseDetail = "Browser blocked or failed cross-origin preflight/CORS fetch before backend response was readable.";
+    } else if (lower.includes("enotfound") || lower.includes("err_name_not_resolved") || lower.includes("econnrefused")) {
+      networkFailureClass = "DNS_OR_CONNECTION_FAILURE";
+      rootCauseConfidence = "CONFIRMED";
+      rootCauseDetail = "DNS resolution or TCP connection failed prior to reaching the backend service.";
+    } else {
+      networkFailureClass = "UNKNOWN_NETWORK_REQUEST_FAILURE";
+      rootCauseConfidence = "UNKNOWN";
+      rootCauseDetail = "Unknown Network/Request Failure: browser fetch failed before receiving an HTTP response. This does not confirm a database outage.";
+    }
+  } else if (isFirestoreConnectivitySignal(fbCode, lower, errObj?.code)) {
+    errorCode = "DB-001";
+    dbFailureClass = fbCode.includes("deadline") || lower.includes("timeout") ? "TIMEOUT" : lower.includes("unavailable") || fbCode.includes("unavailable") ? "FIRESTORE_UNAVAILABLE" : "DATABASE_CONNECTION_FAILURE";
+    dbOperationCategory = dbOperationCategory || "connection";
+    rootCauseConfidence = "CONFIRMED";
+    rootCauseDetail = `Verified Firestore connectivity failure (${fbCode || "unavailable"}).`;
+    failureStage = "DATABASE";
+  } else if (isFirestoreOperationSignal(fbCode, lower, errObj?.code) || input.isDatabaseContext && !httpStatus) {
+    errorCode = "DB-002";
+    if (fbCode.includes("permission") || lower.includes("insufficient permissions")) {
+      dbFailureClass = "PERMISSION_DENIED";
+    } else if (fbCode.includes("aborted") || lower.includes("aborted")) {
+      dbFailureClass = "TRANSACTION_ABORTED";
+      dbOperationCategory = dbOperationCategory || "transaction";
+    } else if (dbOperationCategory === "write") {
+      dbFailureClass = "WRITE_FAILURE";
+    } else if (dbOperationCategory === "read") {
+      dbFailureClass = "READ_FAILURE";
+    } else {
+      dbFailureClass = "WRITE_FAILURE";
+    }
+    rootCauseConfidence = fbCode || dbFailureClass === "TRANSACTION_ABORTED" || dbFailureClass === "PERMISSION_DENIED" ? "CONFIRMED" : "SUSPECTED";
+    rootCauseDetail = `Database operation failed during ${dbOperationCategory || "query/mutation"} (${fbCode || exceptionType}).`;
+    failureStage = "DATABASE";
+  } else if (httpStatus === 401 || fbCode === "auth/id-token-expired" || fbCode === "auth/id-token-revoked" || fbCode === "auth/user-token-expired" || upperCode === "SESSION_EXPIRED" || lower.includes("session expired") || lower.includes("token expired") || lower.includes("revoked") || lower.includes("sign in again")) {
+    const isSessionExpired = fbCode.includes("expired") || fbCode.includes("revoked") || lower.includes("expired") || lower.includes("revoked") || lower.includes("session") || httpStatus === 401 && !endpoint?.includes("/auth/login");
+    errorCode = isSessionExpired ? "AUTH-002" : "AUTH-001";
+    rootCauseConfidence = "CONFIRMED";
+    rootCauseDetail = isSessionExpired ? "Authentication session token is expired, missing, or revoked." : "Authentication credentials or identity verification failed.";
+    failureStage = backendReqId || httpStatus ? "BACKEND_PROCESSING" : "CLIENT_RUNTIME";
+  } else if (fbCode.startsWith("auth/") || upperCode.includes("LOCKED") || upperCode.includes("AUTH") || endpoint?.includes("/api/auth/login")) {
+    errorCode = "AUTH-001";
+    rootCauseConfidence = "CONFIRMED";
+    rootCauseDetail = `Authentication rejected (${fbCode || upperCode || `HTTP ${httpStatus || 401}`}).`;
+    failureStage = httpStatus ? "BACKEND_PROCESSING" : "CLIENT_RUNTIME";
+  } else if (httpStatus === 403 || upperCode === "COMPANY_WIFI_ACCESS_DENIED" || upperCode === "CORS_ORIGIN_FORBIDDEN" || fbCode === "permission-denied" || fbCode === "firestore/permission-denied") {
+    errorCode = "PERM-001";
+    rootCauseConfidence = "CONFIRMED";
+    rootCauseDetail = upperCode === "COMPANY_WIFI_ACCESS_DENIED" ? "Request denied by Company Wi-Fi Access Control policy." : upperCode === "CORS_ORIGIN_FORBIDDEN" ? "Request blocked by backend CORS origin allowlist." : "Caller lacks required role or module permission for this operation.";
+    failureStage = "BACKEND_PROCESSING";
+  } else if (httpStatus === 502 || httpStatus === 503) {
+    errorCode = "SYS-001";
+    networkFailureClass = "UPSTREAM_GATEWAY_502_503_504";
+    rootCauseConfidence = "CONFIRMED";
+    rootCauseDetail = `Backend or upstream proxy returned HTTP ${httpStatus} (Service Unavailable / Bad Gateway).`;
+    failureStage = "BACKEND_PROCESSING";
+  } else if (httpStatus === 400 || httpStatus === 422 || upperCode === "INVALID_JSON_BODY") {
+    if (moduleName.toLowerCase().includes("qr") || endpoint?.includes("/qr")) {
+      errorCode = "QR-001";
+    } else if (moduleName.toLowerCase().includes("import") || lower.includes("excel") || lower.includes("upload")) {
+      errorCode = "FILE-001";
+    } else {
+      errorCode = "VAL-001";
+    }
+    rootCauseConfidence = "CONFIRMED";
+    rootCauseDetail = `Request failed validation with HTTP ${httpStatus || 400}.`;
+    failureStage = "BACKEND_PROCESSING";
+  } else if (httpStatus && httpStatus >= 500) {
+    if (moduleName.toLowerCase().includes("attendance") || endpoint?.includes("/attendance")) {
+      errorCode = "ATT-001";
+    } else {
+      errorCode = "API-001";
+    }
+    rootCauseConfidence = "SUSPECTED";
+    rootCauseDetail = `Backend endpoint returned HTTP ${httpStatus} internal processing error.`;
+    failureStage = "BACKEND_PROCESSING";
+  } else if (httpStatus && httpStatus >= 400) {
+    if (moduleName.toLowerCase().includes("attendance") || endpoint?.includes("/attendance")) {
+      errorCode = "ATT-001";
+    } else if (moduleName.toLowerCase().includes("qr")) {
+      errorCode = "QR-001";
+    } else {
+      errorCode = "API-001";
+    }
+    rootCauseConfidence = "CONFIRMED";
+    rootCauseDetail = `API request rejected with HTTP ${httpStatus}.`;
+    failureStage = "BACKEND_PROCESSING";
+  } else if (input.forcedErrorCode && input.forcedErrorCode in ERROR_CODE_REGISTRY) {
+    errorCode = input.forcedErrorCode;
+    rootCauseConfidence = "SUSPECTED";
+    rootCauseDetail = `Module-classified ${errorCode} failure in ${moduleName}.`;
+    if (errorCode === "DB-001") {
+      dbFailureClass = "DATABASE_CONNECTION_FAILURE";
+      dbOperationCategory = dbOperationCategory || "connection";
+      failureStage = "DATABASE";
+    } else if (errorCode === "DB-002") {
+      dbFailureClass = dbOperationCategory === "read" ? "READ_FAILURE" : "WRITE_FAILURE";
+      failureStage = "DATABASE";
+    }
+  } else if (moduleName.toLowerCase().includes("export") || lower.includes("download") || lower.includes("xlsx")) {
+    errorCode = "FILE-002";
+    rootCauseConfidence = "SUSPECTED";
+    rootCauseDetail = "Client-side file generation or export operation failed.";
+    failureStage = "CLIENT_RUNTIME";
+  } else if (moduleName.toLowerCase().includes("import") || lower.includes("upload")) {
+    errorCode = "FILE-001";
+    rootCauseConfidence = "SUSPECTED";
+    rootCauseDetail = "File parsing or upload operation failed.";
+    failureStage = "CLIENT_RUNTIME";
+  } else if (moduleName.toLowerCase().includes("qr")) {
+    errorCode = "QR-001";
+    rootCauseConfidence = "SUSPECTED";
+    rootCauseDetail = "QR processing or camera scanning encountered an error.";
+    failureStage = "CLIENT_RUNTIME";
+  } else if (moduleName.toLowerCase().includes("attendance") || moduleName.toLowerCase().includes("scanner")) {
+    errorCode = "ATT-001";
+    rootCauseConfidence = "SUSPECTED";
+    rootCauseDetail = "Attendance operation failed during client or server execution.";
+  } else {
+    errorCode = "SYS-999";
+    rootCauseConfidence = "UNKNOWN";
+    rootCauseDetail = "Unexpected error occurred; exact root cause could not be automatically verified.";
+  }
+  if (backendReqId && upperCode in ERROR_CODE_REGISTRY) {
+    errorCode = upperCode;
+  }
+  const def = ERROR_CODE_REGISTRY[errorCode];
+  const canPreserveBusinessMsg = input.preserveSafeValidationMessage !== false && (errorCode === "VAL-001" || errorCode === "AUTH-001" || errorCode === "PERM-001" || errorCode === "ATT-001" || errorCode === "QR-001") && rawMessage.trim().length > 0 && rawMessage.trim().length <= 180 && !containsRawTechnicalLeak(rawMessage) || upperCode === "COMPANY_WIFI_ACCESS_DENIED";
+  const userAction = canPreserveBusinessMsg ? sanitizeTextForLog(rawMessage, 180) : def.defaultAction;
+  const shortLabel = `${def.userTitle} \u2013 Error Code: ${def.code}`;
+  const safeUserMessage = canPreserveBusinessMsg ? `${userAction} (Error Code: ${def.code} | Ref: ${referenceId})` : `${shortLabel}. ${def.defaultAction} (Ref: ${referenceId})`;
+  return {
+    errorCode: def.code,
+    category: def.category,
+    categoryLabel: def.categoryLabel,
+    userTitle: def.userTitle,
+    shortLabel,
+    userAction,
+    safeUserMessage,
+    referenceId,
+    referenceIdSource,
+    requestId: backendReqId,
+    errorEventId,
+    moduleName,
+    endpoint,
+    httpStatus,
+    technicalMessage: sanitizedTechnical,
+    rootCauseConfidence,
+    rootCauseDetail: sanitizeTextForLog(rootCauseDetail, 500),
+    exceptionType,
+    networkFailureClass,
+    dbFailureClass,
+    dbOperationCategory,
+    failureStage,
+    retryCount,
+    retryable: def.retryable,
+    timestampUtc,
+    timestampIst
+  };
+}
+
+// serverDiagnostics.ts
+var COL_TECHNICAL_ERROR_LOGS = "technical_error_logs";
+var DUPLICATE_GROUPING_WINDOW_MS = 15 * 60 * 1e3;
+var MAX_OCCURRENCES_STORED = 50;
+var MAX_RELATED_REQUEST_IDS = 100;
+var MAX_LIFECYCLE_EVENTS = 16;
+function generateBackendRequestId(now = /* @__PURE__ */ new Date()) {
+  const correlationUuid = crypto7.randomUUID();
+  const { dateCompactIst } = formatUtcAndIstTimestamps(now);
+  const randHex = crypto7.randomBytes(6).toString("hex").toUpperCase();
+  return {
+    requestId: `REQ-${dateCompactIst}-${randHex}`,
+    correlationUuid
+  };
+}
+function markRequestLifecycle(req, stage, detail, meta) {
+  if (!req?.traceState) return;
+  const state = req.traceState;
+  if (meta?.caller) {
+    state.userUid = meta.caller.uid || state.userUid;
+    state.userLoginId = meta.caller.loginId || state.userLoginId;
+    state.userRole = String(meta.caller.role || state.userRole).toUpperCase();
+  }
+  if (meta?.dbOperationCategory !== void 0) {
+    state.dbOperationCategory = meta.dbOperationCategory;
+  }
+  if (meta?.dbCollectionSafe !== void 0) {
+    state.dbCollectionSafe = meta.dbCollectionSafe ? sanitizeTextForLog(meta.dbCollectionSafe, 64) : null;
+  }
+  if (meta?.transactionRetryCount !== void 0) {
+    state.transactionRetryCount = meta.transactionRetryCount;
+  }
+  if (state.lifecycleEvents.length < MAX_LIFECYCLE_EVENTS) {
+    state.lifecycleEvents.push({
+      stage,
+      timestampUtc: (/* @__PURE__ */ new Date()).toISOString(),
+      elapsedMs: Math.max(0, Date.now() - state.startedAtMs),
+      ...detail ? { detail: sanitizeTextForLog(detail, 200) } : {}
+    });
+  }
+}
+function sanitizeEndpointPath(rawUrl) {
+  const withoutQuery = String(rawUrl || "/").split("?")[0] || "/";
+  return sanitizeTextForLog(withoutQuery, 160);
+}
+function extractSafeUserAgentSummary(req) {
+  const ua = String(req.headers["user-agent"] || "").trim();
+  if (!ua) return "Unknown Client";
+  return sanitizeTextForLog(ua, 180);
+}
+function inferModuleFromEndpoint(endpoint) {
+  const p = String(endpoint || "").toLowerCase();
+  if (p.includes("/api/attendance")) return "Attendance Scanner";
+  if (p.includes("/api/employees")) return "Employee Master";
+  if (p.includes("/api/dashboard")) return "Dashboard";
+  if (p.includes("/api/company-wifi")) return "Network Security";
+  if (p.includes("/api/auth")) return "Authentication";
+  if (p.includes("/api/security")) return "Security & Lockouts";
+  if (p.includes("/api/audit")) return "Audit Logs & Security";
+  if (p.includes("/api/diagnostics")) return "Technical Error Logs";
+  if (p.includes("/api/monitoring") || p.includes("/api/network")) return "System Performance";
+  if (p.includes("/api/masters/shifts")) return "Shift Management";
+  if (p.includes("/api/masters")) return "Organization Management";
+  if (p.includes("/api/admin") || p.includes("/api/roles")) return "User Rights & Auth";
+  return "Backend API";
+}
+function resolveRuntimeEnvironment() {
+  if (process.env.VITEST || process.env.NODE_ENV === "test") return "test";
+  if (process.env.VERCEL === "1" && process.env.VERCEL_ENV === "production") return "production";
+  return "preview";
+}
+function computeErrorFingerprint(params) {
+  const normalizedEndpoint = params.apiEndpoint.replace(/\/[a-zA-Z0-9_-]{12,}/g, "/:id");
+  const raw = [
+    params.errorCode,
+    params.moduleName.toLowerCase(),
+    normalizedEndpoint.toLowerCase(),
+    String(params.httpStatus ?? "none"),
+    params.exceptionType.toLowerCase(),
+    params.networkFailureClass,
+    params.dbFailureClass,
+    params.referenceIdSource
+  ].join("|");
+  return crypto7.createHash("sha256").update(raw).digest("hex").slice(0, 20);
+}
+async function persistTechnicalErrorLog(params) {
+  try {
+    const nowMs = params.nowMs ?? Date.now();
+    const { utc: nowUtc, ist: nowIst } = formatUtcAndIstTimestamps(new Date(nowMs));
+    const def = ERROR_CODE_REGISTRY[params.errorCode] || ERROR_CODE_REGISTRY["SYS-999"];
+    const cleanRequestId = isValidReferenceId(params.requestId) ? params.requestId : null;
+    const cleanErrorEventId = isValidReferenceId(params.errorEventId) ? params.errorEventId : null;
+    const referenceId = cleanRequestId || cleanErrorEventId || generateBackendRequestId(new Date(nowMs)).requestId;
+    const networkFailureClass = params.networkFailureClass || "NONE";
+    const dbFailureClass = params.dbFailureClass || "NONE";
+    const apiEndpoint = sanitizeEndpointPath(params.apiEndpoint || "/");
+    const moduleName = sanitizeTextForLog(params.moduleName || inferModuleFromEndpoint(apiEndpoint), 80);
+    const exceptionType = sanitizeTextForLog(params.exceptionType || "Error", 80);
+    const fingerprint = computeErrorFingerprint({
+      errorCode: def.code,
+      moduleName,
+      apiEndpoint,
+      httpStatus: params.httpStatus,
+      exceptionType,
+      networkFailureClass,
+      dbFailureClass,
+      referenceIdSource: params.referenceIdSource
+    });
+    const occurrence = {
+      requestId: cleanRequestId,
+      errorEventId: cleanErrorEventId,
+      timestampUtc: nowUtc,
+      timestampIst: nowIst,
+      userUid: sanitizeTextForLog(params.affectedUserUid || "anonymous", 128),
+      userLoginId: sanitizeTextForLog(params.affectedUserLoginId || "anonymous", 64),
+      userRole: sanitizeTextForLog(params.userRole || "ANONYMOUS", 40).toUpperCase(),
+      httpStatus: params.httpStatus,
+      retryCount: Math.max(0, Math.floor(Number(params.retryCount || 0)))
+    };
+    const isSecurityCritical = Boolean(def.securityCritical);
+    if (!isSecurityCritical && !params.forceSeparateRecord) {
+      const existingSnap = await params.db.collection(COL_TECHNICAL_ERROR_LOGS).where("fingerprint", "==", fingerprint).get();
+      const candidates = existingSnap.docs.map((d) => d.data()).filter((r) => r && r.resolutionStatus !== "RESOLVED").sort((a, b) => String(b.lastSeenAtUtc || b.timestampUtc).localeCompare(String(a.lastSeenAtUtc || a.timestampUtc)));
+      const latest = candidates[0];
+      if (latest) {
+        const lastSeenMs = Date.parse(latest.lastSeenAtUtc || latest.timestampUtc || "");
+        if (Number.isFinite(lastSeenMs) && nowMs - lastSeenMs <= DUPLICATE_GROUPING_WINDOW_MS) {
+          const prevOccurrences = Array.isArray(latest.occurrences) ? latest.occurrences : [];
+          const nextOccurrences = [...prevOccurrences, occurrence].slice(-MAX_OCCURRENCES_STORED);
+          const prevRelated = Array.isArray(latest.relatedRequestIds) ? latest.relatedRequestIds : [];
+          const nextRelatedSet = new Set(prevRelated);
+          if (cleanRequestId) nextRelatedSet.add(cleanRequestId);
+          if (cleanErrorEventId) nextRelatedSet.add(cleanErrorEventId);
+          const nextRelated = Array.from(nextRelatedSet).slice(-MAX_RELATED_REQUEST_IDS);
+          const updated = {
+            ...latest,
+            lastSeenAtUtc: nowUtc,
+            lastSeenAtIst: nowIst,
+            occurrenceCount: (Number(latest.occurrenceCount) || 1) + 1,
+            occurrences: nextOccurrences,
+            relatedRequestIds: nextRelated,
+            retryCount: Math.max(Number(latest.retryCount) || 0, occurrence.retryCount)
+          };
+          await params.db.collection(COL_TECHNICAL_ERROR_LOGS).doc(latest.errorId).set(updated);
+          return updated;
+        }
+      }
+    }
+    const errorId = `terr_${nowMs}_${crypto7.randomBytes(4).toString("hex")}`;
+    const relatedIds = [];
+    if (cleanRequestId) relatedIds.push(cleanRequestId);
+    if (cleanErrorEventId && cleanErrorEventId !== cleanRequestId) relatedIds.push(cleanErrorEventId);
+    const record = {
+      errorId,
+      fingerprint,
+      errorCode: def.code,
+      errorCategory: def.category,
+      errorCategoryLabel: def.categoryLabel,
+      timestampUtc: nowUtc,
+      timestampIst: nowIst,
+      lastSeenAtUtc: nowUtc,
+      lastSeenAtIst: nowIst,
+      affectedUserUid: occurrence.userUid,
+      affectedUserLoginId: occurrence.userLoginId,
+      userRole: occurrence.userRole,
+      moduleName,
+      apiEndpoint,
+      httpStatus: params.httpStatus,
+      requestId: cleanRequestId,
+      errorEventId: cleanErrorEventId,
+      referenceId,
+      referenceIdSource: params.referenceIdSource,
+      correlationUuid: params.correlationUuid || null,
+      relatedRequestIds: relatedIds,
+      technicalMessage: sanitizeTextForLog(params.technicalMessage, 900),
+      rootCauseConfidence: params.rootCauseConfidence || "UNKNOWN",
+      rootCauseDetails: sanitizeTextForLog(params.rootCauseDetails, 600),
+      exceptionType,
+      browserDeviceInfo: sanitizeTextForLog(params.browserDeviceInfo || "Unknown Client", 180),
+      networkFailureClass,
+      dbFailureClass,
+      dbOperationCategory: params.dbOperationCategory ?? null,
+      dbCollectionSafe: params.dbCollectionSafe ? sanitizeTextForLog(params.dbCollectionSafe, 64) : null,
+      failureStage: params.failureStage || (params.referenceIdSource === "backend" ? "BACKEND_PROCESSING" : "CLIENT_RUNTIME"),
+      retryCount: occurrence.retryCount,
+      transactionRetryCount: params.transactionRetryCount ?? null,
+      occurrenceCount: 1,
+      occurrences: [occurrence],
+      lifecycleEvents: Array.isArray(params.lifecycleEvents) ? params.lifecycleEvents.slice(0, MAX_LIFECYCLE_EVENTS) : [],
+      resolutionStatus: "OPEN",
+      resolvedBy: null,
+      resolvedAtUtc: null,
+      resolvedAtIst: null,
+      resolutionNotes: "",
+      environment: resolveRuntimeEnvironment()
+    };
+    await params.db.collection(COL_TECHNICAL_ERROR_LOGS).doc(errorId).set(record);
+    return record;
+  } catch (err) {
+    console.warn("[Diagnostics] Non-fatal error persisting diagnostic log:", err instanceof Error ? err.message : String(err));
+    return null;
+  }
+}
+function createRequestIdAndDiagnosticsMiddleware(getDb) {
+  return (req, res, next) => {
+    if (!req.path.startsWith("/api")) {
+      return next();
+    }
+    const { requestId, correlationUuid } = generateBackendRequestId();
+    const rawClientCorr = String(req.headers["x-correlation-id"] || "").trim();
+    const clientCorrelationId = rawClientCorr ? sanitizeTextForLog(rawClientCorr, 64) : null;
+    req.requestId = requestId;
+    req.traceState = {
+      requestId,
+      correlationUuid,
+      clientCorrelationId,
+      startedAtMs: Date.now(),
+      endpoint: sanitizeEndpointPath(req.originalUrl || req.path || "/api"),
+      method: String(req.method || "GET").toUpperCase(),
+      moduleName: inferModuleFromEndpoint(req.originalUrl || req.path || "/api"),
+      userUid: "anonymous",
+      userLoginId: "anonymous",
+      userRole: "ANONYMOUS",
+      browserDeviceInfo: extractSafeUserAgentSummary(req),
+      lifecycleEvents: [],
+      dbOperationCategory: null,
+      dbCollectionSafe: null,
+      transactionRetryCount: null,
+      errorLogged: false
+    };
+    markRequestLifecycle(req, "REQUEST_RECEIVED", `${req.traceState.method} ${req.traceState.endpoint}`);
+    res.setHeader("X-Request-ID", requestId);
+    const originalJson = res.json.bind(res);
+    res.json = ((body) => {
+      try {
+        const status = res.statusCode || 200;
+        const isErrorPayload = status >= 400 || body && typeof body === "object" && body.success === false;
+        if (isErrorPayload && body && typeof body === "object" && !Array.isArray(body)) {
+          const rawErrText = String(body.error || body.message || `HTTP ${status} API error`);
+          const normalized = classifyAndNormalizeError({
+            rawMessage: rawErrText,
+            httpStatus: status,
+            code: body.errorCode || body.code,
+            moduleName: req.traceState?.moduleName,
+            endpoint: req.traceState?.endpoint,
+            requestId,
+            dbOperationCategory: req.traceState?.dbOperationCategory ?? null
+          });
+          res.setHeader("X-Error-Code", normalized.errorCode);
+          res.setHeader("X-Error-Category", normalized.category);
+          const safeBody = {
+            ...body,
+            requestId,
+            errorCode: normalized.errorCode,
+            errorCategory: normalized.category
+          };
+          if (status >= 500 && containsRawTechnicalLeak(rawErrText)) {
+            safeBody.error = `${normalized.userTitle} \u2013 Error Code: ${normalized.errorCode}. ${normalized.userAction}`;
+          }
+          markRequestLifecycle(req, "RESPONSE_SENT", `HTTP ${status} (${normalized.errorCode})`);
+          const db = getDb();
+          const shouldLog = Boolean(db) && !req.traceState?.errorLogged && !req.path.startsWith("/api/diagnostics/report") && (status >= 500 || status === 401 || status === 403 || status === 404 || status === 429);
+          if (shouldLog && db && req.traceState) {
+            req.traceState.errorLogged = true;
+            void persistTechnicalErrorLog({
+              db,
+              errorCode: normalized.errorCode,
+              errorCategory: normalized.category,
+              affectedUserUid: req.traceState.userUid,
+              affectedUserLoginId: req.traceState.userLoginId,
+              userRole: req.traceState.userRole,
+              moduleName: req.traceState.moduleName,
+              apiEndpoint: req.traceState.endpoint,
+              httpStatus: status,
+              requestId,
+              errorEventId: null,
+              referenceIdSource: "backend",
+              correlationUuid: req.traceState.correlationUuid,
+              technicalMessage: rawErrText,
+              rootCauseConfidence: normalized.rootCauseConfidence,
+              rootCauseDetails: normalized.rootCauseDetail,
+              exceptionType: normalized.exceptionType,
+              browserDeviceInfo: req.traceState.browserDeviceInfo,
+              networkFailureClass: normalized.networkFailureClass,
+              dbFailureClass: normalized.dbFailureClass,
+              dbOperationCategory: req.traceState.dbOperationCategory ?? normalized.dbOperationCategory,
+              dbCollectionSafe: req.traceState.dbCollectionSafe,
+              failureStage: normalized.failureStage,
+              retryCount: 0,
+              transactionRetryCount: req.traceState.transactionRetryCount,
+              lifecycleEvents: req.traceState.lifecycleEvents
+            });
+          }
+          return originalJson(safeBody);
+        }
+        markRequestLifecycle(req, "RESPONSE_SENT", `HTTP ${status}`);
+      } catch {
+      }
+      return originalJson(body);
+    });
+    return next();
+  };
+}
+async function isAuthorizedForTechnicalLogs(db, caller) {
+  const roleId = normalizeRoleValue(caller.role);
+  if (roleId === "super_admin") return true;
+  if (roleId !== "admin") return false;
+  try {
+    const permDoc = await getCachedRolePermissionsDoc(db, roleId);
+    const mp = permDoc?.exists ? permDoc.data?.modulePermissions : void 0;
+    if (mp?.audit_logs?.view === true) {
+      return true;
+    }
+  } catch {
+  }
+  return false;
+}
+var ClientDiagnosticReportSchema = z7.object({
+  errorCode: z7.enum([
+    "NET-001",
+    "NET-002",
+    "DB-001",
+    "DB-002",
+    "AUTH-001",
+    "AUTH-002",
+    "PERM-001",
+    "API-001",
+    "SYS-001",
+    "FILE-001",
+    "FILE-002",
+    "QR-001",
+    "ATT-001",
+    "VAL-001",
+    "SYS-999"
+  ]),
+  moduleName: z7.string().trim().min(1).max(80),
+  apiEndpoint: z7.string().trim().max(160).optional(),
+  httpStatus: z7.number().int().min(0).max(599).nullable().optional(),
+  requestId: z7.string().trim().max(64).nullable().optional(),
+  errorEventId: z7.string().trim().max(64).nullable().optional(),
+  technicalMessage: z7.string().trim().min(1).max(1200),
+  rootCauseConfidence: z7.enum(["CONFIRMED", "SUSPECTED", "UNKNOWN"]).optional(),
+  rootCauseDetails: z7.string().trim().max(600).optional(),
+  exceptionType: z7.string().trim().max(80).optional(),
+  browserDeviceInfo: z7.string().trim().max(220).optional(),
+  networkFailureClass: z7.enum([
+    "INTERNET_DISCONNECTED",
+    "REQUEST_TIMEOUT",
+    "DNS_OR_CONNECTION_FAILURE",
+    "SERVER_UNREACHABLE",
+    "UPSTREAM_GATEWAY_502_503_504",
+    "CORS_OR_PREFLIGHT_FAILURE",
+    "UNKNOWN_NETWORK_REQUEST_FAILURE",
+    "NONE"
+  ]).optional(),
+  dbFailureClass: z7.enum([
+    "FIRESTORE_UNAVAILABLE",
+    "DATABASE_CONNECTION_FAILURE",
+    "PERMISSION_DENIED",
+    "TRANSACTION_ABORTED",
+    "READ_FAILURE",
+    "WRITE_FAILURE",
+    "TIMEOUT",
+    "NONE"
+  ]).optional(),
+  dbOperationCategory: z7.enum(["read", "write", "transaction", "connection"]).nullable().optional(),
+  failureStage: z7.enum(["BEFORE_BACKEND", "BACKEND_PROCESSING", "DATABASE", "CLIENT_RUNTIME"]).optional(),
+  retryCount: z7.number().int().min(0).max(20).optional(),
+  extraMetadata: z7.record(z7.string(), z7.unknown()).optional()
+});
+var ResolutionStatusUpdateSchema = z7.object({
+  resolutionStatus: z7.enum(["OPEN", "INVESTIGATING", "RESOLVED"]),
+  resolutionNotes: z7.string().trim().max(800).optional()
+});
+function registerDiagnosticRoutes(app, deps) {
+  const { db, requireVerifiedCaller } = deps;
+  const getNowMs = deps.nowProvider || (() => Date.now());
+  app.post("/api/diagnostics/report", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        "*",
+        "Report Diagnostic Error Event",
+        { skipWifiCheck: true }
+      );
+      if (!caller) return;
+      const parsed = ClientDiagnosticReportSchema.safeParse(req.body || {});
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid diagnostic event payload."
+        });
+      }
+      const d = parsed.data;
+      const def = ERROR_CODE_REGISTRY[d.errorCode] || ERROR_CODE_REGISTRY["SYS-999"];
+      const validatedBackendReqId = isValidReferenceId(d.requestId) && d.requestId.startsWith("REQ-") ? d.requestId : null;
+      const validatedClientEventId = isValidReferenceId(d.errorEventId) && d.errorEventId.startsWith("ERR-") ? d.errorEventId : !validatedBackendReqId ? `ERR-${formatUtcAndIstTimestamps(new Date(getNowMs())).dateCompactIst}-${crypto7.randomBytes(6).toString("hex").toUpperCase()}` : null;
+      const sanitizedExtra = d.extraMetadata ? JSON.stringify(sanitizeDiagnosticObject(d.extraMetadata)) : "";
+      const combinedTechnical = sanitizedExtra && sanitizedExtra !== "{}" ? `${d.technicalMessage} | meta=${sanitizedExtra}` : d.technicalMessage;
+      const saved = await persistTechnicalErrorLog({
+        db,
+        errorCode: def.code,
+        errorCategory: def.category,
+        affectedUserUid: caller.uid,
+        affectedUserLoginId: caller.loginId,
+        userRole: String(caller.role || "USER").toUpperCase(),
+        moduleName: d.moduleName,
+        apiEndpoint: d.apiEndpoint || "client://ui",
+        httpStatus: d.httpStatus ?? null,
+        requestId: validatedBackendReqId,
+        errorEventId: validatedClientEventId,
+        referenceIdSource: validatedBackendReqId ? "backend" : "frontend",
+        correlationUuid: req.traceState?.correlationUuid || null,
+        technicalMessage: combinedTechnical,
+        rootCauseConfidence: d.rootCauseConfidence || "UNKNOWN",
+        rootCauseDetails: d.rootCauseDetails || "Reported by client runtime; technical cause requires administrator review.",
+        exceptionType: d.exceptionType || "ClientError",
+        browserDeviceInfo: d.browserDeviceInfo || extractSafeUserAgentSummary(req),
+        networkFailureClass: d.networkFailureClass || "NONE",
+        dbFailureClass: d.dbFailureClass || "NONE",
+        dbOperationCategory: d.dbOperationCategory ?? null,
+        failureStage: d.failureStage || (validatedBackendReqId ? "BACKEND_PROCESSING" : "CLIENT_RUNTIME"),
+        retryCount: d.retryCount ?? 0,
+        nowMs: getNowMs()
+      });
+      return res.status(201).json({
+        success: true,
+        errorId: saved?.errorId || null,
+        referenceId: saved?.referenceId || validatedBackendReqId || validatedClientEventId,
+        referenceIdSource: validatedBackendReqId ? "backend" : "frontend",
+        occurrenceCount: saved?.occurrenceCount || 1
+      });
+    } catch (err) {
+      console.warn("[Diagnostics] Report ingestion error:", err);
+      return res.status(500).json({
+        success: false,
+        error: "Unable to record diagnostic event."
+      });
+    }
+  });
+  app.get("/api/diagnostics/errors", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        "*",
+        "View Technical Error Logs",
+        { skipWifiCheck: true }
+      );
+      if (!caller) return;
+      const authorized = await isAuthorizedForTechnicalLogs(db, caller);
+      if (!authorized) {
+        return res.status(403).json({
+          success: false,
+          error: "Access Denied: Technical Error Logs are restricted to authorized administrators."
+        });
+      }
+      const search = String(req.query.search || "").trim().toLowerCase();
+      const requestIdFilter = String(req.query.requestId || "").trim().toUpperCase();
+      const errorCodeFilter = String(req.query.errorCode || "").trim().toUpperCase();
+      const categoryFilter = String(req.query.category || "").trim().toUpperCase();
+      const moduleFilter = String(req.query.module || "").trim().toLowerCase();
+      const userIdFilter = String(req.query.userId || "").trim().toLowerCase();
+      const roleFilter = String(req.query.role || "").trim().toUpperCase();
+      const statusFilter = String(req.query.status || "").trim().toUpperCase();
+      const fromFilter = String(req.query.from || "").trim();
+      const toFilter = String(req.query.to || "").trim();
+      const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+      const pageSize = Math.max(1, Math.min(100, parseInt(String(req.query.pageSize || "25"), 10) || 25));
+      const snap = await db.collection(COL_TECHNICAL_ERROR_LOGS).get();
+      const allRecords = snap.docs.map((d) => d.data()).filter((r) => Boolean(r && r.errorId)).sort(
+        (a, b) => String(b.lastSeenAtUtc || b.timestampUtc || "").localeCompare(
+          String(a.lastSeenAtUtc || a.timestampUtc || "")
+        )
+      );
+      const kpis = {
+        totalErrors: allRecords.length,
+        totalOccurrences: allRecords.reduce((acc, r) => acc + (Number(r.occurrenceCount) || 1), 0),
+        networkErrors: allRecords.filter((r) => r.errorCategory === "NETWORK").length,
+        databaseErrors: allRecords.filter((r) => r.errorCategory === "DATABASE").length,
+        apiErrors: allRecords.filter((r) => r.errorCategory === "API" || r.errorCategory === "SYSTEM").length,
+        authErrors: allRecords.filter((r) => r.errorCategory === "AUTH" || r.errorCategory === "PERMISSION").length,
+        unresolvedErrors: allRecords.filter((r) => r.resolutionStatus !== "RESOLVED").length,
+        resolvedErrors: allRecords.filter((r) => r.resolutionStatus === "RESOLVED").length
+      };
+      const availableModules = Array.from(new Set(allRecords.map((r) => r.moduleName).filter(Boolean))).sort();
+      let filtered = allRecords;
+      if (requestIdFilter) {
+        filtered = filtered.filter(
+          (r) => String(r.requestId || "").toUpperCase().includes(requestIdFilter) || String(r.errorEventId || "").toUpperCase().includes(requestIdFilter) || String(r.referenceId || "").toUpperCase().includes(requestIdFilter) || Array.isArray(r.relatedRequestIds) && r.relatedRequestIds.some((id) => String(id).toUpperCase().includes(requestIdFilter))
+        );
+      }
+      if (errorCodeFilter && errorCodeFilter !== "ALL") {
+        filtered = filtered.filter((r) => r.errorCode === errorCodeFilter);
+      }
+      if (categoryFilter && categoryFilter !== "ALL") {
+        filtered = filtered.filter((r) => r.errorCategory === categoryFilter);
+      }
+      if (moduleFilter && moduleFilter !== "all") {
+        filtered = filtered.filter((r) => String(r.moduleName || "").toLowerCase() === moduleFilter);
+      }
+      if (userIdFilter) {
+        filtered = filtered.filter(
+          (r) => String(r.affectedUserUid || "").toLowerCase().includes(userIdFilter) || String(r.affectedUserLoginId || "").toLowerCase().includes(userIdFilter)
+        );
+      }
+      if (roleFilter && roleFilter !== "ALL") {
+        filtered = filtered.filter((r) => String(r.userRole || "").toUpperCase() === roleFilter);
+      }
+      if (statusFilter && statusFilter !== "ALL") {
+        filtered = filtered.filter((r) => String(r.resolutionStatus || "OPEN").toUpperCase() === statusFilter);
+      }
+      if (fromFilter) {
+        const fromMs = Date.parse(fromFilter);
+        if (Number.isFinite(fromMs)) {
+          filtered = filtered.filter((r) => Date.parse(r.lastSeenAtUtc || r.timestampUtc) >= fromMs);
+        }
+      }
+      if (toFilter) {
+        const toMs = Date.parse(toFilter);
+        if (Number.isFinite(toMs)) {
+          filtered = filtered.filter((r) => Date.parse(r.timestampUtc) <= toMs);
+        }
+      }
+      if (search) {
+        filtered = filtered.filter((r) => {
+          const hay = [
+            r.errorId,
+            r.errorCode,
+            r.errorCategory,
+            r.errorCategoryLabel,
+            r.requestId,
+            r.errorEventId,
+            r.referenceId,
+            ...Array.isArray(r.relatedRequestIds) ? r.relatedRequestIds : [],
+            r.affectedUserUid,
+            r.affectedUserLoginId,
+            r.userRole,
+            r.moduleName,
+            r.apiEndpoint,
+            r.technicalMessage,
+            r.rootCauseDetails,
+            r.exceptionType,
+            r.resolutionNotes
+          ].filter(Boolean).join(" ").toLowerCase();
+          return hay.includes(search);
+        });
+      }
+      const totalFiltered = filtered.length;
+      const totalPages = Math.max(1, Math.ceil(totalFiltered / pageSize));
+      const safePage = Math.min(page, totalPages);
+      const start = (safePage - 1) * pageSize;
+      const pageItems = filtered.slice(start, start + pageSize);
+      return res.json({
+        success: true,
+        kpis,
+        availableModules,
+        pagination: {
+          page: safePage,
+          pageSize,
+          totalFiltered,
+          totalPages
+        },
+        errors: pageItems
+      });
+    } catch (err) {
+      console.error("[Diagnostics] List technical error logs failed:", err);
+      return res.status(500).json({
+        success: false,
+        error: "Failed to load technical error logs."
+      });
+    }
+  });
+  app.get("/api/diagnostics/trace/:requestId", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        "*",
+        "Lookup Request Trace",
+        { skipWifiCheck: true }
+      );
+      if (!caller) return;
+      const authorized = await isAuthorizedForTechnicalLogs(db, caller);
+      if (!authorized) {
+        return res.status(403).json({
+          success: false,
+          error: "Access Denied: Technical request traces are restricted to authorized administrators."
+        });
+      }
+      const targetRef = String(req.params.requestId || "").trim().toUpperCase();
+      if (!targetRef || targetRef.length < 4 || targetRef.length > 64) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid Request ID or Reference ID."
+        });
+      }
+      const snap = await db.collection(COL_TECHNICAL_ERROR_LOGS).get();
+      const matched = snap.docs.map((d) => d.data()).filter((r) => {
+        if (!r) return false;
+        if (String(r.requestId || "").toUpperCase() === targetRef) return true;
+        if (String(r.errorEventId || "").toUpperCase() === targetRef) return true;
+        if (String(r.referenceId || "").toUpperCase() === targetRef) return true;
+        if (Array.isArray(r.relatedRequestIds) && r.relatedRequestIds.some((id) => String(id).toUpperCase() === targetRef)) {
+          return true;
+        }
+        return false;
+      }).sort((a, b) => String(a.timestampUtc || "").localeCompare(String(b.timestampUtc || "")));
+      return res.json({
+        success: true,
+        referenceId: targetRef,
+        totalMatched: matched.length,
+        records: matched
+      });
+    } catch (err) {
+      console.error("[Diagnostics] Trace lookup failed:", err);
+      return res.status(500).json({
+        success: false,
+        error: "Failed to retrieve diagnostic request trace."
+      });
+    }
+  });
+  app.patch("/api/diagnostics/errors/:errorId/status", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        "*",
+        "Update Technical Error Resolution Status",
+        { skipWifiCheck: true }
+      );
+      if (!caller) return;
+      const authorized = await isAuthorizedForTechnicalLogs(db, caller);
+      if (!authorized) {
+        return res.status(403).json({
+          success: false,
+          error: "Access Denied: Only authorized administrators can update diagnostic error statuses."
+        });
+      }
+      const errorId = String(req.params.errorId || "").trim();
+      if (!errorId || !/^[a-zA-Z0-9_-]{4,128}$/.test(errorId)) {
+        return res.status(400).json({ success: false, error: "Invalid error ID." });
+      }
+      const parsed = ResolutionStatusUpdateSchema.safeParse(req.body || {});
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || "Invalid status update payload."
+        });
+      }
+      const docRef = db.collection(COL_TECHNICAL_ERROR_LOGS).doc(errorId);
+      const snap = await docRef.get();
+      if (!snap.exists) {
+        return res.status(404).json({ success: false, error: "Technical error record not found." });
+      }
+      const current = snap.data();
+      const nowMs = getNowMs();
+      const { utc: nowUtc, ist: nowIst } = formatUtcAndIstTimestamps(new Date(nowMs));
+      const nextStatus = parsed.data.resolutionStatus;
+      const cleanNotes = parsed.data.resolutionNotes !== void 0 ? sanitizeTextForLog(parsed.data.resolutionNotes, 800) : current.resolutionNotes || "";
+      const updated = {
+        ...current,
+        resolutionStatus: nextStatus,
+        resolvedBy: nextStatus === "RESOLVED" ? caller.loginId : nextStatus === "OPEN" ? null : current.resolvedBy,
+        resolvedAtUtc: nextStatus === "RESOLVED" ? nowUtc : nextStatus === "OPEN" ? null : current.resolvedAtUtc,
+        resolvedAtIst: nextStatus === "RESOLVED" ? nowIst : nextStatus === "OPEN" ? null : current.resolvedAtIst,
+        resolutionNotes: cleanNotes
+      };
+      await docRef.set(updated);
+      void recordEnterpriseAuditEvent(db, {
+        req,
+        action: "technical_error_status_updated",
+        category: "SYSTEM",
+        severity: "INFO",
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: String(caller.role || "ADMIN").toUpperCase(),
+        targetType: "TECHNICAL_ERROR_LOG",
+        targetId: errorId,
+        oldValue: current.resolutionStatus,
+        newValue: nextStatus,
+        actionSource: "TECHNICAL_ERROR_LOGS",
+        description: `Updated technical error ${current.errorCode} (${current.referenceId}) status to ${nextStatus}.`
+      });
+      return res.json({ success: true, errorRecord: updated });
+    } catch (err) {
+      console.error("[Diagnostics] Update status error:", err);
+      return res.status(500).json({
+        success: false,
+        error: "Failed to update diagnostic error status."
+      });
+    }
+  });
+}
+
 // src/config/dashboardCardsConfig.ts
 var DASHBOARD_CARDS = [
   {
@@ -12893,19 +14697,19 @@ function resolveDashboardVisibility(params) {
 
 // server.ts
 function hashPassword(password) {
-  const salt = crypto7.randomBytes(16).toString("hex");
-  const hash = crypto7.scryptSync(password, salt, 64).toString("hex");
+  const salt = crypto8.randomBytes(16).toString("hex");
+  const hash = crypto8.scryptSync(password, salt, 64).toString("hex");
   return `${salt}:${hash}`;
 }
 function verifyPassword(password, storedHash) {
   if (!storedHash || !storedHash.includes(":")) return false;
   const [salt, expectedHash] = storedHash.split(":");
   if (!salt || !expectedHash) return false;
-  const actualHash = crypto7.scryptSync(password, salt, 64).toString("hex");
+  const actualHash = crypto8.scryptSync(password, salt, 64).toString("hex");
   const actualBuf = Buffer.from(actualHash, "hex");
   const expectedBuf = Buffer.from(expectedHash, "hex");
   if (actualBuf.length !== expectedBuf.length) return false;
-  return crypto7.timingSafeEqual(actualBuf, expectedBuf);
+  return crypto8.timingSafeEqual(actualBuf, expectedBuf);
 }
 async function syncExistingFirebaseAuthPassword(email, targetUid, newPassword, knownCurrentPassword) {
   if (typeof knownCurrentPassword !== "string" || knownCurrentPassword.length === 0) {
@@ -12971,17 +14775,17 @@ async function syncExistingFirebaseAuthPassword(email, targetUid, newPassword, k
     return { success: false, error: err?.message || "Firebase Auth sync error." };
   }
 }
-var VerifySessionInputSchema = z7.object({
-  loginId: z7.string().trim().min(1).max(64).optional(),
-  userId: z7.string().trim().min(1).max(128).optional()
+var VerifySessionInputSchema = z8.object({
+  loginId: z8.string().trim().min(1).max(64).optional(),
+  userId: z8.string().trim().min(1).max(128).optional()
 });
-var AdminSetPasswordInputSchema = z7.object({
-  targetLoginId: z7.string().trim().min(1, "targetLoginId is required.").max(64),
-  newPassword: z7.string().min(6, "Password must be at least 6 characters.").max(128),
-  mustChangePassword: z7.boolean().optional(),
-  unlockAccount: z7.boolean().optional(),
-  revokeSessions: z7.boolean().optional(),
-  currentTargetPassword: z7.string().optional()
+var AdminSetPasswordInputSchema = z8.object({
+  targetLoginId: z8.string().trim().min(1, "targetLoginId is required.").max(64),
+  newPassword: z8.string().min(6, "Password must be at least 6 characters.").max(128),
+  mustChangePassword: z8.boolean().optional(),
+  unlockAccount: z8.boolean().optional(),
+  revokeSessions: z8.boolean().optional(),
+  currentTargetPassword: z8.string().optional()
 });
 var RESERVED_CUSTOM_ROLE_ALIASES = /* @__PURE__ */ new Set([
   "superadmin",
@@ -12990,66 +14794,66 @@ var RESERVED_CUSTOM_ROLE_ALIASES = /* @__PURE__ */ new Set([
   "system",
   "super_admin_root"
 ]);
-var DynamicRoleIdSchema = z7.string().trim().min(2, "Role ID must be at least 2 characters.").max(64, "Role ID must be 64 characters or fewer.").transform((val) => deriveStrictRoleId(val)).refine((val) => VALID_ROLE_ID_REGEX.test(val), {
+var DynamicRoleIdSchema = z8.string().trim().min(2, "Role ID must be at least 2 characters.").max(64, "Role ID must be 64 characters or fewer.").transform((val) => deriveStrictRoleId(val)).refine((val) => VALID_ROLE_ID_REGEX.test(val), {
   message: "Role ID must start with a letter and contain only lowercase letters, numbers, or underscores."
 });
-var RoleDefinitionInputSchema = z7.object({
-  roleId: z7.string().trim().max(64).optional(),
-  roleName: z7.string().trim().min(2, "Role name must be at least 2 characters.").max(48, "Role name must be 48 characters or fewer."),
-  description: z7.string().trim().min(3, "Role description must be at least 3 characters.").max(500, "Role description must be 500 characters or fewer."),
-  isActive: z7.boolean().default(true),
-  defaultPermissions: z7.record(
-    z7.string(),
-    z7.object({
-      view: z7.boolean().optional(),
-      add: z7.boolean().optional(),
-      edit: z7.boolean().optional(),
-      delete: z7.boolean().optional()
+var RoleDefinitionInputSchema = z8.object({
+  roleId: z8.string().trim().max(64).optional(),
+  roleName: z8.string().trim().min(2, "Role name must be at least 2 characters.").max(48, "Role name must be 48 characters or fewer."),
+  description: z8.string().trim().min(3, "Role description must be at least 3 characters.").max(500, "Role description must be 500 characters or fewer."),
+  isActive: z8.boolean().default(true),
+  defaultPermissions: z8.record(
+    z8.string(),
+    z8.object({
+      view: z8.boolean().optional(),
+      add: z8.boolean().optional(),
+      edit: z8.boolean().optional(),
+      delete: z8.boolean().optional()
     })
   ).optional()
 });
-var CreateUserInputSchema = z7.object({
-  callerLoginId: z7.string().trim().min(1).max(64).optional(),
-  loginId: z7.string().trim().min(2, "Login ID must be at least 2 characters.").max(64).regex(/^[a-zA-Z0-9_.-]+$/, "Login ID can only contain letters, numbers, hyphens, underscores, and dots."),
-  name: z7.string().trim().min(1, "Name is required.").max(128),
-  email: z7.string().trim().email("Valid email is required.").max(128),
+var CreateUserInputSchema = z8.object({
+  callerLoginId: z8.string().trim().min(1).max(64).optional(),
+  loginId: z8.string().trim().min(2, "Login ID must be at least 2 characters.").max(64).regex(/^[a-zA-Z0-9_.-]+$/, "Login ID can only contain letters, numbers, hyphens, underscores, and dots."),
+  name: z8.string().trim().min(1, "Name is required.").max(128),
+  email: z8.string().trim().email("Valid email is required.").max(128),
   role: DynamicRoleIdSchema,
-  password: z7.string().min(6, "Password must be at least 6 characters.").max(128),
-  modulesAllowed: z7.array(z7.string().max(64)).optional(),
-  status: z7.enum(["Active", "Inactive"]).default("Active"),
-  mustChangePassword: z7.boolean().optional()
+  password: z8.string().min(6, "Password must be at least 6 characters.").max(128),
+  modulesAllowed: z8.array(z8.string().max(64)).optional(),
+  status: z8.enum(["Active", "Inactive"]).default("Active"),
+  mustChangePassword: z8.boolean().optional()
 });
-var DeleteUserInputSchema = z7.object({
-  callerLoginId: z7.string().trim().min(1).max(64).optional(),
-  targetId: z7.string().trim().min(1).max(128).optional(),
-  targetLoginId: z7.string().trim().min(1).max(64).optional()
+var DeleteUserInputSchema = z8.object({
+  callerLoginId: z8.string().trim().min(1).max(64).optional(),
+  targetId: z8.string().trim().min(1).max(128).optional(),
+  targetLoginId: z8.string().trim().min(1).max(64).optional()
 });
-var SetUserPermissionsInputSchema = z7.object({
-  callerLoginId: z7.string().trim().min(1).max(64).optional(),
-  targetId: z7.string().trim().min(1).max(128),
+var SetUserPermissionsInputSchema = z8.object({
+  callerLoginId: z8.string().trim().min(1).max(64).optional(),
+  targetId: z8.string().trim().min(1).max(128),
   role: DynamicRoleIdSchema.optional(),
-  status: z7.enum(["Active", "Inactive"]).optional(),
-  modulesAllowed: z7.array(z7.string().max(64)).optional(),
-  permissions: z7.record(
-    z7.string(),
-    z7.object({
-      view: z7.boolean().optional(),
-      add: z7.boolean().optional(),
-      edit: z7.boolean().optional(),
-      delete: z7.boolean().optional()
+  status: z8.enum(["Active", "Inactive"]).optional(),
+  modulesAllowed: z8.array(z8.string().max(64)).optional(),
+  permissions: z8.record(
+    z8.string(),
+    z8.object({
+      view: z8.boolean().optional(),
+      add: z8.boolean().optional(),
+      edit: z8.boolean().optional(),
+      delete: z8.boolean().optional()
     })
   ).optional()
 });
-var RolePermissionsInputSchema = z7.object({
-  callerLoginId: z7.string().trim().min(1).max(64).optional(),
+var RolePermissionsInputSchema = z8.object({
+  callerLoginId: z8.string().trim().min(1).max(64).optional(),
   roleId: DynamicRoleIdSchema,
-  modulePermissions: z7.record(
-    z7.string(),
-    z7.object({
-      view: z7.boolean().optional(),
-      add: z7.boolean().optional(),
-      edit: z7.boolean().optional(),
-      delete: z7.boolean().optional()
+  modulePermissions: z8.record(
+    z8.string(),
+    z8.object({
+      view: z8.boolean().optional(),
+      add: z8.boolean().optional(),
+      edit: z8.boolean().optional(),
+      delete: z8.boolean().optional()
     })
   )
 });
@@ -13346,7 +15150,7 @@ async function seedInitialAccounts(db) {
       const userRef = db.collection("user_roles").doc(docId);
       const snap = await userRef.get();
       if (!snap.exists) {
-        const randomInitialHash = hashPassword(crypto7.randomBytes(24).toString("hex"));
+        const randomInitialHash = hashPassword(crypto8.randomBytes(24).toString("hex"));
         await userRef.set({
           id: docId,
           loginId: acc.loginId,
@@ -13508,6 +15312,7 @@ function createApp(options = {}) {
     }
     return false;
   };
+  app.use(createRequestIdAndDiagnosticsMiddleware(() => db));
   app.use((req, res, next) => {
     res.setHeader("Vary", "Origin");
     const origin = req.headers.origin;
@@ -13531,9 +15336,18 @@ function createApp(options = {}) {
         allowedHeaders: [
           "Content-Type",
           "Authorization",
-          "X-Correlation-ID"
+          "X-Correlation-ID",
+          "X-Request-ID"
         ],
-        exposedHeaders: ["X-Correlation-ID", "X-Server-Process-Ms", "X-Payload-Bytes", "Server-Timing"],
+        exposedHeaders: [
+          "X-Request-ID",
+          "X-Error-Code",
+          "X-Error-Category",
+          "X-Correlation-ID",
+          "X-Server-Process-Ms",
+          "X-Payload-Bytes",
+          "Server-Timing"
+        ],
         optionsSuccessStatus: 204
       });
     })
@@ -13697,6 +15511,7 @@ function createApp(options = {}) {
         nowMs: getNowMs()
       });
       if (!caller) {
+        markRequestLifecycle(req, "AUTH_VERIFIED", `Authentication rejected on ${actionLabel}`);
         await logAuditEvent({
           req,
           action: "unauthorized_access_attempt",
@@ -13713,7 +15528,9 @@ function createApp(options = {}) {
         });
         return null;
       }
+      markRequestLifecycle(req, "AUTH_VERIFIED", `Authenticated as ${caller.loginId}`, { caller });
       if (allowedRoles !== "*" && !allowedRoles.includes(caller.role)) {
+        markRequestLifecycle(req, "AUTHORIZATION_CHECKED", `Role denied for ${actionLabel}`, { caller });
         await logAuditEvent({
           req,
           action: "unauthorized_access_attempt",
@@ -13731,6 +15548,7 @@ function createApp(options = {}) {
         });
         return null;
       }
+      markRequestLifecycle(req, "AUTHORIZATION_CHECKED", `Role permitted for ${actionLabel}`, { caller });
       if (caller.role !== "super_admin" && !options2?.skipWifiCheck) {
         const wifiResult = await enforceCompanyWifiAccess(adminDb, req, caller, {
           nowMs: getNowMs()
@@ -13746,9 +15564,13 @@ function createApp(options = {}) {
           return null;
         }
       }
+      markRequestLifecycle(req, "PROCESSING_STARTED", actionLabel, { caller });
       return caller;
     } catch (err) {
       if (noteRuntimeFirestoreError(err)) {
+        markRequestLifecycle(req, "DB_OPERATION_FAILED", "Firestore permission denied during caller verification", {
+          dbOperationCategory: "read"
+        });
         res.status(503).json({
           success: false,
           code: "FIREBASE_ADMIN_PERMISSION_DENIED",
@@ -13853,6 +15675,11 @@ function createApp(options = {}) {
     credentialMode
   });
   registerCompanyWifiRoutes(app, {
+    db: adminDb,
+    requireVerifiedCaller,
+    nowProvider: getNowMs
+  });
+  registerDiagnosticRoutes(app, {
     db: adminDb,
     requireVerifiedCaller,
     nowProvider: getNowMs
@@ -14175,7 +16002,7 @@ function createApp(options = {}) {
           },
           details: `Password reset by Super Admin "${cleanCallerId}" for "${cleanTargetId}" (${targetRole}, UID: ${targetUid}, email: ${matchedFirebaseEmail}). Force next login change: ${forceChange}.`
         });
-        const resetLogId = `reset_${Date.now()}_${crypto7.randomBytes(3).toString("hex")}`;
+        const resetLogId = `reset_${Date.now()}_${crypto8.randomBytes(3).toString("hex")}`;
         await adminDb.collection("password_reset_logs").doc(resetLogId).set({
           id: resetLogId,
           targetLoginId: cleanTargetId,
@@ -14839,10 +16666,10 @@ function createApp(options = {}) {
       return res.status(500).json({ success: false, error: err?.message || "Failed to update user permissions." });
     }
   });
-  const BulkUserStatusInputSchema = z7.object({
-    userIds: z7.array(z7.string().trim().min(1)).min(1, "Select at least one user account.").max(200),
-    status: z7.enum(["Active", "Inactive"]),
-    confirmed: z7.literal(true, {
+  const BulkUserStatusInputSchema = z8.object({
+    userIds: z8.array(z8.string().trim().min(1)).min(1, "Select at least one user account.").max(200),
+    status: z8.enum(["Active", "Inactive"]),
+    confirmed: z8.literal(true, {
       message: "Explicit confirmation is required for bulk user status updates."
     })
   });
@@ -15597,9 +17424,9 @@ function createApp(options = {}) {
           otHoursMins += m.overtimeMinutes;
         }
       }
-      const autoClosed = attendance.filter((a) => a.punchOutType === "AUTO" || a.autoClosed).length;
+      const autoClosed = attendance.filter((a) => resolveAttendanceMetrics(a, nowMs).isCurrentlyAutoClosed).length;
       const missedPunchOut = attendance.filter(
-        (a) => a.missedPunchOut || a.attendanceStatus === "MISSED PUNCH OUT"
+        (a) => resolveAttendanceMetrics(a, nowMs).isCurrentlyAutoClosed || a.missedPunchOut && a.punchOutType !== "ACTUAL" || a.attendanceStatus === "MISSED PUNCH OUT"
       ).length;
       const onLeave = rosterSnap.size;
       const allMetrics = {

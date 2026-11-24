@@ -145,10 +145,31 @@ export function getShiftScheduledEndIso(shiftDate: string, shift: Shift): string
   return `${targetDateKey}T${h.padStart(2, '0')}:${m.padStart(2, '0')}:00+05:30`;
 }
 
-// Format ISO string to time string "hh:mm A" in Asia/Kolkata
-export function formatTimeDisplay(isoString: string | null): string {
+// Format ISO string to time string "hh:mm AM/PM" strictly in Asia/Kolkata (IST)
+export function formatTimeDisplay(isoString: string | null | undefined): string {
   if (!isoString) return '--:--';
-  return KOLKATA_TIME_DISPLAY_FORMATTER.format(new Date(isoString));
+  const dt = new Date(isoString);
+  if (Number.isNaN(dt.getTime())) return '--:--';
+  return getKolkataTimeParts(dt).timeDisplay;
+}
+
+// Format ISO string to full IST date+time string "DD Mon YYYY, hh:mm:ss AM/PM IST" (returns "N/A" if absent)
+export function formatDateTimeDisplay(isoString: string | null | undefined): string {
+  if (!isoString) return 'N/A';
+  const dt = new Date(isoString);
+  if (Number.isNaN(dt.getTime())) return 'N/A';
+  const parts = new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+  }).formatToParts(dt);
+  const map: Record<string, string> = {};
+  for (const p of parts) {
+    map[p.type] = p.value;
+  }
+  const timeParts = getKolkataTimeParts(dt);
+  return `${String(map.day || '01').padStart(2, '0')} ${map.month || 'Jan'} ${map.year || '1970'}, ${timeParts.timeWithSeconds} IST`;
 }
 
 export type QrPayloadFormat = 'JSON_TOKEN' | 'TOKEN_STRING' | 'LEGACY_EMPLOYEE_ID' | 'INVALID';

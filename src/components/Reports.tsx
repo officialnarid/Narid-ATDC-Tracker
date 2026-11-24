@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { getSafeErrorText } from '../services/errorHandlingService';
 import { 
   FileSpreadsheet, 
   Download, 
@@ -12,10 +13,15 @@ import { AttendanceRecord, Employee, Floor, Section, Department, Shift, UserRole
 import { RolePermissionRecord } from '../services/permissionService';
 import { collection, getDocs, query, where } from 'firebase/firestore';
 import { db } from '../firebase';
-import { formatDateKey, formatMinutes, formatTimeDisplay } from '../services/attendanceService';
+import { formatDateKey } from '../services/attendanceService';
 import { exportTableToExcel, exportTableToCsv } from '../services/exportService';
 import { sendServerAuditEvent } from '../services/auditService';
-import { formatDurationClock, resolveAttendanceMetrics } from '../utils/attendanceStatus';
+import {
+  buildAttendanceReportTable,
+  computeAttendanceReportSummary,
+  type ReportType,
+} from '../utils/attendanceReportBuilder';
+import { getAttendanceStatusBadgeClasses } from '../utils/attendanceStatus';
 import { TableSkeletonRows } from './Skeletons';
 import { recordPerfMetric, subscribeAttendanceCommitted } from '../utils/perfMonitor';
 import { useBulkSelection } from '../hooks/useBulkSelection';
@@ -28,6 +34,8 @@ import {
 import { CrossPageSelectConfirmModal } from './BulkConfirmModal';
 import { exportChunkedToCsv, exportChunkedToExcel } from '../services/bulkActionService';
 
+export type { ReportType };
+
 interface ReportsProps {
   employees: Employee[];
   floors: Floor[];
@@ -37,20 +45,6 @@ interface ReportsProps {
   currentUserRole?: UserRoleRecord | null;
   rolePermissions?: Record<string, RolePermissionRecord>;
 }
-
-export type ReportType =
-  | 'daily_attendance'
-  | 'monthly_attendance'
-  | 'floor_wise'
-  | 'section_wise'
-  | 'dept_wise'
-  | 'emp_type'
-  | 'shift_wise'
-  | 'employee_wise'
-  | 'late_arrival'
-  | 'missed_punch_out'
-  | 'overtime'
-  | 'absent_manpower';
 
 export const Reports: React.FC<ReportsProps> = ({
   employees,
@@ -111,7 +105,9 @@ export const Reports: React.FC<ReportsProps> = ({
       } catch (err: any) {
         if (reqId !== fetchCounterRef.current) return;
         console.error('Error fetching report data:', err);
-        setFetchError(err?.message || 'Unable to load report records. Please retry.');
+        setFetchError(
+          getSafeErrorText(err, { moduleName: 'Reports & Export', dbOperationCategory: 'read' })
+        );
       } finally {
         if (reqId === fetchCounterRef.current) {
           setLoading(false);
@@ -168,286 +164,18 @@ export const Reports: React.FC<ReportsProps> = ({
   // Compute Active Employees
   const activeEmps = useMemo(() => employees.filter(e => e.employeeStatus === 'Active'), [employees]);
 
-  // Transform Data according to active report
-  const { tableColumns, tableData, fileName } = useMemo(() => {
-    let cols: { header: string; key: string }[] = [];
-    let rows: Record<string, any>[] = [];
-    let name = `${activeReport}_${selectedDate}`;
-
-    switch (activeReport) {
-      case 'daily_attendance':
-        cols = [
-          { header: 'Employee ID', key: 'employeeId' },
-          { header: 'Name', key: 'name' },
-          { header: 'Line', key: 'floor' },
-          { header: 'Section', key: 'section' },
-          { header: 'Department', key: 'dept' },
-          { header: 'Shift', key: 'shift' },
-          { header: 'State', key: 'state' },
-          { header: 'Scheduled Shift Start', key: 'scheduledStart' },
-          { header: 'Actual Punch In', key: 'inTime' },
-          { header: 'Early Arrival Duration', key: 'earlyArrival' },
-          { header: 'Last Out', key: 'outTime' },
-          { header: 'Punches', key: 'punches' },
-          { header: 'Out Type', key: 'outType' },
-          { header: 'Duty Hours', key: 'duty' },
-          { header: 'Early OT', key: 'earlyOt' },
-          { header: 'Post-shift OT', key: 'postShiftOt' },
-          { header: 'Total OT', key: 'ot' },
-          { header: 'Status', key: 'status' },
-        ];
-        rows = attendanceRecords.map(a => {
-          const m = resolveAttendanceMetrics(a);
-          return {
-            employeeId: a.employeeId,
-            name: a.employeeNameSnapshot,
-            floor: a.floorIdSnapshot,
-            section: a.sectionIdSnapshot,
-            dept: a.departmentIdSnapshot,
-            shift: a.shiftNameSnapshot,
-            state: m.state,
-            scheduledStart: m.scheduledStartDisplay,
-            inTime: formatTimeDisplay(a.firstPunchIn || a.punchIn),
-            earlyArrival: formatDurationClock(m.earlyArrivalMinutes),
-            outTime: m.isOpen ? 'In Progress' : formatTimeDisplay(a.lastPunchOut || a.actualPunchOut || a.effectivePunchOut),
-            punches: a.punches?.length || (a.actualPunchOut ? 2 : 1),
-            outType: a.punchOutType,
-            duty: m.isOpen
-              ? `00:00 Hours (Elapsed: ${formatDurationClock(m.accumulatedDutyMinutes)})`
-              : `${formatDurationClock(m.completedDutyMinutes)} Hours`,
-            earlyOt: m.isOpen
-              ? (m.provisionalEarlyOtMinutes > 0 ? `${formatDurationClock(m.provisionalEarlyOtMinutes)} (Provisional)` : '00:00')
-              : formatDurationClock(m.earlyOtMinutes),
-            postShiftOt: m.isOpen ? '00:00' : formatDurationClock(m.postShiftOtMinutes),
-            ot: !m.isOpen && m.overtimeMinutes > 0 ? m.otLabel : '00:00',
-            status: m.status,
-          };
-        });
-        break;
-
-      case 'floor_wise':
-        cols = [
-          { header: 'Production Line', key: 'floor' },
-          { header: 'Active Employees', key: 'active' },
-          { header: 'Present', key: 'present' },
-          { header: 'Absent', key: 'absent' },
-          { header: 'Availability %', key: 'percent' },
-        ];
-        rows = floors.map(fl => {
-          const total = activeEmps.filter(e => e.floor === fl.name).length;
-          const present = attendanceRecords.filter(a => a.floorIdSnapshot === fl.name).length;
-          const absent = Math.max(0, total - present);
-          const percent = total > 0 ? `${Math.round((present / total) * 100)}%` : '0%';
-          return { floor: fl.name, active: total, present, absent, percent };
-        });
-        break;
-
-      case 'section_wise':
-        cols = [
-          { header: 'Section', key: 'section' },
-          { header: 'Active Employees', key: 'active' },
-          { header: 'Present', key: 'present' },
-          { header: 'Absent', key: 'absent' },
-          { header: 'Availability %', key: 'percent' },
-        ];
-        rows = sections.map(sec => {
-          const total = activeEmps.filter(e => e.section === sec.name).length;
-          const present = attendanceRecords.filter(a => a.sectionIdSnapshot === sec.name).length;
-          const absent = Math.max(0, total - present);
-          const percent = total > 0 ? `${Math.round((present / total) * 100)}%` : '0%';
-          return { section: sec.name, active: total, present, absent, percent };
-        });
-        break;
-
-      case 'dept_wise':
-        cols = [
-          { header: 'Department', key: 'department' },
-          { header: 'Active Employees', key: 'active' },
-          { header: 'Present', key: 'present' },
-          { header: 'Absent', key: 'absent' },
-          { header: 'Availability %', key: 'percent' },
-        ];
-        rows = departments.map(d => {
-          const total = activeEmps.filter(e => e.department === d.name).length;
-          const present = attendanceRecords.filter(a => a.departmentIdSnapshot === d.name).length;
-          const absent = Math.max(0, total - present);
-          const percent = total > 0 ? `${Math.round((present / total) * 100)}%` : '0%';
-          return { department: d.name, active: total, present, absent, percent };
-        });
-        break;
-
-      case 'emp_type':
-        cols = [
-          { header: 'Employee Type', key: 'type' },
-          { header: 'Active Employees', key: 'active' },
-          { header: 'Present', key: 'present' },
-          { header: 'Absent', key: 'absent' },
-          { header: 'Availability %', key: 'percent' },
-        ];
-        rows = ['Permanent', 'Staff', 'Offroll'].map(type => {
-          const total = activeEmps.filter(e => e.employeeType === type).length;
-          const present = attendanceRecords.filter(a => a.employeeTypeSnapshot === type).length;
-          const absent = Math.max(0, total - present);
-          const percent = total > 0 ? `${Math.round((present / total) * 100)}%` : '0%';
-          return { type, active: total, present, absent, percent };
-        });
-        break;
-
-      case 'late_arrival':
-        cols = [
-          { header: 'Employee ID', key: 'employeeId' },
-          { header: 'Name', key: 'name' },
-          { header: 'Line', key: 'floor' },
-          { header: 'Department', key: 'dept' },
-          { header: 'Shift', key: 'shift' },
-          { header: 'Punch In Time', key: 'inTime' },
-          { header: 'Status', key: 'status' },
-        ];
-        rows = attendanceRecords
-          .filter(a => resolveAttendanceMetrics(a).isLate)
-          .map(a => ({
-            employeeId: a.employeeId,
-            name: a.employeeNameSnapshot,
-            floor: a.floorIdSnapshot,
-            dept: a.departmentIdSnapshot,
-            shift: a.shiftNameSnapshot,
-            inTime: formatTimeDisplay(a.punchIn),
-            status: 'LATE ARRIVAL',
-          }));
-        break;
-
-      case 'missed_punch_out':
-        cols = [
-          { header: 'Employee ID', key: 'employeeId' },
-          { header: 'Name', key: 'name' },
-          { header: 'Line', key: 'floor' },
-          { header: 'Shift', key: 'shift' },
-          { header: 'Punch In', key: 'inTime' },
-          { header: 'Auto-Close Time', key: 'autoOut' },
-          { header: 'Punch Out Type', key: 'outType' },
-          { header: 'OT Allocated', key: 'ot' },
-          { header: 'Status', key: 'status' },
-        ];
-        rows = attendanceRecords
-          .filter(a => a.punchOutType === 'AUTO')
-          .map(a => ({
-            employeeId: a.employeeId,
-            name: a.employeeNameSnapshot,
-            floor: a.floorIdSnapshot,
-            shift: a.shiftNameSnapshot,
-            inTime: formatTimeDisplay(a.punchIn),
-            autoOut: formatTimeDisplay(a.effectivePunchOut),
-            outType: 'AUTO',
-            ot: '00:00 (Zero)',
-            status: 'MISSED PUNCH OUT',
-          }));
-        break;
-
-      case 'overtime':
-        cols = [
-          { header: 'Employee ID', key: 'employeeId' },
-          { header: 'Name', key: 'name' },
-          { header: 'Line / Dept', key: 'floorDept' },
-          { header: 'Shift', key: 'shift' },
-          { header: 'Scheduled Shift Start', key: 'scheduledStart' },
-          { header: 'Actual Punch In', key: 'inTime' },
-          { header: 'Punch Out', key: 'outTime' },
-          { header: 'Early Arrival Duration', key: 'earlyArrival' },
-          { header: 'Regular Duty', key: 'duty' },
-          { header: 'Early OT', key: 'earlyOt' },
-          { header: 'Post-shift OT', key: 'postShiftOt' },
-          { header: 'Total OT', key: 'ot' },
-        ];
-        rows = attendanceRecords
-          .filter(a => {
-            const m = resolveAttendanceMetrics(a);
-            return !m.isOpen && m.overtimeMinutes > 0;
-          })
-          .map(a => {
-            const m = resolveAttendanceMetrics(a);
-            return {
-              employeeId: a.employeeId,
-              name: a.employeeNameSnapshot,
-              floorDept: `${a.floorIdSnapshot} • ${a.departmentIdSnapshot}`,
-              shift: a.shiftNameSnapshot,
-              scheduledStart: m.scheduledStartDisplay,
-              inTime: formatTimeDisplay(a.firstPunchIn || a.punchIn),
-              outTime: formatTimeDisplay(a.lastPunchOut || a.actualPunchOut),
-              earlyArrival: formatDurationClock(m.earlyArrivalMinutes),
-              duty: formatMinutes(m.regularDutyMinutes),
-              earlyOt: formatDurationClock(m.earlyOtMinutes),
-              postShiftOt: formatDurationClock(m.postShiftOtMinutes),
-              ot: m.otLabel,
-            };
-          });
-        break;
-
-      case 'absent_manpower':
-        cols = [
-          { header: 'Employee ID', key: 'employeeId' },
-          { header: 'Name', key: 'name' },
-          { header: 'Line', key: 'floor' },
-          { header: 'Section', key: 'section' },
-          { header: 'Department', key: 'dept' },
-          { header: 'Type', key: 'type' },
-          { header: 'Status', key: 'status' },
-        ];
-        const clockedIds = new Set(attendanceRecords.map(a => a.employeeId));
-        rows = activeEmps
-          .filter(e => !clockedIds.has(e.employeeId))
-          .map(e => ({
-            employeeId: e.employeeId,
-            name: e.employeeName,
-            floor: e.floor,
-            section: e.section,
-            dept: e.department,
-            type: e.employeeType,
-            status: 'ABSENT (No Punch)',
-          }));
-        break;
-
-      default:
-        // Monthly / Shift-wise / Employee-wise breakdown
-        cols = [
-          { header: 'Employee ID', key: 'employeeId' },
-          { header: 'Name', key: 'name' },
-          { header: 'Date', key: 'date' },
-          { header: 'Shift', key: 'shift' },
-          { header: 'Scheduled Shift Start', key: 'scheduledStart' },
-          { header: 'Actual Punch In', key: 'inTime' },
-          { header: 'Early Arrival Duration', key: 'earlyArrival' },
-          { header: 'Duty', key: 'duty' },
-          { header: 'Early OT', key: 'earlyOt' },
-          { header: 'Post-shift OT', key: 'postShiftOt' },
-          { header: 'Total OT', key: 'ot' },
-        ];
-        rows = attendanceRecords.map(a => {
-          const m = resolveAttendanceMetrics(a);
-          return {
-            employeeId: a.employeeId,
-            name: a.employeeNameSnapshot,
-            date: a.shiftDate,
-            shift: a.shiftNameSnapshot,
-            scheduledStart: m.scheduledStartDisplay,
-            inTime: formatTimeDisplay(a.firstPunchIn || a.punchIn),
-            earlyArrival: formatDurationClock(m.earlyArrivalMinutes),
-            duty: m.isOpen ? '00:00 Hours' : `${formatDurationClock(m.completedDutyMinutes)} Hours`,
-            earlyOt: m.isOpen
-              ? (m.provisionalEarlyOtMinutes > 0 ? `${formatDurationClock(m.provisionalEarlyOtMinutes)} (Provisional)` : '00:00')
-              : formatDurationClock(m.earlyOtMinutes),
-            postShiftOt: m.isOpen ? '00:00' : formatDurationClock(m.postShiftOtMinutes),
-            ot: !m.isOpen && m.overtimeMinutes > 0 ? m.otLabel : '00:00',
-          };
-        });
-    }
-
-    const keyedRows = rows.map((row, idx) => ({
-      ...row,
-      _rowKey: `${activeReport}:${row.employeeId || row.floor || row.section || row.department || row.type || 'row'}:${row.date || idx}:${idx}`,
-    }));
-
-    return { tableColumns: cols, tableData: keyedRows, fileName: name };
-  }, [activeReport, attendanceRecords, activeEmps, floors, sections, departments, selectedDate]);
+  // Transform Data according to active report (shared deterministic builder used by Preview, Excel & CSV)
+  const { tableColumns, tableData, fileName, reportTitle, periodLabel, summary } = useMemo(() => {
+    return buildAttendanceReportTable(activeReport, {
+      attendanceRecords,
+      activeEmps,
+      floors,
+      sections,
+      departments,
+      selectedDate,
+      selectedMonth,
+    });
+  }, [activeReport, attendanceRecords, activeEmps, floors, sections, departments, selectedDate, selectedMonth]);
 
   const totalPages = Math.max(1, Math.ceil(tableData.length / pageSize));
   const safePage = Math.min(page, totalPages);
@@ -477,8 +205,7 @@ export const Reports: React.FC<ReportsProps> = ({
     });
     try {
       const fn = format === 'xlsx' ? exportChunkedToExcel : exportChunkedToCsv;
-      const period = activeReport === 'monthly_attendance' || activeReport === 'employee_wise' ? selectedMonth : selectedDate;
-      const out = await fn(rows, tableColumns, `${fileName}_selected`, {
+      const out = await fn(rows, tableColumns, `${fileName}_Selected`, {
         onProgress: (completed, total) =>
           setBulkProgress({
             label: format === 'xlsx' ? 'Exporting selected report rows to Excel...' : 'Exporting selected report rows to CSV...',
@@ -487,7 +214,11 @@ export const Reports: React.FC<ReportsProps> = ({
           }),
         auditTargetType: 'REPORT',
         auditSource: 'REPORTS_MODULE',
-        auditDescription: `Bulk exported ${rows.length} selected rows from "${activeReport}" (${period}) as ${format.toUpperCase()}.`,
+        auditDescription: `Bulk exported ${rows.length} selected rows from "${activeReport}" (${periodLabel}) as ${format.toUpperCase()}.`,
+        reportTitle: `${reportTitle} (Selected)`,
+        periodLabel,
+        sheetName: reportTitle,
+        summary: summary ? computeAttendanceReportSummary(rows) : null,
       });
       setBulkSummary({
         type: 'success',
@@ -500,15 +231,21 @@ export const Reports: React.FC<ReportsProps> = ({
       setBulkSummary({
         type: 'error',
         title: 'Selected Report Export Failed',
-        message: err?.message || 'Unable to export selected rows.',
+        message: getSafeErrorText(err, { moduleName: 'Reports & Export', forcedErrorCode: 'FILE-002' }),
       });
     } finally {
       setBulkProgress(null);
     }
   };
 
-  const handleExportXlsx = () => {
-    exportTableToExcel(tableData, tableColumns, fileName);
+  const handleExportXlsx = async () => {
+    await exportTableToExcel(tableData, tableColumns, fileName, {
+      reportTitle,
+      reportType: activeReport,
+      periodLabel,
+      sheetName: reportTitle,
+      summary,
+    });
     sendServerAuditEvent({
       action: 'REPORT_EXPORTED',
       category: 'EXPORT',
@@ -518,10 +255,10 @@ export const Reports: React.FC<ReportsProps> = ({
         format: 'xlsx',
         fileName,
         rowCount: tableData.length,
-        period: activeReport === 'monthly_attendance' || activeReport === 'employee_wise' ? selectedMonth : selectedDate,
+        period: periodLabel,
       },
       actionSource: 'REPORTS_MODULE',
-      description: `Exported "${activeReport}" report (${tableData.length} rows) as Excel (.xlsx).`,
+      description: `Exported "${activeReport}" report (${tableData.length} rows) as formatted Excel (.xlsx).`,
     });
   };
 
@@ -536,7 +273,7 @@ export const Reports: React.FC<ReportsProps> = ({
         format: 'csv',
         fileName,
         rowCount: tableData.length,
-        period: activeReport === 'monthly_attendance' || activeReport === 'employee_wise' ? selectedMonth : selectedDate,
+        period: periodLabel,
       },
       actionSource: 'REPORTS_MODULE',
       description: `Exported "${activeReport}" report (${tableData.length} rows) as CSV.`,
@@ -715,13 +452,43 @@ export const Reports: React.FC<ReportsProps> = ({
             ]}
           />
 
+          {/* Dynamic Executive Summary Strip (mirrors Excel Export KPI block) */}
+          {summary && !showInitialTableSkeleton && (
+            <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-2.5">
+              <div className="bg-white rounded-lg border border-slate-200 px-3 py-2.5">
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Employees</div>
+                <div className="text-lg font-bold text-slate-900 font-mono tabular-nums mt-0.5">{summary.totalEmployees}</div>
+              </div>
+              <div className="bg-white rounded-lg border border-emerald-200/80 px-3 py-2.5">
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-emerald-700">Completed</div>
+                <div className="text-lg font-bold text-emerald-700 font-mono tabular-nums mt-0.5">{summary.completedCount}</div>
+              </div>
+              <div className="bg-white rounded-lg border border-amber-200/80 px-3 py-2.5">
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-amber-800">Auto-Closed</div>
+                <div className="text-lg font-bold text-amber-800 font-mono tabular-nums mt-0.5">{summary.autoClosedCount}</div>
+              </div>
+              <div className="bg-white rounded-lg border border-yellow-200/80 px-3 py-2.5">
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-yellow-800">Half Day</div>
+                <div className="text-lg font-bold text-yellow-800 font-mono tabular-nums mt-0.5">{summary.halfDayCount}</div>
+              </div>
+              <div className="bg-white rounded-lg border border-red-200/80 px-3 py-2.5">
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-red-700">Short Leave</div>
+                <div className="text-lg font-bold text-red-700 font-mono tabular-nums mt-0.5">{summary.shortLeaveCount}</div>
+              </div>
+              <div className="bg-white rounded-lg border border-indigo-200/80 px-3 py-2.5">
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-indigo-700">Total OT Hours</div>
+                <div className="text-lg font-bold text-indigo-800 font-mono tabular-nums mt-0.5">{summary.totalOtHoursFormatted}</div>
+              </div>
+            </div>
+          )}
+
           {/* Table Preview */}
           <div className="bg-white rounded-xl border border-slate-200 shadow-2xs overflow-hidden">
-            <div className="overflow-x-auto max-h-[500px]">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-slate-50 text-slate-600 uppercase font-semibold border-b border-slate-200 sticky top-0">
+            <div className="overflow-x-auto max-h-[520px]">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead className="bg-[#1B365D] text-white uppercase text-[11px] font-semibold tracking-wide sticky top-0 z-10">
                   <tr>
-                    <th className="py-2.5 px-3 w-10 text-center">
+                    <th className="py-3 px-3 w-10 text-center">
                       <SelectAllCheckbox
                         checked={bulk.isPageAllSelected}
                         indeterminate={bulk.isPageIndeterminate}
@@ -730,33 +497,51 @@ export const Reports: React.FC<ReportsProps> = ({
                         ariaLabel="Select all report rows on current page"
                       />
                     </th>
-                    {tableColumns.map((col, idx) => (
-                      <th key={idx} className="py-2.5 px-3">
-                        {col.header}
-                      </th>
-                    ))}
+                    {tableColumns.map((col, idx) => {
+                      const isRight =
+                        col.key === 'dutyHours' ||
+                        col.key === 'otHours' ||
+                        col.key === 'totalWorkingHours';
+                      return (
+                        <th
+                          key={idx}
+                          className={`py-3 px-3 whitespace-nowrap ${isRight ? 'text-right' : ''}`}
+                        >
+                          {col.header}
+                        </th>
+                      );
+                    })}
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-100">
+                <tbody className="divide-y divide-slate-200/75">
                   {showInitialTableSkeleton ? (
                     <TableSkeletonRows
                       rows={8}
                       cols={Math.max(2, tableColumns.length + 1)}
-                      rowHeightClass="py-2 px-3"
+                      rowHeightClass="py-2.5 px-3"
                     />
                   ) : tableData.length === 0 ? (
                     <tr>
-                      <td colSpan={tableColumns.length + 1} className="py-8 text-center text-slate-400">
+                      <td colSpan={tableColumns.length + 1} className="py-10 text-center text-slate-400">
                         No records found for this report and date.
                       </td>
                     </tr>
                   ) : (
-                    paginatedRows.map((row) => {
+                    paginatedRows.map((row, rowIdx) => {
                       const rowId = String(row._rowKey);
                       const isChecked = bulk.isSelected(rowId);
                       return (
-                      <tr key={rowId} className={isChecked ? 'bg-blue-50/60 hover:bg-blue-50/90' : 'hover:bg-slate-50'}>
-                        <td className="py-2 px-3 text-center">
+                      <tr
+                        key={rowId}
+                        className={
+                          isChecked
+                            ? 'bg-blue-50/70 hover:bg-blue-50'
+                            : rowIdx % 2 === 1
+                              ? 'bg-slate-50/60 hover:bg-slate-100/70'
+                              : 'bg-white hover:bg-slate-50'
+                        }
+                      >
+                        <td className="py-2.5 px-3 text-center">
                           <input
                             type="checkbox"
                             checked={isChecked}
@@ -766,11 +551,58 @@ export const Reports: React.FC<ReportsProps> = ({
                             className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4 cursor-pointer"
                           />
                         </td>
-                        {tableColumns.map((col, colIdx) => (
-                          <td key={colIdx} className="py-2 px-3 text-slate-700">
-                            {(row as Record<string, any>)[col.key]}
-                          </td>
-                        ))}
+                        {tableColumns.map((col, colIdx) => {
+                          const val = (row as Record<string, any>)[col.key];
+
+                          if (col.key === 'status' && val) {
+                            return (
+                              <td key={colIdx} className="py-2.5 px-3 whitespace-nowrap">
+                                <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wide ${getAttendanceStatusBadgeClasses(String(val))}`}>
+                                  {val}
+                                </span>
+                              </td>
+                            );
+                          }
+
+                          const isHighlightedAutoClose =
+                            col.key === 'autoCloseTime' && val && val !== 'N/A';
+                          const isDuration =
+                            col.key === 'dutyHours' ||
+                            col.key === 'otHours' ||
+                            col.key === 'totalWorkingHours';
+                          const isPositiveOt = col.key === 'otHours' && val && val !== '00:00';
+                          const isTimeCol =
+                            col.key === 'scheduledStart' ||
+                            col.key === 'scheduledEnd' ||
+                            col.key === 'inTime' ||
+                            col.key === 'actualOutTime' ||
+                            col.key === 'autoCloseTime' ||
+                            col.key === 'autoCloseRecordedAt' ||
+                            col.key === 'date';
+
+                          return (
+                            <td
+                              key={colIdx}
+                              className={`py-2.5 px-3 whitespace-nowrap ${
+                                col.key === 'employeeId'
+                                  ? 'font-mono font-bold text-slate-900 tabular-nums'
+                                  : isHighlightedAutoClose
+                                    ? 'font-mono font-bold text-amber-800 tabular-nums'
+                                    : isPositiveOt
+                                      ? 'font-mono font-bold text-indigo-800 bg-indigo-50/70 text-right tabular-nums'
+                                      : col.key === 'totalWorkingHours'
+                                        ? 'font-mono font-bold text-slate-900 text-right tabular-nums'
+                                        : isDuration
+                                          ? 'font-mono font-medium text-slate-800 text-right tabular-nums'
+                                          : isTimeCol
+                                            ? `font-mono tabular-nums ${val === 'N/A' ? 'text-slate-400' : 'text-slate-700'}`
+                                            : 'text-slate-700'
+                              }`}
+                            >
+                              {val}
+                            </td>
+                          );
+                        })}
                       </tr>
                       );
                     })

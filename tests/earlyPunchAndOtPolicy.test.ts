@@ -509,11 +509,10 @@ describe('Approved Early Punch & Early Overtime Policy (Option A)', () => {
       })
     );
     expect(reportsHtml).toContain('Scheduled Shift Start');
-    expect(reportsHtml).toContain('Actual Punch In');
-    expect(reportsHtml).toContain('Early Arrival Duration');
-    expect(reportsHtml).toContain('Early OT');
-    expect(reportsHtml).toContain('Post-shift OT');
-    expect(reportsHtml).toContain('Total OT');
+    expect(reportsHtml).toContain('Actual Punch-In');
+    expect(reportsHtml).toContain('Duty Hours');
+    expect(reportsHtml).toContain('OT Hours');
+    expect(reportsHtml).toContain('Total Working Hours');
 
     const dashHtml = renderToStaticMarkup(
       React.createElement(Dashboard, {

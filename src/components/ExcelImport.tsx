@@ -1,4 +1,5 @@
 import React, { useState, useRef } from 'react';
+import { getSafeErrorText } from '../services/errorHandlingService';
 import { 
   UploadCloud, 
   Download, 
@@ -9,7 +10,9 @@ import {
   Check, 
   ArrowRight,
   RefreshCw,
-  Info
+  Info,
+  Sparkles,
+  ShieldAlert
 } from 'lucide-react';
 import { Floor, Section, Department } from '../types';
 import {
@@ -18,6 +21,7 @@ import {
   commitImportedEmployees,
   EmployeeImportCommitError,
   EmployeeImportCommitResult,
+  FieldNormalizationInfo,
   ImportFailureCategory,
   ImportFailedRow,
   ImportValidationResult,
@@ -59,6 +63,29 @@ function getFailureCategoryLabel(category: ImportFailureCategory): string {
   }
 }
 
+function renderNormalizedCell(
+  canonicalValue: string,
+  info?: FieldNormalizationInfo
+): React.ReactNode {
+  if (!info || !info.wasNormalized) {
+    return <span>{canonicalValue}</span>;
+  }
+
+  return (
+    <div className="flex flex-col gap-0.5">
+      <span className="font-semibold text-slate-900">{canonicalValue}</span>
+      <span
+        className="inline-flex items-center gap-1 text-[10px] text-indigo-700 bg-indigo-50 border border-indigo-200 rounded px-1.5 py-0.5 w-fit"
+        title={`Uploaded Excel value "${info.originalValue}" was matched case-insensitively to existing master value "${info.canonicalValue}".`}
+      >
+        <span className="line-through text-indigo-500/80">{info.originalValue}</span>
+        <ArrowRight className="w-2.5 h-2.5 shrink-0" />
+        <span className="font-medium">Matched</span>
+      </span>
+    </div>
+  );
+}
+
 export const ExcelImport: React.FC<ExcelImportProps> = ({
   floors,
   sections,
@@ -76,10 +103,6 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const validFloorNames = floors.map(f => f.name);
-  const validSectionNames = sections.map(s => s.name);
-  const validDepartmentNames = departments.map(d => d.name);
-
   const handleFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selected = e.target.files?.[0];
     if (!selected) return;
@@ -91,11 +114,12 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
 
     setIsValidating(true);
     try {
+      // Pass full master objects so canonical IDs (departmentId, sectionId, floorId/lineId) are resolved
       const res = await parseAndValidateEmployeeExcel(
         selected,
-        validFloorNames,
-        validSectionNames,
-        validDepartmentNames
+        floors,
+        sections,
+        departments
       );
       setValidationResult(res);
       if (res.invalidRows.length > 0 && res.validRows.length === 0) {
@@ -104,7 +128,9 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
         setActiveTab('valid');
       }
     } catch (err: any) {
-      setValidationError(err?.message || 'Unable to parse the selected spreadsheet.');
+      setValidationError(
+        getSafeErrorText(err, { moduleName: 'Excel Import', forcedErrorCode: 'FILE-001' })
+      );
       setFile(null);
       if (fileInputRef.current) fileInputRef.current.value = '';
     } finally {
@@ -147,7 +173,10 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
 
         setCommitError({
           category: err.category,
-          message: err.message,
+          message: getSafeErrorText(err, {
+            moduleName: 'Excel Import',
+            endpoint: '/api/employees/bulk-import',
+          }),
           partialCommit: hasPartial,
           savedCount: totalSaved,
           insertedCount: totalInserted,
@@ -162,7 +191,11 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
       } else {
         setCommitError({
           category: 'DATABASE_WRITE_ERROR',
-          message: err?.message || 'Unexpected error during database commit.',
+          message: getSafeErrorText(err, {
+            moduleName: 'Excel Import',
+            endpoint: '/api/employees/bulk-import',
+            dbOperationCategory: 'write',
+          }),
           partialCommit: Boolean(priorPartial && priorPartial.savedCount > 0),
           savedCount: priorPartial?.savedCount || 0,
           insertedCount: priorPartial?.insertedCount || 0,
@@ -196,6 +229,10 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
     await runCommitRows(failedSubset, file.name, commitError);
   };
 
+  const normalizationMappings = validationResult?.normalizationSummary ?? [];
+  const ambiguityConflicts = validationResult?.ambiguities ?? [];
+  const normalizedCellCount = validationResult?.normalizedCellCount ?? 0;
+
   return (
     <div className="p-6 bg-slate-50 min-h-full flex flex-col gap-6">
       {/* Title & Instructions */}
@@ -227,7 +264,10 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
           <p className="font-semibold">Super Admin Master Import Rules:</p>
           <ul className="list-disc list-inside text-blue-800 space-y-0.5 text-[11px]">
             <li>Matches employees by <strong>Employee ID</strong>. Existing records are updated; new IDs are inserted.</li>
-            <li><strong>Data Safety Guarantee:</strong> Updating employee details NEVER deletes or alters past attendance records.</li>
+            <li>
+              <strong>Automatic Case-Insensitive Master Matching:</strong> Department, Section, Line/Floor, Employee Type, Designation, and Status are matched case-insensitively and normalized to existing website master capitalization without creating duplicate master records.
+            </li>
+            <li><strong>Data Safety Guarantee:</strong> Updating employee details NEVER deletes or alters past attendance records or fields omitted from the file.</li>
             <li>Existing QR security tokens are securely preserved so physical badges remain valid.</li>
           </ul>
         </div>
@@ -242,7 +282,7 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
           Upload Employee Master File
         </h3>
         <p className="text-xs text-slate-500 max-w-md mt-1 mb-4">
-          Select or drop your filled .xlsx or .csv file. The system will validate all rows and display an import preview before applying changes.
+          Select or drop your filled .xlsx or .csv file. The system will validate all rows, normalize master data case differences, and display an import preview before applying changes.
         </p>
 
         <input
@@ -401,6 +441,111 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
             </div>
           </div>
 
+          {/* Ambiguous Master Data Conflict Warning */}
+          {ambiguityConflicts.length > 0 && (
+            <div
+              role="alert"
+              className="bg-amber-50 border border-amber-300 rounded-xl p-4 text-amber-950 text-xs flex flex-col gap-2.5"
+            >
+              <div className="flex items-start gap-2.5">
+                <ShieldAlert className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                <div>
+                  <div className="font-bold text-sm text-amber-950">
+                    Ambiguous Master Data Detected ({validationResult.ambiguousRowCount || ambiguityConflicts.length} affected row{(validationResult.ambiguousRowCount || ambiguityConflicts.length) === 1 ? '' : 's'})
+                  </div>
+                  <p className="text-amber-900 mt-0.5">
+                    Multiple existing master records match the same normalized value. The system never guesses between conflicting master records. An authorized administrator must resolve the duplicate master entries before importing these rows.
+                  </p>
+                </div>
+              </div>
+              <div className="bg-white/90 border border-amber-200 rounded-lg overflow-x-auto">
+                <table className="w-full text-left text-[11px]">
+                  <thead className="bg-amber-100/70 text-amber-900 uppercase font-semibold border-b border-amber-200">
+                    <tr>
+                      <th className="py-2 px-3">Field</th>
+                      <th className="py-2 px-3">Excel Value</th>
+                      <th className="py-2 px-3">Conflicting Master Records</th>
+                      <th className="py-2 px-3">Rows</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-amber-100">
+                    {ambiguityConflicts.map((conflict, idx) => (
+                      <tr key={`${conflict.field}-${idx}`}>
+                        <td className="py-2 px-3 font-semibold text-slate-800">{conflict.fieldLabel}</td>
+                        <td className="py-2 px-3 font-mono text-amber-900">{conflict.excelValue}</td>
+                        <td className="py-2 px-3 text-slate-700">
+                          {conflict.candidates.map((c) => `"${c.name}" (${c.id})`).join(', ')}
+                        </td>
+                        <td className="py-2 px-3 font-mono text-amber-900">
+                          {conflict.rowNumbers.join(', ')}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Case-Insensitive Master Normalization Banner & Mapping Table */}
+          {normalizedCellCount > 0 && normalizationMappings.length > 0 && (
+            <div className="bg-indigo-50/80 border border-indigo-200 rounded-xl p-4 text-indigo-950 text-xs flex flex-col gap-3">
+              <div className="flex items-start justify-between gap-3 flex-wrap">
+                <div className="flex items-start gap-2.5">
+                  <Sparkles className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
+                  <div>
+                    <div className="font-bold text-indigo-950">
+                      Case differences automatically normalized using existing master data.
+                    </div>
+                    <p className="text-[11px] text-indigo-800 mt-0.5">
+                      {normalizedCellCount} value{normalizedCellCount === 1 ? '' : 's'} across{' '}
+                      {validationResult.caseNormalizedRowCount || 0} row{(validationResult.caseNormalizedRowCount || 0) === 1 ? '' : 's'} matched existing website master records without altering master capitalization or creating duplicates.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-white border border-indigo-200/80 rounded-lg overflow-x-auto max-h-52">
+                <table className="w-full text-left text-[11px]">
+                  <thead className="bg-indigo-50 text-indigo-900 uppercase font-semibold border-b border-indigo-200 sticky top-0">
+                    <tr>
+                      <th className="py-2 px-3">Field</th>
+                      <th className="py-2 px-3">Excel Value</th>
+                      <th className="py-2 px-3">Existing Master (Saved Value)</th>
+                      <th className="py-2 px-3">Result</th>
+                      <th className="py-2 px-3 text-right">Cells</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-indigo-100">
+                    {normalizationMappings.map((entry, idx) => (
+                      <tr key={`${entry.field}-${entry.excelValue}-${idx}`} className="hover:bg-indigo-50/40">
+                        <td className="py-1.5 px-3 font-semibold text-slate-800">{entry.fieldLabel}</td>
+                        <td className="py-1.5 px-3 font-mono text-slate-600">{entry.excelValue}</td>
+                        <td className="py-1.5 px-3">
+                          <span className="font-semibold text-slate-900">{entry.canonicalValue}</span>
+                          {entry.masterId && (
+                            <span className="ml-1.5 text-[10px] font-mono text-slate-500">
+                              [{entry.masterId}]
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-1.5 px-3">
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 font-semibold text-[10px]">
+                            <Check className="w-3 h-3" />
+                            <span>Matched</span>
+                          </span>
+                        </td>
+                        <td className="py-1.5 px-3 text-right font-mono text-slate-600">
+                          {entry.occurrenceCount}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
           {/* Preview Tabs: Valid vs Invalid */}
           <div className="flex items-center justify-between border-b border-slate-200 pb-2">
             <div className="flex items-center gap-3 text-xs">
@@ -454,13 +599,14 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
                     <th className="py-2.5 px-3">Line</th>
                     <th className="py-2.5 px-3">Section</th>
                     <th className="py-2.5 px-3">Department</th>
+                    <th className="py-2.5 px-3">Designation</th>
                     <th className="py-2.5 px-3">Status</th>
                     <th className="py-2.5 px-3">Details / Changes</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {validationResult.validRows.map((row, i) => (
-                    <tr key={i} className="hover:bg-slate-50">
+                    <tr key={i} className="hover:bg-slate-50 align-top">
                       <td className="py-2 px-3">
                         <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
                           row.actionType === 'NEW' ? 'bg-blue-100 text-blue-800' :
@@ -472,11 +618,24 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
                       </td>
                       <td className="py-2 px-3 font-mono font-bold text-slate-900">{row.data.employeeId}</td>
                       <td className="py-2 px-3 font-medium text-slate-800">{row.data.employeeName}</td>
-                      <td className="py-2 px-3 text-slate-600">{row.data.employeeType}</td>
-                      <td className="py-2 px-3 text-slate-600">{row.data.floor}</td>
-                      <td className="py-2 px-3 text-slate-600">{row.data.section}</td>
-                      <td className="py-2 px-3 text-slate-600">{row.data.department}</td>
-                      <td className="py-2 px-3 text-slate-600">{row.data.employeeStatus}</td>
+                      <td className="py-2 px-3 text-slate-600">
+                        {renderNormalizedCell(row.data.employeeType, row.normalizedFields?.employeeType)}
+                      </td>
+                      <td className="py-2 px-3 text-slate-600">
+                        {renderNormalizedCell(row.data.floor, row.normalizedFields?.floor)}
+                      </td>
+                      <td className="py-2 px-3 text-slate-600">
+                        {renderNormalizedCell(row.data.section, row.normalizedFields?.section)}
+                      </td>
+                      <td className="py-2 px-3 text-slate-600">
+                        {renderNormalizedCell(row.data.department, row.normalizedFields?.department)}
+                      </td>
+                      <td className="py-2 px-3 text-slate-600">
+                        {renderNormalizedCell(row.data.designation, row.normalizedFields?.designation)}
+                      </td>
+                      <td className="py-2 px-3 text-slate-600">
+                        {renderNormalizedCell(row.data.employeeStatus, row.normalizedFields?.employeeStatus)}
+                      </td>
                       <td className="py-2 px-3 text-[11px] text-slate-500">
                         {row.diffs && row.diffs.length > 0 ? (
                           <span className="text-amber-700">{row.diffs.join('; ')}</span>
@@ -498,13 +657,20 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
                     <th className="py-2.5 px-3">Row #</th>
                     <th className="py-2.5 px-3">Raw ID</th>
                     <th className="py-2.5 px-3">Raw Name</th>
-                    <th className="py-2.5 px-3">Rejection Errors</th>
+                    <th className="py-2.5 px-3">Rejection / Resolution Details</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-red-100">
                   {validationResult.invalidRows.map((inv, idx) => (
-                    <tr key={idx} className="bg-red-50/30">
-                      <td className="py-2 px-3 font-mono font-bold text-red-900">Line {inv.rowNumber}</td>
+                    <tr key={idx} className={inv.hasAmbiguity ? 'bg-amber-50/60' : 'bg-red-50/30'}>
+                      <td className="py-2 px-3 font-mono font-bold text-red-900">
+                        <div>Line {inv.rowNumber}</div>
+                        {inv.hasAmbiguity && (
+                          <span className="inline-block mt-1 px-1.5 py-0.5 rounded bg-amber-100 border border-amber-300 text-amber-900 font-sans text-[10px] font-semibold">
+                            Ambiguous Match
+                          </span>
+                        )}
+                      </td>
                       <td className="py-2 px-3 font-mono text-slate-800">{inv.raw.id || '<empty>'}</td>
                       <td className="py-2 px-3 text-slate-800">{inv.raw.name || '<empty>'}</td>
                       <td className="py-2 px-3 text-red-700 font-medium">
@@ -521,3 +687,4 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
     </div>
   );
 };
+

@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { getSafeErrorText } from '../services/errorHandlingService';
 import { 
   ShieldCheck, 
   Key, 
@@ -309,7 +310,11 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       setUsersBulkSummary({ type: 'success', title: `Exported ${out.rowCount} User Accounts`, message: `Downloaded "${out.fileName}".`, savedCount: out.rowCount });
       usersBulk.clearSelection();
     } catch (err: any) {
-      setUsersBulkSummary({ type: 'error', title: 'User Export Failed', message: err?.message || 'Unable to export users.' });
+      setUsersBulkSummary({
+        type: 'error',
+        title: 'User Export Failed',
+        message: getSafeErrorText(err, { moduleName: 'User Rights', forcedErrorCode: 'FILE-002' }),
+      });
     } finally {
       setUsersBulkProgress(null);
       setIsUsersBulkBusy(false);
@@ -349,7 +354,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       setUsersBulkSummary({
         type: 'error',
         title: 'User Bulk Status Update Blocked',
-        message: err?.message || 'Permission or validation error.',
+        message: getSafeErrorText(err, { moduleName: 'User Rights', endpoint: '/api/admin/users/bulk-status' }),
       });
     } finally {
       setUsersBulkProgress(null);
@@ -487,7 +492,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       setUsers(data);
     } catch (err: any) {
       console.error('Failed to load user roles:', err);
-      setUsersLoadError(err?.message || 'Unable to load user accounts from server.');
+      setUsersLoadError(getSafeErrorText(err, { moduleName: 'User Rights', endpoint: '/api/admin/users' }));
     } finally {
       setIsLoadingUsers(false);
     }
@@ -511,7 +516,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       setCleanupAuditData(cleanup);
       if (adminStatus) setFirebaseAdminStatus(adminStatus);
     } catch (err: any) {
-      showToast('error', err.message || 'Failed to load authentication & cleanup audit reports.');
+      showToast('error', getSafeErrorText(err, { moduleName: 'User Rights', endpoint: '/api/admin/auth-audit' }));
     } finally {
       setIsLoadingDuplicateReport(false);
       setIsLoadingAuthAudit(false);
@@ -555,7 +560,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       const refreshed = await fetchAccountCleanupAudit();
       setCleanupAuditData(refreshed);
     } catch (err: any) {
-      showToast('error', err.message || 'Failed to approve account cleanup.');
+      showToast('error', getSafeErrorText(err, { moduleName: 'User Rights', endpoint: '/api/admin/cleanup' }));
     } finally {
       setIsApprovingCleanup(false);
     }
@@ -570,7 +575,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       setDuplicateReport(rep);
       loadUsersManual();
     } catch (err: any) {
-      showToast('error', err.message || 'Failed to consolidate duplicates.');
+      showToast('error', getSafeErrorText(err, { moduleName: 'User Rights', endpoint: '/api/admin/consolidate' }));
     } finally {
       setIsConsolidating(false);
     }
@@ -649,7 +654,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       loadPasswordHistory();
       loadUsersManual();
     } catch (err: any) {
-      showToast('error', err.message || 'Failed to reset password.');
+      showToast('error', getSafeErrorText(err, { moduleName: 'User Rights', endpoint: '/api/admin/set-password' }));
     } finally {
       setIsSubmittingPanelReset(false);
     }
@@ -716,7 +721,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       setIsCreateModalOpen(false);
       loadUsersManual();
     } catch (err: any) {
-      showToast('error', err.message || 'Failed to create user account.');
+      showToast('error', getSafeErrorText(err, { moduleName: 'User Rights', endpoint: '/api/admin/users' }));
     } finally {
       setIsSubmittingCreate(false);
     }
@@ -761,7 +766,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       loadPasswordHistory();
       loadUsersManual();
     } catch (err: any) {
-      showToast('error', err.message || 'Failed to update password.');
+      showToast('error', getSafeErrorText(err, { moduleName: 'User Rights', endpoint: '/api/admin/set-password' }));
     } finally {
       setIsSubmittingPassword(false);
     }
@@ -803,7 +808,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       showToast('success', `Permissions for "${selectedUser.loginId}" updated in Firebase!`);
       setIsPermissionsModalOpen(false);
     } catch (err: any) {
-      showToast('error', err.message || 'Failed to update permissions.');
+      showToast('error', getSafeErrorText(err, { moduleName: 'User Rights', endpoint: '/api/admin/permissions' }));
     } finally {
       setIsSubmittingPermissions(false);
     }
@@ -832,7 +837,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       showToast('success', `User "${userToDelete.loginId}" (${userToDelete.name}) successfully deleted from Firebase.`);
       setUserToDelete(null);
     } catch (err: any) {
-      showToast('error', err.message || 'Failed to delete user.');
+      showToast('error', getSafeErrorText(err, { moduleName: 'User Rights', endpoint: '/api/admin/users/delete' }));
     } finally {
       setIsDeletingUser(false);
     }
@@ -967,7 +972,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
 
       showToast('success', `Customized permissions for "${targetUser.loginId}" saved to Firebase!`);
     } catch (err: any) {
-      showToast('error', err.message || 'Failed to save individual permissions.');
+      showToast('error', getSafeErrorText(err, { moduleName: 'User Rights', endpoint: '/api/admin/user-permissions' }));
     } finally {
       setIsSavingUserMatrix(false);
     }
@@ -1111,7 +1116,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       );
       setIsRoleModalOpen(false);
     } catch (err: any) {
-      showToast('error', err.message || 'Failed to save role definition.');
+      showToast('error', getSafeErrorText(err, { moduleName: 'User Rights', endpoint: '/api/admin/roles' }));
     } finally {
       setIsSubmittingRole(false);
     }
@@ -1136,7 +1141,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
         `Custom role "${roleObj.roleName}" ${!roleObj.isActive ? 'activated' : 'deactivated'}.`
       );
     } catch (err: any) {
-      showToast('error', err.message || 'Failed to update role status.');
+      showToast('error', getSafeErrorText(err, { moduleName: 'User Rights', endpoint: '/api/admin/roles' }));
     }
   };
 
@@ -1148,7 +1153,7 @@ export const UserRights: React.FC<UserRightsProps> = ({ currentUserRole, onRoleP
       showToast('success', `Custom role "${roleToDelete.roleName}" deleted.`);
       setRoleToDelete(null);
     } catch (err: any) {
-      showToast('error', err.message || 'Failed to delete custom role.');
+      showToast('error', getSafeErrorText(err, { moduleName: 'User Rights', endpoint: '/api/admin/roles' }));
     } finally {
       setIsDeletingRole(false);
     }

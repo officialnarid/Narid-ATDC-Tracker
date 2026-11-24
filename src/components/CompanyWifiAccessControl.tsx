@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { getSafeErrorText } from '../services/errorHandlingService';
 import {
   Wifi,
   WifiOff,
@@ -141,7 +142,9 @@ export const CompanyWifiAccessControl: React.FC<CompanyWifiAccessControlProps> =
       setUserMode(data.policies.user.accessMode);
       setUserSelectedIds(data.policies.user.allowedNetworkIds);
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Failed to load Company Wi-Fi Access Control configuration.');
+      setErrorMessage(
+        getSafeErrorText(err, { moduleName: 'Network Security', endpoint: '/api/company-wifi/dashboard' })
+      );
     } finally {
       setIsLoading(false);
     }
@@ -158,7 +161,9 @@ export const CompanyWifiAccessControl: React.FC<CompanyWifiAccessControlProps> =
       });
       setLogs(res.logs);
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Failed to load access history logs.');
+      setErrorMessage(
+        getSafeErrorText(err, { moduleName: 'Network Security', endpoint: '/api/company-wifi/logs' })
+      );
     } finally {
       setIsLoadingLogs(false);
     }
@@ -261,7 +266,9 @@ export const CompanyWifiAccessControl: React.FC<CompanyWifiAccessControlProps> =
       setEditingNetwork(null);
       await loadDashboard();
     } catch (err: any) {
-      setFormError(err?.message || 'Failed to save Company Wi-Fi network.');
+      setFormError(
+        getSafeErrorText(err, { moduleName: 'Network Security', endpoint: '/api/company-wifi/networks' })
+      );
     } finally {
       setIsSavingNetwork(false);
     }
@@ -278,7 +285,9 @@ export const CompanyWifiAccessControl: React.FC<CompanyWifiAccessControlProps> =
       );
       await loadDashboard();
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Failed to update network status.');
+      setErrorMessage(
+        getSafeErrorText(err, { moduleName: 'Network Security', endpoint: '/api/company-wifi/networks' })
+      );
     }
   };
 
@@ -290,7 +299,9 @@ export const CompanyWifiAccessControl: React.FC<CompanyWifiAccessControlProps> =
       setPendingDeleteNetwork(null);
       await loadDashboard();
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Failed to delete Company Wi-Fi network.');
+      setErrorMessage(
+        getSafeErrorText(err, { moduleName: 'Network Security', endpoint: '/api/company-wifi/networks' })
+      );
     }
   };
 
@@ -306,7 +317,9 @@ export const CompanyWifiAccessControl: React.FC<CompanyWifiAccessControlProps> =
       );
       await loadDashboard();
     } catch (err: any) {
-      setErrorMessage(err?.message || `Failed to save ${roleId.toUpperCase()} Wi-Fi policy.`);
+      setErrorMessage(
+        getSafeErrorText(err, { moduleName: 'Network Security', endpoint: '/api/company-wifi/policies' })
+      );
     } finally {
       setIsSavingRole(null);
     }
@@ -324,7 +337,9 @@ export const CompanyWifiAccessControl: React.FC<CompanyWifiAccessControlProps> =
       showToast('Company Wi-Fi enforcement turned OFF. All roles can now access without Wi-Fi blocking.');
       await loadDashboard();
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Failed to disable enforcement.');
+      setErrorMessage(
+        getSafeErrorText(err, { moduleName: 'Network Security', endpoint: '/api/company-wifi/settings' })
+      );
     } finally {
       setIsUpdatingSettings(false);
     }
@@ -339,7 +354,9 @@ export const CompanyWifiAccessControl: React.FC<CompanyWifiAccessControlProps> =
       showToast('Company Wi-Fi Access Control enforcement is now ON. Super Admin remains unrestricted.');
       await loadDashboard();
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Failed to enable enforcement.');
+      setErrorMessage(
+        getSafeErrorText(err, { moduleName: 'Network Security', endpoint: '/api/company-wifi/settings' })
+      );
     } finally {
       setIsUpdatingSettings(false);
     }
@@ -353,7 +370,12 @@ export const CompanyWifiAccessControl: React.FC<CompanyWifiAccessControlProps> =
       showToast('Emergency Recovery executed: Company Wi-Fi enforcement is now OFF.');
       await loadDashboard();
     } catch (err: any) {
-      setErrorMessage(err?.message || 'Emergency disable failed.');
+      setErrorMessage(
+        getSafeErrorText(err, {
+          moduleName: 'Network Security',
+          endpoint: '/api/company-wifi/emergency-disable',
+        })
+      );
     } finally {
       setIsUpdatingSettings(false);
     }

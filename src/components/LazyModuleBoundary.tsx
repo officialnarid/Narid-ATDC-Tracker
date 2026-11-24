@@ -1,5 +1,8 @@
 import React, { Component, type ComponentType, type ErrorInfo, type ReactNode, lazy } from 'react';
 import { AlertTriangle, RefreshCw } from 'lucide-react';
+import { SafeErrorBanner } from './SafeErrorBanner';
+import { handleAppError } from '../services/errorHandlingService';
+import type { NormalizedAppError } from '../utils/errorRegistry';
 
 function isDynamicImportError(error: unknown): boolean {
   const msg = String((error as any)?.message || error || '').toLowerCase();
@@ -78,38 +81,52 @@ interface ModuleErrorBoundaryProps {
 
 interface ModuleErrorBoundaryState {
   hasError: boolean;
-  errorMessage: string;
+  safeError: NormalizedAppError | null;
   retryNonce: number;
 }
 
 export class ModuleErrorBoundary extends Component<ModuleErrorBoundaryProps, ModuleErrorBoundaryState> {
   state: ModuleErrorBoundaryState = {
     hasError: false,
-    errorMessage: '',
+    safeError: null,
     retryNonce: 0,
   };
 
   static getDerivedStateFromError(error: Error): Partial<ModuleErrorBoundaryState> {
+    const safeError = handleAppError(error, {
+      moduleName: 'Module Loader',
+      reportToBackend: false,
+      notifyGlobalToast: false,
+    });
     return {
       hasError: true,
-      errorMessage: error?.message || 'Unexpected error while loading module.',
+      safeError,
     };
   }
 
   componentDidCatch(error: Error, info: ErrorInfo): void {
     console.error('[ModuleErrorBoundary] Caught module error:', error, info);
+    handleAppError(error, {
+      moduleName: this.props.resetKey || 'Module Loader',
+      reportToBackend: true,
+      notifyGlobalToast: false,
+      extraMetadata: {
+        resetKey: this.props.resetKey,
+        componentStackPresent: Boolean(info?.componentStack),
+      },
+    });
   }
 
   componentDidUpdate(prevProps: ModuleErrorBoundaryProps): void {
     if (prevProps.resetKey !== this.props.resetKey && this.state.hasError) {
-      this.setState({ hasError: false, errorMessage: '' });
+      this.setState({ hasError: false, safeError: null });
     }
   }
 
   private handleRetry = () => {
     this.setState((prev) => ({
       hasError: false,
-      errorMessage: '',
+      safeError: null,
       retryNonce: prev.retryNonce + 1,
     }));
   };
@@ -124,17 +141,24 @@ export class ModuleErrorBoundary extends Component<ModuleErrorBoundaryProps, Mod
     if (this.state.hasError) {
       return (
         <div className="p-6 flex items-center justify-center min-h-[320px]">
-          <div className="bg-white border border-amber-200 rounded-xl shadow-sm p-6 max-w-md w-full text-center space-y-4">
-            <div className="w-11 h-11 rounded-full bg-amber-100 border border-amber-200 flex items-center justify-center mx-auto text-amber-700">
-              <AlertTriangle className="w-5 h-5" />
+          <div className="bg-white border border-amber-200 rounded-xl shadow-sm p-6 max-w-lg w-full space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-amber-100 border border-amber-200 flex items-center justify-center text-amber-700 shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-slate-900">Unable to Open Module</h3>
+                <p className="text-xs text-slate-500">
+                  A safe recovery boundary prevented this view from interrupting your session.
+                </p>
+              </div>
             </div>
-            <div>
-              <h3 className="text-sm font-bold text-slate-900">Module Failed to Load</h3>
-              <p className="text-xs text-slate-600 mt-1 break-words">
-                {this.state.errorMessage}
-              </p>
-            </div>
-            <div className="flex items-center justify-center gap-2.5 pt-1">
+
+            {this.state.safeError && (
+              <SafeErrorBanner error={this.state.safeError} onRetry={this.handleRetry} />
+            )}
+
+            <div className="flex items-center justify-end gap-2.5 pt-1">
               <button
                 type="button"
                 onClick={this.handleRetry}

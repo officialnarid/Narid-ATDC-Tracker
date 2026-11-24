@@ -81,8 +81,8 @@ describe('Server-Side Attendance Engine, Concurrent 3-Strike Lockout & Persisten
     expect(outRes.body.action).toBe('PUNCH_OUT');
     expect(outRes.body.currentState).toBe('OUTSIDE');
     expect(outRes.body.attendance.totalDutyMinutes).toBe(600);
-    expect(outRes.body.attendance.regularDutyMinutes).toBe(510);
-    expect(outRes.body.attendance.overtimeMinutes).toBe(90);
+    expect(outRes.body.attendance.regularDutyMinutes).toBe(505);
+    expect(outRes.body.attendance.overtimeMinutes).toBe(95);
 
     // 4. Duplicate Consecutive Punch OUT MUST be rejected (409)
     const dupOutRes = await request(app)
@@ -658,8 +658,8 @@ describe('Server-Side Attendance Engine, Concurrent 3-Strike Lockout & Persisten
       expect(manualOutRes.body.action).toBe('PUNCH_OUT');
       expect(manualOutRes.body.currentState).toBe('OUTSIDE');
       expect(manualOutRes.body.attendance.totalDutyMinutes).toBe(600);
-      expect(manualOutRes.body.attendance.regularDutyMinutes).toBe(510);
-      expect(manualOutRes.body.attendance.overtimeMinutes).toBe(90);
+      expect(manualOutRes.body.attendance.regularDutyMinutes).toBe(505);
+      expect(manualOutRes.body.attendance.overtimeMinutes).toBe(95);
 
       // 10. Mixed workflow works seamlessly when both permissions are granted: QR Punch In -> Manual Punch Out
       const qrInRes = await request(app)

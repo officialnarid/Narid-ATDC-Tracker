@@ -155,12 +155,36 @@ export function apiUrl(path: string): string {
   return resolveApiUrl(path, import.meta.env.VITE_API_BASE_URL, getActiveHostname());
 }
 
+import {
+  type StandardErrorCode,
+  containsRawTechnicalLeak,
+  generateFrontendErrorEventId,
+  getErrorDefinition,
+  sanitizeTextForLog,
+} from '../utils/errorRegistry';
+import { queueClientTelemetry } from '../utils/perfMonitor';
+
 export interface ParsedApiResponse<T = any> {
   ok: boolean;
   status: number;
   data: T | null;
   errorMessage: string;
   isHtmlOrNonJson: boolean;
+  requestId?: string | null;
+  errorEventId?: string | null;
+  errorCode?: StandardErrorCode;
+  technicalDetail?: string;
+}
+
+export interface ApiRequestErrorExtras {
+  requestId?: string | null;
+  errorEventId?: string | null;
+  errorCode?: StandardErrorCode;
+  technicalDetail?: string;
+  endpoint?: string;
+  isTimeout?: boolean;
+  isNetworkFetchFailure?: boolean;
+  retryCount?: number;
 }
 
 export class ApiRequestError<T = any> extends Error {
@@ -171,8 +195,22 @@ export class ApiRequestError<T = any> extends Error {
   requiresFreshAuth?: boolean;
   firebaseAuthSynced?: boolean;
   adminSdkConfigured?: boolean;
+  requestId?: string | null;
+  errorEventId?: string | null;
+  errorCode?: StandardErrorCode;
+  technicalDetail?: string;
+  endpoint?: string;
+  isTimeout?: boolean;
+  isNetworkFetchFailure?: boolean;
+  retryCount?: number;
 
-  constructor(message: string, status: number, data: T | null, isHtmlOrNonJson: boolean) {
+  constructor(
+    message: string,
+    status: number,
+    data: T | null,
+    isHtmlOrNonJson: boolean,
+    extras?: ApiRequestErrorExtras
+  ) {
     super(message);
     this.name = 'ApiRequestError';
     this.status = status;
@@ -184,11 +222,27 @@ export class ApiRequestError<T = any> extends Error {
       if (obj.requiresFreshAuth !== undefined) this.requiresFreshAuth = Boolean(obj.requiresFreshAuth);
       if (obj.firebaseAuthSynced !== undefined) this.firebaseAuthSynced = Boolean(obj.firebaseAuthSynced);
       if (obj.adminSdkConfigured !== undefined) this.adminSdkConfigured = Boolean(obj.adminSdkConfigured);
+      if (typeof obj.requestId === 'string' && obj.requestId.trim()) {
+        this.requestId = obj.requestId.trim();
+      }
+      if (typeof obj.errorCode === 'string' && obj.errorCode.trim()) {
+        this.errorCode = obj.errorCode.trim() as StandardErrorCode;
+      }
+    }
+    if (extras) {
+      if (extras.requestId !== undefined) this.requestId = extras.requestId;
+      if (extras.errorEventId !== undefined) this.errorEventId = extras.errorEventId;
+      if (extras.errorCode !== undefined) this.errorCode = extras.errorCode;
+      if (extras.technicalDetail !== undefined) this.technicalDetail = extras.technicalDetail;
+      if (extras.endpoint !== undefined) this.endpoint = extras.endpoint;
+      if (extras.isTimeout !== undefined) this.isTimeout = extras.isTimeout;
+      if (extras.isNetworkFetchFailure !== undefined) {
+        this.isNetworkFetchFailure = extras.isNetworkFetchFailure;
+      }
+      if (extras.retryCount !== undefined) this.retryCount = extras.retryCount;
     }
   }
 }
-
-import { queueClientTelemetry } from '../utils/perfMonitor';
 
 type CompanyWifiBlockedHandler = (payload: Record<string, any>) => void;
 let companyWifiBlockedHandler: CompanyWifiBlockedHandler | null = null;
@@ -203,6 +257,7 @@ export interface ExecuteApiFetchOptions {
   timeoutMs?: number;
   noRetryOnNetworkError?: boolean;
   preferSameOriginInPreview?: boolean;
+  skipDiagnosticCapture?: boolean;
 }
 
 function createClientCorrelationId(): string {
@@ -312,6 +367,8 @@ export async function executeApiFetch(
     credentials: effectiveInit.credentials ?? 'include',
   };
 
+  let retryCount = 0;
+
   try {
     let res: Response;
     if (useStrictLocalPreviewBackend) {
@@ -327,6 +384,7 @@ export async function executeApiFetch(
           try {
             const previewText = await res.clone().text();
             if (isNginxWarmupHtmlBody(previewText)) {
+              retryCount += 1;
               await new Promise((r) => setTimeout(r, 600));
               res = await fetch(sameOriginPath, sameOriginInit);
             }
@@ -343,6 +401,7 @@ export async function executeApiFetch(
         try {
           const clonedBody = await res.clone().json();
           if (clonedBody && clonedBody.error === 'API endpoint not found.') {
+            retryCount += 1;
             res = await fetch(sameOriginPath, sameOriginInit);
           }
         } catch {
@@ -381,9 +440,25 @@ export async function executeApiFetch(
           message: `Client request timeout (${timeoutMs}ms) on ${method} ${endpointPath}`,
         });
       }
-      const label = endpointLabel || url;
-      throw new Error(
-        `Request timed out for ${label}. Do not assume failure — verify Dual Gate Activity or Attendance History before retrying.`
+      const eventId = generateFrontendErrorEventId();
+      const def = getErrorDefinition('NET-002');
+      const technicalDetail = sanitizeTextForLog(
+        `Client request timed out after ${timeoutMs}ms on ${method} ${endpointPath}`
+      );
+      throw new ApiRequestError(
+        `${def.userTitle} – Error Code: ${def.code}. ${def.defaultAction} (Ref: ${eventId})`,
+        408,
+        null,
+        false,
+        {
+          errorEventId: eventId,
+          errorCode: 'NET-002',
+          technicalDetail,
+          endpoint: endpointPath,
+          isTimeout: true,
+          isNetworkFetchFailure: false,
+          retryCount,
+        }
       );
     }
 
@@ -397,6 +472,7 @@ export async function executeApiFetch(
       !options?.noRetryOnNetworkError
     ) {
       try {
+        retryCount += 1;
         return await fetch(sameOriginPath, {
           ...baseInit,
           credentials: baseInit.credentials ?? 'include',
@@ -420,16 +496,26 @@ export async function executeApiFetch(
       });
     }
 
-    const label = endpointLabel || url;
-    const targetDesc = useStrictLocalPreviewBackend
-      ? (typeof window !== 'undefined' && window.location ? window.location.origin : 'local Preview backend')
-      : getEffectiveApiBaseUrl() ||
-        (typeof window !== 'undefined' && window.location ? window.location.origin : 'backend API');
-    const detail = err?.message ? ` (${err.message})` : '';
-    throw new Error(
-      useStrictLocalPreviewBackend
-        ? `Unable to reach local Preview backend for ${label} at ${targetDesc}${detail}. Verify the local Express server is running on port 3000.`
-        : `Unable to reach ${label} at ${targetDesc}${detail}. Verify Vercel /api Serverless Functions (or VITE_API_BASE_URL) are deployed and reachable.`
+    const eventId = generateFrontendErrorEventId();
+    const def = getErrorDefinition('NET-001');
+    const rawDetail = err?.message ? String(err.message) : 'Network fetch failure';
+    const technicalDetail = sanitizeTextForLog(
+      `Browser network fetch failed on ${method} ${endpointPath}: ${rawDetail}`
+    );
+    throw new ApiRequestError(
+      `${def.userTitle} – Error Code: ${def.code}. ${def.defaultAction} (Ref: ${eventId})`,
+      0,
+      null,
+      false,
+      {
+        errorEventId: eventId,
+        errorCode: 'NET-001',
+        technicalDetail,
+        endpoint: endpointPath,
+        isTimeout: false,
+        isNetworkFetchFailure: true,
+        retryCount,
+      }
     );
   } finally {
     if (timeoutId !== null) {
@@ -444,17 +530,30 @@ export async function safeParseJsonResponse<T = any>(
 ): Promise<ParsedApiResponse<T>> {
   const status = res.status;
   const contentType = (res.headers?.get?.('content-type') || '').toLowerCase();
+  const headerRequestId = res.headers?.get?.('x-request-id')?.trim() || null;
+  const headerErrorCode = (res.headers?.get?.('x-error-code')?.trim() || undefined) as
+    | StandardErrorCode
+    | undefined;
   let rawText = '';
 
   try {
     rawText = await res.text();
   } catch (readErr: any) {
+    const eventId = headerRequestId ? null : generateFrontendErrorEventId();
+    const def = getErrorDefinition('API-001');
+    const refId = headerRequestId || eventId || '';
     return {
       ok: false,
       status,
       data: null,
-      errorMessage: `HTTP ${status} (${endpointLabel || 'API request'}): failed to read response body (${readErr?.message || 'stream error'}).`,
+      errorMessage: `${def.userTitle} – Error Code: ${def.code}. ${def.defaultAction}${refId ? ` (Ref: ${refId})` : ''}`,
       isHtmlOrNonJson: true,
+      requestId: headerRequestId,
+      errorEventId: eventId,
+      errorCode: 'API-001',
+      technicalDetail: sanitizeTextForLog(
+        `HTTP ${status} (${endpointLabel || 'API request'}): response stream read error (${readErr?.message || 'stream error'})`
+      ),
     };
   }
 
@@ -477,39 +576,84 @@ export async function safeParseJsonResponse<T = any>(
   }
 
   if (!jsonValid || looksLikeHtml) {
-    const label = endpointLabel || res.url || 'API endpoint';
-    let errorMessage = '';
+    const label = endpointLabel || extractEndpointPath(res.url || '') || 'API endpoint';
+    const eventId = headerRequestId ? null : generateFrontendErrorEventId();
+    const refId = headerRequestId || eventId || '';
+    let errorCode: StandardErrorCode = status >= 500 ? 'SYS-001' : 'API-001';
+    let technicalDetail = '';
+
     if (status === 404) {
-      errorMessage = `HTTP 404 Not Found from ${label} (received ${contentType || (looksLikeHtml ? 'text/html' : 'non-JSON')} instead of backend JSON). Verify Vercel Serverless Function routing (/api/*) and vercel.json rewrites.`;
+      errorCode = 'API-001';
+      technicalDetail = `HTTP 404 non-JSON response (${contentType || (looksLikeHtml ? 'text/html' : 'non-JSON')}) from ${label}`;
     } else if (status >= 500) {
-      errorMessage = `Backend service error (HTTP ${status}${res.statusText ? ` ${res.statusText}` : ''} from ${label}). Received non-JSON response (${contentType || 'text/plain'}).`;
+      errorCode = status === 502 || status === 503 || status === 504 ? 'NET-001' : 'SYS-001';
+      technicalDetail = `Upstream/service HTTP ${status} non-JSON response (${contentType || 'text/plain'}) from ${label}`;
     } else if (looksLikeHtml && isPreviewAuthBridgeHtml(res, trimmed)) {
-      errorMessage = `AI Studio Preview session authentication check intercepted ${label} (HTTP ${status} text/html). Please refresh the Preview window and sign in again.`;
+      errorCode = 'AUTH-001';
+      technicalDetail = `Session authentication bridge HTML intercepted ${label} (HTTP ${status})`;
     } else if (looksLikeHtml && isNginxWarmupHtmlBody(trimmed)) {
-      errorMessage = `Local Preview backend server is starting up or returned HTTP 502/503 (${label} received warmup HTML instead of JSON). Please wait a moment and try again.`;
+      errorCode = 'NET-001';
+      technicalDetail = `Gateway warmup HTML returned on ${label} (HTTP ${status})`;
     } else if (looksLikeHtml && isFrontendSpaIndexHtml(trimmed)) {
-      errorMessage = `API routing error: ${label} returned frontend HTML (index.html, HTTP ${status}) instead of backend JSON. Verify Express /api middleware order and proxy routing.`;
+      errorCode = 'API-001';
+      technicalDetail = `SPA HTML returned instead of JSON on ${label} (HTTP ${status})`;
     } else {
-      errorMessage = `Unexpected non-JSON response (HTTP ${status}${res.statusText ? ` ${res.statusText}` : ''} from ${label}, content-type: ${contentType || 'unknown'}).`;
+      errorCode = 'API-001';
+      technicalDetail = `Non-JSON response (HTTP ${status}, content-type: ${contentType || 'unknown'}) from ${label}`;
     }
+
+    const def = getErrorDefinition(errorCode);
     return {
       ok: false,
       status,
       data: null,
-      errorMessage,
+      errorMessage: `${def.userTitle} – Error Code: ${def.code}. ${def.defaultAction}${refId ? ` (Ref: ${refId})` : ''}`,
       isHtmlOrNonJson: true,
+      requestId: headerRequestId,
+      errorEventId: eventId,
+      errorCode,
+      technicalDetail: sanitizeTextForLog(technicalDetail),
     };
   }
 
+  const effectiveRequestId =
+    headerRequestId || (typeof parsed.requestId === 'string' ? parsed.requestId.trim() : null) || null;
+  const effectiveErrorCode =
+    (typeof parsed.errorCode === 'string' && parsed.errorCode.trim()
+      ? (parsed.errorCode.trim() as StandardErrorCode)
+      : headerErrorCode) || undefined;
+
   const apiSuccessFlag = parsed.success !== false;
   const ok = res.ok && apiSuccessFlag;
-  const errorMessage = ok
-    ? ''
-    : String(
-        parsed.error ||
-          parsed.message ||
-          `HTTP ${status}${res.statusText ? ` ${res.statusText}` : ''} (${endpointLabel || 'API request'})`
+
+  let errorMessage = '';
+  let technicalDetail: string | undefined;
+
+  if (!ok) {
+    const rawMsg = String(parsed.error || parsed.message || '').trim();
+    const hasLeak = !rawMsg || status >= 500 || containsRawTechnicalLeak(rawMsg);
+    if (hasLeak) {
+      const code: StandardErrorCode =
+        effectiveErrorCode ||
+        (status === 401
+          ? 'AUTH-001'
+          : status === 403
+            ? 'PERM-001'
+            : status >= 500
+              ? 'SYS-001'
+              : 'API-001');
+      const def = getErrorDefinition(code);
+      errorMessage = `${def.userTitle} – Error Code: ${def.code}. ${def.defaultAction}${
+        effectiveRequestId ? ` (Ref: ${effectiveRequestId})` : ''
+      }`;
+      technicalDetail = sanitizeTextForLog(
+        rawMsg || `HTTP ${status} (${endpointLabel || 'API request'})`
       );
+    } else {
+      errorMessage = rawMsg;
+      technicalDetail = sanitizeTextForLog(rawMsg);
+    }
+  }
 
   if (
     !ok &&
@@ -530,6 +674,10 @@ export async function safeParseJsonResponse<T = any>(
     data: parsed as T,
     errorMessage,
     isHtmlOrNonJson: false,
+    requestId: effectiveRequestId,
+    errorEventId: null,
+    errorCode: effectiveErrorCode,
+    technicalDetail,
   };
 }
 
@@ -544,7 +692,14 @@ export async function parseApiJsonOrThrow<T = any>(
       parsed.errorMessage || fallbackMessage,
       parsed.status,
       parsed.data,
-      parsed.isHtmlOrNonJson
+      parsed.isHtmlOrNonJson,
+      {
+        requestId: parsed.requestId,
+        errorEventId: parsed.errorEventId,
+        errorCode: parsed.errorCode,
+        technicalDetail: parsed.technicalDetail,
+        endpoint: endpointLabel ? extractEndpointPath(endpointLabel.replace(/^[A-Z]+\s+/, '')) : undefined,
+      }
     );
   }
   return parsed.data;

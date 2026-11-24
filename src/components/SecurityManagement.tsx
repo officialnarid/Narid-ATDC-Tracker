@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { getSafeErrorText } from '../services/errorHandlingService';
 import {
   ShieldAlert,
   ShieldCheck,
@@ -187,7 +188,11 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
       setBulkSummary({ type: 'success', title: `Exported ${out.rowCount} Login Attempts`, message: `Downloaded "${out.fileName}".`, savedCount: out.rowCount });
       attemptsBulk.clearSelection();
     } catch (err: any) {
-      setBulkSummary({ type: 'error', title: 'Export Failed', message: err?.message || 'Unable to export attempts.' });
+      setBulkSummary({
+        type: 'error',
+        title: 'Export Failed',
+        message: getSafeErrorText(err, { moduleName: 'Security & Lockouts', forcedErrorCode: 'FILE-002' }),
+      });
     } finally {
       setBulkProgress(null);
     }
@@ -227,7 +232,11 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
       setBulkSummary({ type: 'success', title: `Exported ${out.rowCount} Security Logs`, message: `Downloaded "${out.fileName}".`, savedCount: out.rowCount });
       secAuditsBulk.clearSelection();
     } catch (err: any) {
-      setBulkSummary({ type: 'error', title: 'Export Failed', message: err?.message || 'Unable to export security audit logs.' });
+      setBulkSummary({
+        type: 'error',
+        title: 'Export Failed',
+        message: getSafeErrorText(err, { moduleName: 'Security & Lockouts', forcedErrorCode: 'FILE-002' }),
+      });
     } finally {
       setBulkProgress(null);
     }
@@ -242,7 +251,10 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
       setAttemptsList(data.recentAttempts || []);
       setAuditLogsList(data.recentSecurityLogs || []);
     } catch (err: any) {
-      setBanner({ type: 'error', text: err?.message || 'Failed to load security telemetry.' });
+      setBanner({
+        type: 'error',
+        text: getSafeErrorText(err, { moduleName: 'Security & Lockouts', endpoint: '/api/security/overview' }),
+      });
     } finally {
       setIsLoading(false);
     }
@@ -263,7 +275,10 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
       });
       setAttemptsList(rows);
     } catch (err: any) {
-      setBanner({ type: 'error', text: err?.message || 'Failed to filter login attempts.' });
+      setBanner({
+        type: 'error',
+        text: getSafeErrorText(err, { moduleName: 'Security & Lockouts', endpoint: '/api/security/attempts' }),
+      });
     }
   }, [isSuperAdmin, attemptLoginFilter, attemptOutcomeFilter, attemptSearch]);
 
@@ -277,7 +292,10 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
       });
       setAuditLogsList(rows);
     } catch (err: any) {
-      setBanner({ type: 'error', text: err?.message || 'Failed to filter security audit logs.' });
+      setBanner({
+        type: 'error',
+        text: getSafeErrorText(err, { moduleName: 'Security & Lockouts', endpoint: '/api/security/audit-logs' }),
+      });
     }
   }, [isSuperAdmin, auditLoginFilter, auditSeverityFilter, auditSearch]);
 
@@ -356,7 +374,9 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
       setUnblockTarget(null);
       await loadSecurityData();
     } catch (err: any) {
-      setUnblockError(err?.message || 'Failed to unblock account.');
+      setUnblockError(
+        getSafeErrorText(err, { moduleName: 'Security & Lockouts', endpoint: '/api/security/unblock' })
+      );
     } finally {
       setIsUnblocking(false);
     }
@@ -407,7 +427,9 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
       });
       await loadSecurityData();
     } catch (err: any) {
-      setTempPwdError(err?.message || 'Failed to generate temporary password.');
+      setTempPwdError(
+        getSafeErrorText(err, { moduleName: 'Security & Lockouts', endpoint: '/api/security/temp-password' })
+      );
     } finally {
       setIsGeneratingTempPwd(false);
     }
@@ -465,7 +487,12 @@ export const SecurityManagement: React.FC<SecurityManagementProps> = ({ currentU
       setResetLevelTarget(null);
       await loadSecurityData();
     } catch (err: any) {
-      setResetLevelError(err?.message || 'Failed to reset progressive lockout level.');
+      setResetLevelError(
+        getSafeErrorText(err, {
+          moduleName: 'Security & Lockouts',
+          endpoint: '/api/security/reset-lockout-level',
+        })
+      );
     } finally {
       setIsResettingLevel(false);
     }

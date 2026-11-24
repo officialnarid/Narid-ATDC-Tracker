@@ -21,6 +21,8 @@ import {
   LoginAuthError,
 } from '../services/authService';
 import { UserRoleRecord } from '../types';
+import { getSafeErrorText } from '../services/errorHandlingService';
+import { containsRawTechnicalLeak } from '../utils/errorRegistry';
 
 export interface ServerTempLockoutState {
   loginId: string;
@@ -408,12 +410,22 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
         authErr?.code === 'FIREBASE_ADMIN_UNCONFIGURED'
       ) {
         setAlertState({
-          message: rawMsg,
+          message: getSafeErrorText(err, {
+            moduleName: 'Authentication',
+            endpoint: '/api/auth/login',
+            forcedErrorCode: 'DB-001',
+          }),
           tone: 'warning',
         });
       } else {
+        const safeMessage = containsRawTechnicalLeak(rawMsg)
+          ? getSafeErrorText(err, {
+              moduleName: 'Authentication',
+              endpoint: '/api/auth/login',
+            })
+          : rawMsg;
         setAlertState({
-          message: rawMsg,
+          message: safeMessage,
           tone: 'error',
           attemptNumber: authErr.attemptNumber,
           maxAttempts: authErr.maxAttempts,

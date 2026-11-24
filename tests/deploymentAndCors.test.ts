@@ -171,8 +171,12 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
     expect(parsed404.ok).toBe(false);
     expect(parsed404.status).toBe(404);
     expect(parsed404.isHtmlOrNonJson).toBe(true);
-    expect(parsed404.errorMessage).toContain('HTTP 404');
-    expect(parsed404.errorMessage).toContain('vercel.json');
+    expect(parsed404.errorCode).toBe('API-001');
+    // User-facing message MUST NOT expose raw HTML, endpoints, or vercel.json internals
+    expect(parsed404.errorMessage).toContain('API-001');
+    expect(parsed404.errorMessage.toLowerCase()).not.toContain('vercel.json');
+    expect(parsed404.errorMessage).not.toContain('/api/auth/login');
+    expect(parsed404.technicalDetail).toContain('HTTP 404');
 
     const json423 = new Response(JSON.stringify({ success: false, code: 'LOCKED', error: 'Account locked' }), {
       status: 423,
@@ -366,7 +370,15 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
     const notFoundRes = await request(app).get('/api/does-not-exist');
     expect(notFoundRes.status).toBe(404);
     expect(notFoundRes.headers['content-type']).toContain('application/json');
-    expect(notFoundRes.body).toEqual({ success: false, error: 'API endpoint not found.' });
+    expect(notFoundRes.headers['x-request-id']).toMatch(/^REQ-\d{8}-[A-Z0-9]{12}$/);
+    expect(notFoundRes.body).toEqual(
+      expect.objectContaining({
+        success: false,
+        error: 'API endpoint not found.',
+        requestId: notFoundRes.headers['x-request-id'],
+        errorCode: 'API-001',
+      })
+    );
 
     // Confirm disableBackgroundBoot performs zero cold-start seed/migration writes
     expect(Object.keys(db.getRawCollection('user_roles'))).toHaveLength(0);
@@ -820,7 +832,13 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
     const unknownApi = await request(normalizedServer).get('/api/unknown-route-check');
     expect(unknownApi.status).toBe(404);
     expect(unknownApi.headers['content-type']).toContain('application/json');
-    expect(unknownApi.body).toEqual({ success: false, error: 'API endpoint not found.' });
+    expect(unknownApi.body).toEqual(
+      expect.objectContaining({
+        success: false,
+        error: 'API endpoint not found.',
+        requestId: unknownApi.headers['x-request-id'],
+      })
+    );
 
     // Confirm ACTUAL unmocked Vercel handler (handlerMod.default) dispatches GET/POST routes, preserves POST body, and reaches POST /api/auth/login
     const { privateKey } = crypto.generateKeyPairSync('rsa', {
@@ -855,13 +873,25 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
       const postHealth = await request(realSrv).post('/api/health').send({});
       expect(postHealth.status).toBe(404);
       expect(postHealth.headers['content-type']).toContain('application/json');
-      expect(postHealth.body).toEqual({ success: false, error: 'API endpoint not found.' });
+      expect(postHealth.body).toEqual(
+        expect.objectContaining({
+          success: false,
+          error: 'API endpoint not found.',
+          requestId: postHealth.headers['x-request-id'],
+        })
+      );
 
       // 3) Unknown rewritten API route -> JSON 404
       const unknownRewritten = await request(realSrv).get('/api/index?__api_path=unknown/endpoint');
       expect(unknownRewritten.status).toBe(404);
       expect(unknownRewritten.headers['content-type']).toContain('application/json');
-      expect(unknownRewritten.body).toEqual({ success: false, error: 'API endpoint not found.' });
+      expect(unknownRewritten.body).toEqual(
+        expect.objectContaining({
+          success: false,
+          error: 'API endpoint not found.',
+          requestId: unknownRewritten.headers['x-request-id'],
+        })
+      );
 
       // 4) POST /api/auth/login & rewritten POST /api/index?__api_path=auth/login reach actual Express login handler with preserved POST body
       const realLoginDirect = await request(realSrv)
@@ -869,7 +899,13 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
         .set('Origin', 'https://narid-atdc-tracker.vercel.app')
         .send({ loginId: 'admin' });
       expect(realLoginDirect.status).toBe(400);
-      expect(realLoginDirect.body).toEqual({ success: false, error: 'Please enter your password.' });
+      expect(realLoginDirect.body).toEqual(
+        expect.objectContaining({
+          success: false,
+          error: 'Please enter your password.',
+          requestId: realLoginDirect.headers['x-request-id'],
+        })
+      );
       expect(realLoginDirect.headers['access-control-allow-origin']).toBe('https://narid-atdc-tracker.vercel.app');
 
       const realLoginRewritten = await request(realSrv)
@@ -877,7 +913,13 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
         .set('Origin', 'https://ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app')
         .send({ loginId: 'admin' });
       expect(realLoginRewritten.status).toBe(400);
-      expect(realLoginRewritten.body).toEqual({ success: false, error: 'Please enter your password.' });
+      expect(realLoginRewritten.body).toEqual(
+        expect.objectContaining({
+          success: false,
+          error: 'Please enter your password.',
+          requestId: realLoginRewritten.headers['x-request-id'],
+        })
+      );
       expect(realLoginRewritten.headers['access-control-allow-origin']).toBe(
         'https://ais-dev-ffrnx5p5324ee4aajyzxbj-356936239657.asia-southeast1.run.app'
       );
@@ -907,7 +949,13 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
             try {
               const payload = chunk ? JSON.parse(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)) : {};
               expect(this.statusCode).toBe(400);
-              expect(payload).toEqual({ success: false, error: 'Please enter your password.' });
+              expect(payload).toEqual(
+                expect.objectContaining({
+                  success: false,
+                  error: 'Please enter your password.',
+                  requestId: this.headers['x-request-id'],
+                })
+              );
               resolve();
             } catch (err) {
               reject(err);
@@ -1027,7 +1075,12 @@ describe('Deployment Readiness, CORS Policy & Secret Hygiene', () => {
 
       await expect(
         executeApiFetch('/api/attendance/auto-close', { method: 'POST' }, 'POST /api/attendance/auto-close')
-      ).rejects.toThrow('Unable to reach POST /api/attendance/auto-close');
+      ).rejects.toMatchObject({
+        name: 'ApiRequestError',
+        errorCode: 'NET-001',
+        isNetworkFetchFailure: true,
+        status: 0,
+      });
     } finally {
       (globalThis as any).window = prevWindow;
       globalThis.fetch = prevFetch;

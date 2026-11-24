@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Clock, Play, CheckCircle2, ScanLine, LogOut, Menu } from 'lucide-react';
 import { runAutoCloseShiftsEngine, getKolkataTimeParts } from '../services/attendanceService';
 import { isModuleAllowedForUser } from '../services/authService';
+import { getSafeErrorText } from '../services/errorHandlingService';
 import { Shift, UserRoleRecord } from '../types';
 
 interface HeaderProps {
@@ -85,8 +86,13 @@ export const Header: React.FC<HeaderProps> = ({
       }
       setTimeout(() => setAutoCloseMessage(null), 6000);
       onRefreshDataRef.current?.();
-    } catch {
-      setAutoCloseMessage('Error executing shift auto-close.');
+    } catch (err) {
+      setAutoCloseMessage(
+        getSafeErrorText(err, {
+          moduleName: 'Attendance Auto-Close',
+          endpoint: '/api/attendance/auto-close',
+        })
+      );
     } finally {
       isAutoCloseInFlightRef.current = false;
       setIsRunningAutoClose(false);

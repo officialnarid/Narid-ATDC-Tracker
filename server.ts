@@ -59,6 +59,11 @@ import {
   registerCompanyWifiRoutes,
   enforceCompanyWifiAccess,
 } from './serverCompanyWifi.ts';
+import {
+  createRequestIdAndDiagnosticsMiddleware,
+  registerDiagnosticRoutes,
+  markRequestLifecycle,
+} from './serverDiagnostics.ts';
 import { resolveAttendanceMetrics } from './src/utils/attendanceStatus.ts';
 import {
   DASHBOARD_CARDS,
@@ -827,6 +832,10 @@ export function createApp(options: ServerAppOptions = {}) {
     return false;
   };
 
+  // Authoritative unique X-Request-ID & centralized technical diagnostics middleware
+  // Mounted BEFORE CORS and routes so even CORS 403, 503 unconfigured-DB, and 404 responses carry X-Request-ID
+  app.use(createRequestIdAndDiagnosticsMiddleware(() => db));
+
   app.use((req: Request, res: Response, next: NextFunction) => {
     res.setHeader('Vary', 'Origin');
     const origin = req.headers.origin;
@@ -852,8 +861,17 @@ export function createApp(options: ServerAppOptions = {}) {
           'Content-Type',
           'Authorization',
           'X-Correlation-ID',
+          'X-Request-ID',
         ],
-        exposedHeaders: ['X-Correlation-ID', 'X-Server-Process-Ms', 'X-Payload-Bytes', 'Server-Timing'],
+        exposedHeaders: [
+          'X-Request-ID',
+          'X-Error-Code',
+          'X-Error-Category',
+          'X-Correlation-ID',
+          'X-Server-Process-Ms',
+          'X-Payload-Bytes',
+          'Server-Timing',
+        ],
         optionsSuccessStatus: 204,
       });
     })
@@ -1081,6 +1099,7 @@ export function createApp(options: ServerAppOptions = {}) {
         nowMs: getNowMs(),
       });
       if (!caller) {
+        markRequestLifecycle(req, 'AUTH_VERIFIED', `Authentication rejected on ${actionLabel}`);
         await logAuditEvent({
           req,
           action: 'unauthorized_access_attempt',
@@ -1097,7 +1116,9 @@ export function createApp(options: ServerAppOptions = {}) {
         });
         return null;
       }
+      markRequestLifecycle(req, 'AUTH_VERIFIED', `Authenticated as ${caller.loginId}`, { caller });
       if (allowedRoles !== '*' && !allowedRoles.includes(caller.role)) {
+        markRequestLifecycle(req, 'AUTHORIZATION_CHECKED', `Role denied for ${actionLabel}`, { caller });
         await logAuditEvent({
           req,
           action: 'unauthorized_access_attempt',
@@ -1115,6 +1136,7 @@ export function createApp(options: ServerAppOptions = {}) {
         });
         return null;
       }
+      markRequestLifecycle(req, 'AUTHORIZATION_CHECKED', `Role permitted for ${actionLabel}`, { caller });
       // Authoritative Server-Side Company Wi-Fi Access Control Gate
       // Super Admin ALWAYS bypasses Wi-Fi restrictions. Non-Super-Admin callers are verified on every protected request.
       if (caller.role !== 'super_admin' && !options?.skipWifiCheck) {
@@ -1132,9 +1154,13 @@ export function createApp(options: ServerAppOptions = {}) {
           return null;
         }
       }
+      markRequestLifecycle(req, 'PROCESSING_STARTED', actionLabel, { caller });
       return caller;
     } catch (err: any) {
       if (noteRuntimeFirestoreError(err)) {
+        markRequestLifecycle(req, 'DB_OPERATION_FAILED', 'Firestore permission denied during caller verification', {
+          dbOperationCategory: 'read',
+        });
         res.status(503).json({
           success: false,
           code: 'FIREBASE_ADMIN_PERMISSION_DENIED',
@@ -1279,6 +1305,12 @@ export function createApp(options: ServerAppOptions = {}) {
   });
 
   registerCompanyWifiRoutes(app, {
+    db: adminDb,
+    requireVerifiedCaller,
+    nowProvider: getNowMs,
+  });
+
+  registerDiagnosticRoutes(app, {
     db: adminDb,
     requireVerifiedCaller,
     nowProvider: getNowMs,
@@ -3401,9 +3433,12 @@ export function createApp(options: ServerAppOptions = {}) {
           otHoursMins += m.overtimeMinutes;
         }
       }
-      const autoClosed = attendance.filter((a) => a.punchOutType === 'AUTO' || a.autoClosed).length;
+      const autoClosed = attendance.filter((a) => resolveAttendanceMetrics(a, nowMs).isCurrentlyAutoClosed).length;
       const missedPunchOut = attendance.filter(
-        (a) => a.missedPunchOut || a.attendanceStatus === 'MISSED PUNCH OUT'
+        (a) =>
+          resolveAttendanceMetrics(a, nowMs).isCurrentlyAutoClosed ||
+          (a.missedPunchOut && a.punchOutType !== 'ACTUAL') ||
+          a.attendanceStatus === 'MISSED PUNCH OUT'
       ).length;
       const onLeave = rosterSnap.size;
 
