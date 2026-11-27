@@ -1,4 +1,5 @@
 import { Employee } from '../types';
+import { fetchEmployeeQrDataUrls } from '../services/employeeService';
 
 export const IDENTITY_CARD_WIDTH = 900;
 export const IDENTITY_CARD_HEIGHT = 1320;
@@ -153,14 +154,28 @@ export function fitSingleLineFontSize(
 }
 
 /**
- * Generates pure unembellished QR Data URL from exact existing employeeId + qrCodeToken.
+ * Generates pure unembellished QR Data URL.
+ * When raw qrCodeToken is withheld from API responses (F-01), fetches the server-rendered
+ * scannable QR PNG via POST /api/employees/qr-cards/render.
+ * When qrCodeToken is locally present (e.g., unit tests), renders directly using qrcode.
  */
 export async function generatePureEmployeeQrDataUrl(
-  employee: Pick<Employee, 'employeeId' | 'qrCodeToken'>,
+  employee: Pick<Employee, 'employeeId' | 'qrCodeToken' | 'hasQrToken'>,
   width = 470
 ): Promise<string> {
-  if (!employee.employeeId || !employee.qrCodeToken) {
-    throw new Error(`Missing Employee ID or QR security token for ${employee.employeeId || 'employee'}.`);
+  if (!employee.employeeId) {
+    throw new Error('Missing Employee ID for QR code generation.');
+  }
+  if (!employee.qrCodeToken) {
+    if (employee.hasQrToken === false) {
+      throw new Error(`Missing QR security token for ${employee.employeeId}.`);
+    }
+    const rendered = await fetchEmployeeQrDataUrls([employee.employeeId], width);
+    const entry = rendered[employee.employeeId.trim().toUpperCase()] || rendered[employee.employeeId];
+    if (!entry?.qrDataUrl) {
+      throw new Error(`Missing QR security token for ${employee.employeeId}.`);
+    }
+    return entry.qrDataUrl;
   }
   const QRCodeMod = await import('qrcode');
   const QRCode = QRCodeMod.default || QRCodeMod;
@@ -388,15 +403,17 @@ export function drawEmployeeIdentityCardToCanvas(
   });
 }
 
-export async function renderEmployeeIdentityCardBlob(employee: Employee): Promise<Blob> {
+export async function renderEmployeeIdentityCardBlob(
+  employee: Employee,
+  options?: { preRenderedQrDataUrl?: string }
+): Promise<Blob> {
   if (typeof document === 'undefined') {
     throw new Error('Identity card PNG rendering requires a browser canvas environment.');
   }
 
-  const qrDataUrl = await generatePureEmployeeQrDataUrl(
-    employee,
-    IDENTITY_CARD_QR_BOX.qrDrawSize
-  );
+  const qrDataUrl =
+    options?.preRenderedQrDataUrl ||
+    (await generatePureEmployeeQrDataUrl(employee, IDENTITY_CARD_QR_BOX.qrDrawSize));
   const qrImg = await loadImageElement(qrDataUrl);
 
   const canvas = document.createElement('canvas');
@@ -417,8 +434,11 @@ export async function renderEmployeeIdentityCardBlob(employee: Employee): Promis
   return res.blob();
 }
 
-export async function downloadEmployeeIdentityCardPng(employee: Employee): Promise<string> {
-  const blob = await renderEmployeeIdentityCardBlob(employee);
+export async function downloadEmployeeIdentityCardPng(
+  employee: Employee,
+  options?: { preRenderedQrDataUrl?: string }
+): Promise<string> {
+  const blob = await renderEmployeeIdentityCardBlob(employee, options);
   const fileName = buildIdentityCardFileName(employee.employeeId);
   const url = URL.createObjectURL(blob);
 

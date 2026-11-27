@@ -322,17 +322,18 @@ describe('Employee Master Excel Bulk Import (Server Admin SDK & Safe Batching)',
   });
 
   it('6. Client parseAndValidateEmployeeExcel rejects invalid Employee ID characters upfront', async () => {
-    const XLSX = await import('xlsx');
-    const ws = XLSX.utils.aoa_to_sheet([
-      ['Employee ID', 'Employee Name', 'Employee Type', 'Section', 'Department', 'Line', 'Designation', 'Status'],
-      ['VALID_01', 'VALID USER', 'Permanent', 'MI', 'Production', 'MI-01', 'Operator', 'Active'],
-      ['BAD ID/02', 'INVALID ID USER', 'Permanent', 'MI', 'Production', 'MI-01', 'Operator', 'Active'],
-    ]);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
-    const buf = XLSX.write(wb, { type: 'array', bookType: 'xlsx' }) as ArrayBuffer;
+    const ExcelJSMod = await import('exceljs');
+    const ExcelJS = (ExcelJSMod as any).default ?? ExcelJSMod;
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('Sheet1');
+    ws.addRow(['Employee ID', 'Employee Name', 'Employee Type', 'Section', 'Department', 'Line', 'Designation', 'Status']);
+    ws.addRow(['VALID_01', 'VALID USER', 'Permanent', 'MI', 'Production', 'MI-01', 'Operator', 'Active']);
+    ws.addRow(['BAD ID/02', 'INVALID ID USER', 'Permanent', 'MI', 'Production', 'MI-01', 'Operator', 'Active']);
+    const raw = await wb.xlsx.writeBuffer();
+    const u8 = new Uint8Array(raw as ArrayLike<number>);
+    const buf = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
 
-    // Spy on employeeService.getEmployees to avoid requiring live client Firestore network in unit test
+    // Spy on employeeService.getEmployees to avoid requiring live client network in unit test
     const employeeService = await import('../src/services/employeeService');
     const getEmpsSpy = vi.spyOn(employeeService, 'getEmployees').mockResolvedValue([]);
 
@@ -340,6 +341,7 @@ describe('Employee Master Excel Bulk Import (Server Admin SDK & Safe Batching)',
       const { parseAndValidateEmployeeExcel } = await import('../src/services/exportService');
       const fakeFile = {
         name: 'test_validation.xlsx',
+        size: buf.byteLength,
         arrayBuffer: async () => buf,
       } as unknown as File;
 

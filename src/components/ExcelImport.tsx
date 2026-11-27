@@ -26,6 +26,11 @@ import {
   ImportFailedRow,
   ImportValidationResult,
 } from '../services/exportService';
+import {
+  MAX_IMPORT_FILE_BYTES,
+  SpreadsheetValidationError,
+  validateSpreadsheetFileMeta,
+} from '../utils/safeSpreadsheetParser';
 
 interface ExcelImportProps {
   floors: Floor[];
@@ -114,6 +119,7 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
 
     setIsValidating(true);
     try {
+      validateSpreadsheetFileMeta(selected, { maxFileBytes: MAX_IMPORT_FILE_BYTES });
       // Pass full master objects so canonical IDs (departmentId, sectionId, floorId/lineId) are resolved
       const res = await parseAndValidateEmployeeExcel(
         selected,
@@ -129,7 +135,9 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
       }
     } catch (err: any) {
       setValidationError(
-        getSafeErrorText(err, { moduleName: 'Excel Import', forcedErrorCode: 'FILE-001' })
+        err instanceof SpreadsheetValidationError
+          ? err.message
+          : getSafeErrorText(err, { moduleName: 'Excel Import', forcedErrorCode: 'FILE-001' })
       );
       setFile(null);
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -288,7 +296,7 @@ export const ExcelImport: React.FC<ExcelImportProps> = ({
         <input
           ref={fileInputRef}
           type="file"
-          accept=".xlsx, .xls, .csv"
+          accept=".xlsx, .csv"
           onChange={handleFileSelected}
           className="hidden"
           id="excel-file-upload"

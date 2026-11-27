@@ -14,7 +14,7 @@ import {
   Archive
 } from 'lucide-react';
 import { Employee, Floor, Department, UserRoleRecord } from '../types';
-import { regenerateQrToken } from '../services/employeeService';
+import { fetchEmployeeQrDataUrls, regenerateQrToken } from '../services/employeeService';
 import { RolePermissionRecord, hasModulePermission, normalizeRoleId } from '../services/permissionService';
 import { QrManagementSkeleton } from './Skeletons';
 import {
@@ -139,7 +139,8 @@ export const QrManagement: React.FC<QrManagementProps> = ({
     return combined;
   }, [paginatedFiltered, isPrintModalOpen, printEmployees]);
 
-  // Generate QR data URLs in parallel batches for visible/selected employees with cache keyed by employeeId + qrCodeToken
+  // Generate/fetch QR data URLs in parallel batches for visible/selected employees
+  // Cache keyed by employeeId + qrTokenReference (never requires raw qrCodeToken client-side)
   useEffect(() => {
     let cancelled = false;
     const generateQrs = async () => {
@@ -149,28 +150,56 @@ export const QrManagement: React.FC<QrManagementProps> = ({
       }
 
       const map: Record<string, string> = {};
-      const pending: Employee[] = [];
+      const pendingLocal: Employee[] = [];
+      const pendingServer: Employee[] = [];
 
       for (const emp of targetList) {
-        if (!emp.employeeId || !emp.qrCodeToken) continue;
-        const cacheKey = `${emp.employeeId}:${emp.qrCodeToken}`;
+        const hasToken = Boolean(emp.hasQrToken || emp.qrCodeToken);
+        if (!emp.employeeId || !hasToken) continue;
+        const cacheKey = `${emp.employeeId}:${emp.qrTokenReference || emp.qrCodeToken || 'server'}`;
         const cached = qrCacheRef.current.get(cacheKey);
         if (cached) {
           map[emp.employeeId] = cached;
+        } else if (emp.qrCodeToken) {
+          pendingLocal.push(emp);
         } else {
-          pending.push(emp);
+          pendingServer.push(emp);
         }
       }
 
-      if (pending.length === 0) {
+      if (pendingLocal.length === 0 && pendingServer.length === 0) {
         setQrImages((prev) => ({ ...prev, ...map }));
         return;
       }
 
+      // Fetch server-rendered QR PNGs in batch (F-01: raw qrCodeToken stays strictly server-side)
+      if (pendingServer.length > 0 && !cancelled) {
+        try {
+          const rendered = await fetchEmployeeQrDataUrls(
+            pendingServer.map((e) => e.employeeId),
+            240
+          );
+          for (const emp of pendingServer) {
+            const entry = rendered[emp.employeeId.trim().toUpperCase()] || rendered[emp.employeeId];
+            if (entry?.qrDataUrl) {
+              const cacheKey = `${emp.employeeId}:${emp.qrTokenReference || entry.qrTokenReference || 'server'}`;
+              qrCacheRef.current.set(cacheKey, entry.qrDataUrl);
+              map[emp.employeeId] = entry.qrDataUrl;
+            }
+          }
+        } catch (err: any) {
+          if (!cancelled) {
+            setActionError(
+              getSafeErrorText(err, { moduleName: 'QR Management', forcedErrorCode: 'QR-001' })
+            );
+          }
+        }
+      }
+
       const BATCH_SIZE = 20;
-      for (let i = 0; i < pending.length; i += BATCH_SIZE) {
+      for (let i = 0; i < pendingLocal.length; i += BATCH_SIZE) {
         if (cancelled) return;
-        const batch = pending.slice(i, i + BATCH_SIZE);
+        const batch = pendingLocal.slice(i, i + BATCH_SIZE);
         const results = await Promise.all(
           batch.map(async (emp) => {
             try {
@@ -184,7 +213,10 @@ export const QrManagement: React.FC<QrManagementProps> = ({
         );
         for (const { emp, dataUrl } of results) {
           if (dataUrl) {
-            qrCacheRef.current.set(`${emp.employeeId}:${emp.qrCodeToken}`, dataUrl);
+            qrCacheRef.current.set(
+              `${emp.employeeId}:${emp.qrTokenReference || emp.qrCodeToken || 'server'}`,
+              dataUrl
+            );
             map[emp.employeeId] = dataUrl;
           }
         }
@@ -205,11 +237,21 @@ export const QrManagement: React.FC<QrManagementProps> = ({
     setActionError(null);
     setRegeneratingId(empId);
     try {
-      await regenerateQrToken(empId);
+      const res = await regenerateQrToken(empId);
+      if (res.qrDataUrl) {
+        qrCacheRef.current.set(`${empId}:${res.qrTokenReference || 'server'}`, res.qrDataUrl);
+        setQrImages((prev) => ({ ...prev, [empId]: res.qrDataUrl }));
+      }
       setConfirmRegenId(null);
       onRefresh();
     } catch (e: any) {
-      setActionError(e?.message || `Failed to re-issue QR security token for ${empId}.`);
+      setActionError(
+        getSafeErrorText(e, {
+          moduleName: 'QR Management',
+          endpoint: '/api/employees/regenerate-qr',
+          forcedErrorCode: 'QR-001',
+        })
+      );
     } finally {
       setRegeneratingId(null);
     }
@@ -567,7 +609,7 @@ export const QrManagement: React.FC<QrManagementProps> = ({
                   <button
                     type="button"
                     onClick={() => handleDownloadCard(emp)}
-                    disabled={downloadingId === emp.employeeId || !emp.qrCodeToken}
+                    disabled={downloadingId === emp.employeeId || !(emp.hasQrToken || emp.qrCodeToken)}
                     className="px-2.5 py-1.5 rounded bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 font-medium flex items-center gap-1.5 transition disabled:opacity-50"
                     title="Download Employee QR Identity Card (PNG)"
                   >

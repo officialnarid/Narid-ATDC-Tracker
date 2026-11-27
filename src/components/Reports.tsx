@@ -11,9 +11,7 @@ import {
 } from 'lucide-react';
 import { AttendanceRecord, Employee, Floor, Section, Department, Shift, UserRoleRecord } from '../types';
 import { RolePermissionRecord } from '../services/permissionService';
-import { collection, getDocs, query, where } from 'firebase/firestore';
-import { db } from '../firebase';
-import { formatDateKey } from '../services/attendanceService';
+import { formatDateKey, getAttendanceRecords } from '../services/attendanceService';
 import { exportTableToExcel, exportTableToCsv } from '../services/exportService';
 import { sendServerAuditEvent } from '../services/auditService';
 import {
@@ -80,23 +78,23 @@ export const Reports: React.FC<ReportsProps> = ({
       setFetchError(null);
 
       try {
-        let q;
+        let records: AttendanceRecord[];
         if (activeReport === 'monthly_attendance' || activeReport === 'employee_wise') {
-          q = query(
-            collection(db, 'attendance'),
-            where('shiftDate', '>=', `${selectedMonth}-01`),
-            where('shiftDate', '<=', `${selectedMonth}-31`)
-          );
+          const [yrStr, moStr] = selectedMonth.split('-');
+          const yr = Number(yrStr) || new Date().getFullYear();
+          const mo = Number(moStr) || 1;
+          const lastDay = new Date(Date.UTC(yr, mo, 0)).getUTCDate();
+          const toDate = `${selectedMonth}-${String(lastDay).padStart(2, '0')}`;
+          records = await getAttendanceRecords({
+            fromDate: `${selectedMonth}-01`,
+            toDate,
+          });
         } else {
-          q = query(
-            collection(db, 'attendance'),
-            where('shiftDate', '==', selectedDate)
-          );
+          records = await getAttendanceRecords({ shiftDate: selectedDate });
         }
 
-        const snap = await getDocs(q);
         if (reqId !== fetchCounterRef.current) return;
-        setAttendanceRecords(snap.docs.map(d => d.data() as AttendanceRecord));
+        setAttendanceRecords(records);
         setHasLoaded(true);
         if (!isInitial) {
           const dur = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt;

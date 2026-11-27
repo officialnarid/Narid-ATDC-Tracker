@@ -34,7 +34,8 @@ import {
   saveEmployee, 
   toggleEmployeeStatus, 
   regenerateQrToken,
-  deleteEmployee 
+  deleteEmployee,
+  fetchEmployeeQrDataUrls,
 } from '../services/employeeService';
 import { UserRoleRecord } from '../types';
 import { RolePermissionRecord, hasModulePermission, normalizeRoleId } from '../services/permissionService';
@@ -123,12 +124,12 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
   const [isDownloadingBadge, setIsDownloadingBadge] = useState(false);
   const [badgeDownloadError, setBadgeDownloadError] = useState<string | null>(null);
 
-  // Generate QR image on demand when viewing badge using centralized Master Card utility
+  // Generate/fetch QR image on demand when viewing badge using centralized Master Card utility
   const handleOpenBadge = async (emp: Employee) => {
     setViewEmployee(emp);
     setBadgeQrUrl(null);
     setBadgeDownloadError(null);
-    if (!emp.qrCodeToken) {
+    if (!emp.hasQrToken && !emp.qrCodeToken) {
       setBadgeDownloadError(`QR security token is missing for ${emp.employeeId || 'this employee'}.`);
       return;
     }
@@ -137,7 +138,9 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
       setBadgeQrUrl(url);
     } catch (e: any) {
       console.error('Failed to generate QR data URL:', e);
-      setBadgeDownloadError(e?.message || 'Failed to generate QR preview.');
+      setBadgeDownloadError(
+        getSafeErrorText(e, { moduleName: 'Employee Master', forcedErrorCode: 'QR-001' })
+      );
     }
   };
 
@@ -239,10 +242,17 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
     if (!canReissueQr) return;
     if (!confirm(`Are you sure you want to regenerate the QR token for ${employeeId}? Old QR code will be invalidated.`)) return;
     try {
-      const newToken = await regenerateQrToken(employeeId);
+      const res = await regenerateQrToken(employeeId);
       onRefresh();
       if (viewEmployee && viewEmployee.employeeId === employeeId) {
-        await handleOpenBadge({ ...viewEmployee, qrCodeToken: newToken });
+        setViewEmployee({
+          ...viewEmployee,
+          hasQrToken: true,
+          qrTokenReference: res.qrTokenReference,
+        });
+        if (res.qrDataUrl) {
+          setBadgeQrUrl(res.qrDataUrl);
+        }
       }
     } catch (err: any) {
       handleAppError(err, {
@@ -452,12 +462,31 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
     setIsGeneratingPrintQrs(true);
     const nextMap: Record<string, string> = {};
     try {
+      const serverTargets = targets.filter((e) => !e.qrCodeToken && e.hasQrToken);
+      const localTargets = targets.filter((e) => Boolean(e.qrCodeToken));
+
+      if (serverTargets.length > 0) {
+        try {
+          const rendered = await fetchEmployeeQrDataUrls(
+            serverTargets.map((e) => e.employeeId),
+            240
+          );
+          for (const emp of serverTargets) {
+            const entry = rendered[emp.employeeId.trim().toUpperCase()] || rendered[emp.employeeId];
+            if (entry?.qrDataUrl) {
+              nextMap[emp.employeeId] = entry.qrDataUrl;
+            }
+          }
+        } catch (err) {
+          console.error('Failed to batch-render print QR codes:', err);
+        }
+      }
+
       const CHUNK = 8;
-      for (let i = 0; i < targets.length; i += CHUNK) {
-        const chunk = targets.slice(i, i + CHUNK);
+      for (let i = 0; i < localTargets.length; i += CHUNK) {
+        const chunk = localTargets.slice(i, i + CHUNK);
         await Promise.all(
           chunk.map(async (emp) => {
-            if (!emp.qrCodeToken) return;
             try {
               nextMap[emp.employeeId] = await generatePureEmployeeQrDataUrl(emp, 240);
             } catch {
@@ -1161,7 +1190,7 @@ export const EmployeeMaster: React.FC<EmployeeMasterProps> = ({
               <div className="flex items-center gap-2 w-full">
                 <button
                   type="button"
-                  disabled={isDownloadingBadge || !viewEmployee.qrCodeToken}
+                  disabled={isDownloadingBadge || !(viewEmployee.hasQrToken || viewEmployee.qrCodeToken)}
                   onClick={() => handleDownloadBadgeCard(viewEmployee)}
                   className="flex-1 bg-slate-800 hover:bg-slate-900 text-white text-xs py-2 rounded font-medium flex items-center justify-center gap-1.5 transition disabled:opacity-50 cursor-pointer"
                 >

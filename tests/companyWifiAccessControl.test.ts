@@ -530,20 +530,43 @@ describe('Company Wi-Fi Access Control (Full Replacement Suite)', () => {
       .set('X-Forwarded-For', `${PLANT1_IP}, ${UNAUTHORIZED_IP}`);
     expect(spoofedXff.status).toBe(403);
 
-    // Attacker sends allowed IP in POST body & custom headers while x-vercel-forwarded-for reports real IP
-    const spoofedBody = await request(app)
-      .post('/api/attendance/scan')
-      .set('Authorization', `Bearer ${adminToken}`)
-      .set('X-Forwarded-For', PLANT1_IP)
-      .set('X-Vercel-Forwarded-For', UNAUTHORIZED_IP)
-      .send({
-        rawPayload: 'QR_EMP001_VALID',
-        scannerType: 'IN',
-        ip: PLANT1_IP,
-        publicIp: PLANT1_IP,
-        observedIp: PLANT1_IP,
-      });
-    expect(spoofedBody.status).toBe(403);
+    // Attacker sends allowed IP in POST body & custom headers while x-vercel-forwarded-for reports real IP (verified Vercel runtime)
+    const prevVercel = process.env.VERCEL;
+    process.env.VERCEL = '1';
+    try {
+      const spoofedBody = await request(app)
+        .post('/api/attendance/scan')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .set('X-Forwarded-For', PLANT1_IP)
+        .set('X-Vercel-Forwarded-For', UNAUTHORIZED_IP)
+        .send({
+          rawPayload: 'QR_EMP001_VALID',
+          scannerType: 'IN',
+          ip: PLANT1_IP,
+          publicIp: PLANT1_IP,
+          observedIp: PLANT1_IP,
+        });
+      expect(spoofedBody.status).toBe(403);
+    } finally {
+      if (prevVercel === undefined) delete process.env.VERCEL;
+      else process.env.VERCEL = prevVercel;
+    }
+
+    // Outside Vercel runtime, spoofed X-Vercel-Forwarded-For claiming allowed Plant IP MUST be ignored (F-05)
+    const prevVercelEnv = process.env.VERCEL_ENV;
+    delete process.env.VERCEL;
+    delete process.env.VERCEL_ENV;
+    try {
+      const nonVercelSpoof = await request(app)
+        .get('/api/dashboard/summary')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .set('X-Vercel-Forwarded-For', PLANT1_IP)
+        .set('X-Forwarded-For', UNAUTHORIZED_IP);
+      expect(nonVercelSpoof.status).toBe(403);
+    } finally {
+      if (prevVercel !== undefined) process.env.VERCEL = prevVercel;
+      if (prevVercelEnv !== undefined) process.env.VERCEL_ENV = prevVercelEnv;
+    }
   });
 
   // --------------------------------------------------------------------------

@@ -192,7 +192,8 @@ export async function fetchAttendanceHistoryOverview(
   return apiFetchJson<AttendanceHistoryOverviewResponse>(
     `/api/attendance-history/overview${toQueryString({ date })}`,
     { method: 'GET', headers },
-    'Failed to load Attendance History overview.'
+    'Failed to load Attendance History overview.',
+    { preferSameOriginInPreview: true }
   );
 }
 
@@ -210,7 +211,8 @@ export async function searchAttendanceHistoryEmployees(params: {
   return apiFetchJson<EmployeesSearchResponse>(
     `/api/attendance-history/employees${toQueryString(params)}`,
     { method: 'GET', headers },
-    'Failed to search employees.'
+    'Failed to search employees.',
+    { preferSameOriginInPreview: true }
   );
 }
 
@@ -224,7 +226,8 @@ export async function fetchEmployeeMonthlyCalendar(
   return apiFetchJson<EmployeeCalendarResponse>(
     `/api/attendance-history/employee/${safeEmpId}/calendar${toQueryString({ year, month })}`,
     { method: 'GET', headers },
-    'Failed to load employee monthly calendar.'
+    'Failed to load employee monthly calendar.',
+    { preferSameOriginInPreview: true }
   );
 }
 
@@ -245,7 +248,8 @@ export async function fetchAbsentManpower(params: {
   return apiFetchJson<AbsentManpowerResponse>(
     `/api/attendance-history/absent-manpower${toQueryString(params)}`,
     { method: 'GET', headers },
-    'Failed to load absent manpower data.'
+    'Failed to load absent manpower data.',
+    { preferSameOriginInPreview: true }
   );
 }
 
@@ -266,7 +270,8 @@ export async function fetchDailyAttendanceLedger(params: {
   return apiFetchJson<DailyAttendanceResponse>(
     `/api/attendance-history/daily${toQueryString(params)}`,
     { method: 'GET', headers },
-    'Failed to load daily attendance ledger.'
+    'Failed to load daily attendance ledger.',
+    { preferSameOriginInPreview: true }
   );
 }
 
@@ -280,7 +285,8 @@ export async function fetchAttendanceAnalytics(params: {
   return apiFetchJson<AttendanceAnalyticsResponse>(
     `/api/attendance-history/analytics${toQueryString(params)}`,
     { method: 'GET', headers },
-    'Failed to load attendance analytics.'
+    'Failed to load attendance analytics.',
+    { preferSameOriginInPreview: true }
   );
 }
 

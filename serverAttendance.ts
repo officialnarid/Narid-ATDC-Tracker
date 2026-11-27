@@ -5,7 +5,11 @@ import {
   type AdminFirestoreLike,
   type AdminQuerySnapLike,
   type VerifiedCaller,
+  hashQrTokenReference,
   recordEnterpriseAuditEvent,
+  redactSensitiveData,
+  sanitizeAttendanceForApi,
+  sanitizeEmployeeForApi,
 } from './serverSecurityAudit.ts';
 import {
   getCachedRolePermissionsDoc,
@@ -646,7 +650,19 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
 
   async function writePunchLog(entry: Record<string, any>) {
     const id = `log_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
-    await db.collection('punch_logs').doc(id).set({ ...entry, id });
+    const safeEntry = {
+      ...entry,
+      rawPayload:
+        typeof entry.rawPayload === 'string'
+          ? String(redactSensitiveData(entry.rawPayload) ?? '')
+          : entry.rawPayload,
+      message:
+        typeof entry.message === 'string'
+          ? String(redactSensitiveData(entry.message) ?? '')
+          : entry.message,
+      id,
+    };
+    await db.collection('punch_logs').doc(id).set(safeEntry);
   }
 
   // --------------------------------------------------------------------------
@@ -915,7 +931,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                 success: false,
                 action: 'REJECTED',
                 scannerType: scannerType || 'IN',
-                employee,
+                employee: sanitizeEmployeeForApi(employee),
                 error: 'Employee Is Inactive. Attendance Cannot Be Recorded.',
                 message: 'Employee Is Inactive. Attendance Cannot Be Recorded.',
                 time: timeDisplay,
@@ -930,14 +946,14 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
               employeeName: employee.employeeName,
               timestamp: now.toISOString(),
               action: 'REJECTED_TOKEN',
-              rawPayload,
+              rawPayload: '[REDACTED_QR_PAYLOAD]',
               scannerDevice,
               qrVerificationMode: 'TOKEN_REJECTED',
               performedByUid: caller.uid,
               performedByLoginId: caller.loginId,
               message: token
-                ? `Token mismatch: provided ${token}, expected configured qrCodeToken`
-                : 'Missing required QR security token for employee with configured qrCodeToken',
+                ? 'Token mismatch: provided QR security token did not match employee record.'
+                : 'Missing required QR security token for employee with configured qrCodeToken.',
             });
             return {
               httpStatus: 403,
@@ -945,7 +961,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                 success: false,
                 action: 'REJECTED',
                 scannerType: scannerType || 'IN',
-                employee,
+                employee: sanitizeEmployeeForApi(employee),
                 error: token
                   ? 'QR Token Expired or Revoked. Please re-issue QR code.'
                   : 'Invalid QR Payload: Security token is required for this employee.',
@@ -1353,7 +1369,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                 success: false,
                 action: 'REJECTED',
                 scannerType: scannerType || 'IN',
-                employee,
+                employee: sanitizeEmployeeForApi(employee),
                 error: 'Employee Is Inactive. Attendance Cannot Be Recorded.',
                 message: 'Employee Is Inactive. Attendance Cannot Be Recorded.',
                 time: timeDisplay,
@@ -1552,6 +1568,8 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
       candidateSnap,
     } = params;
     let { scannerType } = params;
+    const safeEmployee = sanitizeEmployeeForApi(employee);
+    const safeRawPayload = String(redactSensitiveData(rawPayload) ?? '');
 
         const shiftsMap = new Map(shifts.map((s) => [s.id, s]));
 
@@ -1752,8 +1770,8 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                   action: 'REJECTED_DUPLICATE',
                   scannerType: 'IN',
                   currentState: 'INSIDE',
-                  employee,
-                  attendance: txRes.record,
+                  employee: safeEmployee,
+                  attendance: sanitizeAttendanceForApi(txRes.record),
                   message: 'Consecutive Punch In rejected. Employee is already Punched In (Status: INSIDE).',
                   time: timeDisplay,
                   punchCount: txRes.record.punches?.length || 1,
@@ -1769,8 +1787,8 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                   action: 'REJECTED_DUPLICATE',
                   scannerType: 'IN',
                   currentState: 'OUTSIDE',
-                  employee,
-                  attendance: txRes.record,
+                  employee: safeEmployee,
+                  attendance: sanitizeAttendanceForApi(txRes.record),
                   message: 'Duplicate scan prevented. Please wait a few seconds before scanning again.',
                   time: timeDisplay,
                 },
@@ -1798,8 +1816,8 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                 action: 'PUNCH_IN',
                 scannerType: 'IN',
                 currentState: 'INSIDE',
-                employee,
-                attendance: txRes.record,
+                employee: safeEmployee,
+                attendance: sanitizeAttendanceForApi(txRes.record),
                 shift,
                 punchOutSchedule: reentrySchedule || undefined,
                 message: `Punch In Successfully Recorded (Re-entry #${txRes.record.punches.length}).`,
@@ -1817,7 +1835,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
               employeeName: employee.employeeName,
               timestamp: now.toISOString(),
               action: 'REJECTED_SHIFT',
-              rawPayload,
+              rawPayload: safeRawPayload,
               scannerDevice,
               performedByUid: caller.uid,
               performedByLoginId: caller.loginId,
@@ -1829,7 +1847,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                 success: false,
                 action: 'REJECTED',
                 scannerType: 'IN',
-                employee,
+                employee: safeEmployee,
                 message: 'No Valid Shift Found For This Punch-In Time.',
                 time: timeDisplay,
               },
@@ -1909,7 +1927,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             arrivalStatus,
             missedPunchOut: false,
             autoClosed: false,
-            qrTokenReference: employee.qrCodeToken || '',
+            qrTokenReference: hashQrTokenReference(employee.qrCodeToken),
             qrVerificationMode,
             createdByUid: caller.uid,
             createdByLoginId: caller.loginId,
@@ -1935,7 +1953,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
               employeeName: employee.employeeName,
               timestamp: now.toISOString(),
               action: 'PUNCH_IN',
-              rawPayload,
+              rawPayload: safeRawPayload,
               scannerDevice,
               qrVerificationMode,
               performedByUid: caller.uid,
@@ -1953,8 +1971,8 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
                 action: 'REJECTED_DUPLICATE',
                 scannerType: 'IN',
                 currentState: 'INSIDE',
-                employee,
-                attendance: txRes.record,
+                employee: safeEmployee,
+                attendance: sanitizeAttendanceForApi(txRes.record),
                 message: 'Consecutive Punch In rejected. Employee is already Punched In (Status: INSIDE).',
                 time: timeDisplay,
               },
@@ -1975,8 +1993,8 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
               action: 'PUNCH_IN',
               scannerType: 'IN',
               currentState: 'INSIDE',
-              employee,
-              attendance: newAttendanceRecord,
+              employee: safeEmployee,
+              attendance: sanitizeAttendanceForApi(newAttendanceRecord),
               shift,
               punchOutSchedule: firstInSchedule || undefined,
               message: isLate
@@ -2001,7 +2019,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             employeeName: employee.employeeName,
             timestamp: now.toISOString(),
             action: 'REJECTED_TOKEN',
-            rawPayload,
+            rawPayload: safeRawPayload,
             scannerDevice,
             performedByUid: caller.uid,
             performedByLoginId: caller.loginId,
@@ -2013,7 +2031,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
               success: false,
               action: 'REJECTED',
               scannerType: 'OUT',
-              employee,
+              employee: safeEmployee,
               message: 'Punch Out rejected: No valid Punch In found for employee. Please Punch In first.',
               time: timeDisplay,
             },
@@ -2194,7 +2212,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
               success: false,
               action: 'REJECTED',
               scannerType: 'OUT',
-              employee,
+              employee: safeEmployee,
               message:
                 txOutRes.kind === 'EMPLOYEE_MISMATCH'
                   ? 'Punch Out rejected: Attendance record does not match scanned employee.'
@@ -2210,7 +2228,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             employeeName: employee.employeeName,
             timestamp: now.toISOString(),
             action: 'REJECTED_DUPLICATE',
-            rawPayload,
+            rawPayload: safeRawPayload,
             scannerDevice,
             performedByUid: caller.uid,
             performedByLoginId: caller.loginId,
@@ -2223,8 +2241,8 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
               action: 'REJECTED_DUPLICATE',
               scannerType: 'OUT',
               currentState: 'OUTSIDE',
-              employee,
-              attendance: txOutRes.record,
+              employee: safeEmployee,
+              attendance: sanitizeAttendanceForApi(txOutRes.record),
               message: 'Consecutive Punch Out rejected. Employee has already Punched Out (Status: OUTSIDE).',
               time: timeDisplay,
               punchCount: txOutRes.record.punches?.length || 1,
@@ -2240,8 +2258,8 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
               action: 'REJECTED_DUPLICATE',
               scannerType: 'OUT',
               currentState: 'INSIDE',
-              employee,
-              attendance: txOutRes.record,
+              employee: safeEmployee,
+              attendance: sanitizeAttendanceForApi(txOutRes.record),
               message: 'Duplicate scan prevented. Please wait a few seconds before scanning again.',
               time: timeDisplay,
             },
@@ -2282,8 +2300,8 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
             scannerType: 'OUT',
             currentState: 'OUTSIDE',
             reconciledFromAutoClose: txOutRes.reconciledFromAutoClose,
-            employee,
-            attendance: txOutRes.record,
+            employee: safeEmployee,
+            attendance: sanitizeAttendanceForApi(txOutRes.record),
             shift,
             punchOutSchedule: outSchedule || undefined,
             message: txOutRes.reconciledFromAutoClose
@@ -2509,7 +2527,7 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
       return res.json({
         success: true,
         closedCount: closedRecords.length,
-        closedRecords,
+        closedRecords: closedRecords.map((rec) => sanitizeAttendanceForApi(rec)),
       });
     } catch (err: any) {
       console.error('[API Auto Close] Error:', err);
@@ -2971,6 +2989,228 @@ export function registerAttendanceRoutes(app: express.Express, deps: AttendanceR
     } catch (err: any) {
       console.error('[API Clear Attendance] Error:', err);
       return res.status(500).json({ success: false, error: 'Failed to clear attendance records.' });
+    }
+  });
+
+  // --------------------------------------------------------------------------
+  // 6. GET /api/attendance/records — Authenticated & Wi-Fi Enforced Attendance Read (F-01 / F-02)
+  // --------------------------------------------------------------------------
+  async function callerCanReadAttendanceData(
+    caller: VerifiedCaller,
+    allowedModules: ReadonlyArray<string>
+  ): Promise<boolean> {
+    if (caller.role === 'super_admin') return true;
+    try {
+      const [userPermSnap, rolePermSnap] = await Promise.all([
+        caller.prefetchedUserPermSnap
+          ? Promise.resolve(caller.prefetchedUserPermSnap)
+          : db.collection('user_permissions').doc(caller.profileDocId).get(),
+        getCachedRolePermissionsDoc(db, caller.role),
+      ]);
+      const userPermData = userPermSnap.exists ? userPermSnap.data() : undefined;
+      const rolePermData = rolePermSnap.exists ? rolePermSnap.data : undefined;
+
+      for (const mod of allowedModules) {
+        if (userPermData && userPermData.isCustomOverride !== false) {
+          const overrideMod = userPermData.permissions?.[mod];
+          if (overrideMod && typeof overrideMod.view === 'boolean') {
+            if (overrideMod.view) return true;
+            continue;
+          }
+        }
+        const roleMod = rolePermData?.modulePermissions?.[mod];
+        if (roleMod && typeof roleMod.view === 'boolean') {
+          if (roleMod.view) return true;
+          continue;
+        }
+        if (caller.role === 'admin') {
+          return true;
+        }
+        if (Array.isArray(caller.modulesAllowed) && caller.modulesAllowed.includes(mod)) {
+          return true;
+        }
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  const DATE_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+  app.get('/api/attendance/records', async (req: Request, res: Response) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        '*',
+        'View Attendance Records',
+        { prefetchUserPermission: true }
+      );
+      if (!caller) return;
+
+      const allowed = await callerCanReadAttendanceData(caller, [
+        'dashboard',
+        'reports',
+        'history',
+        'attendance',
+      ]);
+      if (!allowed) {
+        return res.status(403).json({
+          success: false,
+          error: 'Forbidden: Your role does not have permission to view attendance records.',
+        });
+      }
+
+      const shiftDate = typeof req.query.shiftDate === 'string' ? req.query.shiftDate.trim() : '';
+      const fromDate = typeof req.query.fromDate === 'string' ? req.query.fromDate.trim() : '';
+      const toDate = typeof req.query.toDate === 'string' ? req.query.toDate.trim() : '';
+      const shiftId = typeof req.query.shiftId === 'string' ? req.query.shiftId.trim() : '';
+
+      let docs: Record<string, any>[] = [];
+      if (shiftDate) {
+        if (!DATE_KEY_RE.test(shiftDate)) {
+          return res.status(400).json({ success: false, error: 'Invalid shiftDate format (YYYY-MM-DD).' });
+        }
+        const snap = await db.collection('attendance').where('shiftDate', '==', shiftDate).get();
+        docs = snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+      } else if (fromDate && toDate) {
+        if (!DATE_KEY_RE.test(fromDate) || !DATE_KEY_RE.test(toDate) || fromDate > toDate) {
+          return res.status(400).json({ success: false, error: 'Invalid date range.' });
+        }
+        const diffDays =
+          Math.ceil((new Date(`${toDate}T00:00:00Z`).getTime() - new Date(`${fromDate}T00:00:00Z`).getTime()) / 86400000) + 1;
+        if (diffDays > 93) {
+          return res.status(400).json({ success: false, error: 'Date range cannot exceed 93 days.' });
+        }
+        const snap = await db
+          .collection('attendance')
+          .where('shiftDate', '>=', fromDate)
+          .where('shiftDate', '<=', toDate)
+          .get();
+        docs = snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+      } else {
+        const todayKey = getKolkataTimeParts(new Date()).dateKey;
+        const snap = await db.collection('attendance').where('shiftDate', '==', todayKey).get();
+        docs = snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+      }
+
+      if (shiftId && shiftId !== 'ALL') {
+        docs = docs.filter((r) => String(r.shiftId || '') === shiftId);
+      }
+
+      return res.json({
+        success: true,
+        records: docs.map((r) => sanitizeAttendanceForApi(r)),
+      });
+    } catch (err: any) {
+      console.error('[API Attendance Records] Error:', err);
+      return res.status(500).json({ success: false, error: 'Failed to load attendance records.' });
+    }
+  });
+
+  app.get('/api/attendance/punch-events', async (req: Request, res: Response) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        '*',
+        'View Punch Events',
+        { prefetchUserPermission: true }
+      );
+      if (!caller) return;
+
+      const allowed = await callerCanReadAttendanceData(caller, [
+        'dashboard',
+        'history',
+        'attendance',
+        'reports',
+      ]);
+      if (!allowed) {
+        return res.status(403).json({
+          success: false,
+          error: 'Forbidden: Your role does not have permission to view punch events.',
+        });
+      }
+
+      const shiftDate = typeof req.query.shiftDate === 'string' ? req.query.shiftDate.trim() : '';
+      const employeeId = typeof req.query.employeeId === 'string' ? req.query.employeeId.trim().toUpperCase() : '';
+      const rawLimit = Number(req.query.limit || 200);
+      const maxLimit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(500, Math.floor(rawLimit))) : 200;
+
+      let snap: AdminQuerySnapLike;
+      if (shiftDate) {
+        if (!DATE_KEY_RE.test(shiftDate)) {
+          return res.status(400).json({ success: false, error: 'Invalid shiftDate format.' });
+        }
+        snap = await db.collection('punch_events').where('shiftDate', '==', shiftDate).get();
+      } else {
+        snap = await db.collection('punch_events').get();
+      }
+
+      let events = snap.docs
+        .map((d) => ({ id: d.id, ...(d.data() || {}) }))
+        .sort((a: any, b: any) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')));
+
+      if (employeeId) {
+        events = events.filter((e: any) => String(e.employeeId || '').toUpperCase() === employeeId);
+      }
+
+      return res.json({
+        success: true,
+        events: events.slice(0, maxLimit),
+      });
+    } catch (err: any) {
+      console.error('[API Punch Events] Error:', err);
+      return res.status(500).json({ success: false, error: 'Failed to load punch events.' });
+    }
+  });
+
+  app.get('/api/attendance/rosters', async (req: Request, res: Response) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        '*',
+        'View Shift Rosters',
+        { prefetchUserPermission: true }
+      );
+      if (!caller) return;
+
+      const allowed = await callerCanReadAttendanceData(caller, [
+        'dashboard',
+        'shifts',
+        'attendance',
+        'reports',
+      ]);
+      if (!allowed) {
+        return res.status(403).json({
+          success: false,
+          error: 'Forbidden: Your role does not have permission to view shift rosters.',
+        });
+      }
+
+      const shiftDate = typeof req.query.shiftDate === 'string' ? req.query.shiftDate.trim() : '';
+      const shiftId = typeof req.query.shiftId === 'string' ? req.query.shiftId.trim() : '';
+
+      if (shiftDate && !DATE_KEY_RE.test(shiftDate)) {
+        return res.status(400).json({ success: false, error: 'Invalid shiftDate format.' });
+      }
+
+      const targetDate = shiftDate || getKolkataTimeParts(new Date()).dateKey;
+      const snap = await db.collection('shift_rosters').where('shiftDate', '==', targetDate).get();
+      let rosters = snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+      if (shiftId && shiftId !== 'ALL') {
+        rosters = rosters.filter((r: any) => String(r.shiftId || '') === shiftId);
+      }
+
+      return res.json({
+        success: true,
+        rosters,
+      });
+    } catch (err: any) {
+      console.error('[API Shift Rosters] Error:', err);
+      return res.status(500).json({ success: false, error: 'Failed to load shift rosters.' });
     }
   });
 }

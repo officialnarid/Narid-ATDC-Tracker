@@ -4,6 +4,7 @@ import { z } from 'zod';
 import {
   type AdminFirestoreLike,
   type VerifiedCaller,
+  extractAuthoritativePublicIp,
   normalizeRoleValue,
   recordEnterpriseAuditEvent,
 } from './serverSecurityAudit.ts';
@@ -55,63 +56,9 @@ function defaultRolePolicy(roleId: CompanyWifiManagedRoleId): CompanyWifiRolePol
 }
 
 // ============================================================================
-// Trusted Proxy Public IP Extraction (Spoof-Resistant — Never Trusts Client Payload)
+// Trusted Proxy Public IP Extraction (Re-exported from Unified Security Core)
 // ============================================================================
-
-function parseHeaderIpList(headerVal: string | string[] | undefined): string[] {
-  if (!headerVal) return [];
-  const joined = Array.isArray(headerVal) ? headerVal.join(',') : headerVal;
-  return joined
-    .split(',')
-    .map((part) => normalizeIpString(part))
-    .filter((ip) => {
-      if (!ip) return false;
-      const p = parseIpOrCidr(ip);
-      return p.valid && !p.isCidr;
-    });
-}
-
-/**
- * Extracts the server-observed Public IP from trusted reverse proxy headers or socket.
- * - Never trusts client-submitted IP fields in request bodies or query strings.
- * - On Vercel: prefers x-vercel-forwarded-for (set at Vercel Edge).
- * - Behind trusted proxy hops (default 1): reads right-to-left from X-Forwarded-For
- *   so client-prepended spoofed leftmost values are ignored.
- * - Falls back to req.socket.remoteAddress / req.ip.
- */
-export function extractAuthoritativePublicIp(
-  req: Request,
-  trustedProxyHops = 1
-): { ip: string; isPublic: boolean; source: string } {
-  const safeHops = Math.max(0, Math.min(5, Math.floor(Number(trustedProxyHops) || 1)));
-
-  const vercelIps = parseHeaderIpList(req.headers['x-vercel-forwarded-for']);
-  if (vercelIps.length > 0 && safeHops > 0) {
-    const ip = vercelIps[vercelIps.length - 1];
-    return { ip, isPublic: !isPrivateOrNonPublicIp(ip), source: 'x-vercel-forwarded-for' };
-  }
-
-  const xffIps = parseHeaderIpList(req.headers['x-forwarded-for']);
-  if (xffIps.length > 0 && safeHops > 0) {
-    const idx = Math.max(0, xffIps.length - safeHops);
-    const ip = xffIps[idx];
-    return { ip, isPublic: !isPrivateOrNonPublicIp(ip), source: 'x-forwarded-for:trusted-hop' };
-  }
-
-  const directCandidate = normalizeIpString(req.socket?.remoteAddress || req.ip || '');
-  if (directCandidate) {
-    const parsed = parseIpOrCidr(directCandidate);
-    if (parsed.valid && !parsed.isCidr) {
-      return {
-        ip: directCandidate,
-        isPublic: !isPrivateOrNonPublicIp(directCandidate),
-        source: 'socket',
-      };
-    }
-  }
-
-  return { ip: 'unavailable', isPublic: false, source: 'unavailable' };
-}
+export { extractAuthoritativePublicIp };
 
 // ============================================================================
 // Scoped Per-DB Cache with Immediate Invalidation & Policy Version Sync

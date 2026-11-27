@@ -37,6 +37,86 @@ export const DEFAULT_SUPER_ADMIN_LOCKOUT_RESET_HOURS = 24;
 export const MIN_SUPER_ADMIN_LOCKOUT_RESET_HOURS = 6;
 export const MAX_SUPER_ADMIN_LOCKOUT_RESET_HOURS = 720;
 
+// Short-lived, IP-bound, single-use HMAC token for post-login Firebase Auth throttle signals (F-03)
+const THROTTLE_SIGNAL_TTL_MS = 2 * 60 * 1000;
+const THROTTLE_SIGNAL_SECRET =
+  process.env.THROTTLE_SIGNAL_SECRET || crypto.randomBytes(32).toString('hex');
+const consumedThrottleNonces = new Map<string, number>();
+const MAX_CONSUMED_THROTTLE_NONCES = 5000;
+
+function pruneConsumedThrottleNonces(nowMs: number): void {
+  if (consumedThrottleNonces.size === 0) return;
+  for (const [nonce, exp] of consumedThrottleNonces.entries()) {
+    if (exp <= nowMs) {
+      consumedThrottleNonces.delete(nonce);
+    }
+  }
+  while (consumedThrottleNonces.size > MAX_CONSUMED_THROTTLE_NONCES) {
+    const oldest = consumedThrottleNonces.keys().next().value;
+    if (oldest === undefined) break;
+    consumedThrottleNonces.delete(oldest);
+  }
+}
+
+export function issueThrottleSignalToken(loginId: string, ipAddress: string, nowMs = Date.now()): string {
+  const cleanId = String(loginId || '').trim().toLowerCase().slice(0, 64);
+  const cleanIp = String(ipAddress || 'unavailable').trim();
+  const nonce = crypto.randomBytes(12).toString('hex');
+  const exp = nowMs + THROTTLE_SIGNAL_TTL_MS;
+  const payload = Buffer.from(JSON.stringify({ l: cleanId, i: cleanIp, n: nonce, e: exp })).toString('base64url');
+  const sig = crypto.createHmac('sha256', THROTTLE_SIGNAL_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+function verifyAndConsumeThrottleSignalToken(
+  rawToken: unknown,
+  loginId: string,
+  ipAddress: string,
+  nowMs = Date.now()
+): boolean {
+  if (typeof rawToken !== 'string' || !rawToken.includes('.')) return false;
+  const parts = rawToken.split('.');
+  if (parts.length !== 2) return false;
+  const [payloadB64, providedSig] = parts;
+  if (!payloadB64 || !providedSig) return false;
+
+  const expectedSig = crypto
+    .createHmac('sha256', THROTTLE_SIGNAL_SECRET)
+    .update(payloadB64)
+    .digest('base64url');
+  const sigBufA = Buffer.from(providedSig);
+  const sigBufB = Buffer.from(expectedSig);
+  if (sigBufA.length !== sigBufB.length || !crypto.timingSafeEqual(sigBufA, sigBufB)) {
+    return false;
+  }
+
+  let decoded: { l?: string; i?: string; n?: string; e?: number };
+  try {
+    decoded = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+  } catch {
+    return false;
+  }
+
+  if (
+    typeof decoded.l !== 'string' ||
+    typeof decoded.i !== 'string' ||
+    typeof decoded.n !== 'string' ||
+    typeof decoded.e !== 'number'
+  ) {
+    return false;
+  }
+  if (decoded.e < nowMs) return false;
+  if (decoded.l !== String(loginId || '').trim().toLowerCase().slice(0, 64)) return false;
+  if (decoded.i !== String(ipAddress || 'unavailable').trim()) return false;
+
+  pruneConsumedThrottleNonces(nowMs);
+  if (consumedThrottleNonces.has(decoded.n)) {
+    return false;
+  }
+  consumedThrottleNonces.set(decoded.n, decoded.e);
+  return true;
+}
+
 export function computeSuperAdminLockDurationMinutes(progressiveLockLevel: number): number {
   const safeLevel = Math.max(1, Math.floor(Number(progressiveLockLevel) || 1));
   const idx = Math.min(safeLevel - 1, SUPER_ADMIN_PROGRESSIVE_LOCK_MINUTES.length - 1);
@@ -2337,6 +2417,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
           detail: `Authenticated session ${sessionId}`,
         });
 
+        const throttleSignalToken = issueThrottleSignalToken(cleanId, telemetry.ipAddress, nowMs);
         const { passwordHash: _ph, ...sanitizedProfile } = resolvedUserData;
         return {
           status: 200,
@@ -2358,6 +2439,7 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
             },
             sessionToken,
             sessionId,
+            throttleSignalToken,
           },
         };
       });
@@ -2677,16 +2759,32 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
     }
   });
 
-  // B. Record Firebase Auth Native Abuse Protection Signal
+  // B. Record Firebase Auth Native Abuse Protection Signal (Strictly Authenticated via Server-Issued Token)
+  // Security Fix (F-03): Never allow unauthenticated callers to mutate ip_rate_limits or flood Firestore.
   app.post('/api/auth/firebase-throttle-signal', async (req: Request, res: Response) => {
     try {
       const cleanId =
         typeof req.body?.loginId === 'string' && req.body.loginId.trim()
           ? req.body.loginId.trim().toLowerCase().slice(0, 64)
-          : 'unknown';
-      const telemetry = await captureTelemetryContext(db, req);
-      const ipRes = await recordIpFailurePersistent(db, telemetry.ipAddress, 'firebase_throttle', cleanId);
+          : '';
+      const rawToken = req.body?.throttleSignalToken;
+      const authoritativeIp = extractTrustedClientIp(req);
 
+      if (
+        !cleanId ||
+        !verifyAndConsumeThrottleSignalToken(rawToken, cleanId, authoritativeIp, getNowMs())
+      ) {
+        return res.status(403).json({
+          success: false,
+          code: 'UNAUTHORIZED_THROTTLE_SIGNAL',
+          error: 'Invalid or expired authentication telemetry token.',
+        });
+      }
+
+      const telemetry = await captureTelemetryContext(db, req);
+
+      // Telemetry-only audit record: intentionally does NOT call recordIpFailurePersistent()
+      // so client-reported Firebase throttling can never lock out a shared office NAT IP.
       await Promise.all([
         recordLoginAttemptDoc(db, {
           loginId: cleanId,
@@ -2699,16 +2797,16 @@ export function registerLoginSecurityRoutes(app: express.Express, deps: LoginSec
         }),
         recordSecurityAuditLogDoc(db, {
           action: 'FIREBASE_TOO_MANY_ATTEMPTS',
-          severity: 'CRITICAL',
+          severity: 'WARNING',
           targetLoginId: cleanId,
           reason: 'Firebase native abuse protection TOO_MANY_ATTEMPTS_TRY_LATER encountered',
           details: `Firebase Auth enforced TOO_MANY_ATTEMPTS_TRY_LATER for "${cleanId}" from IP ${telemetry.ipAddress}. Automatic retries prevented.`,
-          metadata: { cooldownSeconds: ipRes.cooldownSeconds },
+          metadata: { ipRateLimitMutated: false },
           telemetry,
         }),
       ]);
 
-      return res.json({ success: true, cooldownSeconds: ipRes.cooldownSeconds });
+      return res.json({ success: true, cooldownSeconds: 0 });
     } catch {
       return res.status(200).json({ success: false });
     }

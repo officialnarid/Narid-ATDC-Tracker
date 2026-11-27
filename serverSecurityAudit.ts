@@ -9,6 +9,11 @@ import {
   invalidateUidRolePointer,
   roundMs,
 } from './serverPerfCache.ts';
+import {
+  isPrivateOrNonPublicIp,
+  normalizeIpString,
+  parseIpOrCidr,
+} from './src/utils/companyWifiUtils.ts';
 
 const KOLKATA_CA_DATE_FORMATTER = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' });
 
@@ -602,30 +607,106 @@ export async function verifyCallerIdentity(
 // ============================================================================
 // 2. Trusted Reverse-Proxy IP, User-Agent & Safe Geo Lookup
 // ============================================================================
-export function extractTrustedClientIp(req: Request): string {
-  const xff = req.headers['x-forwarded-for'];
-  let candidate = '';
-  if (typeof xff === 'string' && xff.trim()) {
-    candidate = xff.split(',')[0].trim();
-  } else if (Array.isArray(xff) && xff.length > 0) {
-    candidate = String(xff[0]).split(',')[0].trim();
-  } else if (typeof req.headers['cf-connecting-ip'] === 'string') {
-    candidate = req.headers['cf-connecting-ip'].trim();
-  } else if (typeof req.headers['x-real-ip'] === 'string') {
-    candidate = req.headers['x-real-ip'].trim();
-  } else {
-    candidate = req.socket?.remoteAddress || '127.0.0.1';
+export function isVerifiedVercelRuntime(): boolean {
+  return process.env.VERCEL === '1' || Boolean(process.env.VERCEL_ENV);
+}
+
+export function isCloudRunRuntime(): boolean {
+  return Boolean(process.env.K_SERVICE || process.env.CLOUD_RUN_JOB);
+}
+
+function parseValidatedHeaderIpList(headerVal: string | string[] | undefined): string[] {
+  if (!headerVal) return [];
+  const joined = Array.isArray(headerVal) ? headerVal.join(',') : headerVal;
+  return joined
+    .split(',')
+    .map((part) => normalizeIpString(part))
+    .filter((ip) => {
+      if (!ip) return false;
+      const p = parseIpOrCidr(ip);
+      return p.valid && !p.isCidr;
+    });
+}
+
+function resolveEffectiveTrustedProxyHops(configuredHops: number): number {
+  const envRaw = process.env.TRUSTED_PROXY_HOPS;
+  if (typeof envRaw === 'string' && envRaw.trim() !== '') {
+    const envParsed = Number(envRaw.trim());
+    if (Number.isFinite(envParsed)) {
+      return Math.max(0, Math.min(5, Math.floor(envParsed)));
+    }
+  }
+  if (!Number.isFinite(configuredHops)) return 1;
+  return Math.max(0, Math.min(5, Math.floor(configuredHops)));
+}
+
+/**
+ * Extracts the server-observed Public IP from trusted reverse proxy headers or socket.
+ * - Never trusts client-submitted IP fields, arbitrary cf-connecting-ip, or x-real-ip.
+ * - Accepts x-vercel-forwarded-for ONLY in verified Vercel runtimes (VERCEL=1 or VERCEL_ENV).
+ * - When socket.remoteAddress is already a direct PUBLIC IP (no reverse proxy), ignores
+ *   client-supplied X-Forwarded-For completely to prevent header spoofing on Docker/direct hosts.
+ * - Behind trusted proxy hops (Vercel, Cloud Run, Nginx/ALB, or local loopback proxy), reads
+ *   right-to-left from X-Forwarded-For so client-prepended leftmost spoofed IPs are ignored.
+ */
+export function extractAuthoritativePublicIp(
+  req: Request,
+  trustedProxyHops = 1
+): { ip: string; isPublic: boolean; source: string } {
+  const safeHops = resolveEffectiveTrustedProxyHops(trustedProxyHops);
+
+  const directRaw = normalizeIpString(req.socket?.remoteAddress || req.ip || '');
+  const directParsed = directRaw ? parseIpOrCidr(directRaw) : { valid: false, isCidr: false };
+  const directValid = Boolean(directRaw && directParsed.valid && !directParsed.isCidr);
+  const directIsPublic = directValid && !isPrivateOrNonPublicIp(directRaw);
+
+  // 1. Verified Vercel Edge runtime ONLY
+  if (isVerifiedVercelRuntime() && safeHops > 0) {
+    const vercelIps = parseValidatedHeaderIpList(req.headers['x-vercel-forwarded-for']);
+    if (vercelIps.length > 0) {
+      const ip = vercelIps[vercelIps.length - 1];
+      return { ip, isPublic: !isPrivateOrNonPublicIp(ip), source: 'x-vercel-forwarded-for' };
+    }
   }
 
-  candidate = candidate.replace(/^::ffff:/i, '').replace(/^\[|\]$/g, '');
-  if (/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(candidate)) {
-    candidate = candidate.split(':')[0];
+  // 2. Trusted reverse-proxy X-Forwarded-For (right-to-left hop selection)
+  // Never trust X-Forwarded-For if connection arrived directly from a public internet socket.
+  if (safeHops > 0 && !directIsPublic) {
+    const xffIps = parseValidatedHeaderIpList(req.headers['x-forwarded-for']);
+    if (xffIps.length > 0) {
+      const idx = Math.max(0, xffIps.length - safeHops);
+      const ip = xffIps[idx];
+      return {
+        ip,
+        isPublic: !isPrivateOrNonPublicIp(ip),
+        source: isCloudRunRuntime()
+          ? 'x-forwarded-for:cloud-run-hop'
+          : 'x-forwarded-for:trusted-hop',
+      };
+    }
   }
 
-  if (!/^[a-fA-F0-9:.]{3,45}$/.test(candidate)) {
+  // 3. Direct socket / Express req.ip fallback
+  if (directValid) {
+    return {
+      ip: directRaw,
+      isPublic: !isPrivateOrNonPublicIp(directRaw),
+      source: 'socket',
+    };
+  }
+
+  return { ip: 'unavailable', isPublic: false, source: 'unavailable' };
+}
+
+export function extractTrustedClientIp(req: Request, trustedProxyHops = 1): string {
+  const extracted = extractAuthoritativePublicIp(req, trustedProxyHops);
+  if (!extracted.ip || extracted.ip === 'unavailable') {
     return 'unavailable';
   }
-  return candidate;
+  if (!/^[a-fA-F0-9:.]{3,45}$/.test(extracted.ip)) {
+    return 'unavailable';
+  }
+  return extracted.ip;
 }
 
 export function isPrivateOrLocalIp(ip: string): boolean {
@@ -677,7 +758,18 @@ export function parseUserAgent(uaRaw?: string | string[]): UserAgentMeta {
   return { browser, os, deviceType, raw: ua.slice(0, 300) };
 }
 
+const MAX_GEO_CACHE_SIZE = 1000;
 const geoCache = new Map<string, { data: GeoLocationInfo; expiresAt: number }>();
+
+function setBoundedGeoCache(ip: string, data: GeoLocationInfo, ttlMs: number): void {
+  if (geoCache.size >= MAX_GEO_CACHE_SIZE && !geoCache.has(ip)) {
+    const oldestKey = geoCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      geoCache.delete(oldestKey);
+    }
+  }
+  geoCache.set(ip, { data, expiresAt: Date.now() + ttlMs });
+}
 
 export async function resolveIpGeoLocation(ip: string, enabled = true): Promise<GeoLocationInfo> {
   if (!enabled || isPrivateOrLocalIp(ip)) {
@@ -707,7 +799,7 @@ export async function resolveIpGeoLocation(ip: string, enabled = true): Promise<
           city: String(json.city || 'unavailable'),
           status: 'resolved',
         };
-        geoCache.set(ip, { data: result, expiresAt: Date.now() + 3600 * 1000 });
+        setBoundedGeoCache(ip, result, 3600 * 1000);
         return result;
       }
     }
@@ -721,8 +813,76 @@ export async function resolveIpGeoLocation(ip: string, enabled = true): Promise<
     city: 'unavailable',
     status: 'unavailable',
   };
-  geoCache.set(ip, { data: fallback, expiresAt: Date.now() + 5 * 60 * 1000 });
+  setBoundedGeoCache(ip, fallback, 5 * 60 * 1000);
   return fallback;
+}
+
+// ============================================================================
+// 2b. Non-Reversible QR Token Reference & Employee/Attendance DTO Sanitization
+// ============================================================================
+export const RAW_QR_TOKEN_INLINE_PATTERN = /\bQR_[A-Za-z0-9._-]+_[A-Za-z0-9._-]+\b/g;
+
+/**
+ * Computes a deterministic, non-reversible SHA-256 reference for a QR token.
+ * Safe for attendance records, audit trails, and UI cache keys without ever exposing raw tokens.
+ */
+export function hashQrTokenReference(rawToken: string | null | undefined): string {
+  const clean = typeof rawToken === 'string' ? rawToken.trim() : '';
+  if (!clean) return '';
+  if (/^qrref_[0-9a-f]{16}$/i.test(clean)) {
+    return clean.toLowerCase();
+  }
+  const digest = crypto.createHash('sha256').update(clean).digest('hex').slice(0, 16);
+  return `qrref_${digest}`;
+}
+
+/**
+ * Strips raw qrCodeToken from any employee object returned by backend APIs,
+ * replacing it with non-sensitive availability + non-reversible reference metadata.
+ */
+export function sanitizeEmployeeForApi<T extends Record<string, any> | null | undefined>(
+  employee: T
+): T extends null | undefined ? T : Omit<NonNullable<T>, 'qrCodeToken'> & {
+  hasQrToken: boolean;
+  qrTokenReference: string;
+} {
+  if (!employee || typeof employee !== 'object') {
+    return employee as any;
+  }
+  const { qrCodeToken, ...safeFields } = employee as Record<string, any>;
+  const hasQrToken = Boolean(
+    (typeof qrCodeToken === 'string' && qrCodeToken.trim().length > 0) ||
+      safeFields.hasQrToken === true
+  );
+  const qrTokenReference =
+    typeof qrCodeToken === 'string' && qrCodeToken.trim().length > 0
+      ? hashQrTokenReference(qrCodeToken)
+      : typeof safeFields.qrTokenReference === 'string' && safeFields.qrTokenReference.trim()
+        ? hashQrTokenReference(safeFields.qrTokenReference)
+        : '';
+  return {
+    ...safeFields,
+    hasQrToken,
+    qrTokenReference,
+  } as any;
+}
+
+/**
+ * Sanitizes attendance documents on read/write so legacy raw QR tokens stored in
+ * qrTokenReference are converted to non-reversible qrref_<hash> before leaving the API.
+ */
+export function sanitizeAttendanceForApi<T extends Record<string, any> | null | undefined>(
+  record: T
+): T {
+  if (!record || typeof record !== 'object') return record;
+  const copy: Record<string, any> = { ...record };
+  if ('qrCodeToken' in copy) {
+    delete copy.qrCodeToken;
+  }
+  if (typeof copy.qrTokenReference === 'string' && copy.qrTokenReference.trim()) {
+    copy.qrTokenReference = hashQrTokenReference(copy.qrTokenReference);
+  }
+  return copy as T;
 }
 
 // ============================================================================
@@ -738,7 +898,12 @@ export function redactSensitiveData(value: any, depth = 0): any {
     if (value.startsWith('Bearer ') || /^[0-9a-f]{32}:[0-9a-f]{128}$/i.test(value)) {
       return '[REDACTED]';
     }
-    return value.length > 8000 ? `${value.slice(0, 7950)}...[truncated]` : value;
+    let cleaned = value.replace(RAW_QR_TOKEN_INLINE_PATTERN, '[REDACTED_QR_TOKEN]');
+    cleaned = cleaned.replace(
+      /("?(?:qrCodeToken|qrToken|token)"?\s*:\s*")([^"]+)(")/gi,
+      '$1[REDACTED]$3'
+    );
+    return cleaned.length > 8000 ? `${cleaned.slice(0, 7950)}...[truncated]` : cleaned;
   }
   if (typeof value === 'number' || typeof value === 'boolean') {
     return value;

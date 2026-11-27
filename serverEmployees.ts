@@ -1,12 +1,15 @@
 import express, { type Request, type Response } from 'express';
 import crypto from 'crypto';
+import QRCode from 'qrcode';
 import { z } from 'zod';
 import { isFirestorePermissionDeniedError } from './serverFirebaseAdmin.ts';
 import {
   type AdminDocRefLike,
   type AdminFirestoreLike,
   type VerifiedCaller,
+  hashQrTokenReference,
   recordEnterpriseAuditEvent,
+  sanitizeEmployeeForApi,
 } from './serverSecurityAudit.ts';
 import { getCachedRolePermissionsDoc } from './serverPerfCache.ts';
 import {
@@ -76,7 +79,7 @@ const BulkImportRequestSchema = z.object({
 });
 
 function generateServerQrToken(employeeId: string): string {
-  const rand = crypto.randomBytes(4).toString('hex').toUpperCase();
+  const rand = crypto.randomBytes(12).toString('hex').toUpperCase();
   const ts = Date.now().toString(36).toUpperCase();
   return `QR_${employeeId}_${ts}_${rand}`;
 }
@@ -1183,6 +1186,630 @@ export function registerEmployeeRoutes(app: express.Express, deps: EmployeeRoute
         code: classified.code,
         error: classified.message,
       });
+    }
+  });
+
+  // ==========================================================================
+  // F-01 & F-02: Server-Authoritative Employee Directory, Single-Record CRUD
+  // & Server-Side QR Image Rendering (Zero Raw qrCodeToken Exposure)
+  // ==========================================================================
+  const SingleEmployeeUpsertSchema = z.object({
+    employeeId: z
+      .string()
+      .trim()
+      .min(1, 'Employee ID is required.')
+      .max(128, 'Employee ID must be 128 characters or fewer.')
+      .regex(EMPLOYEE_ID_PATTERN, 'Invalid Employee ID characters.'),
+    employeeName: z.string().trim().min(1, 'Employee Name is required.').max(200),
+    employeeType: z.enum(['Permanent', 'Offroll', 'Staff']).default('Permanent'),
+    section: z.string().trim().min(1).max(100).default('MI'),
+    department: z.string().trim().min(1).max(100).default('Production'),
+    floor: z.string().trim().min(1).max(100).default('MI-01'),
+    designation: z.string().trim().min(1).max(120).default('Operator'),
+    employeeStatus: z.enum(['Active', 'Inactive']).default('Active'),
+  });
+
+  const SingleEmployeeStatusSchema = z.object({
+    employeeStatus: z.enum(['Active', 'Inactive']),
+  });
+
+  const RenderQrCardsSchema = z.object({
+    employeeIds: z.array(z.string().trim().min(1).max(128)).min(1).max(200),
+    size: z.number().int().min(120).max(600).optional(),
+  });
+
+  async function callerHasAnyModuleAction(
+    caller: VerifiedCaller,
+    checks: Array<{ module: string; action: 'view' | 'add' | 'edit' | 'delete' }>
+  ): Promise<boolean> {
+    if (caller.role === 'super_admin') return true;
+    try {
+      const [userPermSnap, rolePermSnap] = await Promise.all([
+        caller.prefetchedUserPermSnap
+          ? Promise.resolve(caller.prefetchedUserPermSnap)
+          : db.collection('user_permissions').doc(caller.profileDocId).get(),
+        getCachedRolePermissionsDoc(db, caller.role),
+      ]);
+      const userPermData = userPermSnap.exists ? userPermSnap.data() : undefined;
+      const rolePermData = rolePermSnap.exists ? rolePermSnap.data : undefined;
+
+      for (const { module: mod, action } of checks) {
+        if (userPermData && userPermData.isCustomOverride !== false) {
+          const m = userPermData.permissions?.[mod];
+          if (m && typeof m[action] === 'boolean') {
+            if (m[action] === true && (action === 'view' || m.view !== false)) return true;
+            continue;
+          }
+        }
+        const rm = rolePermData?.modulePermissions?.[mod];
+        if (rm && typeof rm[action] === 'boolean') {
+          if (rm[action] === true && (action === 'view' || rm.view !== false)) return true;
+          continue;
+        }
+        if (caller.role === 'admin' && action !== 'delete') {
+          return true;
+        }
+        if (
+          action === 'view' &&
+          Array.isArray(caller.modulesAllowed) &&
+          caller.modulesAllowed.includes(mod)
+        ) {
+          return true;
+        }
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  async function callerCanAccessQrSecrets(
+    caller: VerifiedCaller,
+    action: 'view' | 'edit'
+  ): Promise<boolean> {
+    if (caller.role === 'super_admin') return true;
+    try {
+      const [userPermSnap, rolePermSnap] = await Promise.all([
+        caller.prefetchedUserPermSnap
+          ? Promise.resolve(caller.prefetchedUserPermSnap)
+          : db.collection('user_permissions').doc(caller.profileDocId).get(),
+        getCachedRolePermissionsDoc(db, caller.role),
+      ]);
+      const userPermData = userPermSnap.exists ? userPermSnap.data() : undefined;
+      const rolePermData = rolePermSnap.exists ? rolePermSnap.data : undefined;
+
+      if (userPermData && userPermData.isCustomOverride !== false) {
+        const m = userPermData.permissions?.qr_codes;
+        if (m && typeof m[action] === 'boolean') {
+          return m[action] === true && (action === 'view' || m.view !== false);
+        }
+      }
+      const rm = rolePermData?.modulePermissions?.qr_codes;
+      if (rm && typeof rm[action] === 'boolean') {
+        return rm[action] === true && (action === 'view' || rm.view !== false);
+      }
+      // Admin defaults to QR view/edit unless explicitly revoked; ordinary users default DENIED.
+      if (caller.role === 'admin') {
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  async function renderQrPngDataUrlServer(employeeId: string, qrCodeToken: string, width = 240): Promise<string> {
+    const payload = JSON.stringify({
+      employeeId: employeeId.trim().toUpperCase(),
+      token: qrCodeToken.trim(),
+    });
+    return QRCode.toDataURL(payload, {
+      width,
+      margin: 1,
+      errorCorrectionLevel: 'M',
+      color: { dark: '#0f172a', light: '#ffffff' },
+    });
+  }
+
+  // GET /api/employees — Sanitized employee directory (NEVER exposes raw qrCodeToken)
+  app.get('/api/employees', async (req: Request, res: Response) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, '*', 'List Employees', {
+        prefetchUserPermission: true,
+      });
+      if (!caller) return;
+
+      const allowed = await callerHasAnyModuleAction(caller, [
+        { module: 'employees', action: 'view' },
+        { module: 'qr_codes', action: 'view' },
+        { module: 'dashboard', action: 'view' },
+        { module: 'history', action: 'view' },
+        { module: 'reports', action: 'view' },
+        { module: 'excel_import', action: 'view' },
+        { module: 'shifts', action: 'view' },
+        { module: 'attendance', action: 'view' },
+      ]);
+      if (!allowed) {
+        return res.status(403).json({
+          success: false,
+          error: 'Forbidden: You do not have permission to view employee records.',
+        });
+      }
+
+      const snap = await db.collection('employees').get();
+      let list = snap.docs.map((d) => sanitizeEmployeeForApi({ id: d.id, ...(d.data() || {}) }));
+
+      const search = typeof req.query.search === 'string' ? req.query.search.trim().toLowerCase() : '';
+      const floor = typeof req.query.floor === 'string' ? req.query.floor.trim() : '';
+      const section = typeof req.query.section === 'string' ? req.query.section.trim() : '';
+      const department = typeof req.query.department === 'string' ? req.query.department.trim() : '';
+      const employeeType = typeof req.query.employeeType === 'string' ? req.query.employeeType.trim() : '';
+      const employeeStatus = typeof req.query.employeeStatus === 'string' ? req.query.employeeStatus.trim() : '';
+
+      if (search) {
+        list = list.filter(
+          (e: any) =>
+            String(e.employeeId || '').toLowerCase().includes(search) ||
+            String(e.employeeName || '').toLowerCase().includes(search) ||
+            String(e.designation || '').toLowerCase().includes(search)
+        );
+      }
+      if (floor && floor !== 'All') list = list.filter((e: any) => e.floor === floor);
+      if (section && section !== 'All') list = list.filter((e: any) => e.section === section);
+      if (department && department !== 'All') list = list.filter((e: any) => e.department === department);
+      if (employeeType && employeeType !== 'All') list = list.filter((e: any) => e.employeeType === employeeType);
+      if (employeeStatus && employeeStatus !== 'All') list = list.filter((e: any) => e.employeeStatus === employeeStatus);
+
+      list.sort((a: any, b: any) => String(a.employeeId || '').localeCompare(String(b.employeeId || '')));
+
+      return res.json({ success: true, employees: list });
+    } catch (err: any) {
+      console.error('[API List Employees] Error:', err);
+      return res.status(500).json({ success: false, error: 'Failed to load employees.' });
+    }
+  });
+
+  // POST /api/employees/qr-cards/render — Server-Side QR PNG Rendering (Strictly qr_codes.view; ZERO raw token in response)
+  app.post('/api/employees/qr-cards/render', async (req: Request, res: Response) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, '*', 'Render Employee QR Cards', {
+        prefetchUserPermission: true,
+      });
+      if (!caller) return;
+
+      const canViewQr = await callerCanAccessQrSecrets(caller, 'view');
+      if (!canViewQr) {
+        return res.status(403).json({
+          success: false,
+          code: 'QR_ACCESS_DENIED',
+          error: 'Forbidden: QR Code Management view permission is required.',
+        });
+      }
+
+      const parsed = RenderQrCardsSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || 'Invalid QR card render request.',
+        });
+      }
+
+      const uniqueIds = Array.from(
+        new Set(parsed.data.employeeIds.map((id) => id.trim().toUpperCase()).filter(Boolean))
+      );
+      const size = parsed.data.size || 240;
+
+      const items: Record<string, { qrDataUrl: string; qrTokenReference: string; hasQrToken: boolean }> = {};
+      const missingIds: string[] = [];
+
+      const snaps = await Promise.all(uniqueIds.map((id) => db.collection('employees').doc(id).get()));
+      await Promise.all(
+        snaps.map(async (snap, idx) => {
+          const empId = uniqueIds[idx];
+          if (!snap.exists) {
+            missingIds.push(empId);
+            return;
+          }
+          const data = snap.data() || {};
+          const rawToken = typeof data.qrCodeToken === 'string' ? data.qrCodeToken.trim() : '';
+          if (!rawToken) {
+            missingIds.push(empId);
+            return;
+          }
+          const qrDataUrl = await renderQrPngDataUrlServer(empId, rawToken, size);
+          items[empId] = {
+            qrDataUrl,
+            qrTokenReference: hashQrTokenReference(rawToken),
+            hasQrToken: true,
+          };
+        })
+      );
+
+      return res.json({ success: true, items, missingIds });
+    } catch (err: any) {
+      console.error('[API Render QR Cards] Error:', err);
+      return res.status(500).json({ success: false, error: 'Failed to render QR codes.' });
+    }
+  });
+
+  // GET /api/employees/:employeeId — Sanitized single employee (NEVER exposes raw qrCodeToken)
+  app.get('/api/employees/:employeeId', async (req: Request, res: Response) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, '*', 'Get Employee', {
+        prefetchUserPermission: true,
+      });
+      if (!caller) return;
+
+      const allowed = await callerHasAnyModuleAction(caller, [
+        { module: 'employees', action: 'view' },
+        { module: 'qr_codes', action: 'view' },
+        { module: 'dashboard', action: 'view' },
+        { module: 'history', action: 'view' },
+        { module: 'reports', action: 'view' },
+      ]);
+      if (!allowed) {
+        return res.status(403).json({ success: false, error: 'Forbidden: Insufficient permissions.' });
+      }
+
+      const cleanId = String(req.params.employeeId || '').trim().toUpperCase();
+      if (!cleanId || !EMPLOYEE_ID_PATTERN.test(cleanId)) {
+        return res.status(400).json({ success: false, error: 'Invalid Employee ID.' });
+      }
+
+      const snap = await db.collection('employees').doc(cleanId).get();
+      if (!snap.exists) {
+        return res.status(404).json({ success: false, error: `Employee ${cleanId} not found.` });
+      }
+      return res.json({ success: true, employee: sanitizeEmployeeForApi(snap.data()!) });
+    } catch (err: any) {
+      console.error('[API Get Employee] Error:', err);
+      return res.status(500).json({ success: false, error: 'Failed to load employee.' });
+    }
+  });
+
+  // POST /api/employees — Create new employee (Server-side CSPRNG QR token; sanitized response)
+  app.post('/api/employees', async (req: Request, res: Response) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, '*', 'Create Employee', {
+        prefetchUserPermission: true,
+      });
+      if (!caller) return;
+
+      const canAdd = await callerHasAnyModuleAction(caller, [{ module: 'employees', action: 'add' }]);
+      if (!canAdd) {
+        return res.status(403).json({
+          success: false,
+          error: 'Forbidden: Employee creation permission is required.',
+        });
+      }
+
+      const parsed = SingleEmployeeUpsertSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || 'Invalid employee data.',
+        });
+      }
+
+      const cleanId = parsed.data.employeeId.trim().toUpperCase();
+      const empRef = db.collection('employees').doc(cleanId);
+      const existing = await empRef.get();
+      if (existing.exists) {
+        return res.status(409).json({
+          success: false,
+          error: `Employee ID "${cleanId}" already exists. ID must be unique.`,
+        });
+      }
+
+      const now = new Date().toISOString();
+      const newToken = generateServerQrToken(cleanId);
+      const fullEmployee = {
+        employeeId: cleanId,
+        employeeName: parsed.data.employeeName.trim().toUpperCase(),
+        employeeType: parsed.data.employeeType,
+        section: parsed.data.section,
+        department: parsed.data.department,
+        floor: parsed.data.floor,
+        designation: parsed.data.designation,
+        qrCodeToken: newToken,
+        employeeStatus: parsed.data.employeeStatus,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      await empRef.set(fullEmployee);
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: 'CREATE_EMPLOYEE',
+        category: 'EMPLOYEE',
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        employeeId: cleanId,
+        targetType: 'EMPLOYEE',
+        targetId: cleanId,
+        newValue: `${fullEmployee.employeeName} (${fullEmployee.department} - ${fullEmployee.floor})`,
+        actionSource: 'EMPLOYEE_MASTER',
+        captureGeo: false,
+      });
+
+      return res.status(201).json({ success: true, employee: sanitizeEmployeeForApi(fullEmployee) });
+    } catch (err: any) {
+      console.error('[API Create Employee] Error:', err);
+      return res.status(500).json({ success: false, error: 'Failed to create employee.' });
+    }
+  });
+
+  // PUT /api/employees/:employeeId — Update employee while STRICTLY preserving existing qrCodeToken
+  app.put('/api/employees/:employeeId', async (req: Request, res: Response) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, '*', 'Update Employee', {
+        prefetchUserPermission: true,
+      });
+      if (!caller) return;
+
+      const canEdit = await callerHasAnyModuleAction(caller, [{ module: 'employees', action: 'edit' }]);
+      if (!canEdit) {
+        return res.status(403).json({
+          success: false,
+          error: 'Forbidden: Employee edit permission is required.',
+        });
+      }
+
+      const cleanId = String(req.params.employeeId || '').trim().toUpperCase();
+      if (!cleanId || !EMPLOYEE_ID_PATTERN.test(cleanId)) {
+        return res.status(400).json({ success: false, error: 'Invalid Employee ID.' });
+      }
+
+      const parsed = SingleEmployeeUpsertSchema.safeParse({ ...req.body, employeeId: cleanId });
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || 'Invalid employee data.',
+        });
+      }
+
+      const empRef = db.collection('employees').doc(cleanId);
+      const existingSnap = await empRef.get();
+      if (!existingSnap.exists) {
+        return res.status(404).json({ success: false, error: `Employee ${cleanId} not found.` });
+      }
+
+      const prev = existingSnap.data() || {};
+      const now = new Date().toISOString();
+      const updatedEmployee = {
+        ...prev,
+        employeeId: cleanId,
+        employeeName: parsed.data.employeeName.trim().toUpperCase(),
+        employeeType: parsed.data.employeeType,
+        section: parsed.data.section,
+        department: parsed.data.department,
+        floor: parsed.data.floor,
+        designation: parsed.data.designation,
+        employeeStatus: parsed.data.employeeStatus,
+        // Strictly preserve existing qrCodeToken — never rotate during profile edits
+        qrCodeToken: prev.qrCodeToken || generateServerQrToken(cleanId),
+        createdAt: prev.createdAt || now,
+        updatedAt: now,
+      };
+
+      await empRef.set(updatedEmployee);
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: 'UPDATE_EMPLOYEE',
+        category: 'EMPLOYEE',
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        employeeId: cleanId,
+        targetType: 'EMPLOYEE',
+        targetId: cleanId,
+        oldValue: `${prev.employeeName || cleanId} (${prev.department || ''} - ${prev.floor || ''})`,
+        newValue: `${updatedEmployee.employeeName} (${updatedEmployee.department} - ${updatedEmployee.floor})`,
+        actionSource: 'EMPLOYEE_MASTER',
+        captureGeo: false,
+      });
+
+      return res.json({ success: true, employee: sanitizeEmployeeForApi(updatedEmployee) });
+    } catch (err: any) {
+      console.error('[API Update Employee] Error:', err);
+      return res.status(500).json({ success: false, error: 'Failed to update employee.' });
+    }
+  });
+
+  // PATCH /api/employees/:employeeId/status — Toggle Active/Inactive while preserving qrCodeToken
+  app.patch('/api/employees/:employeeId/status', async (req: Request, res: Response) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, '*', 'Toggle Employee Status', {
+        prefetchUserPermission: true,
+      });
+      if (!caller) return;
+
+      const canEdit = await callerHasAnyModuleAction(caller, [{ module: 'employees', action: 'edit' }]);
+      if (!canEdit) {
+        return res.status(403).json({
+          success: false,
+          error: 'Forbidden: Employee edit permission is required.',
+        });
+      }
+
+      const cleanId = String(req.params.employeeId || '').trim().toUpperCase();
+      if (!cleanId || !EMPLOYEE_ID_PATTERN.test(cleanId)) {
+        return res.status(400).json({ success: false, error: 'Invalid Employee ID.' });
+      }
+
+      const parsed = SingleEmployeeStatusSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ success: false, error: 'Invalid status value.' });
+      }
+
+      const empRef = db.collection('employees').doc(cleanId);
+      const existing = await empRef.get();
+      if (!existing.exists) {
+        return res.status(404).json({ success: false, error: `Employee ${cleanId} not found.` });
+      }
+
+      const prev = existing.data() || {};
+      const oldStatus = prev.employeeStatus || 'Active';
+      const now = new Date().toISOString();
+      await empRef.update({
+        employeeStatus: parsed.data.employeeStatus,
+        updatedAt: now,
+      });
+
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: 'TOGGLE_EMPLOYEE_STATUS',
+        category: 'EMPLOYEE',
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        employeeId: cleanId,
+        targetType: 'EMPLOYEE',
+        targetId: cleanId,
+        oldValue: oldStatus,
+        newValue: parsed.data.employeeStatus,
+        actionSource: 'EMPLOYEE_MASTER',
+        reason: `Status toggled to ${parsed.data.employeeStatus}`,
+        captureGeo: false,
+      });
+
+      return res.json({
+        success: true,
+        employee: sanitizeEmployeeForApi({
+          ...prev,
+          employeeStatus: parsed.data.employeeStatus,
+          updatedAt: now,
+        }),
+      });
+    } catch (err: any) {
+      console.error('[API Toggle Employee Status] Error:', err);
+      return res.status(500).json({ success: false, error: 'Failed to update employee status.' });
+    }
+  });
+
+  // DELETE /api/employees/:employeeId — Authenticated delete with RBAC + audit
+  app.delete('/api/employees/:employeeId', async (req: Request, res: Response) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, '*', 'Delete Employee', {
+        prefetchUserPermission: true,
+      });
+      if (!caller) return;
+
+      const canDelete = await callerHasAnyModuleAction(caller, [{ module: 'employees', action: 'delete' }]);
+      if (!canDelete) {
+        return res.status(403).json({
+          success: false,
+          error: 'Forbidden: Employee delete permission is required.',
+        });
+      }
+
+      const cleanId = String(req.params.employeeId || '').trim().toUpperCase();
+      if (!cleanId || !EMPLOYEE_ID_PATTERN.test(cleanId)) {
+        return res.status(400).json({ success: false, error: 'Invalid Employee ID.' });
+      }
+
+      const empRef = db.collection('employees').doc(cleanId);
+      const existing = await empRef.get();
+      if (!existing.exists) {
+        return res.status(404).json({ success: false, error: `Employee ${cleanId} not found.` });
+      }
+
+      const empData = existing.data() || {};
+      await empRef.delete();
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: 'DELETE_EMPLOYEE',
+        category: 'EMPLOYEE',
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        employeeId: cleanId,
+        targetType: 'EMPLOYEE',
+        targetId: cleanId,
+        oldValue: `${empData.employeeName || cleanId} (${empData.department || ''} - ${empData.floor || ''})`,
+        newValue: 'DELETED',
+        actionSource: 'EMPLOYEE_MASTER',
+        reason: 'Administrator permanently deleted employee record',
+        captureGeo: false,
+      });
+
+      return res.json({ success: true, employeeId: cleanId });
+    } catch (err: any) {
+      console.error('[API Delete Employee] Error:', err);
+      return res.status(500).json({ success: false, error: 'Failed to delete employee.' });
+    }
+  });
+
+  // POST /api/employees/:employeeId/regenerate-qr — Authorized manual QR re-issue (NEVER exposes raw token)
+  app.post('/api/employees/:employeeId/regenerate-qr', async (req: Request, res: Response) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, '*', 'Regenerate Employee QR Token', {
+        prefetchUserPermission: true,
+      });
+      if (!caller) return;
+
+      const canReissue = await callerCanAccessQrSecrets(caller, 'edit');
+      if (!canReissue) {
+        return res.status(403).json({
+          success: false,
+          code: 'QR_ACCESS_DENIED',
+          error: 'Forbidden: QR Code Management edit permission is required to regenerate QR tokens.',
+        });
+      }
+
+      const cleanId = String(req.params.employeeId || '').trim().toUpperCase();
+      if (!cleanId || !EMPLOYEE_ID_PATTERN.test(cleanId)) {
+        return res.status(400).json({ success: false, error: 'Invalid Employee ID.' });
+      }
+
+      const empRef = db.collection('employees').doc(cleanId);
+      const existing = await empRef.get();
+      if (!existing.exists) {
+        return res.status(404).json({ success: false, error: `Employee ${cleanId} not found.` });
+      }
+
+      const prev = existing.data() || {};
+      const oldRef = hashQrTokenReference(prev.qrCodeToken);
+      const newToken = generateServerQrToken(cleanId);
+      const newRef = hashQrTokenReference(newToken);
+      const now = new Date().toISOString();
+
+      await empRef.update({
+        qrCodeToken: newToken,
+        updatedAt: now,
+      });
+
+      const qrDataUrl = await renderQrPngDataUrlServer(cleanId, newToken, 240);
+
+      // F-01: Log ONLY non-reversible SHA-256 reference in audit_logs (never raw qrCodeToken)
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: 'REGENERATE_QR_TOKEN',
+        category: 'EMPLOYEE',
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        employeeId: cleanId,
+        targetType: 'EMPLOYEE',
+        targetId: cleanId,
+        oldValue: oldRef || 'NONE',
+        newValue: newRef,
+        actionSource: 'QR_MANAGEMENT',
+        reason: 'Administrator manually regenerated QR security token',
+        captureGeo: false,
+      });
+
+      return res.json({
+        success: true,
+        employeeId: cleanId,
+        hasQrToken: true,
+        qrTokenReference: newRef,
+        qrDataUrl,
+      });
+    } catch (err: any) {
+      console.error('[API Regenerate QR] Error:', err);
+      return res.status(500).json({ success: false, error: 'Failed to regenerate QR token.' });
     }
   });
 }

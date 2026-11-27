@@ -3,8 +3,10 @@ import { getAuthHeaders, sendServerAuditEvent } from './auditService';
 import { apiFetchJson } from '../config/api';
 import {
   buildIdentityCardFileName,
+  IDENTITY_CARD_QR_BOX,
   renderEmployeeIdentityCardBlob,
 } from '../utils/qrIdentityCard';
+import { fetchEmployeeQrDataUrls } from './employeeService';
 import { createZipBlob, ZipEntryInput } from '../utils/zipBuilder';
 import { reportUiActivity } from '../utils/perfMonitor';
 import { downloadPremiumExcelWorkbook } from '../utils/excelReportExporter';
@@ -191,11 +193,28 @@ export async function downloadQrIdentityCardsZip(
     throw new Error('Select at least one employee to download QR identity cards.');
   }
 
-  const renderFn = options.renderCardBlob || renderEmployeeIdentityCardBlob;
+  const customRenderFn = options.renderCardBlob;
   const entries: ZipEntryInput[] = [];
   const exportedIds: string[] = [];
   const skippedIds: string[] = [];
   const failedItems: BulkQrZipFailedItem[] = [];
+
+  // When rendering in browser without local raw qrCodeToken, batch-fetch server-rendered QR PNGs
+  const serverQrDataUrls: Record<string, string> = {};
+  if (!customRenderFn) {
+    const serverQrIds = employees
+      .filter((e) => Boolean(e.employeeId) && !e.qrCodeToken && Boolean(e.hasQrToken))
+      .map((e) => e.employeeId);
+    if (serverQrIds.length > 0) {
+      const rendered = await fetchEmployeeQrDataUrls(serverQrIds, IDENTITY_CARD_QR_BOX.qrDrawSize);
+      for (const id of serverQrIds) {
+        const entry = rendered[id.trim().toUpperCase()] || rendered[id];
+        if (entry?.qrDataUrl) {
+          serverQrDataUrls[id] = entry.qrDataUrl;
+        }
+      }
+    }
+  }
 
   const BATCH_SIZE = 4;
   let processed = 0;
@@ -203,7 +222,8 @@ export async function downloadQrIdentityCardsZip(
   for (let i = 0; i < employees.length; i += BATCH_SIZE) {
     const chunk = employees.slice(i, i + BATCH_SIZE);
     for (const emp of chunk) {
-      if (!emp.employeeId || !emp.qrCodeToken) {
+      const hasToken = Boolean(emp.hasQrToken || emp.qrCodeToken);
+      if (!emp.employeeId || !hasToken) {
         skippedIds.push(emp.employeeId || 'UNKNOWN');
         processed++;
         options.onProgress?.({
@@ -215,7 +235,11 @@ export async function downloadQrIdentityCardsZip(
       }
 
       try {
-        const pngBlob = await renderFn(emp);
+        const pngBlob = customRenderFn
+          ? await customRenderFn(emp)
+          : await renderEmployeeIdentityCardBlob(emp, {
+              preRenderedQrDataUrl: serverQrDataUrls[emp.employeeId],
+            });
         entries.push({
           name: buildIdentityCardFileName(emp.employeeId),
           data: pngBlob,

@@ -1,6 +1,6 @@
 import http from 'http';
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
-import * as XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
 import { createApp } from '../server.ts';
 import {
   InMemoryAdminAuth,
@@ -9,7 +9,7 @@ import {
   seedIsolatedTestEnvironment,
 } from './helpers/inMemoryAdmin.ts';
 
-function buildExcelFile(rows: Array<Record<string, any>>, fileName: string): File {
+async function buildExcelFile(rows: Array<Record<string, any>>, fileName: string): Promise<File> {
   const headers = [
     'Employee ID',
     'Employee Name',
@@ -21,9 +21,11 @@ function buildExcelFile(rows: Array<Record<string, any>>, fileName: string): Fil
     'Status',
   ];
 
-  const sheetData = [
-    headers,
-    ...rows.map((r) => [
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Employee_Master');
+  ws.addRow(headers);
+  for (const r of rows) {
+    ws.addRow([
       r.employeeId,
       r.employeeName,
       r.employeeType,
@@ -32,13 +34,11 @@ function buildExcelFile(rows: Array<Record<string, any>>, fileName: string): Fil
       r.floor,
       r.designation,
       r.employeeStatus,
-    ]),
-  ];
-
-  const ws = XLSX.utils.aoa_to_sheet(sheetData);
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, 'Employee_Master');
-  const buf = XLSX.write(wb, { type: 'array', bookType: 'xlsx' }) as ArrayBuffer;
+    ]);
+  }
+  const raw = await wb.xlsx.writeBuffer();
+  const u8 = new Uint8Array(raw as unknown as Uint8Array);
+  const buf = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
 
   return {
     name: fileName,
@@ -206,7 +206,7 @@ describe('End-to-End Verification: Employee Master Excel Import (Isolated Sandbo
         '../src/services/exportService'
       );
 
-      const excelFile = buildExcelFile(twoEmployeeDataset, 'e2e_test_2_employees.xlsx');
+      const excelFile = await buildExcelFile(twoEmployeeDataset, 'e2e_test_2_employees.xlsx');
       const validation = await parseAndValidateEmployeeExcel(
         excelFile,
         VALID_FLOORS,
@@ -265,7 +265,7 @@ describe('End-to-End Verification: Employee Master Excel Import (Isolated Sandbo
         '../src/services/exportService'
       );
 
-      const repeatFile = buildExcelFile(twoEmployeeDataset, 'e2e_test_2_employees.xlsx');
+      const repeatFile = await buildExcelFile(twoEmployeeDataset, 'e2e_test_2_employees.xlsx');
       const reValidation = await parseAndValidateEmployeeExcel(
         repeatFile,
         VALID_FLOORS,
@@ -409,7 +409,7 @@ describe('End-to-End Verification: Employee Master Excel Import (Isolated Sandbo
         twoEmployeeDataset[1],
       ];
 
-      const updateFile = buildExcelFile(updatedRows, 'e2e_update_employee.xlsx');
+      const updateFile = await buildExcelFile(updatedRows, 'e2e_update_employee.xlsx');
       const validation = await parseAndValidateEmployeeExcel(
         updateFile,
         VALID_FLOORS,
@@ -493,7 +493,7 @@ describe('End-to-End Verification: Employee Master Excel Import (Isolated Sandbo
         };
       });
 
-      const file54 = buildExcelFile(rows54, 'synthetic_54_employees.xlsx');
+      const file54 = await buildExcelFile(rows54, 'synthetic_54_employees.xlsx');
       const validation54 = await parseAndValidateEmployeeExcel(
         file54,
         VALID_FLOORS,

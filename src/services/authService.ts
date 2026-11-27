@@ -423,7 +423,7 @@ export async function loginWithLoginIdAndPassword(
     const fbMsg = String(fbErr?.message || '');
 
     if (fbCode === 'auth/too-many-requests' || fbMsg.includes('TOO_MANY_ATTEMPTS_TRY_LATER')) {
-      await reportFirebaseThrottleSignal(cleanLoginLower);
+      await reportFirebaseThrottleSignal(cleanLoginLower, data?.throttleSignalToken);
       const throttleErr: LoginAuthError = new Error(
         'Too many authentication requests detected by Firebase security protection (TOO_MANY_ATTEMPTS_TRY_LATER). Please wait before trying again.'
       );

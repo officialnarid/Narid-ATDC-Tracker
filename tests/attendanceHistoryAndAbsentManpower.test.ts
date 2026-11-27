@@ -91,7 +91,7 @@ function makeDayAttendance(params: {
     autoClosed,
     autoClosedAt: autoClosed ? `${shiftDate}T17:31:00+05:30` : null,
     autoCloseEffectivePunchOut: autoClosed ? schedEndIso : null,
-    qrTokenReference: employee.qrCodeToken,
+    qrTokenReference: employee.qrTokenReference || employee.qrCodeToken || '',
     createdAt: punchInIso,
     updatedAt: actualOutIso || punchInIso,
   };

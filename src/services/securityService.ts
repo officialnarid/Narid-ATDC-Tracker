@@ -143,15 +143,18 @@ export async function resetSuperAdminLockoutLevel(payload: {
   );
 }
 
-export async function reportFirebaseThrottleSignal(loginId: string): Promise<void> {
-  if (!isApiBaseUsableForCurrentOrigin()) return;
+export async function reportFirebaseThrottleSignal(
+  loginId: string,
+  throttleSignalToken?: string
+): Promise<void> {
+  if (!isApiBaseUsableForCurrentOrigin() || !throttleSignalToken) return;
   try {
     await executeApiFetch(
       apiUrl('/api/auth/firebase-throttle-signal'),
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ loginId }),
+        body: JSON.stringify({ loginId, throttleSignalToken }),
       },
       'POST /api/auth/firebase-throttle-signal'
     );

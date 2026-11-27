@@ -494,6 +494,336 @@ function emitNonSensitivePerfLog(operation, metrics) {
   }
 }
 
+// src/utils/companyWifiUtils.ts
+var COMPANY_WIFI_DENIED_MESSAGE = "Access Denied: Please connect to an authorized Company Wi-Fi network.";
+var COMPANY_WIFI_DENIED_CODE = "COMPANY_WIFI_ACCESS_DENIED";
+function normalizeIpString(raw) {
+  if (typeof raw !== "string") return "";
+  let clean = raw.trim();
+  if (!clean) return "";
+  if (clean.startsWith("[")) {
+    const closeIdx = clean.indexOf("]");
+    if (closeIdx > 1) {
+      clean = clean.slice(1, closeIdx);
+    }
+  }
+  if (/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(clean)) {
+    clean = clean.split(":")[0];
+  }
+  const zoneIdx = clean.indexOf("%");
+  if (zoneIdx > 0) {
+    clean = clean.slice(0, zoneIdx);
+  }
+  if (/^::ffff:\d{1,3}(\.\d{1,3}){3}$/i.test(clean)) {
+    clean = clean.replace(/^::ffff:/i, "");
+  }
+  return clean.toLowerCase();
+}
+function parseIpv4ToBigInt(ip) {
+  const parts = ip.split(".");
+  if (parts.length !== 4) return null;
+  let value = 0n;
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return null;
+    if (part.length > 1 && part.startsWith("0")) return null;
+    const num = Number(part);
+    if (!Number.isInteger(num) || num < 0 || num > 255) return null;
+    value = value << 8n | BigInt(num);
+  }
+  return value;
+}
+function bigIntToIpv4(value) {
+  const a = Number(value >> 24n & 0xffn);
+  const b = Number(value >> 16n & 0xffn);
+  const c = Number(value >> 8n & 0xffn);
+  const d = Number(value & 0xffn);
+  return `${a}.${b}.${c}.${d}`;
+}
+function parseIpv6ToBigInt(ip) {
+  const clean = ip.toLowerCase();
+  if (!clean.includes(":")) return null;
+  let working = clean;
+  const lastColon = working.lastIndexOf(":");
+  const tail = working.slice(lastColon + 1);
+  if (tail.includes(".")) {
+    const v4 = parseIpv4ToBigInt(tail);
+    if (v4 === null) return null;
+    const hi = Number(v4 >> 16n & 0xffffn).toString(16);
+    const lo = Number(v4 & 0xffffn).toString(16);
+    working = `${working.slice(0, lastColon)}:${hi}:${lo}`;
+  }
+  const doubleColonParts = working.split("::");
+  if (doubleColonParts.length > 2) return null;
+  const left = doubleColonParts[0] ? doubleColonParts[0].split(":") : [];
+  const right = doubleColonParts.length === 2 && doubleColonParts[1] ? doubleColonParts[1].split(":") : [];
+  const missing = doubleColonParts.length === 2 ? 8 - (left.length + right.length) : 8 - left.length;
+  if (doubleColonParts.length === 2 ? missing < 1 : missing !== 0) {
+    return null;
+  }
+  const groups = doubleColonParts.length === 2 ? [...left, ...Array(missing).fill("0"), ...right] : left;
+  if (groups.length !== 8) return null;
+  let value = 0n;
+  for (const g of groups) {
+    if (!/^[0-9a-f]{1,4}$/i.test(g)) return null;
+    value = value << 16n | BigInt(parseInt(g, 16));
+  }
+  return value;
+}
+function parseIpOrCidr(rawInput) {
+  const trimmed = String(rawInput || "").trim();
+  if (!trimmed) {
+    return {
+      valid: false,
+      normalized: "",
+      publicIp: "",
+      cidrRange: "",
+      version: "ipv4",
+      isCidr: false,
+      prefixLength: 32,
+      networkInt: 0n,
+      error: "Public IP address or CIDR range is required."
+    };
+  }
+  const slashParts = trimmed.split("/");
+  if (slashParts.length > 2) {
+    return {
+      valid: false,
+      normalized: "",
+      publicIp: "",
+      cidrRange: "",
+      version: "ipv4",
+      isCidr: false,
+      prefixLength: 32,
+      networkInt: 0n,
+      error: "Invalid CIDR format."
+    };
+  }
+  const ipPart = normalizeIpString(slashParts[0]);
+  const hasPrefix = slashParts.length === 2;
+  const v4 = parseIpv4ToBigInt(ipPart);
+  if (v4 !== null) {
+    let prefix = 32;
+    if (hasPrefix) {
+      if (!/^\d{1,2}$/.test(slashParts[1])) {
+        return {
+          valid: false,
+          normalized: "",
+          publicIp: "",
+          cidrRange: "",
+          version: "ipv4",
+          isCidr: true,
+          prefixLength: 32,
+          networkInt: 0n,
+          error: "IPv4 CIDR prefix must be between 0 and 32."
+        };
+      }
+      prefix = Number(slashParts[1]);
+      if (prefix < 0 || prefix > 32) {
+        return {
+          valid: false,
+          normalized: "",
+          publicIp: "",
+          cidrRange: "",
+          version: "ipv4",
+          isCidr: true,
+          prefixLength: 32,
+          networkInt: 0n,
+          error: "IPv4 CIDR prefix must be between 0 and 32."
+        };
+      }
+    }
+    const shift = BigInt(32 - prefix);
+    const maskedInt = prefix === 0 ? 0n : v4 >> shift << shift;
+    const baseIp = hasPrefix ? bigIntToIpv4(maskedInt) : ipPart;
+    return {
+      valid: true,
+      normalized: hasPrefix ? `${baseIp}/${prefix}` : ipPart,
+      publicIp: baseIp,
+      cidrRange: hasPrefix ? `${baseIp}/${prefix}` : "",
+      version: "ipv4",
+      isCidr: hasPrefix,
+      prefixLength: prefix,
+      networkInt: maskedInt
+    };
+  }
+  const v6 = parseIpv6ToBigInt(ipPart);
+  if (v6 !== null) {
+    let prefix = 128;
+    if (hasPrefix) {
+      if (!/^\d{1,3}$/.test(slashParts[1])) {
+        return {
+          valid: false,
+          normalized: "",
+          publicIp: "",
+          cidrRange: "",
+          version: "ipv6",
+          isCidr: true,
+          prefixLength: 128,
+          networkInt: 0n,
+          error: "IPv6 CIDR prefix must be between 0 and 128."
+        };
+      }
+      prefix = Number(slashParts[1]);
+      if (prefix < 0 || prefix > 128) {
+        return {
+          valid: false,
+          normalized: "",
+          publicIp: "",
+          cidrRange: "",
+          version: "ipv6",
+          isCidr: true,
+          prefixLength: 128,
+          networkInt: 0n,
+          error: "IPv6 CIDR prefix must be between 0 and 128."
+        };
+      }
+    }
+    const shift = BigInt(128 - prefix);
+    const maskedInt = prefix === 0 ? 0n : v6 >> shift << shift;
+    return {
+      valid: true,
+      normalized: hasPrefix ? `${ipPart}/${prefix}` : ipPart,
+      publicIp: ipPart,
+      cidrRange: hasPrefix ? `${ipPart}/${prefix}` : "",
+      version: "ipv6",
+      isCidr: hasPrefix,
+      prefixLength: prefix,
+      networkInt: maskedInt
+    };
+  }
+  return {
+    valid: false,
+    normalized: "",
+    publicIp: "",
+    cidrRange: "",
+    version: "ipv4",
+    isCidr: false,
+    prefixLength: 32,
+    networkInt: 0n,
+    error: "Must be a valid public IPv4, IPv6, or CIDR range (e.g., 203.0.113.10 or 203.0.113.0/24)."
+  };
+}
+function ipMatchesCidrOrExact(clientIpRaw, allowEntryRaw) {
+  const clientIp = normalizeIpString(clientIpRaw);
+  if (!clientIp) return false;
+  const parsedEntry = parseIpOrCidr(allowEntryRaw);
+  if (!parsedEntry.valid) return false;
+  if (parsedEntry.version === "ipv4") {
+    const clientV4 = parseIpv4ToBigInt(clientIp);
+    if (clientV4 === null) return false;
+    if (parsedEntry.prefixLength === 0) return true;
+    const shift2 = BigInt(32 - parsedEntry.prefixLength);
+    return clientV4 >> shift2 === parsedEntry.networkInt >> shift2;
+  }
+  const clientV6 = parseIpv6ToBigInt(clientIp);
+  if (clientV6 === null) return false;
+  if (parsedEntry.prefixLength === 0) return true;
+  const shift = BigInt(128 - parsedEntry.prefixLength);
+  return clientV6 >> shift === parsedEntry.networkInt >> shift;
+}
+var NON_PUBLIC_IPV4_RANGES = [
+  "0.0.0.0/8",
+  "10.0.0.0/8",
+  "100.64.0.0/10",
+  "127.0.0.0/8",
+  "169.254.0.0/16",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "224.0.0.0/4",
+  "240.0.0.0/4"
+].map((cidr) => {
+  const p = parseIpOrCidr(cidr);
+  const hostMask = (1n << BigInt(32 - p.prefixLength)) - 1n;
+  return {
+    start: p.networkInt,
+    end: p.networkInt | hostMask,
+    label: cidr
+  };
+});
+var NON_PUBLIC_IPV6_RANGES = [
+  "::/128",
+  "::1/128",
+  "fc00::/7",
+  "fe80::/10",
+  "ff00::/8"
+].map((cidr) => {
+  const p = parseIpOrCidr(cidr);
+  const hostMask = (1n << BigInt(128 - p.prefixLength)) - 1n;
+  return {
+    start: p.networkInt,
+    end: p.networkInt | hostMask,
+    label: cidr
+  };
+});
+function isPrivateOrNonPublicIp(rawIp) {
+  const ip = normalizeIpString(rawIp);
+  if (!ip || ip === "unavailable" || ip === "unknown") return true;
+  const parsed = parseIpOrCidr(ip);
+  if (!parsed.valid || parsed.isCidr) return true;
+  const ranges = parsed.version === "ipv4" ? NON_PUBLIC_IPV4_RANGES : NON_PUBLIC_IPV6_RANGES;
+  return ranges.some((r) => parsed.networkInt >= r.start && parsed.networkInt <= r.end);
+}
+function validatePublicCompanyWifiIpOrCidr(rawInput) {
+  const parsed = parseIpOrCidr(rawInput);
+  if (!parsed.valid) {
+    return parsed;
+  }
+  if (parsed.version === "ipv4") {
+    if (parsed.isCidr && parsed.prefixLength < 16) {
+      return {
+        ...parsed,
+        valid: false,
+        error: "IPv4 CIDR range is too broad. Minimum prefix length is /16 (e.g., 203.0.113.0/24)."
+      };
+    }
+    const hostMask2 = (1n << BigInt(32 - parsed.prefixLength)) - 1n;
+    const rangeStart2 = parsed.networkInt;
+    const rangeEnd2 = parsed.networkInt | hostMask2;
+    const overlapping2 = NON_PUBLIC_IPV4_RANGES.find(
+      (r) => rangeStart2 <= r.end && rangeEnd2 >= r.start
+    );
+    if (overlapping2) {
+      return {
+        ...parsed,
+        valid: false,
+        error: `Private, loopback, or reserved IP ranges (${overlapping2.label}) are not allowed. Enter a routable Public IP or CIDR.`
+      };
+    }
+    return parsed;
+  }
+  if (parsed.isCidr && parsed.prefixLength < 32) {
+    return {
+      ...parsed,
+      valid: false,
+      error: "IPv6 CIDR range is too broad. Minimum prefix length is /32."
+    };
+  }
+  const hostMask = (1n << BigInt(128 - parsed.prefixLength)) - 1n;
+  const rangeStart = parsed.networkInt;
+  const rangeEnd = parsed.networkInt | hostMask;
+  const overlapping = NON_PUBLIC_IPV6_RANGES.find(
+    (r) => rangeStart <= r.end && rangeEnd >= r.start
+  );
+  if (overlapping) {
+    return {
+      ...parsed,
+      valid: false,
+      error: `Private, loopback, or reserved IPv6 ranges (${overlapping.label}) are not allowed. Enter a routable Public IPv6 or CIDR.`
+    };
+  }
+  return parsed;
+}
+function getNetworkMatchTarget(network) {
+  const cidr = String(network.cidrRange || "").trim();
+  return cidr || String(network.publicIp || "").trim();
+}
+function ipMatchesCompanyWifiNetwork(observedIp, network) {
+  if (network.status !== "Active") return false;
+  const target = getNetworkMatchTarget(network);
+  if (!target) return false;
+  return ipMatchesCidrOrExact(observedIp, target);
+}
+
 // serverSecurityAudit.ts
 var KOLKATA_CA_DATE_FORMATTER = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" });
 var CANONICAL_SUPER_ADMIN_UID = "oX2vdSx5jGcoUDxyA0SIYN3SEig2";
@@ -809,28 +1139,75 @@ async function verifyCallerIdentity(req, db, auth, _projectId, options) {
     authFirestoreWrites
   };
 }
-function extractTrustedClientIp(req) {
-  const xff = req.headers["x-forwarded-for"];
-  let candidate = "";
-  if (typeof xff === "string" && xff.trim()) {
-    candidate = xff.split(",")[0].trim();
-  } else if (Array.isArray(xff) && xff.length > 0) {
-    candidate = String(xff[0]).split(",")[0].trim();
-  } else if (typeof req.headers["cf-connecting-ip"] === "string") {
-    candidate = req.headers["cf-connecting-ip"].trim();
-  } else if (typeof req.headers["x-real-ip"] === "string") {
-    candidate = req.headers["x-real-ip"].trim();
-  } else {
-    candidate = req.socket?.remoteAddress || "127.0.0.1";
+function isVerifiedVercelRuntime() {
+  return process.env.VERCEL === "1" || Boolean(process.env.VERCEL_ENV);
+}
+function isCloudRunRuntime() {
+  return Boolean(process.env.K_SERVICE || process.env.CLOUD_RUN_JOB);
+}
+function parseValidatedHeaderIpList(headerVal) {
+  if (!headerVal) return [];
+  const joined = Array.isArray(headerVal) ? headerVal.join(",") : headerVal;
+  return joined.split(",").map((part) => normalizeIpString(part)).filter((ip) => {
+    if (!ip) return false;
+    const p = parseIpOrCidr(ip);
+    return p.valid && !p.isCidr;
+  });
+}
+function resolveEffectiveTrustedProxyHops(configuredHops) {
+  const envRaw = process.env.TRUSTED_PROXY_HOPS;
+  if (typeof envRaw === "string" && envRaw.trim() !== "") {
+    const envParsed = Number(envRaw.trim());
+    if (Number.isFinite(envParsed)) {
+      return Math.max(0, Math.min(5, Math.floor(envParsed)));
+    }
   }
-  candidate = candidate.replace(/^::ffff:/i, "").replace(/^\[|\]$/g, "");
-  if (/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(candidate)) {
-    candidate = candidate.split(":")[0];
+  if (!Number.isFinite(configuredHops)) return 1;
+  return Math.max(0, Math.min(5, Math.floor(configuredHops)));
+}
+function extractAuthoritativePublicIp(req, trustedProxyHops = 1) {
+  const safeHops = resolveEffectiveTrustedProxyHops(trustedProxyHops);
+  const directRaw = normalizeIpString(req.socket?.remoteAddress || req.ip || "");
+  const directParsed = directRaw ? parseIpOrCidr(directRaw) : { valid: false, isCidr: false };
+  const directValid = Boolean(directRaw && directParsed.valid && !directParsed.isCidr);
+  const directIsPublic = directValid && !isPrivateOrNonPublicIp(directRaw);
+  if (isVerifiedVercelRuntime() && safeHops > 0) {
+    const vercelIps = parseValidatedHeaderIpList(req.headers["x-vercel-forwarded-for"]);
+    if (vercelIps.length > 0) {
+      const ip = vercelIps[vercelIps.length - 1];
+      return { ip, isPublic: !isPrivateOrNonPublicIp(ip), source: "x-vercel-forwarded-for" };
+    }
   }
-  if (!/^[a-fA-F0-9:.]{3,45}$/.test(candidate)) {
+  if (safeHops > 0 && !directIsPublic) {
+    const xffIps = parseValidatedHeaderIpList(req.headers["x-forwarded-for"]);
+    if (xffIps.length > 0) {
+      const idx = Math.max(0, xffIps.length - safeHops);
+      const ip = xffIps[idx];
+      return {
+        ip,
+        isPublic: !isPrivateOrNonPublicIp(ip),
+        source: isCloudRunRuntime() ? "x-forwarded-for:cloud-run-hop" : "x-forwarded-for:trusted-hop"
+      };
+    }
+  }
+  if (directValid) {
+    return {
+      ip: directRaw,
+      isPublic: !isPrivateOrNonPublicIp(directRaw),
+      source: "socket"
+    };
+  }
+  return { ip: "unavailable", isPublic: false, source: "unavailable" };
+}
+function extractTrustedClientIp(req, trustedProxyHops = 1) {
+  const extracted = extractAuthoritativePublicIp(req, trustedProxyHops);
+  if (!extracted.ip || extracted.ip === "unavailable") {
     return "unavailable";
   }
-  return candidate;
+  if (!/^[a-fA-F0-9:.]{3,45}$/.test(extracted.ip)) {
+    return "unavailable";
+  }
+  return extracted.ip;
 }
 function isPrivateOrLocalIp(ip) {
   if (!ip || ip === "unavailable" || ip === "::1" || ip === "127.0.0.1" || ip === "0.0.0.0") {
@@ -875,7 +1252,17 @@ function parseUserAgent(uaRaw) {
   }
   return { browser, os, deviceType, raw: ua.slice(0, 300) };
 }
+var MAX_GEO_CACHE_SIZE = 1e3;
 var geoCache = /* @__PURE__ */ new Map();
+function setBoundedGeoCache(ip, data, ttlMs) {
+  if (geoCache.size >= MAX_GEO_CACHE_SIZE && !geoCache.has(ip)) {
+    const oldestKey = geoCache.keys().next().value;
+    if (oldestKey !== void 0) {
+      geoCache.delete(oldestKey);
+    }
+  }
+  geoCache.set(ip, { data, expiresAt: Date.now() + ttlMs });
+}
 async function resolveIpGeoLocation(ip, enabled = true) {
   if (!enabled || isPrivateOrLocalIp(ip)) {
     return {
@@ -902,7 +1289,7 @@ async function resolveIpGeoLocation(ip, enabled = true) {
           city: String(json.city || "unavailable"),
           status: "resolved"
         };
-        geoCache.set(ip, { data: result, expiresAt: Date.now() + 3600 * 1e3 });
+        setBoundedGeoCache(ip, result, 3600 * 1e3);
         return result;
       }
     }
@@ -914,8 +1301,44 @@ async function resolveIpGeoLocation(ip, enabled = true) {
     city: "unavailable",
     status: "unavailable"
   };
-  geoCache.set(ip, { data: fallback, expiresAt: Date.now() + 5 * 60 * 1e3 });
+  setBoundedGeoCache(ip, fallback, 5 * 60 * 1e3);
   return fallback;
+}
+var RAW_QR_TOKEN_INLINE_PATTERN = /\bQR_[A-Za-z0-9._-]+_[A-Za-z0-9._-]+\b/g;
+function hashQrTokenReference(rawToken) {
+  const clean = typeof rawToken === "string" ? rawToken.trim() : "";
+  if (!clean) return "";
+  if (/^qrref_[0-9a-f]{16}$/i.test(clean)) {
+    return clean.toLowerCase();
+  }
+  const digest = crypto.createHash("sha256").update(clean).digest("hex").slice(0, 16);
+  return `qrref_${digest}`;
+}
+function sanitizeEmployeeForApi(employee) {
+  if (!employee || typeof employee !== "object") {
+    return employee;
+  }
+  const { qrCodeToken, ...safeFields } = employee;
+  const hasQrToken = Boolean(
+    typeof qrCodeToken === "string" && qrCodeToken.trim().length > 0 || safeFields.hasQrToken === true
+  );
+  const qrTokenReference = typeof qrCodeToken === "string" && qrCodeToken.trim().length > 0 ? hashQrTokenReference(qrCodeToken) : typeof safeFields.qrTokenReference === "string" && safeFields.qrTokenReference.trim() ? hashQrTokenReference(safeFields.qrTokenReference) : "";
+  return {
+    ...safeFields,
+    hasQrToken,
+    qrTokenReference
+  };
+}
+function sanitizeAttendanceForApi(record) {
+  if (!record || typeof record !== "object") return record;
+  const copy = { ...record };
+  if ("qrCodeToken" in copy) {
+    delete copy.qrCodeToken;
+  }
+  if (typeof copy.qrTokenReference === "string" && copy.qrTokenReference.trim()) {
+    copy.qrTokenReference = hashQrTokenReference(copy.qrTokenReference);
+  }
+  return copy;
 }
 var SENSITIVE_KEY_PATTERN = /(password|passcode|hash|token|secret|apikey|api_key|credential|private_key|salt|authorization)/i;
 function redactSensitiveData(value, depth = 0) {
@@ -925,7 +1348,12 @@ function redactSensitiveData(value, depth = 0) {
     if (value.startsWith("Bearer ") || /^[0-9a-f]{32}:[0-9a-f]{128}$/i.test(value)) {
       return "[REDACTED]";
     }
-    return value.length > 8e3 ? `${value.slice(0, 7950)}...[truncated]` : value;
+    let cleaned = value.replace(RAW_QR_TOKEN_INLINE_PATTERN, "[REDACTED_QR_TOKEN]");
+    cleaned = cleaned.replace(
+      /("?(?:qrCodeToken|qrToken|token)"?\s*:\s*")([^"]+)(")/gi,
+      "$1[REDACTED]$3"
+    );
+    return cleaned.length > 8e3 ? `${cleaned.slice(0, 7950)}...[truncated]` : cleaned;
   }
   if (typeof value === "number" || typeof value === "boolean") {
     return value;
@@ -4453,6 +4881,63 @@ var SUPER_ADMIN_PROGRESSIVE_LOCK_MINUTES = [10, 20, 30, 60];
 var DEFAULT_SUPER_ADMIN_LOCKOUT_RESET_HOURS = 24;
 var MIN_SUPER_ADMIN_LOCKOUT_RESET_HOURS = 6;
 var MAX_SUPER_ADMIN_LOCKOUT_RESET_HOURS = 720;
+var THROTTLE_SIGNAL_TTL_MS = 2 * 60 * 1e3;
+var THROTTLE_SIGNAL_SECRET = process.env.THROTTLE_SIGNAL_SECRET || crypto3.randomBytes(32).toString("hex");
+var consumedThrottleNonces = /* @__PURE__ */ new Map();
+var MAX_CONSUMED_THROTTLE_NONCES = 5e3;
+function pruneConsumedThrottleNonces(nowMs) {
+  if (consumedThrottleNonces.size === 0) return;
+  for (const [nonce, exp] of consumedThrottleNonces.entries()) {
+    if (exp <= nowMs) {
+      consumedThrottleNonces.delete(nonce);
+    }
+  }
+  while (consumedThrottleNonces.size > MAX_CONSUMED_THROTTLE_NONCES) {
+    const oldest = consumedThrottleNonces.keys().next().value;
+    if (oldest === void 0) break;
+    consumedThrottleNonces.delete(oldest);
+  }
+}
+function issueThrottleSignalToken(loginId, ipAddress, nowMs = Date.now()) {
+  const cleanId = String(loginId || "").trim().toLowerCase().slice(0, 64);
+  const cleanIp = String(ipAddress || "unavailable").trim();
+  const nonce = crypto3.randomBytes(12).toString("hex");
+  const exp = nowMs + THROTTLE_SIGNAL_TTL_MS;
+  const payload = Buffer.from(JSON.stringify({ l: cleanId, i: cleanIp, n: nonce, e: exp })).toString("base64url");
+  const sig = crypto3.createHmac("sha256", THROTTLE_SIGNAL_SECRET).update(payload).digest("base64url");
+  return `${payload}.${sig}`;
+}
+function verifyAndConsumeThrottleSignalToken(rawToken, loginId, ipAddress, nowMs = Date.now()) {
+  if (typeof rawToken !== "string" || !rawToken.includes(".")) return false;
+  const parts = rawToken.split(".");
+  if (parts.length !== 2) return false;
+  const [payloadB64, providedSig] = parts;
+  if (!payloadB64 || !providedSig) return false;
+  const expectedSig = crypto3.createHmac("sha256", THROTTLE_SIGNAL_SECRET).update(payloadB64).digest("base64url");
+  const sigBufA = Buffer.from(providedSig);
+  const sigBufB = Buffer.from(expectedSig);
+  if (sigBufA.length !== sigBufB.length || !crypto3.timingSafeEqual(sigBufA, sigBufB)) {
+    return false;
+  }
+  let decoded;
+  try {
+    decoded = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8"));
+  } catch {
+    return false;
+  }
+  if (typeof decoded.l !== "string" || typeof decoded.i !== "string" || typeof decoded.n !== "string" || typeof decoded.e !== "number") {
+    return false;
+  }
+  if (decoded.e < nowMs) return false;
+  if (decoded.l !== String(loginId || "").trim().toLowerCase().slice(0, 64)) return false;
+  if (decoded.i !== String(ipAddress || "unavailable").trim()) return false;
+  pruneConsumedThrottleNonces(nowMs);
+  if (consumedThrottleNonces.has(decoded.n)) {
+    return false;
+  }
+  consumedThrottleNonces.set(decoded.n, decoded.e);
+  return true;
+}
 function computeSuperAdminLockDurationMinutes(progressiveLockLevel) {
   const safeLevel = Math.max(1, Math.floor(Number(progressiveLockLevel) || 1));
   const idx = Math.min(safeLevel - 1, SUPER_ADMIN_PROGRESSIVE_LOCK_MINUTES.length - 1);
@@ -6219,6 +6704,7 @@ function registerLoginSecurityRoutes(app, deps) {
           correlationId: req.correlationId,
           detail: `Authenticated session ${sessionId}`
         });
+        const throttleSignalToken = issueThrottleSignalToken(cleanId, telemetry.ipAddress, nowMs);
         const { passwordHash: _ph, ...sanitizedProfile } = resolvedUserData;
         return {
           status: 200,
@@ -6239,7 +6725,8 @@ function registerLoginSecurityRoutes(app, deps) {
               consecutiveFailedAttempts: 0
             },
             sessionToken,
-            sessionId
+            sessionId,
+            throttleSignalToken
           }
         };
       });
@@ -6518,9 +7005,17 @@ function registerLoginSecurityRoutes(app, deps) {
   });
   app.post("/api/auth/firebase-throttle-signal", async (req, res) => {
     try {
-      const cleanId = typeof req.body?.loginId === "string" && req.body.loginId.trim() ? req.body.loginId.trim().toLowerCase().slice(0, 64) : "unknown";
+      const cleanId = typeof req.body?.loginId === "string" && req.body.loginId.trim() ? req.body.loginId.trim().toLowerCase().slice(0, 64) : "";
+      const rawToken = req.body?.throttleSignalToken;
+      const authoritativeIp = extractTrustedClientIp(req);
+      if (!cleanId || !verifyAndConsumeThrottleSignalToken(rawToken, cleanId, authoritativeIp, getNowMs())) {
+        return res.status(403).json({
+          success: false,
+          code: "UNAUTHORIZED_THROTTLE_SIGNAL",
+          error: "Invalid or expired authentication telemetry token."
+        });
+      }
       const telemetry = await captureTelemetryContext(db, req);
-      const ipRes = await recordIpFailurePersistent(db, telemetry.ipAddress, "firebase_throttle", cleanId);
       await Promise.all([
         recordLoginAttemptDoc(db, {
           loginId: cleanId,
@@ -6533,15 +7028,15 @@ function registerLoginSecurityRoutes(app, deps) {
         }),
         recordSecurityAuditLogDoc(db, {
           action: "FIREBASE_TOO_MANY_ATTEMPTS",
-          severity: "CRITICAL",
+          severity: "WARNING",
           targetLoginId: cleanId,
           reason: "Firebase native abuse protection TOO_MANY_ATTEMPTS_TRY_LATER encountered",
           details: `Firebase Auth enforced TOO_MANY_ATTEMPTS_TRY_LATER for "${cleanId}" from IP ${telemetry.ipAddress}. Automatic retries prevented.`,
-          metadata: { cooldownSeconds: ipRes.cooldownSeconds },
+          metadata: { ipRateLimitMutated: false },
           telemetry
         })
       ]);
-      return res.json({ success: true, cooldownSeconds: ipRes.cooldownSeconds });
+      return res.json({ success: true, cooldownSeconds: 0 });
     } catch {
       return res.status(200).json({ success: false });
     }
@@ -8568,7 +9063,13 @@ function registerAttendanceRoutes(app, deps) {
   const { db, requireVerifiedCaller } = deps;
   async function writePunchLog(entry) {
     const id = `log_${Date.now()}_${crypto4.randomBytes(3).toString("hex")}`;
-    await db.collection("punch_logs").doc(id).set({ ...entry, id });
+    const safeEntry = {
+      ...entry,
+      rawPayload: typeof entry.rawPayload === "string" ? String(redactSensitiveData(entry.rawPayload) ?? "") : entry.rawPayload,
+      message: typeof entry.message === "string" ? String(redactSensitiveData(entry.message) ?? "") : entry.message,
+      id
+    };
+    await db.collection("punch_logs").doc(id).set(safeEntry);
   }
   app.post("/api/attendance/scan", async (req, res) => {
     const reqStartMs = performance.now();
@@ -8781,7 +9282,7 @@ function registerAttendanceRoutes(app, deps) {
                 success: false,
                 action: "REJECTED",
                 scannerType: scannerType || "IN",
-                employee,
+                employee: sanitizeEmployeeForApi(employee),
                 error: "Employee Is Inactive. Attendance Cannot Be Recorded.",
                 message: "Employee Is Inactive. Attendance Cannot Be Recorded.",
                 time: timeDisplay
@@ -8794,12 +9295,12 @@ function registerAttendanceRoutes(app, deps) {
               employeeName: employee.employeeName,
               timestamp: now.toISOString(),
               action: "REJECTED_TOKEN",
-              rawPayload,
+              rawPayload: "[REDACTED_QR_PAYLOAD]",
               scannerDevice,
               qrVerificationMode: "TOKEN_REJECTED",
               performedByUid: caller.uid,
               performedByLoginId: caller.loginId,
-              message: token ? `Token mismatch: provided ${token}, expected configured qrCodeToken` : "Missing required QR security token for employee with configured qrCodeToken"
+              message: token ? "Token mismatch: provided QR security token did not match employee record." : "Missing required QR security token for employee with configured qrCodeToken."
             });
             return {
               httpStatus: 403,
@@ -8807,7 +9308,7 @@ function registerAttendanceRoutes(app, deps) {
                 success: false,
                 action: "REJECTED",
                 scannerType: scannerType || "IN",
-                employee,
+                employee: sanitizeEmployeeForApi(employee),
                 error: token ? "QR Token Expired or Revoked. Please re-issue QR code." : "Invalid QR Payload: Security token is required for this employee.",
                 message: token ? "QR Token Expired or Revoked. Please re-issue QR code." : "Invalid QR Payload: Security token is required for this employee.",
                 time: timeDisplay
@@ -9146,7 +9647,7 @@ function registerAttendanceRoutes(app, deps) {
                 success: false,
                 action: "REJECTED",
                 scannerType: scannerType || "IN",
-                employee,
+                employee: sanitizeEmployeeForApi(employee),
                 error: "Employee Is Inactive. Attendance Cannot Be Recorded.",
                 message: "Employee Is Inactive. Attendance Cannot Be Recorded.",
                 time: timeDisplay
@@ -9313,6 +9814,8 @@ function registerAttendanceRoutes(app, deps) {
       candidateSnap
     } = params;
     let { scannerType } = params;
+    const safeEmployee = sanitizeEmployeeForApi(employee);
+    const safeRawPayload = String(redactSensitiveData(rawPayload) ?? "");
     const shiftsMap = new Map(shifts.map((s) => [s.id, s]));
     const todayKey = kolkata.dateKey;
     const yesterdayKey = getYesterdayKolkataDateKey(now);
@@ -9458,8 +9961,8 @@ function registerAttendanceRoutes(app, deps) {
               action: "REJECTED_DUPLICATE",
               scannerType: "IN",
               currentState: "INSIDE",
-              employee,
-              attendance: txRes2.record,
+              employee: safeEmployee,
+              attendance: sanitizeAttendanceForApi(txRes2.record),
               message: "Consecutive Punch In rejected. Employee is already Punched In (Status: INSIDE).",
               time: timeDisplay,
               punchCount: txRes2.record.punches?.length || 1
@@ -9474,8 +9977,8 @@ function registerAttendanceRoutes(app, deps) {
               action: "REJECTED_DUPLICATE",
               scannerType: "IN",
               currentState: "OUTSIDE",
-              employee,
-              attendance: txRes2.record,
+              employee: safeEmployee,
+              attendance: sanitizeAttendanceForApi(txRes2.record),
               message: "Duplicate scan prevented. Please wait a few seconds before scanning again.",
               time: timeDisplay
             }
@@ -9502,8 +10005,8 @@ function registerAttendanceRoutes(app, deps) {
             action: "PUNCH_IN",
             scannerType: "IN",
             currentState: "INSIDE",
-            employee,
-            attendance: txRes2.record,
+            employee: safeEmployee,
+            attendance: sanitizeAttendanceForApi(txRes2.record),
             shift: shift3,
             punchOutSchedule: reentrySchedule || void 0,
             message: `Punch In Successfully Recorded (Re-entry #${txRes2.record.punches.length}).`,
@@ -9519,7 +10022,7 @@ function registerAttendanceRoutes(app, deps) {
           employeeName: employee.employeeName,
           timestamp: now.toISOString(),
           action: "REJECTED_SHIFT",
-          rawPayload,
+          rawPayload: safeRawPayload,
           scannerDevice,
           performedByUid: caller.uid,
           performedByLoginId: caller.loginId,
@@ -9531,7 +10034,7 @@ function registerAttendanceRoutes(app, deps) {
             success: false,
             action: "REJECTED",
             scannerType: "IN",
-            employee,
+            employee: safeEmployee,
             message: "No Valid Shift Found For This Punch-In Time.",
             time: timeDisplay
           }
@@ -9607,7 +10110,7 @@ function registerAttendanceRoutes(app, deps) {
         arrivalStatus,
         missedPunchOut: false,
         autoClosed: false,
-        qrTokenReference: employee.qrCodeToken || "",
+        qrTokenReference: hashQrTokenReference(employee.qrCodeToken),
         qrVerificationMode,
         createdByUid: caller.uid,
         createdByLoginId: caller.loginId,
@@ -9631,7 +10134,7 @@ function registerAttendanceRoutes(app, deps) {
           employeeName: employee.employeeName,
           timestamp: now.toISOString(),
           action: "PUNCH_IN",
-          rawPayload,
+          rawPayload: safeRawPayload,
           scannerDevice,
           qrVerificationMode,
           performedByUid: caller.uid,
@@ -9648,8 +10151,8 @@ function registerAttendanceRoutes(app, deps) {
             action: "REJECTED_DUPLICATE",
             scannerType: "IN",
             currentState: "INSIDE",
-            employee,
-            attendance: txRes.record,
+            employee: safeEmployee,
+            attendance: sanitizeAttendanceForApi(txRes.record),
             message: "Consecutive Punch In rejected. Employee is already Punched In (Status: INSIDE).",
             time: timeDisplay
           }
@@ -9668,8 +10171,8 @@ function registerAttendanceRoutes(app, deps) {
           action: "PUNCH_IN",
           scannerType: "IN",
           currentState: "INSIDE",
-          employee,
-          attendance: newAttendanceRecord,
+          employee: safeEmployee,
+          attendance: sanitizeAttendanceForApi(newAttendanceRecord),
           shift: shift2,
           punchOutSchedule: firstInSchedule || void 0,
           message: isLate ? `First Punch In Recorded for ${shift2.name} (Marked LATE).` : earlyEval.provisionalEarlyOtMinutes > 0 ? `First Punch In Recorded for ${shift2.name} (Early ${formatMinutes(earlyEval.earlyArrivalMinutes)} \u2022 Provisional Early OT).` : earlyEval.earlyArrivalMinutes > 0 ? `First Punch In Recorded for ${shift2.name} (Early ${formatMinutes(earlyEval.earlyArrivalMinutes)} \u2022 <60m: 0 Early OT).` : `First Punch In Recorded for ${shift2.name}.`,
@@ -9684,7 +10187,7 @@ function registerAttendanceRoutes(app, deps) {
         employeeName: employee.employeeName,
         timestamp: now.toISOString(),
         action: "REJECTED_TOKEN",
-        rawPayload,
+        rawPayload: safeRawPayload,
         scannerDevice,
         performedByUid: caller.uid,
         performedByLoginId: caller.loginId,
@@ -9696,7 +10199,7 @@ function registerAttendanceRoutes(app, deps) {
           success: false,
           action: "REJECTED",
           scannerType: "OUT",
-          employee,
+          employee: safeEmployee,
           message: "Punch Out rejected: No valid Punch In found for employee. Please Punch In first.",
           time: timeDisplay
         }
@@ -9845,7 +10348,7 @@ function registerAttendanceRoutes(app, deps) {
           success: false,
           action: "REJECTED",
           scannerType: "OUT",
-          employee,
+          employee: safeEmployee,
           message: txOutRes.kind === "EMPLOYEE_MISMATCH" ? "Punch Out rejected: Attendance record does not match scanned employee." : "Punch Out rejected: Punch-Out timestamp cannot be earlier than Punch-In.",
           time: timeDisplay
         }
@@ -9857,7 +10360,7 @@ function registerAttendanceRoutes(app, deps) {
         employeeName: employee.employeeName,
         timestamp: now.toISOString(),
         action: "REJECTED_DUPLICATE",
-        rawPayload,
+        rawPayload: safeRawPayload,
         scannerDevice,
         performedByUid: caller.uid,
         performedByLoginId: caller.loginId,
@@ -9870,8 +10373,8 @@ function registerAttendanceRoutes(app, deps) {
           action: "REJECTED_DUPLICATE",
           scannerType: "OUT",
           currentState: "OUTSIDE",
-          employee,
-          attendance: txOutRes.record,
+          employee: safeEmployee,
+          attendance: sanitizeAttendanceForApi(txOutRes.record),
           message: "Consecutive Punch Out rejected. Employee has already Punched Out (Status: OUTSIDE).",
           time: timeDisplay,
           punchCount: txOutRes.record.punches?.length || 1
@@ -9886,8 +10389,8 @@ function registerAttendanceRoutes(app, deps) {
           action: "REJECTED_DUPLICATE",
           scannerType: "OUT",
           currentState: "INSIDE",
-          employee,
-          attendance: txOutRes.record,
+          employee: safeEmployee,
+          attendance: sanitizeAttendanceForApi(txOutRes.record),
           message: "Duplicate scan prevented. Please wait a few seconds before scanning again.",
           time: timeDisplay
         }
@@ -9926,8 +10429,8 @@ function registerAttendanceRoutes(app, deps) {
         scannerType: "OUT",
         currentState: "OUTSIDE",
         reconciledFromAutoClose: txOutRes.reconciledFromAutoClose,
-        employee,
-        attendance: txOutRes.record,
+        employee: safeEmployee,
+        attendance: sanitizeAttendanceForApi(txOutRes.record),
         shift,
         punchOutSchedule: outSchedule || void 0,
         message: txOutRes.reconciledFromAutoClose ? "Actual Punch Out Recorded (Reconciled from Auto-Close)." : "Punch Out Successfully Recorded.",
@@ -10124,7 +10627,7 @@ function registerAttendanceRoutes(app, deps) {
       return res.json({
         success: true,
         closedCount: closedRecords.length,
-        closedRecords
+        closedRecords: closedRecords.map((rec) => sanitizeAttendanceForApi(rec))
       });
     } catch (err) {
       console.error("[API Auto Close] Error:", err);
@@ -10534,6 +11037,191 @@ function registerAttendanceRoutes(app, deps) {
     } catch (err) {
       console.error("[API Clear Attendance] Error:", err);
       return res.status(500).json({ success: false, error: "Failed to clear attendance records." });
+    }
+  });
+  async function callerCanReadAttendanceData(caller, allowedModules) {
+    if (caller.role === "super_admin") return true;
+    try {
+      const [userPermSnap, rolePermSnap] = await Promise.all([
+        caller.prefetchedUserPermSnap ? Promise.resolve(caller.prefetchedUserPermSnap) : db.collection("user_permissions").doc(caller.profileDocId).get(),
+        getCachedRolePermissionsDoc(db, caller.role)
+      ]);
+      const userPermData = userPermSnap.exists ? userPermSnap.data() : void 0;
+      const rolePermData = rolePermSnap.exists ? rolePermSnap.data : void 0;
+      for (const mod of allowedModules) {
+        if (userPermData && userPermData.isCustomOverride !== false) {
+          const overrideMod = userPermData.permissions?.[mod];
+          if (overrideMod && typeof overrideMod.view === "boolean") {
+            if (overrideMod.view) return true;
+            continue;
+          }
+        }
+        const roleMod = rolePermData?.modulePermissions?.[mod];
+        if (roleMod && typeof roleMod.view === "boolean") {
+          if (roleMod.view) return true;
+          continue;
+        }
+        if (caller.role === "admin") {
+          return true;
+        }
+        if (Array.isArray(caller.modulesAllowed) && caller.modulesAllowed.includes(mod)) {
+          return true;
+        }
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+  const DATE_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
+  app.get("/api/attendance/records", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        "*",
+        "View Attendance Records",
+        { prefetchUserPermission: true }
+      );
+      if (!caller) return;
+      const allowed = await callerCanReadAttendanceData(caller, [
+        "dashboard",
+        "reports",
+        "history",
+        "attendance"
+      ]);
+      if (!allowed) {
+        return res.status(403).json({
+          success: false,
+          error: "Forbidden: Your role does not have permission to view attendance records."
+        });
+      }
+      const shiftDate = typeof req.query.shiftDate === "string" ? req.query.shiftDate.trim() : "";
+      const fromDate = typeof req.query.fromDate === "string" ? req.query.fromDate.trim() : "";
+      const toDate = typeof req.query.toDate === "string" ? req.query.toDate.trim() : "";
+      const shiftId = typeof req.query.shiftId === "string" ? req.query.shiftId.trim() : "";
+      let docs = [];
+      if (shiftDate) {
+        if (!DATE_KEY_RE.test(shiftDate)) {
+          return res.status(400).json({ success: false, error: "Invalid shiftDate format (YYYY-MM-DD)." });
+        }
+        const snap = await db.collection("attendance").where("shiftDate", "==", shiftDate).get();
+        docs = snap.docs.map((d) => ({ id: d.id, ...d.data() || {} }));
+      } else if (fromDate && toDate) {
+        if (!DATE_KEY_RE.test(fromDate) || !DATE_KEY_RE.test(toDate) || fromDate > toDate) {
+          return res.status(400).json({ success: false, error: "Invalid date range." });
+        }
+        const diffDays = Math.ceil(((/* @__PURE__ */ new Date(`${toDate}T00:00:00Z`)).getTime() - (/* @__PURE__ */ new Date(`${fromDate}T00:00:00Z`)).getTime()) / 864e5) + 1;
+        if (diffDays > 93) {
+          return res.status(400).json({ success: false, error: "Date range cannot exceed 93 days." });
+        }
+        const snap = await db.collection("attendance").where("shiftDate", ">=", fromDate).where("shiftDate", "<=", toDate).get();
+        docs = snap.docs.map((d) => ({ id: d.id, ...d.data() || {} }));
+      } else {
+        const todayKey = getKolkataTimeParts(/* @__PURE__ */ new Date()).dateKey;
+        const snap = await db.collection("attendance").where("shiftDate", "==", todayKey).get();
+        docs = snap.docs.map((d) => ({ id: d.id, ...d.data() || {} }));
+      }
+      if (shiftId && shiftId !== "ALL") {
+        docs = docs.filter((r) => String(r.shiftId || "") === shiftId);
+      }
+      return res.json({
+        success: true,
+        records: docs.map((r) => sanitizeAttendanceForApi(r))
+      });
+    } catch (err) {
+      console.error("[API Attendance Records] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to load attendance records." });
+    }
+  });
+  app.get("/api/attendance/punch-events", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        "*",
+        "View Punch Events",
+        { prefetchUserPermission: true }
+      );
+      if (!caller) return;
+      const allowed = await callerCanReadAttendanceData(caller, [
+        "dashboard",
+        "history",
+        "attendance",
+        "reports"
+      ]);
+      if (!allowed) {
+        return res.status(403).json({
+          success: false,
+          error: "Forbidden: Your role does not have permission to view punch events."
+        });
+      }
+      const shiftDate = typeof req.query.shiftDate === "string" ? req.query.shiftDate.trim() : "";
+      const employeeId = typeof req.query.employeeId === "string" ? req.query.employeeId.trim().toUpperCase() : "";
+      const rawLimit = Number(req.query.limit || 200);
+      const maxLimit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(500, Math.floor(rawLimit))) : 200;
+      let snap;
+      if (shiftDate) {
+        if (!DATE_KEY_RE.test(shiftDate)) {
+          return res.status(400).json({ success: false, error: "Invalid shiftDate format." });
+        }
+        snap = await db.collection("punch_events").where("shiftDate", "==", shiftDate).get();
+      } else {
+        snap = await db.collection("punch_events").get();
+      }
+      let events = snap.docs.map((d) => ({ id: d.id, ...d.data() || {} })).sort((a, b) => String(b.timestamp || "").localeCompare(String(a.timestamp || "")));
+      if (employeeId) {
+        events = events.filter((e) => String(e.employeeId || "").toUpperCase() === employeeId);
+      }
+      return res.json({
+        success: true,
+        events: events.slice(0, maxLimit)
+      });
+    } catch (err) {
+      console.error("[API Punch Events] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to load punch events." });
+    }
+  });
+  app.get("/api/attendance/rosters", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(
+        req,
+        res,
+        "*",
+        "View Shift Rosters",
+        { prefetchUserPermission: true }
+      );
+      if (!caller) return;
+      const allowed = await callerCanReadAttendanceData(caller, [
+        "dashboard",
+        "shifts",
+        "attendance",
+        "reports"
+      ]);
+      if (!allowed) {
+        return res.status(403).json({
+          success: false,
+          error: "Forbidden: Your role does not have permission to view shift rosters."
+        });
+      }
+      const shiftDate = typeof req.query.shiftDate === "string" ? req.query.shiftDate.trim() : "";
+      const shiftId = typeof req.query.shiftId === "string" ? req.query.shiftId.trim() : "";
+      if (shiftDate && !DATE_KEY_RE.test(shiftDate)) {
+        return res.status(400).json({ success: false, error: "Invalid shiftDate format." });
+      }
+      const targetDate = shiftDate || getKolkataTimeParts(/* @__PURE__ */ new Date()).dateKey;
+      const snap = await db.collection("shift_rosters").where("shiftDate", "==", targetDate).get();
+      let rosters = snap.docs.map((d) => ({ id: d.id, ...d.data() || {} }));
+      if (shiftId && shiftId !== "ALL") {
+        rosters = rosters.filter((r) => String(r.shiftId || "") === shiftId);
+      }
+      return res.json({
+        success: true,
+        rosters
+      });
+    } catch (err) {
+      console.error("[API Shift Rosters] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to load shift rosters." });
     }
   });
 }
@@ -12328,6 +13016,7 @@ function registerAttendanceHistoryRoutes(app, deps) {
 
 // serverEmployees.ts
 import crypto5 from "crypto";
+import QRCode from "qrcode";
 import { z as z5 } from "zod";
 
 // src/utils/excelMasterNormalizer.ts
@@ -12537,6 +13226,17 @@ function matchCanonicalMasterValue(rawInput, indexOrRecords) {
     ambiguousCandidates: []
   };
 }
+function findCaseInsensitiveMasterDuplicate(candidateName, candidateId, existingRecords) {
+  const targetKey = normalizeMasterLookupKey(candidateName);
+  if (!targetKey) return null;
+  for (const rec of existingRecords) {
+    if (candidateId && String(rec.id) === String(candidateId)) continue;
+    if (normalizeMasterLookupKey(rec.name) === targetKey) {
+      return rec;
+    }
+  }
+  return null;
+}
 function buildUnambiguousDesignationMapFromEmployees(employees) {
   const variantsByKey = /* @__PURE__ */ new Map();
   for (const emp of employees) {
@@ -12587,7 +13287,7 @@ var BulkImportRequestSchema = z5.object({
   rows: z5.array(BulkImportRowSchema).min(1, "At least one employee row is required for import.").max(2e3, "A single import request supports up to 2,000 employee rows.")
 });
 function generateServerQrToken(employeeId) {
-  const rand = crypto5.randomBytes(4).toString("hex").toUpperCase();
+  const rand = crypto5.randomBytes(12).toString("hex").toUpperCase();
   const ts = Date.now().toString(36).toUpperCase();
   return `QR_${employeeId}_${ts}_${rand}`;
 }
@@ -13491,6 +14191,530 @@ function registerEmployeeRoutes(app, deps) {
       });
     }
   });
+  const SingleEmployeeUpsertSchema = z5.object({
+    employeeId: z5.string().trim().min(1, "Employee ID is required.").max(128, "Employee ID must be 128 characters or fewer.").regex(EMPLOYEE_ID_PATTERN2, "Invalid Employee ID characters."),
+    employeeName: z5.string().trim().min(1, "Employee Name is required.").max(200),
+    employeeType: z5.enum(["Permanent", "Offroll", "Staff"]).default("Permanent"),
+    section: z5.string().trim().min(1).max(100).default("MI"),
+    department: z5.string().trim().min(1).max(100).default("Production"),
+    floor: z5.string().trim().min(1).max(100).default("MI-01"),
+    designation: z5.string().trim().min(1).max(120).default("Operator"),
+    employeeStatus: z5.enum(["Active", "Inactive"]).default("Active")
+  });
+  const SingleEmployeeStatusSchema = z5.object({
+    employeeStatus: z5.enum(["Active", "Inactive"])
+  });
+  const RenderQrCardsSchema = z5.object({
+    employeeIds: z5.array(z5.string().trim().min(1).max(128)).min(1).max(200),
+    size: z5.number().int().min(120).max(600).optional()
+  });
+  async function callerHasAnyModuleAction(caller, checks) {
+    if (caller.role === "super_admin") return true;
+    try {
+      const [userPermSnap, rolePermSnap] = await Promise.all([
+        caller.prefetchedUserPermSnap ? Promise.resolve(caller.prefetchedUserPermSnap) : db.collection("user_permissions").doc(caller.profileDocId).get(),
+        getCachedRolePermissionsDoc(db, caller.role)
+      ]);
+      const userPermData = userPermSnap.exists ? userPermSnap.data() : void 0;
+      const rolePermData = rolePermSnap.exists ? rolePermSnap.data : void 0;
+      for (const { module: mod, action } of checks) {
+        if (userPermData && userPermData.isCustomOverride !== false) {
+          const m = userPermData.permissions?.[mod];
+          if (m && typeof m[action] === "boolean") {
+            if (m[action] === true && (action === "view" || m.view !== false)) return true;
+            continue;
+          }
+        }
+        const rm = rolePermData?.modulePermissions?.[mod];
+        if (rm && typeof rm[action] === "boolean") {
+          if (rm[action] === true && (action === "view" || rm.view !== false)) return true;
+          continue;
+        }
+        if (caller.role === "admin" && action !== "delete") {
+          return true;
+        }
+        if (action === "view" && Array.isArray(caller.modulesAllowed) && caller.modulesAllowed.includes(mod)) {
+          return true;
+        }
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+  async function callerCanAccessQrSecrets(caller, action) {
+    if (caller.role === "super_admin") return true;
+    try {
+      const [userPermSnap, rolePermSnap] = await Promise.all([
+        caller.prefetchedUserPermSnap ? Promise.resolve(caller.prefetchedUserPermSnap) : db.collection("user_permissions").doc(caller.profileDocId).get(),
+        getCachedRolePermissionsDoc(db, caller.role)
+      ]);
+      const userPermData = userPermSnap.exists ? userPermSnap.data() : void 0;
+      const rolePermData = rolePermSnap.exists ? rolePermSnap.data : void 0;
+      if (userPermData && userPermData.isCustomOverride !== false) {
+        const m = userPermData.permissions?.qr_codes;
+        if (m && typeof m[action] === "boolean") {
+          return m[action] === true && (action === "view" || m.view !== false);
+        }
+      }
+      const rm = rolePermData?.modulePermissions?.qr_codes;
+      if (rm && typeof rm[action] === "boolean") {
+        return rm[action] === true && (action === "view" || rm.view !== false);
+      }
+      if (caller.role === "admin") {
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+  async function renderQrPngDataUrlServer(employeeId, qrCodeToken, width = 240) {
+    const payload = JSON.stringify({
+      employeeId: employeeId.trim().toUpperCase(),
+      token: qrCodeToken.trim()
+    });
+    return QRCode.toDataURL(payload, {
+      width,
+      margin: 1,
+      errorCorrectionLevel: "M",
+      color: { dark: "#0f172a", light: "#ffffff" }
+    });
+  }
+  app.get("/api/employees", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "List Employees", {
+        prefetchUserPermission: true
+      });
+      if (!caller) return;
+      const allowed = await callerHasAnyModuleAction(caller, [
+        { module: "employees", action: "view" },
+        { module: "qr_codes", action: "view" },
+        { module: "dashboard", action: "view" },
+        { module: "history", action: "view" },
+        { module: "reports", action: "view" },
+        { module: "excel_import", action: "view" },
+        { module: "shifts", action: "view" },
+        { module: "attendance", action: "view" }
+      ]);
+      if (!allowed) {
+        return res.status(403).json({
+          success: false,
+          error: "Forbidden: You do not have permission to view employee records."
+        });
+      }
+      const snap = await db.collection("employees").get();
+      let list = snap.docs.map((d) => sanitizeEmployeeForApi({ id: d.id, ...d.data() || {} }));
+      const search = typeof req.query.search === "string" ? req.query.search.trim().toLowerCase() : "";
+      const floor = typeof req.query.floor === "string" ? req.query.floor.trim() : "";
+      const section = typeof req.query.section === "string" ? req.query.section.trim() : "";
+      const department = typeof req.query.department === "string" ? req.query.department.trim() : "";
+      const employeeType = typeof req.query.employeeType === "string" ? req.query.employeeType.trim() : "";
+      const employeeStatus = typeof req.query.employeeStatus === "string" ? req.query.employeeStatus.trim() : "";
+      if (search) {
+        list = list.filter(
+          (e) => String(e.employeeId || "").toLowerCase().includes(search) || String(e.employeeName || "").toLowerCase().includes(search) || String(e.designation || "").toLowerCase().includes(search)
+        );
+      }
+      if (floor && floor !== "All") list = list.filter((e) => e.floor === floor);
+      if (section && section !== "All") list = list.filter((e) => e.section === section);
+      if (department && department !== "All") list = list.filter((e) => e.department === department);
+      if (employeeType && employeeType !== "All") list = list.filter((e) => e.employeeType === employeeType);
+      if (employeeStatus && employeeStatus !== "All") list = list.filter((e) => e.employeeStatus === employeeStatus);
+      list.sort((a, b) => String(a.employeeId || "").localeCompare(String(b.employeeId || "")));
+      return res.json({ success: true, employees: list });
+    } catch (err) {
+      console.error("[API List Employees] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to load employees." });
+    }
+  });
+  app.post("/api/employees/qr-cards/render", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "Render Employee QR Cards", {
+        prefetchUserPermission: true
+      });
+      if (!caller) return;
+      const canViewQr = await callerCanAccessQrSecrets(caller, "view");
+      if (!canViewQr) {
+        return res.status(403).json({
+          success: false,
+          code: "QR_ACCESS_DENIED",
+          error: "Forbidden: QR Code Management view permission is required."
+        });
+      }
+      const parsed = RenderQrCardsSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || "Invalid QR card render request."
+        });
+      }
+      const uniqueIds = Array.from(
+        new Set(parsed.data.employeeIds.map((id) => id.trim().toUpperCase()).filter(Boolean))
+      );
+      const size = parsed.data.size || 240;
+      const items = {};
+      const missingIds = [];
+      const snaps = await Promise.all(uniqueIds.map((id) => db.collection("employees").doc(id).get()));
+      await Promise.all(
+        snaps.map(async (snap, idx) => {
+          const empId = uniqueIds[idx];
+          if (!snap.exists) {
+            missingIds.push(empId);
+            return;
+          }
+          const data = snap.data() || {};
+          const rawToken = typeof data.qrCodeToken === "string" ? data.qrCodeToken.trim() : "";
+          if (!rawToken) {
+            missingIds.push(empId);
+            return;
+          }
+          const qrDataUrl = await renderQrPngDataUrlServer(empId, rawToken, size);
+          items[empId] = {
+            qrDataUrl,
+            qrTokenReference: hashQrTokenReference(rawToken),
+            hasQrToken: true
+          };
+        })
+      );
+      return res.json({ success: true, items, missingIds });
+    } catch (err) {
+      console.error("[API Render QR Cards] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to render QR codes." });
+    }
+  });
+  app.get("/api/employees/:employeeId", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "Get Employee", {
+        prefetchUserPermission: true
+      });
+      if (!caller) return;
+      const allowed = await callerHasAnyModuleAction(caller, [
+        { module: "employees", action: "view" },
+        { module: "qr_codes", action: "view" },
+        { module: "dashboard", action: "view" },
+        { module: "history", action: "view" },
+        { module: "reports", action: "view" }
+      ]);
+      if (!allowed) {
+        return res.status(403).json({ success: false, error: "Forbidden: Insufficient permissions." });
+      }
+      const cleanId = String(req.params.employeeId || "").trim().toUpperCase();
+      if (!cleanId || !EMPLOYEE_ID_PATTERN2.test(cleanId)) {
+        return res.status(400).json({ success: false, error: "Invalid Employee ID." });
+      }
+      const snap = await db.collection("employees").doc(cleanId).get();
+      if (!snap.exists) {
+        return res.status(404).json({ success: false, error: `Employee ${cleanId} not found.` });
+      }
+      return res.json({ success: true, employee: sanitizeEmployeeForApi(snap.data()) });
+    } catch (err) {
+      console.error("[API Get Employee] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to load employee." });
+    }
+  });
+  app.post("/api/employees", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "Create Employee", {
+        prefetchUserPermission: true
+      });
+      if (!caller) return;
+      const canAdd = await callerHasAnyModuleAction(caller, [{ module: "employees", action: "add" }]);
+      if (!canAdd) {
+        return res.status(403).json({
+          success: false,
+          error: "Forbidden: Employee creation permission is required."
+        });
+      }
+      const parsed = SingleEmployeeUpsertSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || "Invalid employee data."
+        });
+      }
+      const cleanId = parsed.data.employeeId.trim().toUpperCase();
+      const empRef = db.collection("employees").doc(cleanId);
+      const existing = await empRef.get();
+      if (existing.exists) {
+        return res.status(409).json({
+          success: false,
+          error: `Employee ID "${cleanId}" already exists. ID must be unique.`
+        });
+      }
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      const newToken = generateServerQrToken(cleanId);
+      const fullEmployee = {
+        employeeId: cleanId,
+        employeeName: parsed.data.employeeName.trim().toUpperCase(),
+        employeeType: parsed.data.employeeType,
+        section: parsed.data.section,
+        department: parsed.data.department,
+        floor: parsed.data.floor,
+        designation: parsed.data.designation,
+        qrCodeToken: newToken,
+        employeeStatus: parsed.data.employeeStatus,
+        createdAt: now,
+        updatedAt: now
+      };
+      await empRef.set(fullEmployee);
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: "CREATE_EMPLOYEE",
+        category: "EMPLOYEE",
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        employeeId: cleanId,
+        targetType: "EMPLOYEE",
+        targetId: cleanId,
+        newValue: `${fullEmployee.employeeName} (${fullEmployee.department} - ${fullEmployee.floor})`,
+        actionSource: "EMPLOYEE_MASTER",
+        captureGeo: false
+      });
+      return res.status(201).json({ success: true, employee: sanitizeEmployeeForApi(fullEmployee) });
+    } catch (err) {
+      console.error("[API Create Employee] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to create employee." });
+    }
+  });
+  app.put("/api/employees/:employeeId", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "Update Employee", {
+        prefetchUserPermission: true
+      });
+      if (!caller) return;
+      const canEdit = await callerHasAnyModuleAction(caller, [{ module: "employees", action: "edit" }]);
+      if (!canEdit) {
+        return res.status(403).json({
+          success: false,
+          error: "Forbidden: Employee edit permission is required."
+        });
+      }
+      const cleanId = String(req.params.employeeId || "").trim().toUpperCase();
+      if (!cleanId || !EMPLOYEE_ID_PATTERN2.test(cleanId)) {
+        return res.status(400).json({ success: false, error: "Invalid Employee ID." });
+      }
+      const parsed = SingleEmployeeUpsertSchema.safeParse({ ...req.body, employeeId: cleanId });
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || "Invalid employee data."
+        });
+      }
+      const empRef = db.collection("employees").doc(cleanId);
+      const existingSnap = await empRef.get();
+      if (!existingSnap.exists) {
+        return res.status(404).json({ success: false, error: `Employee ${cleanId} not found.` });
+      }
+      const prev = existingSnap.data() || {};
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      const updatedEmployee = {
+        ...prev,
+        employeeId: cleanId,
+        employeeName: parsed.data.employeeName.trim().toUpperCase(),
+        employeeType: parsed.data.employeeType,
+        section: parsed.data.section,
+        department: parsed.data.department,
+        floor: parsed.data.floor,
+        designation: parsed.data.designation,
+        employeeStatus: parsed.data.employeeStatus,
+        // Strictly preserve existing qrCodeToken — never rotate during profile edits
+        qrCodeToken: prev.qrCodeToken || generateServerQrToken(cleanId),
+        createdAt: prev.createdAt || now,
+        updatedAt: now
+      };
+      await empRef.set(updatedEmployee);
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: "UPDATE_EMPLOYEE",
+        category: "EMPLOYEE",
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        employeeId: cleanId,
+        targetType: "EMPLOYEE",
+        targetId: cleanId,
+        oldValue: `${prev.employeeName || cleanId} (${prev.department || ""} - ${prev.floor || ""})`,
+        newValue: `${updatedEmployee.employeeName} (${updatedEmployee.department} - ${updatedEmployee.floor})`,
+        actionSource: "EMPLOYEE_MASTER",
+        captureGeo: false
+      });
+      return res.json({ success: true, employee: sanitizeEmployeeForApi(updatedEmployee) });
+    } catch (err) {
+      console.error("[API Update Employee] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to update employee." });
+    }
+  });
+  app.patch("/api/employees/:employeeId/status", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "Toggle Employee Status", {
+        prefetchUserPermission: true
+      });
+      if (!caller) return;
+      const canEdit = await callerHasAnyModuleAction(caller, [{ module: "employees", action: "edit" }]);
+      if (!canEdit) {
+        return res.status(403).json({
+          success: false,
+          error: "Forbidden: Employee edit permission is required."
+        });
+      }
+      const cleanId = String(req.params.employeeId || "").trim().toUpperCase();
+      if (!cleanId || !EMPLOYEE_ID_PATTERN2.test(cleanId)) {
+        return res.status(400).json({ success: false, error: "Invalid Employee ID." });
+      }
+      const parsed = SingleEmployeeStatusSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ success: false, error: "Invalid status value." });
+      }
+      const empRef = db.collection("employees").doc(cleanId);
+      const existing = await empRef.get();
+      if (!existing.exists) {
+        return res.status(404).json({ success: false, error: `Employee ${cleanId} not found.` });
+      }
+      const prev = existing.data() || {};
+      const oldStatus = prev.employeeStatus || "Active";
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      await empRef.update({
+        employeeStatus: parsed.data.employeeStatus,
+        updatedAt: now
+      });
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: "TOGGLE_EMPLOYEE_STATUS",
+        category: "EMPLOYEE",
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        employeeId: cleanId,
+        targetType: "EMPLOYEE",
+        targetId: cleanId,
+        oldValue: oldStatus,
+        newValue: parsed.data.employeeStatus,
+        actionSource: "EMPLOYEE_MASTER",
+        reason: `Status toggled to ${parsed.data.employeeStatus}`,
+        captureGeo: false
+      });
+      return res.json({
+        success: true,
+        employee: sanitizeEmployeeForApi({
+          ...prev,
+          employeeStatus: parsed.data.employeeStatus,
+          updatedAt: now
+        })
+      });
+    } catch (err) {
+      console.error("[API Toggle Employee Status] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to update employee status." });
+    }
+  });
+  app.delete("/api/employees/:employeeId", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "Delete Employee", {
+        prefetchUserPermission: true
+      });
+      if (!caller) return;
+      const canDelete = await callerHasAnyModuleAction(caller, [{ module: "employees", action: "delete" }]);
+      if (!canDelete) {
+        return res.status(403).json({
+          success: false,
+          error: "Forbidden: Employee delete permission is required."
+        });
+      }
+      const cleanId = String(req.params.employeeId || "").trim().toUpperCase();
+      if (!cleanId || !EMPLOYEE_ID_PATTERN2.test(cleanId)) {
+        return res.status(400).json({ success: false, error: "Invalid Employee ID." });
+      }
+      const empRef = db.collection("employees").doc(cleanId);
+      const existing = await empRef.get();
+      if (!existing.exists) {
+        return res.status(404).json({ success: false, error: `Employee ${cleanId} not found.` });
+      }
+      const empData = existing.data() || {};
+      await empRef.delete();
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: "DELETE_EMPLOYEE",
+        category: "EMPLOYEE",
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        employeeId: cleanId,
+        targetType: "EMPLOYEE",
+        targetId: cleanId,
+        oldValue: `${empData.employeeName || cleanId} (${empData.department || ""} - ${empData.floor || ""})`,
+        newValue: "DELETED",
+        actionSource: "EMPLOYEE_MASTER",
+        reason: "Administrator permanently deleted employee record",
+        captureGeo: false
+      });
+      return res.json({ success: true, employeeId: cleanId });
+    } catch (err) {
+      console.error("[API Delete Employee] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to delete employee." });
+    }
+  });
+  app.post("/api/employees/:employeeId/regenerate-qr", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "Regenerate Employee QR Token", {
+        prefetchUserPermission: true
+      });
+      if (!caller) return;
+      const canReissue = await callerCanAccessQrSecrets(caller, "edit");
+      if (!canReissue) {
+        return res.status(403).json({
+          success: false,
+          code: "QR_ACCESS_DENIED",
+          error: "Forbidden: QR Code Management edit permission is required to regenerate QR tokens."
+        });
+      }
+      const cleanId = String(req.params.employeeId || "").trim().toUpperCase();
+      if (!cleanId || !EMPLOYEE_ID_PATTERN2.test(cleanId)) {
+        return res.status(400).json({ success: false, error: "Invalid Employee ID." });
+      }
+      const empRef = db.collection("employees").doc(cleanId);
+      const existing = await empRef.get();
+      if (!existing.exists) {
+        return res.status(404).json({ success: false, error: `Employee ${cleanId} not found.` });
+      }
+      const prev = existing.data() || {};
+      const oldRef = hashQrTokenReference(prev.qrCodeToken);
+      const newToken = generateServerQrToken(cleanId);
+      const newRef = hashQrTokenReference(newToken);
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      await empRef.update({
+        qrCodeToken: newToken,
+        updatedAt: now
+      });
+      const qrDataUrl = await renderQrPngDataUrlServer(cleanId, newToken, 240);
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: "REGENERATE_QR_TOKEN",
+        category: "EMPLOYEE",
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        employeeId: cleanId,
+        targetType: "EMPLOYEE",
+        targetId: cleanId,
+        oldValue: oldRef || "NONE",
+        newValue: newRef,
+        actionSource: "QR_MANAGEMENT",
+        reason: "Administrator manually regenerated QR security token",
+        captureGeo: false
+      });
+      return res.json({
+        success: true,
+        employeeId: cleanId,
+        hasQrToken: true,
+        qrTokenReference: newRef,
+        qrDataUrl
+      });
+    } catch (err) {
+      console.error("[API Regenerate QR] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to regenerate QR token." });
+    }
+  });
 }
 
 // serverMasters.ts
@@ -13744,8 +14968,366 @@ function registerMasterRoutes(app, deps) {
       });
       return res.status(500).json({
         success: false,
-        error: err?.message || "Master bulk status update failed."
+        error: "Master bulk status update failed."
       });
+    }
+  });
+  const MASTER_ID_RE = /^[A-Za-z0-9_.\-]{1,128}$/;
+  const FloorUpsertSchema = z6.object({
+    id: z6.string().trim().min(1).max(128).regex(MASTER_ID_RE, "Invalid Production Line ID."),
+    name: z6.string().trim().min(1, "Production Line name is required.").max(120),
+    code: z6.string().trim().max(60).optional(),
+    order: z6.number().int().min(0).max(1e4).optional(),
+    status: z6.enum(["Active", "Inactive"]).default("Active")
+  });
+  const SectionUpsertSchema = z6.object({
+    id: z6.string().trim().min(1).max(128).regex(MASTER_ID_RE, "Invalid Section ID."),
+    name: z6.string().trim().min(1, "Section name is required.").max(120),
+    code: z6.string().trim().max(60).optional(),
+    floorId: z6.string().trim().max(128).optional(),
+    status: z6.enum(["Active", "Inactive"]).default("Active")
+  });
+  const DepartmentUpsertSchema = z6.object({
+    id: z6.string().trim().min(1).max(128).regex(MASTER_ID_RE, "Invalid Department ID."),
+    name: z6.string().trim().min(1, "Department name is required.").max(120),
+    code: z6.string().trim().max(60).optional(),
+    status: z6.enum(["Active", "Inactive"]).default("Active")
+  });
+  const ShiftUpsertSchema = z6.object({
+    id: z6.string().trim().min(1).max(128).regex(MASTER_ID_RE, "Invalid Shift ID."),
+    name: z6.string().trim().min(1, "Shift name is required.").max(120),
+    startTime: z6.string().trim().regex(/^\d{2}:\d{2}$/, "Invalid startTime (HH:mm)."),
+    endTime: z6.string().trim().regex(/^\d{2}:\d{2}$/, "Invalid endTime (HH:mm)."),
+    scheduledDurationMinutes: z6.number().int().min(60).max(1440),
+    punchInWindowStart: z6.string().trim().regex(/^\d{2}:\d{2}$/, "Invalid punchInWindowStart."),
+    punchInWindowEnd: z6.string().trim().regex(/^\d{2}:\d{2}$/, "Invalid punchInWindowEnd."),
+    isOvernight: z6.boolean(),
+    gracePeriodMinutes: z6.number().int().min(0).max(180).optional(),
+    status: z6.enum(["Active", "Inactive"]).default("Active")
+  });
+  const SystemSettingsUpdateSchema = z6.object({
+    companyName: z6.string().trim().min(1).max(160).optional(),
+    websiteName: z6.string().trim().min(1).max(160).optional(),
+    timezone: z6.string().trim().min(1).max(64).optional(),
+    dateFormat: z6.string().trim().min(1).max(32).optional(),
+    timeFormat: z6.string().trim().min(1).max(32).optional(),
+    autoPunchOutEnabled: z6.boolean().optional(),
+    lateGraceMinutes: z6.number().int().min(0).max(180).optional(),
+    scheduledDurationMinutes: z6.number().int().min(60).max(1440).optional(),
+    overtimeThresholdMinutes: z6.number().int().min(60).max(1440).optional(),
+    scannerMode: z6.enum(["USB_PRIMARY", "WEBCAM", "HYBRID"]).optional(),
+    auditRetentionDays: z6.number().int().min(7).max(3650).optional(),
+    protectCriticalLogs: z6.boolean().optional(),
+    captureGeoLocation: z6.boolean().optional(),
+    failedLoginAlertThreshold: z6.number().int().min(1).max(100).optional(),
+    superAdminLockoutResetHours: z6.number().int().min(6).max(720).optional()
+  });
+  async function requireMasterEditCaller(req, res, resource, actionLabel) {
+    const caller = await requireVerifiedCaller(req, res, "*", actionLabel, {
+      prefetchUserPermission: true
+    });
+    if (!caller) return null;
+    const allowed = await canCallerEditMasterResource(db, caller, resource);
+    if (!allowed) {
+      res.status(403).json({
+        success: false,
+        error: `Forbidden: You do not have permission to modify ${resource}.`
+      });
+      return null;
+    }
+    return caller;
+  }
+  app.get("/api/masters/all", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "Load Master Data");
+      if (!caller) return;
+      const [floorsSnap, sectionsSnap, deptsSnap, shiftsSnap, settingsSnap] = await Promise.all([
+        db.collection("floors").get(),
+        db.collection("sections").get(),
+        db.collection("departments").get(),
+        db.collection("shifts").get(),
+        db.collection("system_settings").doc("global").get()
+      ]);
+      const floors = floorsSnap.docs.map((d) => ({ id: d.id, ...d.data() || {} })).sort((a, b) => (Number(a.order) || 0) - (Number(b.order) || 0));
+      const sections = sectionsSnap.docs.map((d) => ({ id: d.id, ...d.data() || {} }));
+      const departments = deptsSnap.docs.map((d) => ({ id: d.id, ...d.data() || {} }));
+      const shifts = shiftsSnap.docs.map((d) => ({ id: d.id, ...d.data() || {} }));
+      const settings = settingsSnap.exists ? settingsSnap.data() : null;
+      return res.json({ success: true, floors, sections, departments, shifts, settings });
+    } catch (err) {
+      console.error("[API Masters All] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to load master data." });
+    }
+  });
+  app.get("/api/masters/floors", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "List Production Lines");
+      if (!caller) return;
+      const snap = await db.collection("floors").get();
+      const floors = snap.docs.map((d) => ({ id: d.id, ...d.data() || {} })).sort((a, b) => (Number(a.order) || 0) - (Number(b.order) || 0));
+      return res.json({ success: true, floors });
+    } catch (err) {
+      console.error("[API List Floors] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to load production lines." });
+    }
+  });
+  app.post("/api/masters/floors", async (req, res) => {
+    try {
+      const caller = await requireMasterEditCaller(req, res, "floors", "Save Production Line");
+      if (!caller) return;
+      const parsed = FloorUpsertSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || "Invalid production line data."
+        });
+      }
+      const cleanName = normalizeWhitespaceAndUnicode(parsed.data.name);
+      const snap = await db.collection("floors").get();
+      const existing = snap.docs.map((d) => ({ id: d.id, ...d.data() || {} }));
+      const dup = findCaseInsensitiveMasterDuplicate(cleanName, parsed.data.id, existing);
+      if (dup) {
+        return res.status(409).json({
+          success: false,
+          error: `A Production Line named "${dup.name}" already exists. Case-variant duplicates are not allowed.`
+        });
+      }
+      const payload = {
+        ...parsed.data,
+        name: cleanName,
+        code: parsed.data.code || cleanName,
+        order: parsed.data.order ?? existing.length + 1,
+        updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+      };
+      await db.collection("floors").doc(payload.id).set(payload);
+      invalidateConfigCaches(db);
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: "SAVE_FLOOR",
+        category: "ORGANIZATION",
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        targetType: "FLOOR",
+        targetId: payload.id,
+        newValue: payload.name,
+        actionSource: "FLOOR_MANAGEMENT",
+        captureGeo: false
+      });
+      return res.json({ success: true, floor: payload });
+    } catch (err) {
+      console.error("[API Save Floor] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to save production line." });
+    }
+  });
+  app.get("/api/masters/sections", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "List Sections");
+      if (!caller) return;
+      const snap = await db.collection("sections").get();
+      const sections = snap.docs.map((d) => ({ id: d.id, ...d.data() || {} }));
+      return res.json({ success: true, sections });
+    } catch (err) {
+      console.error("[API List Sections] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to load sections." });
+    }
+  });
+  app.post("/api/masters/sections", async (req, res) => {
+    try {
+      const caller = await requireMasterEditCaller(req, res, "sections", "Save Section");
+      if (!caller) return;
+      const parsed = SectionUpsertSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || "Invalid section data."
+        });
+      }
+      const cleanName = normalizeWhitespaceAndUnicode(parsed.data.name);
+      const snap = await db.collection("sections").get();
+      const existing = snap.docs.map((d) => ({ id: d.id, ...d.data() || {} }));
+      const dup = findCaseInsensitiveMasterDuplicate(cleanName, parsed.data.id, existing);
+      if (dup) {
+        return res.status(409).json({
+          success: false,
+          error: `A Section named "${dup.name}" already exists. Case-variant duplicates are not allowed.`
+        });
+      }
+      const payload = {
+        ...parsed.data,
+        name: cleanName,
+        code: parsed.data.code || cleanName,
+        updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+      };
+      await db.collection("sections").doc(payload.id).set(payload);
+      invalidateConfigCaches(db);
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: "SAVE_SECTION",
+        category: "ORGANIZATION",
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        targetType: "SECTION",
+        targetId: payload.id,
+        newValue: payload.name,
+        actionSource: "SECTION_MANAGEMENT",
+        captureGeo: false
+      });
+      return res.json({ success: true, section: payload });
+    } catch (err) {
+      console.error("[API Save Section] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to save section." });
+    }
+  });
+  app.get("/api/masters/departments", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "List Departments");
+      if (!caller) return;
+      const snap = await db.collection("departments").get();
+      const departments = snap.docs.map((d) => ({ id: d.id, ...d.data() || {} }));
+      return res.json({ success: true, departments });
+    } catch (err) {
+      console.error("[API List Departments] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to load departments." });
+    }
+  });
+  app.post("/api/masters/departments", async (req, res) => {
+    try {
+      const caller = await requireMasterEditCaller(req, res, "departments", "Save Department");
+      if (!caller) return;
+      const parsed = DepartmentUpsertSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || "Invalid department data."
+        });
+      }
+      const cleanName = normalizeWhitespaceAndUnicode(parsed.data.name);
+      const snap = await db.collection("departments").get();
+      const existing = snap.docs.map((d) => ({ id: d.id, ...d.data() || {} }));
+      const dup = findCaseInsensitiveMasterDuplicate(cleanName, parsed.data.id, existing);
+      if (dup) {
+        return res.status(409).json({
+          success: false,
+          error: `A Department named "${dup.name}" already exists. Case-variant duplicates are not allowed.`
+        });
+      }
+      const payload = {
+        ...parsed.data,
+        name: cleanName,
+        code: parsed.data.code || cleanName,
+        updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+      };
+      await db.collection("departments").doc(payload.id).set(payload);
+      invalidateConfigCaches(db);
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: "SAVE_DEPARTMENT",
+        category: "ORGANIZATION",
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        targetType: "DEPARTMENT",
+        targetId: payload.id,
+        newValue: payload.name,
+        actionSource: "DEPARTMENT_MANAGEMENT",
+        captureGeo: false
+      });
+      return res.json({ success: true, department: payload });
+    } catch (err) {
+      console.error("[API Save Department] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to save department." });
+    }
+  });
+  app.get("/api/masters/shifts", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "List Shifts");
+      if (!caller) return;
+      const snap = await db.collection("shifts").get();
+      const shifts = snap.docs.map((d) => ({ id: d.id, ...d.data() || {} }));
+      return res.json({ success: true, shifts });
+    } catch (err) {
+      console.error("[API List Shifts] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to load shifts." });
+    }
+  });
+  app.post("/api/masters/shifts", async (req, res) => {
+    try {
+      const caller = await requireMasterEditCaller(req, res, "shifts", "Save Shift");
+      if (!caller) return;
+      const parsed = ShiftUpsertSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || "Invalid shift data."
+        });
+      }
+      const payload = { ...parsed.data, updatedAt: (/* @__PURE__ */ new Date()).toISOString() };
+      await db.collection("shifts").doc(payload.id).set(payload);
+      invalidateConfigCaches(db);
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: "SAVE_SHIFT",
+        category: "SHIFT",
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        targetType: "SHIFT",
+        targetId: payload.id,
+        newValue: `${payload.name} (${payload.startTime}-${payload.endTime})`,
+        actionSource: "SHIFT_MANAGEMENT",
+        captureGeo: false
+      });
+      return res.json({ success: true, shift: payload });
+    } catch (err) {
+      console.error("[API Save Shift] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to save shift." });
+    }
+  });
+  app.get("/api/masters/settings", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, "*", "Get System Settings");
+      if (!caller) return;
+      const snap = await db.collection("system_settings").doc("global").get();
+      return res.json({ success: true, settings: snap.exists ? snap.data() : null });
+    } catch (err) {
+      console.error("[API Get Settings] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to load system settings." });
+    }
+  });
+  app.put("/api/masters/settings", async (req, res) => {
+    try {
+      const caller = await requireVerifiedCaller(req, res, ["super_admin"], "Update System Settings");
+      if (!caller) return;
+      const parsed = SystemSettingsUpdateSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: parsed.error.issues[0]?.message || "Invalid system settings."
+        });
+      }
+      const updates = { ...parsed.data, updatedAt: (/* @__PURE__ */ new Date()).toISOString() };
+      await db.collection("system_settings").doc("global").set(updates, { merge: true });
+      invalidateConfigCaches(db);
+      await recordEnterpriseAuditEvent(db, {
+        req,
+        action: "UPDATE_SYSTEM_SETTINGS",
+        category: "SETTINGS",
+        actorUid: caller.uid,
+        actorLoginId: caller.loginId,
+        actorRole: caller.role.toUpperCase(),
+        targetType: "SYSTEM_SETTINGS",
+        targetId: "global",
+        newValue: JSON.stringify(parsed.data),
+        actionSource: "SETTINGS_PAGE",
+        reason: "Super Admin updated system settings",
+        captureGeo: false
+      });
+      return res.json({ success: true, settings: updates });
+    } catch (err) {
+      console.error("[API Update Settings] Error:", err);
+      return res.status(500).json({ success: false, error: "Failed to update system settings." });
     }
   });
 }
@@ -13753,338 +15335,6 @@ function registerMasterRoutes(app, deps) {
 // serverCompanyWifi.ts
 import crypto6 from "crypto";
 import { z as z7 } from "zod";
-
-// src/utils/companyWifiUtils.ts
-var COMPANY_WIFI_DENIED_MESSAGE = "Access Denied: Please connect to an authorized Company Wi-Fi network.";
-var COMPANY_WIFI_DENIED_CODE = "COMPANY_WIFI_ACCESS_DENIED";
-function normalizeIpString(raw) {
-  if (typeof raw !== "string") return "";
-  let clean = raw.trim();
-  if (!clean) return "";
-  if (clean.startsWith("[")) {
-    const closeIdx = clean.indexOf("]");
-    if (closeIdx > 1) {
-      clean = clean.slice(1, closeIdx);
-    }
-  }
-  if (/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(clean)) {
-    clean = clean.split(":")[0];
-  }
-  const zoneIdx = clean.indexOf("%");
-  if (zoneIdx > 0) {
-    clean = clean.slice(0, zoneIdx);
-  }
-  if (/^::ffff:\d{1,3}(\.\d{1,3}){3}$/i.test(clean)) {
-    clean = clean.replace(/^::ffff:/i, "");
-  }
-  return clean.toLowerCase();
-}
-function parseIpv4ToBigInt(ip) {
-  const parts = ip.split(".");
-  if (parts.length !== 4) return null;
-  let value = 0n;
-  for (const part of parts) {
-    if (!/^\d{1,3}$/.test(part)) return null;
-    if (part.length > 1 && part.startsWith("0")) return null;
-    const num = Number(part);
-    if (!Number.isInteger(num) || num < 0 || num > 255) return null;
-    value = value << 8n | BigInt(num);
-  }
-  return value;
-}
-function bigIntToIpv4(value) {
-  const a = Number(value >> 24n & 0xffn);
-  const b = Number(value >> 16n & 0xffn);
-  const c = Number(value >> 8n & 0xffn);
-  const d = Number(value & 0xffn);
-  return `${a}.${b}.${c}.${d}`;
-}
-function parseIpv6ToBigInt(ip) {
-  const clean = ip.toLowerCase();
-  if (!clean.includes(":")) return null;
-  let working = clean;
-  const lastColon = working.lastIndexOf(":");
-  const tail = working.slice(lastColon + 1);
-  if (tail.includes(".")) {
-    const v4 = parseIpv4ToBigInt(tail);
-    if (v4 === null) return null;
-    const hi = Number(v4 >> 16n & 0xffffn).toString(16);
-    const lo = Number(v4 & 0xffffn).toString(16);
-    working = `${working.slice(0, lastColon)}:${hi}:${lo}`;
-  }
-  const doubleColonParts = working.split("::");
-  if (doubleColonParts.length > 2) return null;
-  const left = doubleColonParts[0] ? doubleColonParts[0].split(":") : [];
-  const right = doubleColonParts.length === 2 && doubleColonParts[1] ? doubleColonParts[1].split(":") : [];
-  const missing = doubleColonParts.length === 2 ? 8 - (left.length + right.length) : 8 - left.length;
-  if (doubleColonParts.length === 2 ? missing < 1 : missing !== 0) {
-    return null;
-  }
-  const groups = doubleColonParts.length === 2 ? [...left, ...Array(missing).fill("0"), ...right] : left;
-  if (groups.length !== 8) return null;
-  let value = 0n;
-  for (const g of groups) {
-    if (!/^[0-9a-f]{1,4}$/i.test(g)) return null;
-    value = value << 16n | BigInt(parseInt(g, 16));
-  }
-  return value;
-}
-function parseIpOrCidr(rawInput) {
-  const trimmed = String(rawInput || "").trim();
-  if (!trimmed) {
-    return {
-      valid: false,
-      normalized: "",
-      publicIp: "",
-      cidrRange: "",
-      version: "ipv4",
-      isCidr: false,
-      prefixLength: 32,
-      networkInt: 0n,
-      error: "Public IP address or CIDR range is required."
-    };
-  }
-  const slashParts = trimmed.split("/");
-  if (slashParts.length > 2) {
-    return {
-      valid: false,
-      normalized: "",
-      publicIp: "",
-      cidrRange: "",
-      version: "ipv4",
-      isCidr: false,
-      prefixLength: 32,
-      networkInt: 0n,
-      error: "Invalid CIDR format."
-    };
-  }
-  const ipPart = normalizeIpString(slashParts[0]);
-  const hasPrefix = slashParts.length === 2;
-  const v4 = parseIpv4ToBigInt(ipPart);
-  if (v4 !== null) {
-    let prefix = 32;
-    if (hasPrefix) {
-      if (!/^\d{1,2}$/.test(slashParts[1])) {
-        return {
-          valid: false,
-          normalized: "",
-          publicIp: "",
-          cidrRange: "",
-          version: "ipv4",
-          isCidr: true,
-          prefixLength: 32,
-          networkInt: 0n,
-          error: "IPv4 CIDR prefix must be between 0 and 32."
-        };
-      }
-      prefix = Number(slashParts[1]);
-      if (prefix < 0 || prefix > 32) {
-        return {
-          valid: false,
-          normalized: "",
-          publicIp: "",
-          cidrRange: "",
-          version: "ipv4",
-          isCidr: true,
-          prefixLength: 32,
-          networkInt: 0n,
-          error: "IPv4 CIDR prefix must be between 0 and 32."
-        };
-      }
-    }
-    const shift = BigInt(32 - prefix);
-    const maskedInt = prefix === 0 ? 0n : v4 >> shift << shift;
-    const baseIp = hasPrefix ? bigIntToIpv4(maskedInt) : ipPart;
-    return {
-      valid: true,
-      normalized: hasPrefix ? `${baseIp}/${prefix}` : ipPart,
-      publicIp: baseIp,
-      cidrRange: hasPrefix ? `${baseIp}/${prefix}` : "",
-      version: "ipv4",
-      isCidr: hasPrefix,
-      prefixLength: prefix,
-      networkInt: maskedInt
-    };
-  }
-  const v6 = parseIpv6ToBigInt(ipPart);
-  if (v6 !== null) {
-    let prefix = 128;
-    if (hasPrefix) {
-      if (!/^\d{1,3}$/.test(slashParts[1])) {
-        return {
-          valid: false,
-          normalized: "",
-          publicIp: "",
-          cidrRange: "",
-          version: "ipv6",
-          isCidr: true,
-          prefixLength: 128,
-          networkInt: 0n,
-          error: "IPv6 CIDR prefix must be between 0 and 128."
-        };
-      }
-      prefix = Number(slashParts[1]);
-      if (prefix < 0 || prefix > 128) {
-        return {
-          valid: false,
-          normalized: "",
-          publicIp: "",
-          cidrRange: "",
-          version: "ipv6",
-          isCidr: true,
-          prefixLength: 128,
-          networkInt: 0n,
-          error: "IPv6 CIDR prefix must be between 0 and 128."
-        };
-      }
-    }
-    const shift = BigInt(128 - prefix);
-    const maskedInt = prefix === 0 ? 0n : v6 >> shift << shift;
-    return {
-      valid: true,
-      normalized: hasPrefix ? `${ipPart}/${prefix}` : ipPart,
-      publicIp: ipPart,
-      cidrRange: hasPrefix ? `${ipPart}/${prefix}` : "",
-      version: "ipv6",
-      isCidr: hasPrefix,
-      prefixLength: prefix,
-      networkInt: maskedInt
-    };
-  }
-  return {
-    valid: false,
-    normalized: "",
-    publicIp: "",
-    cidrRange: "",
-    version: "ipv4",
-    isCidr: false,
-    prefixLength: 32,
-    networkInt: 0n,
-    error: "Must be a valid public IPv4, IPv6, or CIDR range (e.g., 203.0.113.10 or 203.0.113.0/24)."
-  };
-}
-function ipMatchesCidrOrExact(clientIpRaw, allowEntryRaw) {
-  const clientIp = normalizeIpString(clientIpRaw);
-  if (!clientIp) return false;
-  const parsedEntry = parseIpOrCidr(allowEntryRaw);
-  if (!parsedEntry.valid) return false;
-  if (parsedEntry.version === "ipv4") {
-    const clientV4 = parseIpv4ToBigInt(clientIp);
-    if (clientV4 === null) return false;
-    if (parsedEntry.prefixLength === 0) return true;
-    const shift2 = BigInt(32 - parsedEntry.prefixLength);
-    return clientV4 >> shift2 === parsedEntry.networkInt >> shift2;
-  }
-  const clientV6 = parseIpv6ToBigInt(clientIp);
-  if (clientV6 === null) return false;
-  if (parsedEntry.prefixLength === 0) return true;
-  const shift = BigInt(128 - parsedEntry.prefixLength);
-  return clientV6 >> shift === parsedEntry.networkInt >> shift;
-}
-var NON_PUBLIC_IPV4_RANGES = [
-  "0.0.0.0/8",
-  "10.0.0.0/8",
-  "100.64.0.0/10",
-  "127.0.0.0/8",
-  "169.254.0.0/16",
-  "172.16.0.0/12",
-  "192.168.0.0/16",
-  "224.0.0.0/4",
-  "240.0.0.0/4"
-].map((cidr) => {
-  const p = parseIpOrCidr(cidr);
-  const hostMask = (1n << BigInt(32 - p.prefixLength)) - 1n;
-  return {
-    start: p.networkInt,
-    end: p.networkInt | hostMask,
-    label: cidr
-  };
-});
-var NON_PUBLIC_IPV6_RANGES = [
-  "::/128",
-  "::1/128",
-  "fc00::/7",
-  "fe80::/10",
-  "ff00::/8"
-].map((cidr) => {
-  const p = parseIpOrCidr(cidr);
-  const hostMask = (1n << BigInt(128 - p.prefixLength)) - 1n;
-  return {
-    start: p.networkInt,
-    end: p.networkInt | hostMask,
-    label: cidr
-  };
-});
-function isPrivateOrNonPublicIp(rawIp) {
-  const ip = normalizeIpString(rawIp);
-  if (!ip || ip === "unavailable" || ip === "unknown") return true;
-  const parsed = parseIpOrCidr(ip);
-  if (!parsed.valid || parsed.isCidr) return true;
-  const ranges = parsed.version === "ipv4" ? NON_PUBLIC_IPV4_RANGES : NON_PUBLIC_IPV6_RANGES;
-  return ranges.some((r) => parsed.networkInt >= r.start && parsed.networkInt <= r.end);
-}
-function validatePublicCompanyWifiIpOrCidr(rawInput) {
-  const parsed = parseIpOrCidr(rawInput);
-  if (!parsed.valid) {
-    return parsed;
-  }
-  if (parsed.version === "ipv4") {
-    if (parsed.isCidr && parsed.prefixLength < 16) {
-      return {
-        ...parsed,
-        valid: false,
-        error: "IPv4 CIDR range is too broad. Minimum prefix length is /16 (e.g., 203.0.113.0/24)."
-      };
-    }
-    const hostMask2 = (1n << BigInt(32 - parsed.prefixLength)) - 1n;
-    const rangeStart2 = parsed.networkInt;
-    const rangeEnd2 = parsed.networkInt | hostMask2;
-    const overlapping2 = NON_PUBLIC_IPV4_RANGES.find(
-      (r) => rangeStart2 <= r.end && rangeEnd2 >= r.start
-    );
-    if (overlapping2) {
-      return {
-        ...parsed,
-        valid: false,
-        error: `Private, loopback, or reserved IP ranges (${overlapping2.label}) are not allowed. Enter a routable Public IP or CIDR.`
-      };
-    }
-    return parsed;
-  }
-  if (parsed.isCidr && parsed.prefixLength < 32) {
-    return {
-      ...parsed,
-      valid: false,
-      error: "IPv6 CIDR range is too broad. Minimum prefix length is /32."
-    };
-  }
-  const hostMask = (1n << BigInt(128 - parsed.prefixLength)) - 1n;
-  const rangeStart = parsed.networkInt;
-  const rangeEnd = parsed.networkInt | hostMask;
-  const overlapping = NON_PUBLIC_IPV6_RANGES.find(
-    (r) => rangeStart <= r.end && rangeEnd >= r.start
-  );
-  if (overlapping) {
-    return {
-      ...parsed,
-      valid: false,
-      error: `Private, loopback, or reserved IPv6 ranges (${overlapping.label}) are not allowed. Enter a routable Public IPv6 or CIDR.`
-    };
-  }
-  return parsed;
-}
-function getNetworkMatchTarget(network) {
-  const cidr = String(network.cidrRange || "").trim();
-  return cidr || String(network.publicIp || "").trim();
-}
-function ipMatchesCompanyWifiNetwork(observedIp, network) {
-  if (network.status !== "Active") return false;
-  const target = getNetworkMatchTarget(network);
-  if (!target) return false;
-  return ipMatchesCidrOrExact(observedIp, target);
-}
-
-// serverCompanyWifi.ts
 var COL_WIFI_NETWORKS = "company_wifi_networks";
 var COL_WIFI_POLICIES = "company_wifi_access_policies";
 var COL_WIFI_SETTINGS = "company_wifi_settings";
@@ -14107,41 +15357,6 @@ function defaultRolePolicy(roleId) {
     updatedAt: "",
     updatedBy: "system"
   };
-}
-function parseHeaderIpList(headerVal) {
-  if (!headerVal) return [];
-  const joined = Array.isArray(headerVal) ? headerVal.join(",") : headerVal;
-  return joined.split(",").map((part) => normalizeIpString(part)).filter((ip) => {
-    if (!ip) return false;
-    const p = parseIpOrCidr(ip);
-    return p.valid && !p.isCidr;
-  });
-}
-function extractAuthoritativePublicIp(req, trustedProxyHops = 1) {
-  const safeHops = Math.max(0, Math.min(5, Math.floor(Number(trustedProxyHops) || 1)));
-  const vercelIps = parseHeaderIpList(req.headers["x-vercel-forwarded-for"]);
-  if (vercelIps.length > 0 && safeHops > 0) {
-    const ip = vercelIps[vercelIps.length - 1];
-    return { ip, isPublic: !isPrivateOrNonPublicIp(ip), source: "x-vercel-forwarded-for" };
-  }
-  const xffIps = parseHeaderIpList(req.headers["x-forwarded-for"]);
-  if (xffIps.length > 0 && safeHops > 0) {
-    const idx = Math.max(0, xffIps.length - safeHops);
-    const ip = xffIps[idx];
-    return { ip, isPublic: !isPrivateOrNonPublicIp(ip), source: "x-forwarded-for:trusted-hop" };
-  }
-  const directCandidate = normalizeIpString(req.socket?.remoteAddress || req.ip || "");
-  if (directCandidate) {
-    const parsed = parseIpOrCidr(directCandidate);
-    if (parsed.valid && !parsed.isCidr) {
-      return {
-        ip: directCandidate,
-        isPublic: !isPrivateOrNonPublicIp(directCandidate),
-        source: "socket"
-      };
-    }
-  }
-  return { ip: "unavailable", isPublic: false, source: "unavailable" };
 }
 var wifiCacheMap = /* @__PURE__ */ new WeakMap();
 function getWifiCache(db) {

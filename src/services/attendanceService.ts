@@ -1,13 +1,4 @@
 import {
-  collection,
-  getDocs,
-  query,
-  where,
-  orderBy,
-  limit,
-} from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../firebase';
-import {
   apiFetchJson,
   apiUrl,
   assertApiBaseConfigured,
@@ -284,23 +275,49 @@ export function identifyShiftForPunchIn(
   }
 }
 
-// Query punch events for an employee or date (read-only)
+// Query attendance records via authenticated, RBAC & Company Wi-Fi enforced backend API (F-02)
+export async function getAttendanceRecords(options?: {
+  shiftDate?: string;
+  fromDate?: string;
+  toDate?: string;
+  shiftId?: string;
+}): Promise<AttendanceRecord[]> {
+  const headers = await getAuthHeaders();
+  const params = new URLSearchParams();
+  if (options?.shiftDate) params.set('shiftDate', options.shiftDate);
+  if (options?.fromDate) params.set('fromDate', options.fromDate);
+  if (options?.toDate) params.set('toDate', options.toDate);
+  if (options?.shiftId && options.shiftId !== 'ALL') params.set('shiftId', options.shiftId);
+  const qs = params.toString();
+  const data = await apiFetchJson<{ success: boolean; records?: AttendanceRecord[] }>(
+    `/api/attendance/records${qs ? `?${qs}` : ''}`,
+    { method: 'GET', headers },
+    'Failed to load attendance records.',
+    { preferSameOriginInPreview: true }
+  );
+  return Array.isArray(data.records) ? data.records : [];
+}
+
+// Query punch events via authenticated backend API (read-only)
 export async function getPunchEvents(options?: {
   shiftDate?: string;
   employeeId?: string;
   limitCount?: number;
 }): Promise<PunchEvent[]> {
   try {
-    let q = query(collection(db, 'punch_events'), orderBy('timestamp', 'desc'), limit(options?.limitCount || 200));
-    if (options?.shiftDate) {
-      q = query(collection(db, 'punch_events'), where('shiftDate', '==', options.shiftDate), orderBy('timestamp', 'desc'));
-    }
-    const snap = await getDocs(q);
-    let events = snap.docs.map((d) => d.data() as PunchEvent);
-    if (options?.employeeId) {
-      events = events.filter((e) => e.employeeId === options.employeeId);
-    }
-    return events;
+    const headers = await getAuthHeaders();
+    const params = new URLSearchParams();
+    if (options?.shiftDate) params.set('shiftDate', options.shiftDate);
+    if (options?.employeeId) params.set('employeeId', options.employeeId);
+    if (options?.limitCount) params.set('limit', String(options.limitCount));
+    const qs = params.toString();
+    const data = await apiFetchJson<{ success: boolean; events?: PunchEvent[] }>(
+      `/api/attendance/punch-events${qs ? `?${qs}` : ''}`,
+      { method: 'GET', headers },
+      'Failed to load punch events.',
+      { preferSameOriginInPreview: true }
+    );
+    return Array.isArray(data.events) ? data.events : [];
   } catch (err) {
     console.error('Error fetching punch events:', err);
     return [];
@@ -348,7 +365,7 @@ export async function processDualAttendanceScan({
       }),
     },
     'POST /api/attendance/scan',
-    { timeoutMs: 12000 }
+    { timeoutMs: 12000, preferSameOriginInPreview: true }
   );
 
   const parsed = await safeParseJsonResponse<any>(res, 'POST /api/attendance/scan');
@@ -432,7 +449,7 @@ export async function processManualAttendancePunch({
       }),
     },
     'POST /api/attendance/manual-punch',
-    { timeoutMs: 12000 }
+    { timeoutMs: 12000, preferSameOriginInPreview: true }
   );
 
   const parsed = await safeParseJsonResponse<any>(res, 'POST /api/attendance/manual-punch');
@@ -500,7 +517,8 @@ export async function processAttendanceScan(
         ...(customScanTime ? { customScanTime: customScanTime.toISOString() } : {}),
       }),
     },
-    'POST /api/attendance/scan'
+    'POST /api/attendance/scan',
+    { preferSameOriginInPreview: true }
   );
 
   const parsed = await safeParseJsonResponse<any>(res, 'POST /api/attendance/scan');
@@ -548,7 +566,8 @@ export async function runAutoCloseShiftsEngine(options?: {
         headers,
         body: JSON.stringify({}),
       },
-      'POST /api/attendance/auto-close'
+      'POST /api/attendance/auto-close',
+      { preferSameOriginInPreview: true }
     );
     const parsed = await safeParseJsonResponse<any>(res, 'POST /api/attendance/auto-close');
     if (!parsed.ok || !parsed.data) {
@@ -595,22 +614,26 @@ export async function correctAttendanceRecord(
         reason: updates.reason,
       }),
     },
-    'Failed to correct attendance record.'
+    'Failed to correct attendance record.',
+    { preferSameOriginInPreview: true }
   );
 }
 
-// Daily Shift Roster Functions (read-only query)
-export async function getShiftRoster(shiftDate: string, shiftId: string): Promise<ShiftRoster[]> {
+// Daily Shift Roster Functions (read-only query via authenticated backend API)
+export async function getShiftRoster(shiftDate: string, shiftId?: string): Promise<ShiftRoster[]> {
   try {
-    const q = query(
-      collection(db, 'shift_rosters'),
-      where('shiftDate', '==', shiftDate),
-      where('shiftId', '==', shiftId)
+    const headers = await getAuthHeaders();
+    const params = new URLSearchParams({ shiftDate });
+    if (shiftId && shiftId !== 'ALL') params.set('shiftId', shiftId);
+    const data = await apiFetchJson<{ success: boolean; rosters?: ShiftRoster[] }>(
+      `/api/attendance/rosters?${params.toString()}`,
+      { method: 'GET', headers },
+      'Failed to load shift rosters.',
+      { preferSameOriginInPreview: true }
     );
-    const snap = await getDocs(q);
-    return snap.docs.map((d) => d.data() as ShiftRoster);
+    return Array.isArray(data.rosters) ? data.rosters : [];
   } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, 'shift_rosters');
+    console.error('Error fetching shift rosters:', error);
     return [];
   }
 }
@@ -629,7 +652,8 @@ export async function generateRosterForDate(
       headers,
       body: JSON.stringify({ shiftDate, shiftId }),
     },
-    'Failed to generate shift roster.'
+    'Failed to generate shift roster.',
+    { preferSameOriginInPreview: true }
   );
   return { scheduledCount: Number(data.scheduledCount || 0) };
 }

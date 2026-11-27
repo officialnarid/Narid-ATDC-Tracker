@@ -1,17 +1,6 @@
-import { 
-  collection, 
-  doc, 
-  getDoc, 
-  getDocs, 
-  setDoc, 
-  updateDoc, 
-  deleteDoc, 
-  query, 
-  where 
-} from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../firebase';
 import { Employee, EmployeeStatus, EmployeeType } from '../types';
-import { recordAuditLog } from './masterService';
+import { apiFetchJson } from '../config/api';
+import { getAuthHeaders } from './auditService';
 
 export interface EmployeeFilters {
   search?: string;
@@ -22,6 +11,23 @@ export interface EmployeeFilters {
   employeeStatus?: EmployeeStatus | 'All';
 }
 
+export interface RenderedQrCardItem {
+  qrDataUrl: string;
+  qrTokenReference: string;
+  hasQrToken: boolean;
+}
+
+export interface RegenerateQrResult {
+  employeeId: string;
+  hasQrToken: boolean;
+  qrTokenReference: string;
+  qrDataUrl: string;
+}
+
+/**
+ * Legacy helper retained only for local unit tests / non-authoritative preview models.
+ * Authoritative QR tokens are ALWAYS generated server-side via CSPRNG and never returned raw.
+ */
 export function generateQrToken(employeeId: string): string {
   const rand = Math.random().toString(36).substring(2, 9).toUpperCase();
   const ts = Date.now().toString(36).toUpperCase();
@@ -29,55 +35,44 @@ export function generateQrToken(employeeId: string): string {
 }
 
 export async function getEmployees(filters?: EmployeeFilters): Promise<Employee[]> {
-  try {
-    const snap = await getDocs(collection(db, 'employees'));
-    let list: Employee[] = snap.docs.map(d => d.data() as Employee);
-
-    if (filters) {
-      if (filters.search && filters.search.trim() !== '') {
-        const s = filters.search.toLowerCase().trim();
-        list = list.filter(e => 
-          e.employeeId.toLowerCase().includes(s) || 
-          e.employeeName.toLowerCase().includes(s) ||
-          e.designation.toLowerCase().includes(s)
-        );
-      }
-      if (filters.floor && filters.floor !== 'All') {
-        list = list.filter(e => e.floor === filters.floor);
-      }
-      if (filters.section && filters.section !== 'All') {
-        list = list.filter(e => e.section === filters.section);
-      }
-      if (filters.department && filters.department !== 'All') {
-        list = list.filter(e => e.department === filters.department);
-      }
-      if (filters.employeeType && filters.employeeType !== 'All') {
-        list = list.filter(e => e.employeeType === filters.employeeType);
-      }
-      if (filters.employeeStatus && filters.employeeStatus !== 'All') {
-        list = list.filter(e => e.employeeStatus === filters.employeeStatus);
-      }
-    }
-
-    // Sort by employeeId
-    return list.sort((a, b) => a.employeeId.localeCompare(b.employeeId));
-  } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, 'employees');
-    return [];
+  const headers = await getAuthHeaders();
+  const params = new URLSearchParams();
+  if (filters) {
+    if (filters.search && filters.search.trim() !== '') params.set('search', filters.search.trim());
+    if (filters.floor && filters.floor !== 'All') params.set('floor', filters.floor);
+    if (filters.section && filters.section !== 'All') params.set('section', filters.section);
+    if (filters.department && filters.department !== 'All') params.set('department', filters.department);
+    if (filters.employeeType && filters.employeeType !== 'All') params.set('employeeType', filters.employeeType);
+    if (filters.employeeStatus && filters.employeeStatus !== 'All') params.set('employeeStatus', filters.employeeStatus);
   }
+  const qs = params.toString();
+  const data = await apiFetchJson<{ success: boolean; employees?: Employee[] }>(
+    `/api/employees${qs ? `?${qs}` : ''}`,
+    { method: 'GET', headers },
+    'Failed to load employees.',
+    { preferSameOriginInPreview: true }
+  );
+  const list = Array.isArray(data.employees) ? data.employees : [];
+  return list.sort((a, b) => a.employeeId.localeCompare(b.employeeId));
 }
 
 export async function getEmployeeById(employeeId: string): Promise<Employee | null> {
+  const cleanId = employeeId.trim().toUpperCase();
+  if (!cleanId) return null;
+  const headers = await getAuthHeaders();
   try {
-    const cleanId = employeeId.trim();
-    const snap = await getDoc(doc(db, 'employees', cleanId));
-    if (snap.exists()) {
-      return snap.data() as Employee;
+    const data = await apiFetchJson<{ success: boolean; employee?: Employee }>(
+      `/api/employees/${encodeURIComponent(cleanId)}`,
+      { method: 'GET', headers },
+      'Failed to load employee.',
+      { preferSameOriginInPreview: true }
+    );
+    return data.employee || null;
+  } catch (err: any) {
+    if (err?.status === 404 || String(err?.message || '').toLowerCase().includes('not found')) {
+      return null;
     }
-    return null;
-  } catch (error) {
-    handleFirestoreError(error, OperationType.GET, `employees/${employeeId}`);
-    return null;
+    throw err;
   }
 }
 
@@ -86,112 +81,144 @@ export async function saveEmployee(employee: Partial<Employee>, isNew: boolean):
     throw new Error('Employee ID is required.');
   }
   const cleanId = employee.employeeId.trim().toUpperCase();
+  const headers = await getAuthHeaders();
 
-  if (isNew) {
-    const existing = await getEmployeeById(cleanId);
-    if (existing) {
-      throw new Error(`Employee ID "${cleanId}" already exists. ID must be unique.`);
-    }
-  }
-
-  const now = new Date().toISOString();
-  const qrCodeToken = employee.qrCodeToken || generateQrToken(cleanId);
-
-  const fullEmployee: Employee = {
+  const payload = {
     employeeId: cleanId,
     employeeName: (employee.employeeName || '').trim().toUpperCase(),
     employeeType: employee.employeeType || 'Permanent',
     section: employee.section || 'MI',
     department: employee.department || 'Production',
-    floor: employee.floor || '1st Floor',
+    floor: employee.floor || 'MI-01',
     designation: (employee.designation || 'Operator').trim(),
-    qrCodeToken: qrCodeToken,
     employeeStatus: employee.employeeStatus || 'Active',
-    createdAt: employee.createdAt || now,
-    updatedAt: now,
   };
 
-  try {
-    await setDoc(doc(db, 'employees', cleanId), fullEmployee);
-    await recordAuditLog({
-      action: isNew ? 'CREATE_EMPLOYEE' : 'UPDATE_EMPLOYEE',
-      employeeId: cleanId,
-      newValue: `${fullEmployee.employeeName} (${fullEmployee.department} - ${fullEmployee.floor})`,
-      actionSource: 'EMPLOYEE_MASTER',
-    });
-    return fullEmployee;
-  } catch (error) {
-    handleFirestoreError(error, isNew ? OperationType.CREATE : OperationType.UPDATE, `employees/${cleanId}`);
-    throw error;
+  if (isNew) {
+    const data = await apiFetchJson<{ success: boolean; employee: Employee }>(
+      '/api/employees',
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+      },
+      'Failed to create employee.',
+      { preferSameOriginInPreview: true }
+    );
+    return data.employee;
   }
+
+  const data = await apiFetchJson<{ success: boolean; employee: Employee }>(
+    `/api/employees/${encodeURIComponent(cleanId)}`,
+    {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify(payload),
+    },
+    'Failed to update employee.',
+    { preferSameOriginInPreview: true }
+  );
+  return data.employee;
 }
 
 export async function toggleEmployeeStatus(employeeId: string, newStatus: EmployeeStatus): Promise<void> {
-  const cleanId = employeeId.trim();
-  try {
-    const empRef = doc(db, 'employees', cleanId);
-    const existing = await getDoc(empRef);
-    if (!existing.exists()) {
-      throw new Error(`Employee ${cleanId} not found.`);
-    }
-    const oldStatus = existing.data()?.employeeStatus;
-    await updateDoc(empRef, {
-      employeeStatus: newStatus,
-      updatedAt: new Date().toISOString(),
-    });
-    await recordAuditLog({
-      action: 'TOGGLE_EMPLOYEE_STATUS',
-      employeeId: cleanId,
-      oldValue: oldStatus || 'Active',
-      newValue: newStatus,
-      actionSource: 'EMPLOYEE_MASTER',
-      reason: `Super Admin toggled status to ${newStatus}`,
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, `employees/${cleanId}`);
-  }
+  const cleanId = employeeId.trim().toUpperCase();
+  const headers = await getAuthHeaders();
+  await apiFetchJson<{ success: boolean }>(
+    `/api/employees/${encodeURIComponent(cleanId)}/status`,
+    {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify({ employeeStatus: newStatus }),
+    },
+    'Failed to update employee status.',
+    { preferSameOriginInPreview: true }
+  );
 }
 
 export async function deleteEmployee(employeeId: string): Promise<void> {
-  const cleanId = employeeId.trim();
-  try {
-    const empRef = doc(db, 'employees', cleanId);
-    const existing = await getDoc(empRef);
-    const empData = existing.exists() ? existing.data() : null;
-    await deleteDoc(empRef);
-    await recordAuditLog({
-      action: 'DELETE_EMPLOYEE',
-      employeeId: cleanId,
-      oldValue: empData ? `${empData.employeeName} (${empData.department} - ${empData.floor})` : 'Employee Record',
-      newValue: 'DELETED',
-      actionSource: 'EMPLOYEE_MASTER',
-      reason: 'Administrator permanently deleted employee record',
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.DELETE, `employees/${cleanId}`);
-    throw error;
-  }
+  const cleanId = employeeId.trim().toUpperCase();
+  const headers = await getAuthHeaders();
+  await apiFetchJson<{ success: boolean }>(
+    `/api/employees/${encodeURIComponent(cleanId)}`,
+    {
+      method: 'DELETE',
+      headers,
+    },
+    'Failed to delete employee.',
+    { preferSameOriginInPreview: true }
+  );
 }
 
-export async function regenerateQrToken(employeeId: string): Promise<string> {
-  const cleanId = employeeId.trim();
-  const newToken = generateQrToken(cleanId);
-  try {
-    const empRef = doc(db, 'employees', cleanId);
-    await updateDoc(empRef, {
-      qrCodeToken: newToken,
-      updatedAt: new Date().toISOString(),
-    });
-    await recordAuditLog({
-      action: 'REGENERATE_QR_TOKEN',
-      employeeId: cleanId,
-      newValue: newToken,
-      actionSource: 'QR_MANAGEMENT',
-      reason: 'Administrator regenerated QR security token',
-    });
-    return newToken;
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, `employees/${cleanId}`);
-    throw error;
+/**
+ * Manually rotates a single employee's QR token server-side (requires qr_codes.edit).
+ * Never returns raw qrCodeToken — returns only qrTokenReference and server-rendered QR PNG data URL.
+ */
+export async function regenerateQrToken(employeeId: string): Promise<RegenerateQrResult> {
+  const cleanId = employeeId.trim().toUpperCase();
+  const headers = await getAuthHeaders();
+  const data = await apiFetchJson<{
+    success: boolean;
+    employeeId: string;
+    hasQrToken: boolean;
+    qrTokenReference: string;
+    qrDataUrl: string;
+  }>(
+    `/api/employees/${encodeURIComponent(cleanId)}/regenerate-qr`,
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({}),
+    },
+    'Failed to regenerate QR security token.',
+    { preferSameOriginInPreview: true }
+  );
+  return {
+    employeeId: data.employeeId || cleanId,
+    hasQrToken: Boolean(data.hasQrToken),
+    qrTokenReference: data.qrTokenReference || '',
+    qrDataUrl: data.qrDataUrl || '',
+  };
+}
+
+/**
+ * Fetches server-rendered scannable QR PNG data URLs for authorized qr_codes.view users.
+ * Raw qrCodeToken secrets stay strictly on the server.
+ */
+export async function fetchEmployeeQrDataUrls(
+  employeeIds: string[],
+  size = 240
+): Promise<Record<string, RenderedQrCardItem>> {
+  const cleanIds = Array.from(
+    new Set(employeeIds.map((id) => String(id || '').trim().toUpperCase()).filter(Boolean))
+  );
+  if (cleanIds.length === 0) return {};
+
+  const headers = await getAuthHeaders();
+  const clampedSize = Math.max(120, Math.min(600, Math.round(size)));
+  const merged: Record<string, RenderedQrCardItem> = {};
+
+  // Server accepts up to 100 IDs per request
+  const BATCH = 100;
+  for (let i = 0; i < cleanIds.length; i += BATCH) {
+    const chunk = cleanIds.slice(i, i + BATCH);
+    const data = await apiFetchJson<{
+      success: boolean;
+      items?: Record<string, RenderedQrCardItem>;
+    }>(
+      '/api/employees/qr-cards/render',
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ employeeIds: chunk, size: clampedSize }),
+      },
+      'Failed to render employee QR codes.',
+      { preferSameOriginInPreview: true }
+    );
+    if (data.items && typeof data.items === 'object') {
+      Object.assign(merged, data.items);
+    }
   }
+
+  return merged;
 }

@@ -1,26 +1,14 @@
-import { 
-  collection, 
-  doc, 
-  getDoc, 
-  getDocs, 
-  setDoc, 
-  updateDoc, 
-  deleteDoc, 
-  query, 
-  orderBy, 
-  limit 
-} from 'firebase/firestore';
-import { db, auth, handleFirestoreError, OperationType, sanitizeFirestoreData } from '../firebase';
-import { 
-  Floor, 
-  Section, 
-  Department, 
-  Shift, 
-  SystemSetting, 
-  AuditLog, 
-  Employee 
+import { auth } from '../firebase';
+import {
+  Floor,
+  Section,
+  Department,
+  Shift,
+  SystemSetting,
+  AuditLog,
+  Employee,
 } from '../types';
-import { sendServerAuditEvent, getAuthHeaders } from './auditService';
+import { sendServerAuditEvent, getAuthHeaders, fetchAuditLogs } from './auditService';
 import { apiFetchJson } from '../config/api';
 import {
   findCaseInsensitiveMasterDuplicate,
@@ -99,7 +87,7 @@ export const DEFAULT_DEPARTMENTS: Department[] = [
   { id: 'dept_oth', name: 'Others', code: 'OTH', status: 'Active' },
 ];
 
-// Authentic Industrial Manpower dataset with plant production lines
+// Authentic Industrial Manpower reference dataset
 export const AUTHENTIC_INDUSTRIAL_MANPOWER: Partial<Employee>[] = [
   { employeeId: 'JMD12345', employeeName: 'RAHUL SHARMA', employeeType: 'Offroll', section: 'MI', department: 'Production', floor: 'MI-01', designation: 'Manual Insertion Operator' },
   { employeeId: 'JMD12346', employeeName: 'AMIT PATEL', employeeType: 'Permanent', section: 'FATP', department: 'Quality', floor: 'FATP-STB', designation: 'Final QC Inspector' },
@@ -133,118 +121,60 @@ export const AUTHENTIC_INDUSTRIAL_MANPOWER: Partial<Employee>[] = [
   { employeeId: 'JMD12374', employeeName: 'ARUN PRASAD', employeeType: 'Permanent', section: 'FATP', department: 'Production', floor: 'FATP-STB', designation: 'Functional Testing Incharge' },
 ];
 
-// Initialize database with default collections if empty (strictly guarded on Firebase Auth)
+/**
+ * F-02: Client-side master initialization is a safe no-op.
+ * Production master collections are managed exclusively through authenticated server APIs
+ * so ordinary browser sessions can never mutate or delete master configuration documents.
+ */
 export async function initializeMasterData(): Promise<void> {
-  if (!auth.currentUser) return;
-  try {
-    // 1. Settings
-    const settingsRef = doc(db, 'system_settings', 'global');
-    const settingsSnap = await getDoc(settingsRef);
-    if (!settingsSnap.exists()) {
-      await setDoc(settingsRef, DEFAULT_SETTINGS);
-    }
-
-    // 2. Shifts (DAY: 09:00-20:00, NIGHT: 20:00-09:00 next day)
-    const shiftsSnap = await getDocs(collection(db, 'shifts'));
-    if (shiftsSnap.empty) {
-      for (const shift of DEFAULT_SHIFTS) {
-        await setDoc(doc(db, 'shifts', shift.id), shift);
-      }
-    } else {
-      // Sync default shift windows if they have older configurations
-      for (const shift of DEFAULT_SHIFTS) {
-        const existing = shiftsSnap.docs.find(d => d.id === shift.id);
-        if (!existing) {
-          await setDoc(doc(db, 'shifts', shift.id), shift);
-        } else {
-          const data = existing.data() as Shift;
-          if (
-            data.punchInWindowStart === '07:30' ||
-            data.punchInWindowStart === '18:30' ||
-            (shift.id === 'DAY' && data.punchInWindowStart === '09:00' && data.punchInWindowEnd === '20:00') ||
-            (shift.id === 'NIGHT' && data.punchInWindowStart === '20:00' && data.punchInWindowEnd === '09:00')
-          ) {
-            await setDoc(doc(db, 'shifts', shift.id), shift);
-          }
-        }
-      }
-    }
-
-    // 3. Production Lines (MI-01, MI-02, FATP-STB, FATP-ITR, SMT-01)
-    const floorsSnap = await getDocs(collection(db, 'floors'));
-    const existingNames = floorsSnap.docs.map(d => (d.data() as Floor).name);
-    if (floorsSnap.empty || existingNames.some(n => n.includes('Floor'))) {
-      for (const d of floorsSnap.docs) {
-        await deleteDoc(d.ref);
-      }
-      for (const line of DEFAULT_LINES) {
-        await setDoc(doc(db, 'floors', line.id), line);
-      }
-    }
-
-    // 4. Sections
-    const sectionsSnap = await getDocs(collection(db, 'sections'));
-    if (sectionsSnap.empty) {
-      for (const sec of DEFAULT_SECTIONS) {
-        await setDoc(doc(db, 'sections', sec.id), sec);
-      }
-    }
-
-    // 5. Departments
-    const deptsSnap = await getDocs(collection(db, 'departments'));
-    if (deptsSnap.empty) {
-      for (const dept of DEFAULT_DEPARTMENTS) {
-        await setDoc(doc(db, 'departments', dept.id), dept);
-      }
-    }
-
-    // 6. Ensure Authentic Industrial Employees exist if database has no employees
-    const empSnap = await getDocs(collection(db, 'employees'));
-    if (empSnap.empty) {
-      await loadAuthenticIndustrialManpower();
-    }
-  } catch (error) {
-    console.error('Error during master data initialization:', error);
-  }
+  return;
 }
 
-// System Settings
+// System Settings (authenticated server API)
 export async function getSystemSettings(): Promise<SystemSetting> {
   try {
-    const snap = await getDoc(doc(db, 'system_settings', 'global'));
-    if (snap.exists()) {
-      return snap.data() as SystemSetting;
-    }
-    return DEFAULT_SETTINGS;
+    const headers = await getAuthHeaders();
+    const data = await apiFetchJson<{ success: boolean; settings?: SystemSetting | null }>(
+      '/api/masters/settings',
+      { method: 'GET', headers },
+      'Failed to load system settings.',
+      { preferSameOriginInPreview: true }
+    );
+    return data.settings ? { ...DEFAULT_SETTINGS, ...data.settings } : DEFAULT_SETTINGS;
   } catch (error) {
-    handleFirestoreError(error, OperationType.GET, 'system_settings/global');
+    console.error('Error loading system settings:', error);
     return DEFAULT_SETTINGS;
   }
 }
 
 export async function updateSystemSettings(settings: Partial<SystemSetting>): Promise<void> {
-  try {
-    await updateDoc(doc(db, 'system_settings', 'global'), {
-      ...settings,
-    });
-    await recordAuditLog({
-      action: 'UPDATE_SYSTEM_SETTINGS',
-      newValue: JSON.stringify(settings),
-      actionSource: 'SETTINGS_PAGE',
-      reason: 'Administrator updated system settings',
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, 'system_settings/global');
-  }
+  const headers = await getAuthHeaders();
+  await apiFetchJson<{ success: boolean }>(
+    '/api/masters/settings',
+    {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify(settings),
+    },
+    'Failed to update system settings.',
+    { preferSameOriginInPreview: true }
+  );
 }
 
-// Master Getters
+// Master Getters & Mutators (authenticated server APIs)
 export async function getFloors(): Promise<Floor[]> {
   try {
-    const snap = await getDocs(collection(db, 'floors'));
-    return snap.docs.map(d => d.data() as Floor).sort((a, b) => a.order - b.order);
+    const headers = await getAuthHeaders();
+    const data = await apiFetchJson<{ success: boolean; floors?: Floor[] }>(
+      '/api/masters/floors',
+      { method: 'GET', headers },
+      'Failed to load production lines.',
+      { preferSameOriginInPreview: true }
+    );
+    const list = Array.isArray(data.floors) ? data.floors : [];
+    return list.length > 0 ? list.sort((a, b) => (a.order || 0) - (b.order || 0)) : DEFAULT_FLOORS;
   } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, 'floors');
+    console.error('Error loading floors:', error);
     return DEFAULT_FLOORS;
   }
 }
@@ -259,24 +189,32 @@ export async function saveFloor(floor: Floor): Promise<void> {
     );
   }
   const normalizedFloor: Floor = { ...floor, name: cleanName };
-  try {
-    await setDoc(doc(db, 'floors', normalizedFloor.id), normalizedFloor);
-    await recordAuditLog({
-      action: 'SAVE_FLOOR',
-      newValue: normalizedFloor.name,
-      actionSource: 'FLOOR_MANAGEMENT',
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, `floors/${normalizedFloor.id}`);
-  }
+  const headers = await getAuthHeaders();
+  await apiFetchJson<{ success: boolean }>(
+    '/api/masters/floors',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(normalizedFloor),
+    },
+    'Failed to save production line.',
+    { preferSameOriginInPreview: true }
+  );
 }
 
 export async function getSections(): Promise<Section[]> {
   try {
-    const snap = await getDocs(collection(db, 'sections'));
-    return snap.docs.map(d => d.data() as Section);
+    const headers = await getAuthHeaders();
+    const data = await apiFetchJson<{ success: boolean; sections?: Section[] }>(
+      '/api/masters/sections',
+      { method: 'GET', headers },
+      'Failed to load sections.',
+      { preferSameOriginInPreview: true }
+    );
+    const list = Array.isArray(data.sections) ? data.sections : [];
+    return list.length > 0 ? list : DEFAULT_SECTIONS;
   } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, 'sections');
+    console.error('Error loading sections:', error);
     return DEFAULT_SECTIONS;
   }
 }
@@ -291,24 +229,32 @@ export async function saveSection(section: Section): Promise<void> {
     );
   }
   const normalizedSection: Section = { ...section, name: cleanName };
-  try {
-    await setDoc(doc(db, 'sections', normalizedSection.id), normalizedSection);
-    await recordAuditLog({
-      action: 'SAVE_SECTION',
-      newValue: normalizedSection.name,
-      actionSource: 'SECTION_MANAGEMENT',
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, `sections/${normalizedSection.id}`);
-  }
+  const headers = await getAuthHeaders();
+  await apiFetchJson<{ success: boolean }>(
+    '/api/masters/sections',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(normalizedSection),
+    },
+    'Failed to save section.',
+    { preferSameOriginInPreview: true }
+  );
 }
 
 export async function getDepartments(): Promise<Department[]> {
   try {
-    const snap = await getDocs(collection(db, 'departments'));
-    return snap.docs.map(d => d.data() as Department);
+    const headers = await getAuthHeaders();
+    const data = await apiFetchJson<{ success: boolean; departments?: Department[] }>(
+      '/api/masters/departments',
+      { method: 'GET', headers },
+      'Failed to load departments.',
+      { preferSameOriginInPreview: true }
+    );
+    const list = Array.isArray(data.departments) ? data.departments : [];
+    return list.length > 0 ? list : DEFAULT_DEPARTMENTS;
   } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, 'departments');
+    console.error('Error loading departments:', error);
     return DEFAULT_DEPARTMENTS;
   }
 }
@@ -323,39 +269,48 @@ export async function saveDepartment(dept: Department): Promise<void> {
     );
   }
   const normalizedDept: Department = { ...dept, name: cleanName };
-  try {
-    await setDoc(doc(db, 'departments', normalizedDept.id), normalizedDept);
-    await recordAuditLog({
-      action: 'SAVE_DEPARTMENT',
-      newValue: normalizedDept.name,
-      actionSource: 'DEPARTMENT_MANAGEMENT',
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, `departments/${normalizedDept.id}`);
-  }
+  const headers = await getAuthHeaders();
+  await apiFetchJson<{ success: boolean }>(
+    '/api/masters/departments',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(normalizedDept),
+    },
+    'Failed to save department.',
+    { preferSameOriginInPreview: true }
+  );
 }
 
 export async function getShifts(): Promise<Shift[]> {
   try {
-    const snap = await getDocs(collection(db, 'shifts'));
-    return snap.docs.map(d => d.data() as Shift);
+    const headers = await getAuthHeaders();
+    const data = await apiFetchJson<{ success: boolean; shifts?: Shift[] }>(
+      '/api/masters/shifts',
+      { method: 'GET', headers },
+      'Failed to load shifts.',
+      { preferSameOriginInPreview: true }
+    );
+    const list = Array.isArray(data.shifts) ? data.shifts : [];
+    return list.length > 0 ? list : DEFAULT_SHIFTS;
   } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, 'shifts');
+    console.error('Error loading shifts:', error);
     return DEFAULT_SHIFTS;
   }
 }
 
 export async function saveShift(shift: Shift): Promise<void> {
-  try {
-    await setDoc(doc(db, 'shifts', shift.id), shift);
-    await recordAuditLog({
-      action: 'SAVE_SHIFT',
-      newValue: `${shift.name} (${shift.startTime}-${shift.endTime})`,
-      actionSource: 'SHIFT_MANAGEMENT',
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, `shifts/${shift.id}`);
-  }
+  const headers = await getAuthHeaders();
+  await apiFetchJson<{ success: boolean }>(
+    '/api/masters/shifts',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(shift),
+    },
+    'Failed to save shift.',
+    { preferSameOriginInPreview: true }
+  );
 }
 
 // Audit Log — routes exclusively through authenticated server endpoint for IP/Geo/UA enrichment & redaction
@@ -383,71 +338,42 @@ export async function recordAuditLog(log: Omit<AuditLog, 'id' | 'timestamp'>): P
 export async function getAuditLogs(max: number = 100): Promise<AuditLog[]> {
   if (!auth.currentUser) return [];
   try {
-    const q = query(collection(db, 'audit_logs'), orderBy('timestamp', 'desc'), limit(max));
-    const snap = await getDocs(q);
-    return snap.docs.map(d => {
-      const data = d.data();
-      const stringifyField = (val: any) => {
-        if (val === undefined || val === null) return undefined;
-        if (typeof val === 'object') {
-          try {
-            return JSON.stringify(val);
-          } catch {
-            return '[Object]';
-          }
-        }
-        return String(val);
-      };
-
-      return {
-        ...data,
-        id: d.id,
-        action: String(data.action || ''),
-        employeeId: stringifyField(data.employeeId),
-        timestamp: String(data.timestamp || new Date().toISOString()),
-        oldValue: stringifyField(data.oldValue || data.previousValue),
-        newValue: stringifyField(data.newValue),
-        actionSource: String(data.actionSource || 'SYSTEM'),
-        reason: stringifyField(data.reason || data.details || data.description),
-      } as AuditLog;
-    });
+    const res = await fetchAuditLogs({ pageSize: max });
+    return Array.isArray(res.logs) ? res.logs : [];
   } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, 'audit_logs');
+    console.error('Error fetching audit logs:', error);
     return [];
   }
 }
 
-// Load Authentic Industrial Manpower (Real factory employees)
+// Load Authentic Industrial Manpower via authenticated server bulk-import API (server generates CSPRNG QR tokens)
 export async function loadAuthenticIndustrialManpower(): Promise<{ count: number }> {
-  let added = 0;
-  const now = new Date().toISOString();
+  const headers = await getAuthHeaders();
+  const rows = AUTHENTIC_INDUSTRIAL_MANPOWER.map((item) => ({
+    employeeId: item.employeeId!,
+    employeeName: item.employeeName!,
+    employeeType: (item.employeeType as any) || 'Permanent',
+    section: item.section || 'MI',
+    department: item.department || 'Production',
+    floor: item.floor || 'MI-01',
+    designation: item.designation || 'Operator',
+    employeeStatus: 'Active',
+  }));
 
-  for (const item of AUTHENTIC_INDUSTRIAL_MANPOWER) {
-    const fullEmp: Employee = {
-      employeeId: item.employeeId!,
-      employeeName: item.employeeName!,
-      employeeType: (item.employeeType as any) || 'Permanent',
-      section: item.section || 'MI',
-      department: item.department || 'Production',
-      floor: item.floor || '1st Floor',
-      designation: item.designation || 'Operator',
-      qrCodeToken: `QR_${item.employeeId}_AUTH`,
-      employeeStatus: 'Active',
-      createdAt: now,
-      updatedAt: now,
-    };
-    await setDoc(doc(db, 'employees', fullEmp.employeeId), fullEmp);
-    added++;
-  }
+  const data = await apiFetchJson<{ success: boolean; savedCount?: number }>(
+    '/api/employees/bulk-import',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        fileName: 'authentic_industrial_manpower_seed.json',
+        rows,
+      }),
+    },
+    'Failed to load industrial manpower records.'
+  );
 
-  await recordAuditLog({
-    action: 'LOAD_AUTHENTIC_MANPOWER',
-    newValue: `${added} authentic manpower employee records registered`,
-    actionSource: 'MANPOWER_MASTER',
-    reason: 'Loaded original industrial manpower records',
-  });
-
-  return { count: added };
+  return { count: Number(data.savedCount || 0) };
 }
 
 // Wipe out mock / dummy attendance records through authenticated Super Admin backend endpoint

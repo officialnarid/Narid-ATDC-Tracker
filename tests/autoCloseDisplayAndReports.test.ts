@@ -1,5 +1,5 @@
 import request from 'supertest';
-import * as XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createApp } from '../server.ts';
 import {
@@ -463,14 +463,37 @@ describe('NARID ATDC Auto-Close Time Display in Attendance History, Reports & Ex
     expect(histNight.autoCloseRecordedAt).toBe('23 Nov 2026, 04:33:12 AM IST');
     expect(histNight.status).toBe('AUTO CLOSED');
 
-    // Scenario 6: Premium Excel (.xlsx) Export verification via buildExcelWorkbookBuffer + XLSX.read
+    // Scenario 6: Premium Excel (.xlsx) Export verification via buildExcelWorkbookBuffer + ExcelJS
     vi.useRealTimers();
     const dailyReport = buildAttendanceReportTable('daily_attendance', baseParams);
     const xlsxBuf = await buildExcelWorkbookBuffer(dailyReport.tableData, dailyReport.tableColumns, 'DailyReport');
-    const parsedWb = XLSX.read(xlsxBuf, { type: 'array' });
-    expect(parsedWb.SheetNames).toContain('DailyReport');
-    // Table header row is on row 8 (0-indexed row 7) beneath corporate banner & executive summary
-    const parsedRows = XLSX.utils.sheet_to_json<Record<string, any>>(parsedWb.Sheets['DailyReport'], { range: 7 });
+    const parsedWb = new ExcelJS.Workbook();
+    await parsedWb.xlsx.load(xlsxBuf);
+    const dailyWs = parsedWb.getWorksheet('DailyReport');
+    expect(dailyWs).toBeDefined();
+    // Table header row is on row 8 beneath corporate banner & executive summary
+    const headerRow = dailyWs!.getRow(8);
+    const headerNames: string[] = [];
+    headerRow.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+      headerNames[colNumber - 1] = String(cell.value ?? '');
+    });
+    const parsedRows: Record<string, any>[] = [];
+    for (let r = 9; r <= dailyWs!.rowCount; r++) {
+      const row = dailyWs!.getRow(r);
+      const obj: Record<string, any> = {};
+      let hasAny = false;
+      headerNames.forEach((h, idx) => {
+        if (!h) return;
+        const rawVal = row.getCell(idx + 1).value;
+        const v =
+          rawVal instanceof Date
+            ? (rawVal.getTime() - Date.UTC(1899, 11, 30)) / 86400000
+            : rawVal;
+        if (v !== null && v !== undefined && v !== '') hasAny = true;
+        obj[h] = v;
+      });
+      if (hasAny) parsedRows.push(obj);
+    }
 
     const xlsxDayAuto = parsedRows.find((r) => r['Employee ID'] === 'ACD001')!;
     expect(xlsxDayAuto['Scheduled Shift Start']).toBe('09:00 AM');

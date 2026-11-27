@@ -41,10 +41,23 @@ describe('Firestore Security Rules (Strict Zero-Trust UID RBAC)', () => {
     expect(rulesContent).toContain("lockStatus != 'LOCKED'");
   });
 
-  it('blocks direct client writes to attendance, punch_events, punch_logs, and shift_rosters', () => {
-    for (const col of ['attendance', 'punch_events', 'punch_logs', 'shift_rosters']) {
+  it('blocks direct client read and write access to employees, attendance, punch_events, punch_logs, shift_rosters, and master collections (F-02)', () => {
+    const serverOnlyOperational = [
+      'employees',
+      'attendance',
+      'punch_events',
+      'punch_logs',
+      'shift_rosters',
+      'departments',
+      'floors',
+      'sections',
+      'lines',
+      'shifts',
+      'system_settings',
+    ];
+    for (const col of serverOnlyOperational) {
       const block = extractMatchBlock(col);
-      expect(block).toMatch(/allow\s+create,\s*update,\s*delete:\s*if\s+false;/);
+      expect(block).toMatch(/allow\s+read,\s*write:\s*if\s+false;/);
     }
   });
 
@@ -96,7 +109,7 @@ describe('Firestore Security Rules (Strict Zero-Trust UID RBAC)', () => {
     expect(block).toMatch(/allow\s+create,\s*update,\s*delete:\s*if\s+false;/);
   });
 
-  it('supports future dynamic roles via active-role and role_permissions helpers without unapproved hardcoded future roles', () => {
+  it('hardens /users self-writes against locked accounts and privileged field injection, and supports dynamic roles without hardcoded future roles', () => {
     expect(rulesContent).toContain('function callerRoleId()');
     expect(rulesContent).toContain('function isRoleActive()');
     expect(rulesContent).toContain('function hasRoleModuleAction(mod, act)');
@@ -105,14 +118,12 @@ describe('Firestore Security Rules (Strict Zero-Trust UID RBAC)', () => {
     );
     expect(rulesContent).toContain("isSystemRole(callerRoleId())");
 
-    // Verify dynamic role module action wiring for operational master collections
-    const employeesBlock = extractMatchBlock('employees');
-    expect(employeesBlock).toContain("hasRoleModuleAction('employees', 'add')");
-    expect(employeesBlock).toContain("hasRoleModuleAction('employees', 'edit')");
-    expect(employeesBlock).toContain("hasRoleModuleAction('employees', 'delete')");
-
-    const shiftsBlock = extractMatchBlock('shifts');
-    expect(shiftsBlock).toContain("hasRoleModuleAction('shifts', 'add')");
+    // Verify /users self-write hardening
+    const usersBlock = extractMatchBlock('users');
+    expect(usersBlock).toContain('isActiveUser()');
+    expect(usersBlock).toContain('isNotLocked()');
+    expect(usersBlock).toContain("'role'");
+    expect(usersBlock).toContain("'lockStatus'");
 
     // Verify no unapproved future roles are hardcoded in security rules
     const lowerRules = rulesContent.toLowerCase();

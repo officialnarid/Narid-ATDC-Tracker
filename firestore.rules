@@ -146,36 +146,25 @@ service cloud.firestore {
       allow create, update, delete: if false; // Strictly Firebase Admin SDK only
     }
 
-    // 5. Employees Master Directory
+    // 5. Employees Master Directory (Contains QR Security Tokens & Workforce PII)
+    // Strictly Server-Authoritative Backend API (Admin SDK) Only — enforces Company Wi-Fi, RBAC & zero QR token leakage
     match /employees/{employeeId} {
-      allow list, get: if isActiveUser();
-      allow create: if (isAdmin() || hasRoleModuleAction('employees', 'add')) && isValidId(employeeId) &&
-        request.resource.data.employeeId is string &&
-        request.resource.data.employeeName is string &&
-        request.resource.data.employeeStatus in ['Active', 'Inactive'];
-      allow update: if (isAdmin() || hasRoleModuleAction('employees', 'edit')) && isValidId(employeeId) &&
-        request.resource.data.employeeId is string &&
-        request.resource.data.employeeName is string &&
-        request.resource.data.employeeStatus in ['Active', 'Inactive'];
-      allow delete: if (isAdmin() || hasRoleModuleAction('employees', 'delete')) && isValidId(employeeId);
+      allow read, write: if false;
     }
 
-    // 6. Attendance Daily Records (Server-Authoritative Backend API Only Writes)
+    // 6. Attendance Daily Records (Server-Authoritative Backend API Only)
     match /attendance/{attendanceId} {
-      allow list, get: if isActiveUser();
-      allow create, update, delete: if false; // Strictly via authenticated backend API (Admin SDK)
+      allow read, write: if false;
     }
 
-    // 7. Individual Punch Events (Server-Authoritative Backend API Only Writes)
+    // 7. Individual Punch Events (Server-Authoritative Backend API Only)
     match /punch_events/{eventId} {
-      allow list, get: if isAdmin() || hasRoleModuleAction('scanner', 'view') || hasRoleModuleAction('history', 'view');
-      allow create, update, delete: if false; // Strictly via authenticated backend API (Admin SDK)
+      allow read, write: if false;
     }
 
-    // 8. Raw Punch Activity Logs (Server-Authoritative Backend API Only Writes)
+    // 8. Raw Punch Activity Logs (Server-Authoritative Backend API Only)
     match /punch_logs/{logId} {
-      allow list, get: if isAdmin() || hasRoleModuleAction('scanner', 'view') || hasRoleModuleAction('history', 'view');
-      allow create, update, delete: if false; // Strictly via authenticated backend API (Admin SDK)
+      allow read, write: if false;
     }
 
     // 9. Enterprise Compliance Audit Logs (Admin SDK Only Writes)
@@ -208,59 +197,50 @@ service cloud.firestore {
       allow create, update, delete: if false;
     }
 
-    // 10. Organization Hierarchy (Departments, Floors/Lines, Sections, Lines)
+    // 10. Organization Hierarchy (Server-Authoritative Backend API Only — enforces Company Wi-Fi & RBAC)
     match /departments/{departmentId} {
-      allow list, get: if isActiveUser();
-      allow create: if (isAdmin() || hasRoleModuleAction('organization', 'add')) && isValidId(departmentId);
-      allow update: if (isAdmin() || hasRoleModuleAction('organization', 'edit')) && isValidId(departmentId);
-      allow delete: if (isAdmin() || hasRoleModuleAction('organization', 'delete')) && isValidId(departmentId);
+      allow read, write: if false;
     }
 
     match /floors/{floorId} {
-      allow list, get: if isActiveUser();
-      allow create: if (isAdmin() || hasRoleModuleAction('organization', 'add')) && isValidId(floorId);
-      allow update: if (isAdmin() || hasRoleModuleAction('organization', 'edit')) && isValidId(floorId);
-      allow delete: if (isAdmin() || hasRoleModuleAction('organization', 'delete')) && isValidId(floorId);
+      allow read, write: if false;
     }
 
     match /sections/{sectionId} {
-      allow list, get: if isActiveUser();
-      allow create: if (isAdmin() || hasRoleModuleAction('organization', 'add')) && isValidId(sectionId);
-      allow update: if (isAdmin() || hasRoleModuleAction('organization', 'edit')) && isValidId(sectionId);
-      allow delete: if (isAdmin() || hasRoleModuleAction('organization', 'delete')) && isValidId(sectionId);
+      allow read, write: if false;
     }
 
     match /lines/{lineId} {
-      allow list, get: if isActiveUser();
-      allow create: if (isAdmin() || hasRoleModuleAction('organization', 'add')) && isValidId(lineId);
-      allow update: if (isAdmin() || hasRoleModuleAction('organization', 'edit')) && isValidId(lineId);
-      allow delete: if (isAdmin() || hasRoleModuleAction('organization', 'delete')) && isValidId(lineId);
+      allow read, write: if false;
     }
 
-    // 11. Shift Schedules & Server-Managed Rosters
+    // 11. Shift Schedules & Server-Managed Rosters (Server-Authoritative Backend API Only)
     match /shifts/{shiftId} {
-      allow list, get: if isActiveUser();
-      allow create: if (isAdmin() || hasRoleModuleAction('shifts', 'add')) && isValidId(shiftId);
-      allow update: if (isAdmin() || hasRoleModuleAction('shifts', 'edit')) && isValidId(shiftId);
-      allow delete: if (isAdmin() || hasRoleModuleAction('shifts', 'delete')) && isValidId(shiftId);
+      allow read, write: if false;
     }
 
     match /shift_rosters/{rosterId} {
-      allow list, get: if isActiveUser();
-      allow create, update, delete: if false; // Strictly via authenticated backend API (Admin SDK)
+      allow read, write: if false;
     }
 
-    // 12. System Settings
+    // 12. System Settings (Server-Authoritative Backend API Only)
     match /system_settings/{settingId} {
-      allow list, get: if isActiveUser();
-      allow create, update, delete: if isSuperAdmin() && isValidId(settingId);
+      allow read, write: if false;
     }
 
-    // 13. Users Profile Collection
+    // 13. Users Profile Collection (Active, Unlocked Self-Read/Safe-Preference Only)
     match /users/{userId} {
       allow list: if isSuperAdmin();
-      allow get: if isSignedIn() && (isSuperAdmin() || request.auth.uid == userId);
-      allow create, update: if isValidId(userId) && (isSuperAdmin() || (isSignedIn() && request.auth.uid == userId));
+      allow get: if isActiveUser() && (isSuperAdmin() || request.auth.uid == userId);
+      allow create, update: if isValidId(userId) && (
+        isSuperAdmin() ||
+        (
+          isActiveUser() &&
+          isNotLocked() &&
+          request.auth.uid == userId &&
+          !request.resource.data.keys().hasAny(['role', 'status', 'lockStatus', 'loginId', 'email', 'authUid', 'modulesAllowed'])
+        )
+      );
       allow delete: if isSuperAdmin() && isValidId(userId);
     }
 

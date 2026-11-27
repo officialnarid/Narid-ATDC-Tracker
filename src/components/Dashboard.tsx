@@ -33,9 +33,15 @@ import {
   ShiftRoster,
   UserRoleRecord 
 } from '../types';
-import { collection, doc, getDocs, onSnapshot, query, where } from 'firebase/firestore';
+import { doc, onSnapshot } from 'firebase/firestore';
 import { db, auth } from '../firebase';
-import { formatDateKey, formatMinutes, formatTimeDisplay } from '../services/attendanceService';
+import {
+  formatDateKey,
+  formatMinutes,
+  formatTimeDisplay,
+  getAttendanceRecords,
+  getShiftRoster,
+} from '../services/attendanceService';
 import { isModuleAllowedForUser } from '../services/authService';
 import {
   formatDurationClock,
@@ -60,7 +66,7 @@ import {
   normalizeRoleId,
 } from '../services/permissionService';
 import { DashboardSkeleton } from './Skeletons';
-import { recordPerfMetric } from '../utils/perfMonitor';
+import { recordPerfMetric, subscribeAttendanceCommitted } from '../utils/perfMonitor';
 
 interface DashboardProps {
   employees: Employee[];
@@ -156,52 +162,65 @@ export const Dashboard: React.FC<DashboardProps> = ({
     return () => unsubscribe();
   }, [currentUserRole?.loginId]);
 
-  // 2. Real-time Attendance Stream from Firestore
+  // 2. Fetch Attendance Records via authenticated, Company Wi-Fi & RBAC-enforced backend API (F-02)
   useEffect(() => {
     if (!auth.currentUser) return;
-    setLoading(true);
-    setAttendanceError(null);
-    let attQuery = query(
-      collection(db, 'attendance'),
-      where('shiftDate', '==', selectedDate)
-    );
-    if (selectedShift !== 'ALL') {
-      attQuery = query(
-        collection(db, 'attendance'),
-        where('shiftDate', '==', selectedDate),
-        where('shiftId', '==', selectedShift)
-      );
-    }
+    let cancelled = false;
+    const loadAttendance = async (silent = false) => {
+      if (!silent) setLoading(true);
+      setAttendanceError(null);
+      try {
+        const records = await getAttendanceRecords({
+          shiftDate: selectedDate,
+          shiftId: selectedShift,
+        });
+        if (cancelled) return;
+        setAttendanceRecords(records);
+        setHasLoadedAttendance(true);
+      } catch (err) {
+        if (cancelled) return;
+        console.error('[Dashboard] Attendance API error:', err);
+        setAttendanceError(
+          getSafeErrorText(err, {
+            moduleName: 'Dashboard',
+            endpoint: '/api/attendance/records',
+            dbOperationCategory: 'read',
+          })
+        );
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
 
-    const unsubscribe = onSnapshot(attQuery, (snapshot) => {
-      const records = snapshot.docs.map(d => d.data() as AttendanceRecord);
-      setAttendanceRecords(records);
-      setHasLoadedAttendance(true);
-      setLoading(false);
-    }, (err) => {
-      console.error('[Dashboard] Real-time attendance error:', err);
-      setAttendanceError(
-        getSafeErrorText(err, {
-          moduleName: 'Dashboard',
-          dbOperationCategory: 'read',
-        })
-      );
-      setLoading(false);
+    loadAttendance(false);
+
+    // Refresh immediately when local scanner commits a punch
+    const unsubCommit = subscribeAttendanceCommitted((detail) => {
+      if (!detail?.shiftDate || detail.shiftDate === selectedDate) {
+        loadAttendance(true);
+      }
     });
 
-    return () => unsubscribe();
+    // Periodic lightweight background refresh while tab is visible (30s)
+    const intervalId = window.setInterval(() => {
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        loadAttendance(true);
+      }
+    }, 30_000);
+
+    return () => {
+      cancelled = true;
+      unsubCommit();
+      window.clearInterval(intervalId);
+    };
   }, [selectedDate, selectedShift, retryNonce]);
 
-  // 3. Fetch Roster records for selected date
+  // 3. Fetch Roster records for selected date via authenticated backend API (F-02)
   const loadRosterData = async () => {
     if (!auth.currentUser) return;
     try {
-      const rosterQuery = query(
-        collection(db, 'shift_rosters'),
-        where('shiftDate', '==', selectedDate)
-      );
-      const rosterSnap = await getDocs(rosterQuery);
-      setRosterRecords(rosterSnap.docs.map(d => d.data() as ShiftRoster));
+      const rosters = await getShiftRoster(selectedDate);
+      setRosterRecords(rosters);
     } catch (err) {
       console.error('[Dashboard] Error fetching roster records:', err);
     }

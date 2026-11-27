@@ -29,6 +29,10 @@ import {
   downloadPremiumExcelWorkbook,
   type PremiumExcelExportOptions,
 } from '../utils/excelReportExporter';
+import {
+  buildEmployeeTemplateWorkbookBuffer,
+  parseSafeSpreadsheetFile,
+} from '../utils/safeSpreadsheetParser';
 import type { AttendanceReportSummary } from '../utils/attendanceReportBuilder';
 
 export const EMPLOYEE_ID_PATTERN = /^[A-Za-z0-9_.\-]+$/;
@@ -162,49 +166,27 @@ export type {
   NormalizationMappingEntry,
 };
 
-// 1. Download Standard Employee Template
+// 1. Download Standard Employee Template (built via ExcelJS — zero xlsx dependency)
 export async function downloadEmployeeTemplate(): Promise<void> {
-  const XLSX = await import('xlsx');
-  const templateHeaders = [
-    'Employee ID',
-    'Employee Name',
-    'Employee Type',
-    'Section',
-    'Department',
-    'Line',
-    'Designation',
-    'Status',
-  ];
-
-  const sampleRows = [
-    ['JMD12345', 'RAHUL SHARMA', 'Offroll', 'MI', 'Production', 'MI-01', 'Assembly Operator', 'Active'],
-    ['JMD12346', 'AMIT PATEL', 'Permanent', 'FATP', 'Quality', 'FATP-STB', 'Quality Inspector', 'Active'],
-    ['JMD12347', 'SURESH VERMA', 'Staff', 'SMT', 'Production', 'SMT-01', 'Shift Supervisor', 'Active'],
-    ['JMD12348', 'PRIYA NAIR', 'Staff', 'STORE', 'Store', 'FATP-ITR', 'Inventory Officer', 'Active'],
-  ];
-
-  const wsData = [templateHeaders, ...sampleRows];
-  const ws = XLSX.utils.aoa_to_sheet(wsData);
-
-  // Column width styling
-  ws['!cols'] = [
-    { wch: 15 },
-    { wch: 22 },
-    { wch: 15 },
-    { wch: 12 },
-    { wch: 16 },
-    { wch: 14 },
-    { wch: 20 },
-    { wch: 12 },
-  ];
-
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, 'Employee_Master_Template');
-
-  XLSX.writeFile(wb, 'Employee_Master_Template.xlsx');
+  const arrayBuffer = await buildEmployeeTemplateWorkbookBuffer();
+  const blob = new Blob([arrayBuffer], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+  const url = URL.createObjectURL(blob);
+  try {
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'Employee_Master_Template.xlsx';
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  }
 }
 
-// 2. Validate and Parse Uploaded Excel/CSV with Case-Insensitive Master Normalization
+// 2. Validate and Parse Uploaded Excel/CSV with Case-Insensitive Master Normalization (F-06 Hardened Parser)
 export async function parseAndValidateEmployeeExcel(
   file: File,
   validFloors: ReadonlyArray<MasterRecordOption | string>,
@@ -212,11 +194,7 @@ export async function parseAndValidateEmployeeExcel(
   validDepartments: ReadonlyArray<MasterRecordOption | string>,
   options?: ParseEmployeeExcelOptions
 ): Promise<ImportValidationResult> {
-  const [XLSX, buffer] = await Promise.all([import('xlsx'), file.arrayBuffer()]);
-  const wb = XLSX.read(buffer, { type: 'array' });
-  const sheetName = wb.SheetNames[0];
-  const sheet = wb.Sheets[sheetName];
-  const rawJson: any[] = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+  const rawJson: string[][] = await parseSafeSpreadsheetFile(file);
 
   if (rawJson.length < 2) {
     throw new Error('The uploaded file is empty or does not contain data rows.');

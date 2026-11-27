@@ -403,6 +403,17 @@ export async function executeApiFetch(
           if (clonedBody && clonedBody.error === 'API endpoint not found.') {
             retryCount += 1;
             res = await fetch(sameOriginPath, sameOriginInit);
+            if (method === 'GET') {
+              const ct = (res.headers?.get?.('content-type') || '').toLowerCase();
+              if (ct.includes('text/html')) {
+                const previewText = await res.clone().text();
+                if (isNginxWarmupHtmlBody(previewText)) {
+                  retryCount += 1;
+                  await new Promise((r) => setTimeout(r, 600));
+                  res = await fetch(sameOriginPath, sameOriginInit);
+                }
+              }
+            }
           }
         } catch {
           // Non-JSON 404: return original response cleanly

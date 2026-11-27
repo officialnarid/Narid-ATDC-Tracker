@@ -1,6 +1,6 @@
 import http from 'http';
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
-import * as XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
 import { createApp } from '../server.ts';
 import {
   InMemoryAdminAuth,
@@ -14,11 +14,15 @@ import {
   normalizeWhitespaceAndUnicode,
 } from '../src/utils/excelMasterNormalizer.ts';
 
-function buildExcelFileFromAoA(sheetData: any[][], fileName: string): File {
-  const ws = XLSX.utils.aoa_to_sheet(sheetData);
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, 'Employee_Master');
-  const buf = XLSX.write(wb, { type: 'array', bookType: 'xlsx' }) as ArrayBuffer;
+async function buildExcelFileFromAoA(sheetData: any[][], fileName: string): Promise<File> {
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Employee_Master');
+  for (const row of sheetData) {
+    ws.addRow(row);
+  }
+  const raw = await wb.xlsx.writeBuffer();
+  const u8 = new Uint8Array(raw as unknown as Uint8Array);
+  const buf = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
 
   return {
     name: fileName,
@@ -259,7 +263,7 @@ describe('Case-Insensitive Excel Import & Update Normalization (Isolated In-Memo
         ],
       ];
 
-      const file = buildExcelFileFromAoA(sheetData, 'case_normalization_test.xlsx');
+      const file = await buildExcelFileFromAoA(sheetData, 'case_normalization_test.xlsx');
       const validation = await parseAndValidateEmployeeExcel(
         file,
         MASTER_FLOORS,
@@ -396,7 +400,7 @@ describe('Case-Insensitive Excel Import & Update Normalization (Isolated In-Memo
         ['Employee ID', 'Employee Name', 'Department'],
         ['EMP_EXIST_001', 'Priya Nair', '  production  '],
       ];
-      const partialFile = buildExcelFileFromAoA(partialSheet, 'partial_dept_update.xlsx');
+      const partialFile = await buildExcelFileFromAoA(partialSheet, 'partial_dept_update.xlsx');
       const validation = await parseAndValidateEmployeeExcel(
         partialFile,
         MASTER_FLOORS,
@@ -432,7 +436,7 @@ describe('Case-Insensitive Excel Import & Update Normalization (Isolated In-Memo
         ['Employee ID', 'Employee Name', 'Employee Type', 'Section', 'Department', 'Line', 'Designation', 'Status'],
         ['EMP_EXIST_001', 'Priya Nair', 'STAFF', 'store', 'PRODUCTION', 'assembly line', 'INVENTORY OFFICER', 'ACTIVE'],
       ];
-      const casingFile = buildExcelFileFromAoA(casingOnlySheet, 'casing_only_reupload.xlsx');
+      const casingFile = await buildExcelFileFromAoA(casingOnlySheet, 'casing_only_reupload.xlsx');
       const recheck = await parseAndValidateEmployeeExcel(
         casingFile,
         MASTER_FLOORS,
@@ -561,7 +565,7 @@ describe('Case-Insensitive Excel Import & Update Normalization (Isolated In-Memo
         ['Employee ID', 'Employee Name', 'Employee Type', 'Section', 'Department', 'Line', 'Designation', 'Status'],
         ['EMP_AMBIG_001', 'Conflict Test', 'Staff', 'MI', 'Store', 'MI-01', 'Assembly Operator', 'Active'],
       ];
-      const file = buildExcelFileFromAoA(sheet, 'ambiguous_master.xlsx');
+      const file = await buildExcelFileFromAoA(sheet, 'ambiguous_master.xlsx');
 
       // 1. Frontend preview flags ambiguity instead of guessing
       const preview = await parseAndValidateEmployeeExcel(

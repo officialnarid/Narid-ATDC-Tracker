@@ -141,7 +141,7 @@ describe('Global Bulk Selection, ZIP Builder & Chunked Export Engine', () => {
       auditSource: 'TEST_SUITE',
       onProgress: (p) => progressSteps.push({ completed: p.completed, total: p.total }),
       renderCardBlob: async (emp) => {
-        seenTokens.push(emp.qrCodeToken);
+        seenTokens.push(emp.qrCodeToken || '');
         if (emp.employeeId === 'TST_BULK_02') {
           throw new Error('Simulated canvas render failure');
         }

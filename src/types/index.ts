@@ -15,7 +15,9 @@ export interface Employee {
   floorId?: string;
   designation: string;
   designationId?: string;
-  qrCodeToken: string;
+  qrCodeToken?: string;
+  hasQrToken?: boolean;
+  qrTokenReference?: string;
   employeeStatus: EmployeeStatus;
   createdAt: string;
   updatedAt: string;
