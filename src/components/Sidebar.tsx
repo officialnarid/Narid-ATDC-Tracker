@@ -306,12 +306,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
         {/* Logged in User Bar & Logout */}
         {currentUserRole && (
-          <div className="p-3 border-t border-slate-800 bg-[#081527] flex items-center justify-between">
-            <div className="min-w-0 flex-1 pr-2">
-              <div className="text-xs font-semibold text-white truncate">
+          <div className="p-3 border-t border-slate-800 bg-[#081527] flex items-center justify-between gap-2">
+            <div className="min-w-0 flex-1">
+              <div className="text-xs font-semibold text-white whitespace-normal break-words leading-snug">
                 {typeof currentUserRole.name === 'string' ? currentUserRole.name : (currentUserRole.name as any)?.name || currentUserRole.loginId}
               </div>
-              <div className="text-[10px] font-mono text-cyan-400 font-bold uppercase tracking-wider">
+              <div className="text-[10px] font-mono text-cyan-400 font-bold uppercase tracking-wider mt-0.5 whitespace-normal break-words">
                 {String(currentUserRole.role || 'USER').replace('_', ' ')}
               </div>
             </div>

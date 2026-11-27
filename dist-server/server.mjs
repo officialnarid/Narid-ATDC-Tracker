@@ -4,7 +4,7 @@ import cors from "cors";
 import fs2 from "fs";
 import path2 from "path";
 import crypto8 from "crypto";
-import { z as z8 } from "zod";
+import { z as z9 } from "zod";
 
 // serverFirebaseAdmin.ts
 import fs from "fs";
@@ -10538,9 +10538,1797 @@ function registerAttendanceRoutes(app, deps) {
   });
 }
 
+// serverAttendanceHistory.ts
+import { z as z4 } from "zod";
+
+// src/utils/attendanceCalendarEngine.ts
+var WEEKDAY_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+var IST_DATE_FORMATTER = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Kolkata",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit"
+});
+function isValidDateKey(value) {
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return false;
+  const [y, m, d] = trimmed.split("-").map(Number);
+  if (m < 1 || m > 12 || d < 1 || d > 31) return false;
+  const probe = new Date(Date.UTC(y, m - 1, d));
+  return probe.getUTCFullYear() === y && probe.getUTCMonth() === m - 1 && probe.getUTCDate() === d;
+}
+function getTodayIstDateKey(nowMs = Date.now()) {
+  return IST_DATE_FORMATTER.format(new Date(nowMs));
+}
+function extractIstDateKey(input) {
+  if (!input) return null;
+  const str = String(input).trim();
+  if (!str) return null;
+  if (isValidDateKey(str)) return str;
+  const prefix = str.slice(0, 10);
+  if (isValidDateKey(prefix) && (str.length === 10 || str[10] === "T" || str[10] === " ")) {
+    const parsed2 = new Date(str);
+    if (!Number.isNaN(parsed2.getTime())) {
+      return IST_DATE_FORMATTER.format(parsed2);
+    }
+    return prefix;
+  }
+  const parsed = new Date(str);
+  if (!Number.isNaN(parsed.getTime())) {
+    return IST_DATE_FORMATTER.format(parsed);
+  }
+  return null;
+}
+function shiftDateKeyByDays(dateKey, deltaDays) {
+  const [y, m, d] = dateKey.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + deltaDays);
+  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
+}
+function getDayOfWeekFromDateKey(dateKey) {
+  const [y, m, d] = dateKey.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+}
+function getDaysInMonth(year, month) {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+function enumerateMonthDateKeys(year, month) {
+  const total = getDaysInMonth(year, month);
+  const ym = `${year}-${String(month).padStart(2, "0")}`;
+  const out = [];
+  for (let day = 1; day <= total; day++) {
+    out.push(`${ym}-${String(day).padStart(2, "0")}`);
+  }
+  return out;
+}
+function enumerateDateRangeKeys(startDate, endDate) {
+  if (!isValidDateKey(startDate) || !isValidDateKey(endDate) || startDate > endDate) {
+    return [];
+  }
+  const out = [];
+  let cursor = startDate;
+  let guard = 0;
+  while (cursor <= endDate && guard < 400) {
+    out.push(cursor);
+    cursor = shiftDateKeyByDays(cursor, 1);
+    guard += 1;
+  }
+  return out;
+}
+function resolveEmployeeJoiningDate(emp) {
+  const explicitJoining = extractIstDateKey(emp.joiningDate) || extractIstDateKey(emp.dateOfJoining) || extractIstDateKey(emp.doj);
+  if (explicitJoining) return explicitJoining;
+  return extractIstDateKey(emp.createdAt);
+}
+function resolveEmployeeExitDate(emp) {
+  const explicitExit = extractIstDateKey(emp.exitDate) || extractIstDateKey(emp.relievingDate) || extractIstDateKey(emp.deactivatedAt);
+  if (explicitExit) return explicitExit;
+  if (String(emp.employeeStatus || "").toLowerCase() === "inactive") {
+    return extractIstDateKey(emp.updatedAt);
+  }
+  return null;
+}
+function resolveEmployeeWeeklyOffDays(emp, policy) {
+  if (Array.isArray(emp.weeklyOffDays) && emp.weeklyOffDays.length > 0) {
+    return emp.weeklyOffDays.map((n) => Number(n)).filter((n) => Number.isInteger(n) && n >= 0 && n <= 6);
+  }
+  if (typeof emp.weeklyOffDay === "number" && emp.weeklyOffDay >= 0 && emp.weeklyOffDay <= 6) {
+    return [emp.weeklyOffDay];
+  }
+  if (typeof emp.weeklyOffDay === "string") {
+    const map = {
+      SUN: 0,
+      SUNDAY: 0,
+      MON: 1,
+      MONDAY: 1,
+      TUE: 2,
+      TUESDAY: 2,
+      WED: 3,
+      WEDNESDAY: 3,
+      THU: 4,
+      THURSDAY: 4,
+      FRI: 5,
+      FRIDAY: 5,
+      SAT: 6,
+      SATURDAY: 6
+    };
+    const key = emp.weeklyOffDay.trim().toUpperCase();
+    if (key in map) return [map[key]];
+  }
+  return policy.weeklyOffDays;
+}
+function buildSafeEmployeeProfile(emp, shiftsById, inferredShiftId, defaultShiftId = "DAY") {
+  const shiftId = String(emp.currentShiftId || emp.shiftId || emp.defaultShiftId || inferredShiftId || defaultShiftId || "DAY").trim().toUpperCase() || "DAY";
+  const shiftObj = shiftsById.get(shiftId);
+  const shiftName = shiftObj?.name || (shiftId === "NIGHT" ? "NIGHT SHIFT" : "DAY SHIFT");
+  const line = String(emp.line || emp.floor || "Unassigned").trim() || "Unassigned";
+  return {
+    employeeId: String(emp.employeeId || "").trim(),
+    employeeName: String(emp.employeeName || "").trim(),
+    line,
+    floor: String(emp.floor || line).trim(),
+    section: String(emp.section || "Unassigned").trim() || "Unassigned",
+    department: String(emp.department || "Unassigned").trim() || "Unassigned",
+    employeeType: String(emp.employeeType || "Permanent").trim(),
+    designation: String(emp.designation || "").trim(),
+    currentShiftId: shiftId,
+    currentShiftName: shiftName,
+    employeeStatus: String(emp.employeeStatus || "Active").toLowerCase() === "inactive" ? "Inactive" : "Active",
+    joiningDate: resolveEmployeeJoiningDate(emp),
+    exitDate: resolveEmployeeExitDate(emp)
+  };
+}
+function findApprovedLeaveForDate(leaves, dateKey) {
+  if (!leaves || leaves.length === 0) return null;
+  for (const lv of leaves) {
+    const st = String(lv.status || "").trim().toUpperCase();
+    if (st && st !== "APPROVED" && st !== "SANCTIONED") continue;
+    if (isValidDateKey(lv.startDate) && isValidDateKey(lv.endDate)) {
+      if (dateKey >= lv.startDate && dateKey <= lv.endDate) {
+        return lv;
+      }
+    }
+  }
+  return null;
+}
+function classifyEmployeeDay(emp, dateKey, ctx) {
+  const empId = String(emp.employeeId || "").trim();
+  const empName = String(emp.employeeName || "").trim();
+  const dayOfMonth = parseInt(dateKey.slice(8, 10), 10) || 1;
+  const dayOfWeek = getDayOfWeekFromDateKey(dateKey);
+  const weekdayLabel = WEEKDAY_SHORT[dayOfWeek] || "Sun";
+  const key = `${empId}__${dateKey}`;
+  const att = ctx.attendanceByEmpDate.get(key) || null;
+  const roster = ctx.rostersByEmpDate.get(key) || null;
+  const holiday = ctx.holidaysByDate.get(dateKey) || null;
+  const approvedLeave = findApprovedLeaveForDate(ctx.leavesByEmp.get(empId), dateKey);
+  const inferredShiftId = att?.shiftId || roster?.shiftId || emp.currentShiftId || emp.shiftId || emp.defaultShiftId || ctx.inferredShiftByEmp?.get(empId) || ctx.policy.defaultShiftId || "DAY";
+  const shiftObj = ctx.shiftsById.get(String(inferredShiftId).toUpperCase()) || null;
+  const shiftName = att?.shiftNameSnapshot || shiftObj?.name || (String(inferredShiftId).toUpperCase() === "NIGHT" ? "NIGHT SHIFT" : "DAY SHIFT");
+  const bounds = resolveShiftScheduleBounds(dateKey, {
+    id: shiftObj?.id || String(inferredShiftId),
+    shiftId: att?.shiftId || String(inferredShiftId),
+    name: shiftName,
+    startTime: att?.scheduledPunchIn || shiftObj?.startTime,
+    endTime: att?.scheduledPunchOut || shiftObj?.endTime,
+    isOvernight: shiftObj?.isOvernight
+  });
+  const defaultSchedStart = formatIsoTimeKolkata12h(bounds.scheduledStartIso);
+  const defaultSchedEnd = formatIsoTimeKolkata12h(bounds.scheduledEndIso);
+  const base = {
+    date: dateKey,
+    dayOfMonth,
+    dayOfWeek,
+    weekdayLabel,
+    employeeId: empId,
+    employeeName: empName,
+    shiftId: String(inferredShiftId).toUpperCase(),
+    shiftName
+  };
+  if (att) {
+    const metrics = resolveAttendanceMetrics(att, ctx.nowMs, STANDARD_DUTY_MINUTES);
+    const rawUp = String(metrics.status || "").trim().toUpperCase();
+    if (rawUp === "LEAVE" || rawUp === "ON LEAVE") {
+      return {
+        ...base,
+        status: "APPROVED LEAVE",
+        rawAttendanceStatus: rawUp,
+        statusReason: "Approved leave recorded in attendance register",
+        isScheduledWorkingDay: false,
+        isAttended: false,
+        isLate: false,
+        isAutoClosed: false,
+        scheduledShiftStart: metrics.scheduledStartDisplay,
+        scheduledShiftEnd: metrics.scheduledEndDisplay,
+        actualPunchIn: "N/A",
+        actualPunchOut: "N/A",
+        autoCloseTime: "N/A",
+        autoCloseRecordedAt: "N/A",
+        dutyMinutes: 0,
+        otMinutes: 0,
+        totalWorkingMinutes: 0,
+        dutyHours: "00:00",
+        otHours: "00:00",
+        totalWorkingHours: "00:00",
+        leaveOrOffDetail: roster?.remarks || "Approved Leave",
+        attendanceRecordId: att.id || null
+      };
+    }
+    if (rawUp === "WEEKLY_OFF" || rawUp === "WEEKLY OFF") {
+      return {
+        ...base,
+        status: "WEEKLY OFF",
+        rawAttendanceStatus: rawUp,
+        statusReason: "Weekly off",
+        isScheduledWorkingDay: false,
+        isAttended: false,
+        isLate: false,
+        isAutoClosed: false,
+        scheduledShiftStart: "--:--",
+        scheduledShiftEnd: "--:--",
+        actualPunchIn: "N/A",
+        actualPunchOut: "N/A",
+        autoCloseTime: "N/A",
+        autoCloseRecordedAt: "N/A",
+        dutyMinutes: 0,
+        otMinutes: 0,
+        totalWorkingMinutes: 0,
+        dutyHours: "00:00",
+        otHours: "00:00",
+        totalWorkingHours: "00:00",
+        leaveOrOffDetail: roster?.remarks || "Scheduled Weekly Off",
+        attendanceRecordId: att.id || null
+      };
+    }
+    if (rawUp === "HOLIDAY") {
+      return {
+        ...base,
+        status: "HOLIDAY",
+        rawAttendanceStatus: rawUp,
+        statusReason: holiday?.name || "Declared Holiday",
+        isScheduledWorkingDay: false,
+        isAttended: false,
+        isLate: false,
+        isAutoClosed: false,
+        scheduledShiftStart: "--:--",
+        scheduledShiftEnd: "--:--",
+        actualPunchIn: "N/A",
+        actualPunchOut: "N/A",
+        autoCloseTime: "N/A",
+        autoCloseRecordedAt: "N/A",
+        dutyMinutes: 0,
+        otMinutes: 0,
+        totalWorkingMinutes: 0,
+        dutyHours: "00:00",
+        otHours: "00:00",
+        totalWorkingHours: "00:00",
+        leaveOrOffDetail: holiday?.name || roster?.remarks || "Declared Holiday",
+        attendanceRecordId: att.id || null
+      };
+    }
+    if (rawUp === "ABSENT") {
+      return {
+        ...base,
+        status: "ABSENT",
+        rawAttendanceStatus: rawUp,
+        statusReason: "ABSENT \u2013 NO ATTENDANCE RECORD",
+        isScheduledWorkingDay: true,
+        isAttended: false,
+        isLate: false,
+        isAutoClosed: false,
+        scheduledShiftStart: metrics.scheduledStartDisplay,
+        scheduledShiftEnd: metrics.scheduledEndDisplay,
+        actualPunchIn: "N/A",
+        actualPunchOut: "N/A",
+        autoCloseTime: "N/A",
+        autoCloseRecordedAt: "N/A",
+        dutyMinutes: 0,
+        otMinutes: 0,
+        totalWorkingMinutes: 0,
+        dutyHours: "00:00",
+        otHours: "00:00",
+        totalWorkingHours: "00:00",
+        leaveOrOffDetail: null,
+        attendanceRecordId: att.id || null
+      };
+    }
+    let calStatus = "PRESENT";
+    if (metrics.isOpen || rawUp === "IN PROGRESS") {
+      calStatus = "IN PROGRESS";
+    } else if (metrics.isCurrentlyAutoClosed || rawUp === "AUTO CLOSED" || rawUp === "MISSED PUNCH OUT") {
+      calStatus = "AUTO CLOSED";
+    } else if (rawUp === "HALF DAY") {
+      calStatus = "HALF DAY";
+    } else if (rawUp === "SHORT LEAVE") {
+      calStatus = "SHORT LEAVE";
+    } else {
+      calStatus = "PRESENT";
+    }
+    const dutyMinutes = metrics.isOpen ? 0 : metrics.regularDutyMinutes;
+    const otMinutes = metrics.isOpen ? 0 : metrics.overtimeMinutes;
+    const totalWorkingMinutes = metrics.isOpen ? 0 : metrics.completedDutyMinutes;
+    return {
+      ...base,
+      status: calStatus,
+      rawAttendanceStatus: metrics.status,
+      statusReason: calStatus === "AUTO CLOSED" ? `Provisional Auto-Close at ${metrics.autoCloseTimeDisplay}` : calStatus === "IN PROGRESS" ? "Employee currently clocked IN" : metrics.status,
+      isScheduledWorkingDay: true,
+      isAttended: true,
+      isLate: metrics.isLate,
+      isAutoClosed: metrics.isCurrentlyAutoClosed,
+      scheduledShiftStart: metrics.scheduledStartDisplay,
+      scheduledShiftEnd: metrics.scheduledEndDisplay,
+      actualPunchIn: formatIsoTimeKolkata12h(att.firstPunchIn || att.punchIn),
+      actualPunchOut: metrics.isOpen ? "In Progress" : metrics.actualPunchOutIso ? metrics.actualPunchOutDisplay : "N/A",
+      autoCloseTime: metrics.isCurrentlyAutoClosed ? metrics.autoCloseTimeDisplay : "N/A",
+      autoCloseRecordedAt: metrics.isCurrentlyAutoClosed ? metrics.autoCloseRecordedAtDisplay : "N/A",
+      dutyMinutes,
+      otMinutes,
+      totalWorkingMinutes,
+      dutyHours: formatDurationClock(dutyMinutes),
+      otHours: formatDurationClock(otMinutes),
+      totalWorkingHours: formatDurationClock(totalWorkingMinutes),
+      leaveOrOffDetail: null,
+      attendanceRecordId: att.id || null
+    };
+  }
+  if (dateKey > ctx.todayIstKey) {
+    const preNote = holiday ? `Upcoming Holiday: ${holiday.name}` : roster?.rosterStatus === "HOLIDAY" ? `Upcoming Holiday${roster.remarks ? `: ${roster.remarks}` : ""}` : approvedLeave ? `Upcoming Approved Leave${approvedLeave.leaveType ? ` (${approvedLeave.leaveType})` : ""}` : roster?.rosterStatus === "LEAVE" ? `Upcoming Approved Leave${roster.remarks ? `: ${roster.remarks}` : ""}` : null;
+    return {
+      ...base,
+      status: "FUTURE DATE",
+      rawAttendanceStatus: null,
+      statusReason: preNote || "Future date \u2014 attendance not yet applicable",
+      isScheduledWorkingDay: false,
+      isAttended: false,
+      isLate: false,
+      isAutoClosed: false,
+      scheduledShiftStart: defaultSchedStart,
+      scheduledShiftEnd: defaultSchedEnd,
+      actualPunchIn: "N/A",
+      actualPunchOut: "N/A",
+      autoCloseTime: "N/A",
+      autoCloseRecordedAt: "N/A",
+      dutyMinutes: 0,
+      otMinutes: 0,
+      totalWorkingMinutes: 0,
+      dutyHours: "00:00",
+      otHours: "00:00",
+      totalWorkingHours: "00:00",
+      leaveOrOffDetail: preNote,
+      attendanceRecordId: null
+    };
+  }
+  const joiningDate = resolveEmployeeJoiningDate(emp);
+  if (joiningDate && dateKey < joiningDate) {
+    return {
+      ...base,
+      status: "NOT EMPLOYED",
+      rawAttendanceStatus: null,
+      statusReason: `Before employee joining date (${joiningDate})`,
+      isScheduledWorkingDay: false,
+      isAttended: false,
+      isLate: false,
+      isAutoClosed: false,
+      scheduledShiftStart: "--:--",
+      scheduledShiftEnd: "--:--",
+      actualPunchIn: "N/A",
+      actualPunchOut: "N/A",
+      autoCloseTime: "N/A",
+      autoCloseRecordedAt: "N/A",
+      dutyMinutes: 0,
+      otMinutes: 0,
+      totalWorkingMinutes: 0,
+      dutyHours: "00:00",
+      otHours: "00:00",
+      totalWorkingHours: "00:00",
+      leaveOrOffDetail: `Joined on ${joiningDate}`,
+      attendanceRecordId: null
+    };
+  }
+  const exitDate = resolveEmployeeExitDate(emp);
+  if (exitDate && dateKey > exitDate || String(emp.employeeStatus || "").toLowerCase() === "inactive" && !exitDate) {
+    return {
+      ...base,
+      status: "NOT EMPLOYED",
+      rawAttendanceStatus: null,
+      statusReason: exitDate ? `Employee inactive / outside employment period after ${exitDate}` : "Employee status is Inactive",
+      isScheduledWorkingDay: false,
+      isAttended: false,
+      isLate: false,
+      isAutoClosed: false,
+      scheduledShiftStart: "--:--",
+      scheduledShiftEnd: "--:--",
+      actualPunchIn: "N/A",
+      actualPunchOut: "N/A",
+      autoCloseTime: "N/A",
+      autoCloseRecordedAt: "N/A",
+      dutyMinutes: 0,
+      otMinutes: 0,
+      totalWorkingMinutes: 0,
+      dutyHours: "00:00",
+      otHours: "00:00",
+      totalWorkingHours: "00:00",
+      leaveOrOffDetail: exitDate ? `Inactive after ${exitDate}` : "Inactive employee",
+      attendanceRecordId: null
+    };
+  }
+  if (holiday || roster?.rosterStatus === "HOLIDAY") {
+    const label = holiday?.name || roster?.remarks || "Declared Holiday";
+    return {
+      ...base,
+      status: "HOLIDAY",
+      rawAttendanceStatus: "HOLIDAY",
+      statusReason: label,
+      isScheduledWorkingDay: false,
+      isAttended: false,
+      isLate: false,
+      isAutoClosed: false,
+      scheduledShiftStart: "--:--",
+      scheduledShiftEnd: "--:--",
+      actualPunchIn: "N/A",
+      actualPunchOut: "N/A",
+      autoCloseTime: "N/A",
+      autoCloseRecordedAt: "N/A",
+      dutyMinutes: 0,
+      otMinutes: 0,
+      totalWorkingMinutes: 0,
+      dutyHours: "00:00",
+      otHours: "00:00",
+      totalWorkingHours: "00:00",
+      leaveOrOffDetail: label,
+      attendanceRecordId: null
+    };
+  }
+  if (approvedLeave || roster?.rosterStatus === "LEAVE") {
+    const label = approvedLeave ? `${approvedLeave.leaveType || "Approved Leave"}${approvedLeave.reason ? ` \u2014 ${approvedLeave.reason}` : ""}` : roster?.remarks || "Approved Leave (Shift Roster)";
+    return {
+      ...base,
+      status: "APPROVED LEAVE",
+      rawAttendanceStatus: "LEAVE",
+      statusReason: label,
+      isScheduledWorkingDay: false,
+      isAttended: false,
+      isLate: false,
+      isAutoClosed: false,
+      scheduledShiftStart: defaultSchedStart,
+      scheduledShiftEnd: defaultSchedEnd,
+      actualPunchIn: "N/A",
+      actualPunchOut: "N/A",
+      autoCloseTime: "N/A",
+      autoCloseRecordedAt: "N/A",
+      dutyMinutes: 0,
+      otMinutes: 0,
+      totalWorkingMinutes: 0,
+      dutyHours: "00:00",
+      otHours: "00:00",
+      totalWorkingHours: "00:00",
+      leaveOrOffDetail: label,
+      attendanceRecordId: null
+    };
+  }
+  const weeklyOffDays = resolveEmployeeWeeklyOffDays(emp, ctx.policy);
+  if (roster?.rosterStatus === "WEEKLY_OFF" || weeklyOffDays.includes(dayOfWeek)) {
+    const label = roster?.remarks || `Weekly Off (${weekdayLabel})`;
+    return {
+      ...base,
+      status: "WEEKLY OFF",
+      rawAttendanceStatus: "WEEKLY_OFF",
+      statusReason: label,
+      isScheduledWorkingDay: false,
+      isAttended: false,
+      isLate: false,
+      isAutoClosed: false,
+      scheduledShiftStart: "--:--",
+      scheduledShiftEnd: "--:--",
+      actualPunchIn: "N/A",
+      actualPunchOut: "N/A",
+      autoCloseTime: "N/A",
+      autoCloseRecordedAt: "N/A",
+      dutyMinutes: 0,
+      otMinutes: 0,
+      totalWorkingMinutes: 0,
+      dutyHours: "00:00",
+      otHours: "00:00",
+      totalWorkingHours: "00:00",
+      leaveOrOffDetail: label,
+      attendanceRecordId: null
+    };
+  }
+  const scheduleMissing = ctx.policy.scheduleUnverified === true || emp.scheduleUnverified === true || ctx.policy.schedulePolicyMode === "ROSTER_ONLY" && !roster || ctx.shiftsById.size === 0;
+  if (scheduleMissing) {
+    return {
+      ...base,
+      status: "UNKNOWN",
+      rawAttendanceStatus: null,
+      statusReason: "UNKNOWN / NOT VERIFIED \u2014 Schedule or leave verification data unavailable",
+      isScheduledWorkingDay: false,
+      isAttended: false,
+      isLate: false,
+      isAutoClosed: false,
+      scheduledShiftStart: defaultSchedStart,
+      scheduledShiftEnd: defaultSchedEnd,
+      actualPunchIn: "N/A",
+      actualPunchOut: "N/A",
+      autoCloseTime: "N/A",
+      autoCloseRecordedAt: "N/A",
+      dutyMinutes: 0,
+      otMinutes: 0,
+      totalWorkingMinutes: 0,
+      dutyHours: "00:00",
+      otHours: "00:00",
+      totalWorkingHours: "00:00",
+      leaveOrOffDetail: "Schedule not verified",
+      attendanceRecordId: null
+    };
+  }
+  return {
+    ...base,
+    status: "ABSENT",
+    rawAttendanceStatus: "ABSENT",
+    statusReason: "ABSENT \u2013 NO ATTENDANCE RECORD",
+    isScheduledWorkingDay: true,
+    isAttended: false,
+    isLate: false,
+    isAutoClosed: false,
+    scheduledShiftStart: defaultSchedStart,
+    scheduledShiftEnd: defaultSchedEnd,
+    actualPunchIn: "N/A",
+    actualPunchOut: "N/A",
+    autoCloseTime: "N/A",
+    autoCloseRecordedAt: "N/A",
+    dutyMinutes: 0,
+    otMinutes: 0,
+    totalWorkingMinutes: 0,
+    dutyHours: "00:00",
+    otHours: "00:00",
+    totalWorkingHours: "00:00",
+    leaveOrOffDetail: null,
+    attendanceRecordId: null
+  };
+}
+function buildEmployeeMonthlyCalendar(emp, year, month, ctx) {
+  const dateKeys = enumerateMonthDateKeys(year, month);
+  const days = dateKeys.map((dk) => classifyEmployeeDay(emp, dk, ctx));
+  let totalScheduledWorkingDays = 0;
+  let presentDays = 0;
+  let absentDays = 0;
+  let halfDays = 0;
+  let shortLeaveDays = 0;
+  let approvedLeaveDays = 0;
+  let weeklyOffDays = 0;
+  let holidays = 0;
+  let autoClosedDays = 0;
+  let inProgressDays = 0;
+  let futureDays = 0;
+  let notEmployedDays = 0;
+  let unknownDays = 0;
+  let lateDays = 0;
+  let totalDutyMinutes = 0;
+  let totalOtMinutes = 0;
+  let totalWorkingMinutes = 0;
+  for (const day of days) {
+    if (day.isScheduledWorkingDay) {
+      totalScheduledWorkingDays += 1;
+    }
+    if (day.isLate) {
+      lateDays += 1;
+    }
+    totalDutyMinutes += day.dutyMinutes;
+    totalOtMinutes += day.otMinutes;
+    totalWorkingMinutes += day.totalWorkingMinutes;
+    switch (day.status) {
+      case "PRESENT":
+        presentDays += 1;
+        break;
+      case "ABSENT":
+        absentDays += 1;
+        break;
+      case "HALF DAY":
+        halfDays += 1;
+        break;
+      case "SHORT LEAVE":
+        shortLeaveDays += 1;
+        break;
+      case "APPROVED LEAVE":
+        approvedLeaveDays += 1;
+        break;
+      case "WEEKLY OFF":
+        weeklyOffDays += 1;
+        break;
+      case "HOLIDAY":
+        holidays += 1;
+        break;
+      case "AUTO CLOSED":
+        autoClosedDays += 1;
+        break;
+      case "IN PROGRESS":
+        inProgressDays += 1;
+        break;
+      case "FUTURE DATE":
+        futureDays += 1;
+        break;
+      case "NOT EMPLOYED":
+        notEmployedDays += 1;
+        break;
+      case "UNKNOWN":
+        unknownDays += 1;
+        break;
+    }
+  }
+  const attendedDays = presentDays + halfDays + shortLeaveDays + autoClosedDays + inProgressDays;
+  const attendancePercentage = totalScheduledWorkingDays > 0 ? Math.round(attendedDays / totalScheduledWorkingDays * 1e3) / 10 : 0;
+  const summary = {
+    year,
+    month,
+    monthKey: `${year}-${String(month).padStart(2, "0")}`,
+    totalCalendarDays: days.length,
+    totalScheduledWorkingDays,
+    presentDays,
+    absentDays,
+    halfDays,
+    shortLeaveDays,
+    approvedLeaveDays,
+    weeklyOffDays,
+    holidays,
+    autoClosedDays,
+    inProgressDays,
+    futureDays,
+    notEmployedDays,
+    unknownDays,
+    lateDays,
+    attendedDays,
+    totalDutyMinutes,
+    totalOtMinutes,
+    totalWorkingMinutes,
+    totalDutyHours: formatDurationClock(totalDutyMinutes),
+    totalOtHours: formatDurationClock(totalOtMinutes),
+    totalWorkingHours: formatDurationClock(totalWorkingMinutes),
+    attendancePercentage,
+    formulaDescription: "Attendance % = (Present + Half Day + Short Leave + Auto-Closed + In Progress) \xF7 Scheduled Working Days \xD7 100 (excludes Weekly Offs, Holidays, Approved Leave, Future Dates, Pre-Joining & Unverified Days)"
+  };
+  return { days, summary };
+}
+function computeConsecutiveAbsenceMetrics(emp, referenceDate, ctx, options) {
+  const lookbackDays = Math.max(31, Math.min(180, options?.lookbackDays ?? 65));
+  const refDay = classifyEmployeeDay(emp, referenceDate, ctx);
+  const refYear = parseInt(referenceDate.slice(0, 4), 10);
+  const refMonth = parseInt(referenceDate.slice(5, 7), 10);
+  const monthStart = `${refYear}-${String(refMonth).padStart(2, "0")}-01`;
+  const monthEnd = `${refYear}-${String(refMonth).padStart(2, "0")}-${String(getDaysInMonth(refYear, refMonth)).padStart(2, "0")}`;
+  let consecutiveAbsentWorkingDays = 0;
+  let firstDateOfCurrentAbsence = null;
+  let streakBroken = refDay.status !== "ABSENT";
+  let lastPresentDate = null;
+  const lookbackStart = shiftDateKeyByDays(referenceDate, -(lookbackDays - 1));
+  const scanStart = lookbackStart < monthStart ? lookbackStart : monthStart;
+  const classifiedBackward = [];
+  let cursor = referenceDate;
+  let guard = 0;
+  while (cursor >= scanStart && guard < 220) {
+    const day = cursor === referenceDate ? refDay : classifyEmployeeDay(emp, cursor, ctx);
+    classifiedBackward.push(day);
+    if (!lastPresentDate && day.isAttended) {
+      lastPresentDate = day.date;
+    }
+    if (!streakBroken) {
+      if (day.status === "ABSENT") {
+        consecutiveAbsentWorkingDays += 1;
+        firstDateOfCurrentAbsence = day.date;
+      } else if (day.isAttended || day.status === "NOT EMPLOYED" || day.status === "UNKNOWN") {
+        streakBroken = true;
+      }
+    }
+    cursor = shiftDateKeyByDays(cursor, -1);
+    guard += 1;
+  }
+  if (!lastPresentDate && options?.knownLastPresentDate && options.knownLastPresentDate <= referenceDate) {
+    lastPresentDate = options.knownLastPresentDate;
+  }
+  let totalAbsentWorkingDaysInMonth = 0;
+  const monthDateKeys = enumerateMonthDateKeys(refYear, refMonth);
+  for (const dk of monthDateKeys) {
+    if (dk > ctx.todayIstKey) continue;
+    const d = classifyEmployeeDay(emp, dk, ctx);
+    if (d.status === "ABSENT") {
+      totalAbsentWorkingDaysInMonth += 1;
+    }
+  }
+  const chronological = [...classifiedBackward].reverse();
+  const spells = [];
+  let currentSpell = null;
+  for (const day of chronological) {
+    if (day.status === "ABSENT") {
+      if (!currentSpell) {
+        currentSpell = { startDate: day.date, endDate: day.date, workingDays: 1 };
+      } else {
+        currentSpell.endDate = day.date;
+        currentSpell.workingDays += 1;
+      }
+    } else if (day.isAttended || day.status === "NOT EMPLOYED" || day.status === "UNKNOWN") {
+      if (currentSpell) {
+        spells.push(currentSpell);
+        currentSpell = null;
+      }
+    }
+  }
+  if (currentSpell) {
+    spells.push(currentSpell);
+  }
+  const previousAbsenceSpells = [...spells].filter((sp) => !(refDay.status === "ABSENT" && sp.startDate === firstDateOfCurrentAbsence)).reverse();
+  return {
+    isAbsentOnReferenceDate: refDay.status === "ABSENT",
+    referenceDateStatus: refDay.status,
+    consecutiveAbsentWorkingDays,
+    firstDateOfCurrentAbsence,
+    lastPresentDate,
+    totalAbsentWorkingDaysInMonth,
+    previousAbsenceSpells
+  };
+}
+
+// serverAttendanceHistory.ts
+var DEFAULT_SHIFTS2 = [
+  {
+    id: "DAY",
+    name: "DAY SHIFT",
+    startTime: "09:00",
+    endTime: "17:30",
+    scheduledDurationMinutes: 510,
+    punchInWindowStart: "06:00",
+    punchInWindowEnd: "18:00",
+    isOvernight: false,
+    gracePeriodMinutes: 15,
+    status: "Active"
+  },
+  {
+    id: "NIGHT",
+    name: "NIGHT SHIFT",
+    startTime: "20:00",
+    endTime: "04:30",
+    scheduledDurationMinutes: 510,
+    punchInWindowStart: "18:00",
+    punchInWindowEnd: "06:00",
+    isOvernight: true,
+    gracePeriodMinutes: 15,
+    status: "Active"
+  }
+];
+async function callerCanViewAttendanceHistory(db, caller) {
+  if (caller.role === "super_admin") return true;
+  try {
+    const [userPermSnap, rolePermSnap] = await Promise.all([
+      db.collection("user_permissions").doc(caller.profileDocId).get(),
+      getCachedRolePermissionsDoc(db, caller.role)
+    ]);
+    const userPermData = userPermSnap.exists ? userPermSnap.data() : void 0;
+    const rolePermData = rolePermSnap.exists ? rolePermSnap.data : void 0;
+    const checkModule = (moduleKey) => {
+      if (userPermData && userPermData.isCustomOverride !== false) {
+        const mod = userPermData.permissions?.[moduleKey];
+        if (mod && typeof mod.view === "boolean") return mod.view === true;
+      }
+      if (rolePermData) {
+        const mod = rolePermData.modulePermissions?.[moduleKey];
+        if (mod && typeof mod.view === "boolean") return mod.view === true;
+      }
+      return null;
+    };
+    const historyDecision = checkModule("history");
+    if (historyDecision === true) return true;
+    const reportsDecision = checkModule("reports");
+    if (reportsDecision === true) return true;
+    if (historyDecision === false) {
+      return false;
+    }
+    if (caller.role === "admin") {
+      return historyDecision !== false;
+    }
+    let fallbackModules = caller.modulesAllowed;
+    if (fallbackModules === void 0) {
+      const userSnap = await db.collection("user_roles").doc(caller.profileDocId).get();
+      if (userSnap.exists && Array.isArray(userSnap.data()?.modulesAllowed)) {
+        fallbackModules = userSnap.data().modulesAllowed;
+      }
+    }
+    if (Array.isArray(fallbackModules)) {
+      return fallbackModules.includes("all") || fallbackModules.includes("history") || fallbackModules.includes("reports");
+    }
+    return false;
+  } catch (err) {
+    console.error("[AttendanceHistory RBAC] Permission lookup error:", err);
+    return caller.role === "admin";
+  }
+}
+async function requireHistoryReadCaller(db, requireVerifiedCaller, req, res, actionLabel) {
+  const caller = await requireVerifiedCaller(req, res, "*", actionLabel);
+  if (!caller) return null;
+  const allowed = await callerCanViewAttendanceHistory(db, caller);
+  if (!allowed) {
+    await recordEnterpriseAuditEvent(db, {
+      req,
+      action: "unauthorized_access_attempt",
+      category: "SECURITY",
+      severity: "CRITICAL",
+      actorUid: caller.uid,
+      actorLoginId: caller.loginId,
+      actorRole: caller.role.toUpperCase(),
+      targetType: "ATTENDANCE_HISTORY",
+      targetId: req.path,
+      actionSource: "ATTENDANCE_HISTORY_RBAC",
+      description: `Unauthorized attempt to access ${actionLabel} by "${caller.loginId}" (${caller.role}).`,
+      success: false
+    });
+    res.status(403).json({
+      success: false,
+      error: `Forbidden: Role "${caller.role.toUpperCase()}" does not have permission to view Attendance History.`
+    });
+    return null;
+  }
+  return caller;
+}
+async function safeGetCollectionDocs(db, collectionName) {
+  try {
+    const snap = await db.collection(collectionName).get();
+    return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  } catch {
+    return [];
+  }
+}
+async function loadBoundedClassificationData(db, rangeStart, rangeEnd, nowMs, options) {
+  const todayIstKey = getTodayIstDateKey(nowMs);
+  const empPromise = options?.employeeId ? db.collection("employees").where("employeeId", "==", options.employeeId).get().then(async (snap) => {
+    if (!snap.empty) {
+      return snap.docs.map((d) => d.data());
+    }
+    const byDoc = await db.collection("employees").doc(options.employeeId).get();
+    return byDoc.exists ? [byDoc.data()] : [];
+  }) : db.collection("employees").get().then((snap) => snap.docs.map((d) => d.data()));
+  const attQuery = options?.employeeId ? db.collection("attendance").where("employeeId", "==", options.employeeId).where("shiftDate", ">=", rangeStart).where("shiftDate", "<=", rangeEnd).get() : db.collection("attendance").where("shiftDate", ">=", rangeStart).where("shiftDate", "<=", rangeEnd).get();
+  const rosterQuery = options?.employeeId ? db.collection("shift_rosters").where("employeeId", "==", options.employeeId).where("shiftDate", ">=", rangeStart).where("shiftDate", "<=", rangeEnd).get() : db.collection("shift_rosters").where("shiftDate", ">=", rangeStart).where("shiftDate", "<=", rangeEnd).get();
+  const [employees, attSnap, rosterSnap, cachedShiftsRes, settingsRes, holidayDocs, leaveDocs] = await Promise.all([
+    empPromise,
+    attQuery,
+    rosterQuery,
+    getCachedShifts(db, DEFAULT_SHIFTS2),
+    getCachedSystemSettings(db, {}),
+    safeGetCollectionDocs(db, "holidays"),
+    safeGetCollectionDocs(db, "leaves")
+  ]);
+  const rawShifts = Array.isArray(cachedShiftsRes?.shifts) && cachedShiftsRes.shifts.length > 0 ? cachedShiftsRes.shifts : DEFAULT_SHIFTS2;
+  const settings = settingsRes?.data || {};
+  const shiftsById = /* @__PURE__ */ new Map();
+  for (const s of rawShifts) {
+    if (s?.id) shiftsById.set(String(s.id).toUpperCase(), s);
+  }
+  const weeklyOffDays = Array.isArray(settings?.weeklyOffDays) ? settings.weeklyOffDays.map((n) => Number(n)).filter((n) => Number.isInteger(n) && n >= 0 && n <= 6) : [0];
+  const schedulePolicyMode = String(settings?.schedulePolicyMode || "").toUpperCase() === "ROSTER_ONLY" ? "ROSTER_ONLY" : "DEFAULT_WEEKLY";
+  const policy = {
+    weeklyOffDays,
+    schedulePolicyMode,
+    scheduleUnverified: Boolean(settings?.scheduleUnverified),
+    defaultShiftId: String(settings?.defaultShiftId || "DAY").toUpperCase()
+  };
+  const holidaysByDate = /* @__PURE__ */ new Map();
+  for (const h of holidayDocs) {
+    if (String(h.status || "Active").toLowerCase() === "inactive") continue;
+    const dKey = String(h.date || h.holidayDate || "").trim();
+    if (isValidDateKey(dKey)) {
+      holidaysByDate.set(dKey, {
+        date: dKey,
+        name: String(h.name || h.title || "Declared Holiday").trim(),
+        description: h.description ? String(h.description) : void 0,
+        status: "Active"
+      });
+    }
+  }
+  if (Array.isArray(settings?.holidays)) {
+    for (const h of settings.holidays) {
+      const dKey = String(h?.date || "").trim();
+      if (isValidDateKey(dKey) && !holidaysByDate.has(dKey)) {
+        holidaysByDate.set(dKey, {
+          date: dKey,
+          name: String(h?.name || "Declared Holiday").trim()
+        });
+      }
+    }
+  }
+  const rostersByEmpDate = /* @__PURE__ */ new Map();
+  const inferredShiftByEmp = /* @__PURE__ */ new Map();
+  for (const doc of rosterSnap.docs) {
+    const r = doc.data();
+    if (r?.employeeId && r?.shiftDate) {
+      rostersByEmpDate.set(`${r.employeeId}__${r.shiftDate}`, r);
+      if (r.shiftId) {
+        inferredShiftByEmp.set(r.employeeId, String(r.shiftId).toUpperCase());
+      }
+    }
+  }
+  const leavesByEmp = /* @__PURE__ */ new Map();
+  for (const lv of leaveDocs) {
+    const empId = String(lv.employeeId || "").trim();
+    const startDate = String(lv.startDate || lv.date || "").trim();
+    const endDate = String(lv.endDate || lv.startDate || lv.date || "").trim();
+    if (!empId || !isValidDateKey(startDate) || !isValidDateKey(endDate)) continue;
+    const status = String(lv.status || "APPROVED").trim().toUpperCase();
+    if (status !== "APPROVED" && status !== "SANCTIONED") continue;
+    const arr = leavesByEmp.get(empId) || [];
+    arr.push({
+      id: lv.id,
+      employeeId: empId,
+      startDate,
+      endDate,
+      leaveType: lv.leaveType ? String(lv.leaveType) : "Approved Leave",
+      reason: lv.reason ? String(lv.reason) : void 0,
+      status
+    });
+    leavesByEmp.set(empId, arr);
+  }
+  const attendanceRecords = attSnap.docs.map(
+    (d) => ({ id: d.id, ...d.data() })
+  );
+  const attendanceByEmpDate = /* @__PURE__ */ new Map();
+  const latestShiftDateByEmp = /* @__PURE__ */ new Map();
+  for (const rec of attendanceRecords) {
+    if (!rec?.employeeId || !rec?.shiftDate) continue;
+    const k = `${rec.employeeId}__${rec.shiftDate}`;
+    const existing = attendanceByEmpDate.get(k);
+    if (!existing || String(rec.updatedAt || "") >= String(existing.updatedAt || "")) {
+      attendanceByEmpDate.set(k, rec);
+    }
+    const prevDate = latestShiftDateByEmp.get(rec.employeeId);
+    if (!prevDate || rec.shiftDate >= prevDate) {
+      latestShiftDateByEmp.set(rec.employeeId, rec.shiftDate);
+      if (rec.shiftId) {
+        inferredShiftByEmp.set(rec.employeeId, String(rec.shiftId).toUpperCase());
+      }
+    }
+  }
+  const ctx = {
+    todayIstKey,
+    nowMs,
+    shiftsById,
+    policy,
+    holidaysByDate,
+    rostersByEmpDate,
+    leavesByEmp,
+    attendanceByEmpDate,
+    inferredShiftByEmp
+  };
+  return {
+    employees,
+    attendanceRecords,
+    ctx,
+    shifts: rawShifts
+  };
+}
+var OverviewQuerySchema = z4.object({
+  date: z4.string().optional()
+});
+var EmployeesSearchQuerySchema = z4.object({
+  q: z4.string().max(120).optional(),
+  line: z4.string().max(80).optional(),
+  department: z4.string().max(80).optional(),
+  section: z4.string().max(80).optional(),
+  shift: z4.string().max(40).optional(),
+  status: z4.enum(["ALL", "Active", "Inactive"]).optional(),
+  page: z4.coerce.number().int().min(1).max(1e3).optional(),
+  pageSize: z4.coerce.number().int().min(1).max(200).optional()
+});
+var CalendarQuerySchema = z4.object({
+  year: z4.coerce.number().int().min(2e3).max(2100).optional(),
+  month: z4.coerce.number().int().min(1).max(12).optional()
+});
+var AbsentManpowerQuerySchema = z4.object({
+  date: z4.string().optional(),
+  search: z4.string().max(120).optional(),
+  line: z4.string().max(80).optional(),
+  section: z4.string().max(80).optional(),
+  department: z4.string().max(80).optional(),
+  employeeType: z4.string().max(40).optional(),
+  shift: z4.string().max(40).optional(),
+  minConsecutive: z4.coerce.number().int().min(1).max(365).optional(),
+  sortBy: z4.enum(["consecutive_desc", "recent_absence", "department_asc", "line_asc", "name_asc"]).optional(),
+  page: z4.coerce.number().int().min(1).max(1e3).optional(),
+  pageSize: z4.coerce.number().int().min(1).max(200).optional()
+});
+var DailyAttendanceQuerySchema = z4.object({
+  startDate: z4.string().optional(),
+  endDate: z4.string().optional(),
+  search: z4.string().max(120).optional(),
+  line: z4.string().max(80).optional(),
+  department: z4.string().max(80).optional(),
+  shift: z4.string().max(40).optional(),
+  status: z4.string().max(40).optional(),
+  punchOutType: z4.string().max(20).optional(),
+  sortBy: z4.enum(["date_desc", "date_asc", "employeeId_asc", "name_asc", "duty_desc", "ot_desc"]).optional(),
+  page: z4.coerce.number().int().min(1).max(1e3).optional(),
+  pageSize: z4.coerce.number().int().min(1).max(200).optional()
+});
+var AnalyticsQuerySchema = z4.object({
+  date: z4.string().optional(),
+  month: z4.string().regex(/^\d{4}-\d{2}$/).optional(),
+  line: z4.string().max(80).optional(),
+  department: z4.string().max(80).optional()
+});
+function registerAttendanceHistoryRoutes(app, deps) {
+  const { db, requireVerifiedCaller, nowProvider } = deps;
+  const getNowMs = () => nowProvider ? nowProvider() : Date.now();
+  app.get("/api/attendance-history/overview", async (req, res) => {
+    try {
+      const caller = await requireHistoryReadCaller(
+        db,
+        requireVerifiedCaller,
+        req,
+        res,
+        "View Attendance History Overview"
+      );
+      if (!caller) return;
+      const parsed = OverviewQuerySchema.safeParse(req.query);
+      if (!parsed.success) {
+        return res.status(400).json({ success: false, error: "Invalid overview query parameters." });
+      }
+      const nowMs = getNowMs();
+      const todayIst = getTodayIstDateKey(nowMs);
+      const selectedDate = parsed.data.date && isValidDateKey(parsed.data.date) ? parsed.data.date : todayIst;
+      const lookbackStart = shiftDateKeyByDays(selectedDate, -45);
+      const { employees, ctx } = await loadBoundedClassificationData(
+        db,
+        lookbackStart,
+        selectedDate,
+        nowMs
+      );
+      const activeEmployees = employees.filter(
+        (e) => String(e.employeeStatus || "Active").toLowerCase() === "active"
+      );
+      let presentToday = 0;
+      let absentToday = 0;
+      let lateArrivals = 0;
+      let autoClosedAttendance = 0;
+      let currentlyIn = 0;
+      let consecutiveAbsentees = 0;
+      let scheduledWorkingCount = 0;
+      let weeklyOffCount = 0;
+      let holidayCount = 0;
+      let approvedLeaveCount = 0;
+      let unknownCount = 0;
+      const topConsecutiveAbsentees = [];
+      for (const emp of activeEmployees) {
+        const day = classifyEmployeeDay(emp, selectedDate, ctx);
+        if (day.isScheduledWorkingDay) scheduledWorkingCount += 1;
+        if (day.isAttended) presentToday += 1;
+        if (day.isLate) lateArrivals += 1;
+        if (day.isAutoClosed || day.status === "AUTO CLOSED") autoClosedAttendance += 1;
+        if (day.status === "IN PROGRESS") currentlyIn += 1;
+        if (day.status === "WEEKLY OFF") weeklyOffCount += 1;
+        if (day.status === "HOLIDAY") holidayCount += 1;
+        if (day.status === "APPROVED LEAVE") approvedLeaveCount += 1;
+        if (day.status === "UNKNOWN") unknownCount += 1;
+        if (day.status === "ABSENT") {
+          absentToday += 1;
+          const consec = computeConsecutiveAbsenceMetrics(emp, selectedDate, ctx, {
+            lookbackDays: 45
+          });
+          if (consec.consecutiveAbsentWorkingDays >= 2) {
+            consecutiveAbsentees += 1;
+          }
+          const profile = buildSafeEmployeeProfile(
+            emp,
+            ctx.shiftsById,
+            ctx.inferredShiftByEmp?.get(emp.employeeId),
+            ctx.policy.defaultShiftId
+          );
+          topConsecutiveAbsentees.push({
+            employeeId: profile.employeeId,
+            employeeName: profile.employeeName,
+            line: profile.line,
+            section: profile.section,
+            department: profile.department,
+            employeeType: profile.employeeType,
+            lastPresentDate: consec.lastPresentDate,
+            firstDateOfCurrentAbsence: consec.firstDateOfCurrentAbsence,
+            consecutiveAbsentWorkingDays: consec.consecutiveAbsentWorkingDays,
+            totalAbsentWorkingDaysInMonth: consec.totalAbsentWorkingDaysInMonth,
+            currentShift: profile.currentShiftName,
+            currentShiftId: profile.currentShiftId,
+            attendanceStatus: day.status,
+            employeeStatus: profile.employeeStatus
+          });
+        }
+      }
+      topConsecutiveAbsentees.sort(
+        (a, b) => b.consecutiveAbsentWorkingDays - a.consecutiveAbsentWorkingDays || b.totalAbsentWorkingDaysInMonth - a.totalAbsentWorkingDaysInMonth || a.employeeName.localeCompare(b.employeeName)
+      );
+      const overallAttendancePercentage = scheduledWorkingCount > 0 ? Math.round(presentToday / scheduledWorkingCount * 1e3) / 10 : 0;
+      return res.json({
+        success: true,
+        date: selectedDate,
+        todayIst,
+        kpis: {
+          totalActiveEmployees: activeEmployees.length,
+          presentToday,
+          absentToday,
+          lateArrivals,
+          autoClosedAttendance,
+          currentlyIn,
+          consecutiveAbsentees,
+          overallAttendancePercentage
+        },
+        scheduleSummary: {
+          scheduledWorkingCount,
+          weeklyOffCount,
+          holidayCount,
+          approvedLeaveCount,
+          unknownCount,
+          weeklyOffDays: ctx.policy.weeklyOffDays,
+          schedulePolicyMode: ctx.policy.schedulePolicyMode
+        },
+        topConsecutiveAbsentees: topConsecutiveAbsentees.slice(0, 8)
+      });
+    } catch (err) {
+      console.error("[API Attendance History Overview] Error:", err);
+      return res.status(500).json({
+        success: false,
+        error: "Failed to load Attendance History overview."
+      });
+    }
+  });
+  app.get("/api/attendance-history/employees", async (req, res) => {
+    try {
+      const caller = await requireHistoryReadCaller(
+        db,
+        requireVerifiedCaller,
+        req,
+        res,
+        "Search Employees for Attendance History"
+      );
+      if (!caller) return;
+      const parsed = EmployeesSearchQuerySchema.safeParse(req.query);
+      if (!parsed.success) {
+        return res.status(400).json({ success: false, error: "Invalid employee search parameters." });
+      }
+      const {
+        q = "",
+        line = "ALL",
+        department = "ALL",
+        section = "ALL",
+        shift = "ALL",
+        status = "ALL",
+        page = 1,
+        pageSize = 25
+      } = parsed.data;
+      const [empSnap, cachedShiftsRes, settingsRes] = await Promise.all([
+        db.collection("employees").get(),
+        getCachedShifts(db, DEFAULT_SHIFTS2),
+        getCachedSystemSettings(db, {})
+      ]);
+      const rawShifts = Array.isArray(cachedShiftsRes?.shifts) && cachedShiftsRes.shifts.length > 0 ? cachedShiftsRes.shifts : DEFAULT_SHIFTS2;
+      const shiftsById = /* @__PURE__ */ new Map();
+      for (const s of rawShifts) {
+        if (s?.id) shiftsById.set(String(s.id).toUpperCase(), s);
+      }
+      const defaultShiftId = String(settingsRes?.data?.defaultShiftId || "DAY").toUpperCase();
+      const searchLower = q.trim().toLowerCase();
+      const profiles = empSnap.docs.map(
+        (d) => buildSafeEmployeeProfile(
+          d.data(),
+          shiftsById,
+          null,
+          defaultShiftId
+        )
+      ).filter((p) => {
+        if (status !== "ALL" && p.employeeStatus !== status) return false;
+        if (line !== "ALL" && p.line !== line && p.floor !== line) return false;
+        if (department !== "ALL" && p.department !== department) return false;
+        if (section !== "ALL" && p.section !== section) return false;
+        if (shift !== "ALL" && p.currentShiftId !== shift.toUpperCase()) return false;
+        if (searchLower) {
+          const hay = `${p.employeeId} ${p.employeeName} ${p.line} ${p.department} ${p.section}`.toLowerCase();
+          if (!hay.includes(searchLower)) return false;
+        }
+        return true;
+      }).sort((a, b) => a.employeeId.localeCompare(b.employeeId));
+      const total = profiles.length;
+      const totalPages = Math.max(1, Math.ceil(total / pageSize));
+      const safePage = Math.min(page, totalPages);
+      const items = profiles.slice((safePage - 1) * pageSize, safePage * pageSize);
+      return res.json({
+        success: true,
+        total,
+        page: safePage,
+        pageSize,
+        totalPages,
+        employees: items
+      });
+    } catch (err) {
+      console.error("[API Attendance History Employees] Error:", err);
+      return res.status(500).json({
+        success: false,
+        error: "Failed to search employees."
+      });
+    }
+  });
+  app.get(
+    "/api/attendance-history/employee/:employeeId/calendar",
+    async (req, res) => {
+      try {
+        const caller = await requireHistoryReadCaller(
+          db,
+          requireVerifiedCaller,
+          req,
+          res,
+          "View Employee Monthly Attendance Calendar"
+        );
+        if (!caller) return;
+        const employeeId = String(req.params.employeeId || "").trim();
+        if (!employeeId || employeeId.length > 64) {
+          return res.status(400).json({ success: false, error: "Invalid employeeId." });
+        }
+        const parsed = CalendarQuerySchema.safeParse(req.query);
+        if (!parsed.success) {
+          return res.status(400).json({ success: false, error: "Invalid calendar month/year." });
+        }
+        const nowMs = getNowMs();
+        const todayIst = getTodayIstDateKey(nowMs);
+        const year = parsed.data.year ?? parseInt(todayIst.slice(0, 4), 10);
+        const month = parsed.data.month ?? parseInt(todayIst.slice(5, 7), 10);
+        const monthStart = `${year}-${String(month).padStart(2, "0")}-01`;
+        const monthEnd = `${year}-${String(month).padStart(2, "0")}-${String(
+          getDaysInMonth(year, month)
+        ).padStart(2, "0")}`;
+        const referenceDate = monthEnd < todayIst ? monthEnd : todayIst;
+        const lookbackStart = shiftDateKeyByDays(
+          monthStart < referenceDate ? monthStart : referenceDate,
+          -60
+        );
+        const queryEnd = monthEnd > todayIst ? monthEnd : todayIst;
+        const { employees, ctx } = await loadBoundedClassificationData(
+          db,
+          lookbackStart,
+          queryEnd,
+          nowMs,
+          { employeeId }
+        );
+        const emp = employees[0];
+        if (!emp) {
+          return res.status(404).json({
+            success: false,
+            error: `Employee "${employeeId}" not found.`
+          });
+        }
+        const profile = buildSafeEmployeeProfile(
+          emp,
+          ctx.shiftsById,
+          ctx.inferredShiftByEmp?.get(emp.employeeId),
+          ctx.policy.defaultShiftId
+        );
+        const { days, summary } = buildEmployeeMonthlyCalendar(emp, year, month, ctx);
+        const consecutiveAbsence = computeConsecutiveAbsenceMetrics(emp, referenceDate, ctx, {
+          lookbackDays: 60
+        });
+        return res.json({
+          success: true,
+          todayIst,
+          year,
+          month,
+          employee: profile,
+          summary,
+          days,
+          consecutiveAbsence
+        });
+      } catch (err) {
+        console.error("[API Employee Monthly Calendar] Error:", err);
+        return res.status(500).json({
+          success: false,
+          error: "Failed to load employee monthly attendance calendar."
+        });
+      }
+    }
+  );
+  app.get("/api/attendance-history/absent-manpower", async (req, res) => {
+    try {
+      const caller = await requireHistoryReadCaller(
+        db,
+        requireVerifiedCaller,
+        req,
+        res,
+        "View Absent Manpower List"
+      );
+      if (!caller) return;
+      const parsed = AbsentManpowerQuerySchema.safeParse(req.query);
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid absent manpower filter parameters."
+        });
+      }
+      const nowMs = getNowMs();
+      const todayIst = getTodayIstDateKey(nowMs);
+      const selectedDate = parsed.data.date && isValidDateKey(parsed.data.date) ? parsed.data.date : todayIst;
+      const {
+        search = "",
+        line = "ALL",
+        section = "ALL",
+        department = "ALL",
+        employeeType = "ALL",
+        shift = "ALL",
+        minConsecutive = 1,
+        sortBy = "consecutive_desc",
+        page = 1,
+        pageSize = 25
+      } = parsed.data;
+      const lookbackDays = 65;
+      const monthStart = `${selectedDate.slice(0, 7)}-01`;
+      const lookbackStart = shiftDateKeyByDays(selectedDate, -(lookbackDays - 1));
+      const rangeStart = lookbackStart < monthStart ? lookbackStart : monthStart;
+      const { employees, ctx } = await loadBoundedClassificationData(
+        db,
+        rangeStart,
+        selectedDate,
+        nowMs
+      );
+      const activeEmployees = employees.filter(
+        (e) => String(e.employeeStatus || "Active").toLowerCase() === "active"
+      );
+      const allAbsentRows = [];
+      for (const emp of activeEmployees) {
+        const refDay = classifyEmployeeDay(emp, selectedDate, ctx);
+        if (refDay.status !== "ABSENT") continue;
+        const consec = computeConsecutiveAbsenceMetrics(emp, selectedDate, ctx, {
+          lookbackDays
+        });
+        const profile = buildSafeEmployeeProfile(
+          emp,
+          ctx.shiftsById,
+          ctx.inferredShiftByEmp?.get(emp.employeeId),
+          ctx.policy.defaultShiftId
+        );
+        allAbsentRows.push({
+          employeeId: profile.employeeId,
+          employeeName: profile.employeeName,
+          line: profile.line,
+          section: profile.section,
+          department: profile.department,
+          employeeType: profile.employeeType,
+          lastPresentDate: consec.lastPresentDate,
+          firstDateOfCurrentAbsence: consec.firstDateOfCurrentAbsence,
+          consecutiveAbsentWorkingDays: consec.consecutiveAbsentWorkingDays,
+          totalAbsentWorkingDaysInMonth: consec.totalAbsentWorkingDaysInMonth,
+          currentShift: profile.currentShiftName,
+          currentShiftId: profile.currentShiftId,
+          attendanceStatus: refDay.status,
+          employeeStatus: profile.employeeStatus
+        });
+      }
+      const searchLower = search.trim().toLowerCase();
+      const orgFiltered = allAbsentRows.filter((row) => {
+        if (line !== "ALL" && row.line !== line) return false;
+        if (section !== "ALL" && row.section !== section) return false;
+        if (department !== "ALL" && row.department !== department) return false;
+        if (employeeType !== "ALL" && row.employeeType !== employeeType) return false;
+        if (shift !== "ALL" && row.currentShiftId !== shift.toUpperCase()) return false;
+        if (searchLower) {
+          const hay = `${row.employeeId} ${row.employeeName} ${row.line} ${row.section} ${row.department}`.toLowerCase();
+          if (!hay.includes(searchLower)) return false;
+        }
+        return true;
+      });
+      const presetCounts = {
+        absentToday: orgFiltered.length,
+        consecutive2Plus: orgFiltered.filter((r) => r.consecutiveAbsentWorkingDays >= 2).length,
+        consecutive3Plus: orgFiltered.filter((r) => r.consecutiveAbsentWorkingDays >= 3).length,
+        consecutive5Plus: orgFiltered.filter((r) => r.consecutiveAbsentWorkingDays >= 5).length,
+        consecutive7Plus: orgFiltered.filter((r) => r.consecutiveAbsentWorkingDays >= 7).length,
+        consecutive10Plus: orgFiltered.filter((r) => r.consecutiveAbsentWorkingDays >= 10).length
+      };
+      const filtered = orgFiltered.filter(
+        (r) => r.consecutiveAbsentWorkingDays >= minConsecutive
+      );
+      filtered.sort((a, b) => {
+        switch (sortBy) {
+          case "recent_absence":
+            return String(b.firstDateOfCurrentAbsence || "").localeCompare(
+              String(a.firstDateOfCurrentAbsence || "")
+            ) || b.consecutiveAbsentWorkingDays - a.consecutiveAbsentWorkingDays;
+          case "department_asc":
+            return a.department.localeCompare(b.department) || b.consecutiveAbsentWorkingDays - a.consecutiveAbsentWorkingDays;
+          case "line_asc":
+            return a.line.localeCompare(b.line) || b.consecutiveAbsentWorkingDays - a.consecutiveAbsentWorkingDays;
+          case "name_asc":
+            return a.employeeName.localeCompare(b.employeeName);
+          case "consecutive_desc":
+          default:
+            return b.consecutiveAbsentWorkingDays - a.consecutiveAbsentWorkingDays || b.totalAbsentWorkingDaysInMonth - a.totalAbsentWorkingDaysInMonth || a.employeeName.localeCompare(b.employeeName);
+        }
+      });
+      const total = filtered.length;
+      const totalPages = Math.max(1, Math.ceil(total / pageSize));
+      const safePage = Math.min(page, totalPages);
+      const records = filtered.slice((safePage - 1) * pageSize, safePage * pageSize);
+      return res.json({
+        success: true,
+        date: selectedDate,
+        total,
+        page: safePage,
+        pageSize,
+        totalPages,
+        presetCounts,
+        records
+      });
+    } catch (err) {
+      console.error("[API Absent Manpower] Error:", err);
+      return res.status(500).json({
+        success: false,
+        error: "Failed to load absent manpower list."
+      });
+    }
+  });
+  app.get("/api/attendance-history/daily", async (req, res) => {
+    try {
+      const caller = await requireHistoryReadCaller(
+        db,
+        requireVerifiedCaller,
+        req,
+        res,
+        "View Daily Attendance History"
+      );
+      if (!caller) return;
+      const parsed = DailyAttendanceQuerySchema.safeParse(req.query);
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid daily attendance query parameters."
+        });
+      }
+      const nowMs = getNowMs();
+      const todayIst = getTodayIstDateKey(nowMs);
+      const endDate = parsed.data.endDate && isValidDateKey(parsed.data.endDate) ? parsed.data.endDate : todayIst;
+      const startDate = parsed.data.startDate && isValidDateKey(parsed.data.startDate) ? parsed.data.startDate : shiftDateKeyByDays(endDate, -7);
+      if (startDate > endDate) {
+        return res.status(400).json({
+          success: false,
+          error: "startDate cannot be after endDate."
+        });
+      }
+      const {
+        search = "",
+        line = "ALL",
+        department = "ALL",
+        shift = "ALL",
+        status = "ALL",
+        punchOutType = "ALL",
+        sortBy = "date_desc",
+        page = 1,
+        pageSize = 50
+      } = parsed.data;
+      const attSnap = await db.collection("attendance").where("shiftDate", ">=", startDate).where("shiftDate", "<=", endDate).get();
+      const searchLower = search.trim().toLowerCase();
+      const enriched = attSnap.docs.map((d) => {
+        const rec = { id: d.id, ...d.data() };
+        const m = resolveAttendanceMetrics(rec, nowMs, STANDARD_DUTY_MINUTES);
+        const dutyMinutes = m.isOpen ? 0 : m.regularDutyMinutes;
+        const otMinutes = m.isOpen ? 0 : m.overtimeMinutes;
+        const totalWorkingMinutes = m.isOpen ? 0 : m.completedDutyMinutes;
+        return {
+          id: rec.id,
+          employeeId: rec.employeeId,
+          employeeName: rec.employeeNameSnapshot,
+          line: rec.floorIdSnapshot || rec.lineIdSnapshot || "",
+          department: rec.departmentIdSnapshot || "",
+          section: rec.sectionIdSnapshot || "",
+          employeeType: rec.employeeTypeSnapshot || "",
+          attendanceDate: rec.shiftDate,
+          shiftId: rec.shiftId,
+          shiftName: rec.shiftNameSnapshot,
+          state: m.state,
+          scheduledShiftStart: m.scheduledStartDisplay,
+          scheduledShiftEnd: m.scheduledEndDisplay,
+          actualPunchIn: formatIsoTimeKolkata12h(rec.firstPunchIn || rec.punchIn),
+          actualPunchOut: m.isOpen ? "In Progress" : m.actualPunchOutIso ? m.actualPunchOutDisplay : "N/A",
+          autoCloseTime: m.isCurrentlyAutoClosed ? m.autoCloseTimeDisplay : "N/A",
+          autoCloseRecordedAt: m.isCurrentlyAutoClosed ? m.autoCloseRecordedAtDisplay : "N/A",
+          punchOutType: m.punchOutTypeResolved,
+          attendanceStatus: m.status,
+          isLate: m.isLate,
+          earlyArrivalMinutes: m.earlyArrivalMinutes,
+          earlyOtMinutes: m.earlyOtMinutes,
+          postShiftOtMinutes: m.postShiftOtMinutes,
+          dutyMinutes,
+          otMinutes,
+          totalWorkingMinutes,
+          dutyHours: formatDurationClock(dutyMinutes),
+          otHours: formatDurationClock(otMinutes),
+          totalWorkingHours: formatDurationClock(totalWorkingMinutes),
+          record: rec
+        };
+      }).filter((item) => {
+        if (line !== "ALL" && item.line !== line) return false;
+        if (department !== "ALL" && item.department !== department) return false;
+        if (shift !== "ALL" && item.shiftId !== shift) return false;
+        if (punchOutType !== "ALL" && item.punchOutType !== punchOutType) return false;
+        if (status !== "ALL") {
+          if (status === "LATE") {
+            if (!item.isLate) return false;
+          } else if (item.attendanceStatus !== status) {
+            return false;
+          }
+        }
+        if (searchLower) {
+          const hay = `${item.employeeId} ${item.employeeName} ${item.line} ${item.department}`.toLowerCase();
+          if (!hay.includes(searchLower)) return false;
+        }
+        return true;
+      });
+      enriched.sort((a, b) => {
+        switch (sortBy) {
+          case "date_asc":
+            return a.attendanceDate.localeCompare(b.attendanceDate) || a.employeeId.localeCompare(b.employeeId);
+          case "employeeId_asc":
+            return a.employeeId.localeCompare(b.employeeId) || b.attendanceDate.localeCompare(a.attendanceDate);
+          case "name_asc":
+            return a.employeeName.localeCompare(b.employeeName) || b.attendanceDate.localeCompare(a.attendanceDate);
+          case "duty_desc":
+            return b.dutyMinutes - a.dutyMinutes || b.attendanceDate.localeCompare(a.attendanceDate);
+          case "ot_desc":
+            return b.otMinutes - a.otMinutes || b.attendanceDate.localeCompare(a.attendanceDate);
+          case "date_desc":
+          default:
+            return b.attendanceDate.localeCompare(a.attendanceDate) || String(b.record.createdAt || "").localeCompare(String(a.record.createdAt || ""));
+        }
+      });
+      const total = enriched.length;
+      const totalPages = Math.max(1, Math.ceil(total / pageSize));
+      const safePage = Math.min(page, totalPages);
+      const items = enriched.slice((safePage - 1) * pageSize, safePage * pageSize);
+      return res.json({
+        success: true,
+        startDate,
+        endDate,
+        total,
+        page: safePage,
+        pageSize,
+        totalPages,
+        records: items
+      });
+    } catch (err) {
+      console.error("[API Daily Attendance] Error:", err);
+      return res.status(500).json({
+        success: false,
+        error: "Failed to load daily attendance records."
+      });
+    }
+  });
+  app.get("/api/attendance-history/analytics", async (req, res) => {
+    try {
+      const caller = await requireHistoryReadCaller(
+        db,
+        requireVerifiedCaller,
+        req,
+        res,
+        "View Attendance Analytics"
+      );
+      if (!caller) return;
+      const parsed = AnalyticsQuerySchema.safeParse(req.query);
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid analytics query parameters."
+        });
+      }
+      const nowMs = getNowMs();
+      const todayIst = getTodayIstDateKey(nowMs);
+      const selectedDate = parsed.data.date && isValidDateKey(parsed.data.date) ? parsed.data.date : todayIst;
+      const selectedMonth = parsed.data.month || selectedDate.slice(0, 7);
+      const filterLine = parsed.data.line || "ALL";
+      const filterDept = parsed.data.department || "ALL";
+      const [mYear, mMonth] = selectedMonth.split("-").map(Number);
+      const monthStart = `${selectedMonth}-01`;
+      const monthEnd = `${selectedMonth}-${String(getDaysInMonth(mYear, mMonth)).padStart(2, "0")}`;
+      const trendStart = shiftDateKeyByDays(selectedDate, -13);
+      const lookbackStart = shiftDateKeyByDays(selectedDate, -45);
+      const rangeStart = [monthStart, trendStart, lookbackStart].sort()[0];
+      const rangeEnd = selectedDate > monthEnd ? selectedDate : monthEnd;
+      const { employees, ctx } = await loadBoundedClassificationData(
+        db,
+        rangeStart,
+        rangeEnd,
+        nowMs
+      );
+      const scopedEmployees = employees.filter((e) => {
+        if (String(e.employeeStatus || "Active").toLowerCase() !== "active") return false;
+        const empLine = String(e.line || e.floor || "Unassigned").trim();
+        const empDept = String(e.department || "Unassigned").trim();
+        if (filterLine !== "ALL" && empLine !== filterLine) return false;
+        if (filterDept !== "ALL" && empDept !== filterDept) return false;
+        return true;
+      });
+      const trendDates = enumerateDateRangeKeys(trendStart, selectedDate);
+      const dailyTrend = trendDates.map((dk) => {
+        let present = 0;
+        let absent = 0;
+        let scheduled = 0;
+        let autoClosed = 0;
+        let leave = 0;
+        let weeklyOff = 0;
+        let holiday = 0;
+        for (const emp of scopedEmployees) {
+          const d = classifyEmployeeDay(emp, dk, ctx);
+          if (d.isScheduledWorkingDay) scheduled += 1;
+          if (d.isAttended) present += 1;
+          if (d.status === "ABSENT") absent += 1;
+          if (d.status === "AUTO CLOSED") autoClosed += 1;
+          if (d.status === "APPROVED LEAVE") leave += 1;
+          if (d.status === "WEEKLY OFF") weeklyOff += 1;
+          if (d.status === "HOLIDAY") holiday += 1;
+        }
+        const attendancePercentage = scheduled > 0 ? Math.round(present / scheduled * 1e3) / 10 : 0;
+        return {
+          date: dk,
+          present,
+          absent,
+          scheduled,
+          autoClosed,
+          leave,
+          weeklyOff,
+          holiday,
+          attendancePercentage
+        };
+      });
+      const monthDates = enumerateMonthDateKeys(mYear, mMonth).filter((dk) => dk <= todayIst);
+      const weeklyBuckets = /* @__PURE__ */ new Map();
+      for (const dk of monthDates) {
+        const dayNum = parseInt(dk.slice(8, 10), 10);
+        const weekIdx = Math.ceil(dayNum / 7);
+        const bucketKey = `W${weekIdx}`;
+        let bucket = weeklyBuckets.get(bucketKey);
+        if (!bucket) {
+          bucket = {
+            label: `Week ${weekIdx}`,
+            startDate: dk,
+            endDate: dk,
+            present: 0,
+            absent: 0,
+            scheduled: 0
+          };
+          weeklyBuckets.set(bucketKey, bucket);
+        }
+        bucket.endDate = dk;
+        for (const emp of scopedEmployees) {
+          const d = classifyEmployeeDay(emp, dk, ctx);
+          if (d.isScheduledWorkingDay) bucket.scheduled += 1;
+          if (d.isAttended) bucket.present += 1;
+          if (d.status === "ABSENT") bucket.absent += 1;
+        }
+      }
+      const monthlyTrend = Array.from(weeklyBuckets.values()).map((b) => ({
+        ...b,
+        attendancePercentage: b.scheduled > 0 ? Math.round(b.present / b.scheduled * 1e3) / 10 : 0
+      }));
+      const bumpGroup = (map, groupKey, day) => {
+        const k = groupKey || "Unassigned";
+        let g = map.get(k);
+        if (!g) {
+          g = {
+            key: k,
+            totalActive: 0,
+            scheduled: 0,
+            present: 0,
+            absent: 0,
+            autoClosed: 0,
+            late: 0,
+            leave: 0,
+            weeklyOff: 0,
+            attendancePercentage: 0
+          };
+          map.set(k, g);
+        }
+        g.totalActive += 1;
+        if (day.isScheduledWorkingDay) g.scheduled += 1;
+        if (day.isAttended) g.present += 1;
+        if (day.status === "ABSENT") g.absent += 1;
+        if (day.status === "AUTO CLOSED") g.autoClosed += 1;
+        if (day.isLate) g.late += 1;
+        if (day.status === "APPROVED LEAVE") g.leave += 1;
+        if (day.status === "WEEKLY OFF") g.weeklyOff += 1;
+      };
+      const deptMap = /* @__PURE__ */ new Map();
+      const lineMap = /* @__PURE__ */ new Map();
+      const shiftMap = /* @__PURE__ */ new Map();
+      const typeMap = /* @__PURE__ */ new Map();
+      const longestContinuousAbsence = [];
+      const topAbsenceEmployees = [];
+      for (const emp of scopedEmployees) {
+        const profile = buildSafeEmployeeProfile(
+          emp,
+          ctx.shiftsById,
+          ctx.inferredShiftByEmp?.get(emp.employeeId),
+          ctx.policy.defaultShiftId
+        );
+        const refDay = classifyEmployeeDay(emp, selectedDate, ctx);
+        bumpGroup(deptMap, profile.department, refDay);
+        bumpGroup(lineMap, profile.line, refDay);
+        bumpGroup(shiftMap, profile.currentShiftName, refDay);
+        bumpGroup(typeMap, profile.employeeType, refDay);
+        const consec = computeConsecutiveAbsenceMetrics(emp, selectedDate, ctx, {
+          lookbackDays: 45
+        });
+        if (refDay.status === "ABSENT" && consec.consecutiveAbsentWorkingDays > 0) {
+          longestContinuousAbsence.push({
+            employeeId: profile.employeeId,
+            employeeName: profile.employeeName,
+            line: profile.line,
+            section: profile.section,
+            department: profile.department,
+            employeeType: profile.employeeType,
+            lastPresentDate: consec.lastPresentDate,
+            firstDateOfCurrentAbsence: consec.firstDateOfCurrentAbsence,
+            consecutiveAbsentWorkingDays: consec.consecutiveAbsentWorkingDays,
+            totalAbsentWorkingDaysInMonth: consec.totalAbsentWorkingDaysInMonth,
+            currentShift: profile.currentShiftName,
+            currentShiftId: profile.currentShiftId,
+            attendanceStatus: refDay.status,
+            employeeStatus: profile.employeeStatus
+          });
+        }
+        let absentInMonth = 0;
+        let scheduledInMonth = 0;
+        for (const dk of monthDates) {
+          const md = classifyEmployeeDay(emp, dk, ctx);
+          if (md.isScheduledWorkingDay) scheduledInMonth += 1;
+          if (md.status === "ABSENT") absentInMonth += 1;
+        }
+        if (absentInMonth > 0) {
+          topAbsenceEmployees.push({
+            employeeId: profile.employeeId,
+            employeeName: profile.employeeName,
+            line: profile.line,
+            department: profile.department,
+            employeeType: profile.employeeType,
+            absentDaysInMonth: absentInMonth,
+            scheduledDaysInMonth: scheduledInMonth,
+            consecutiveAbsentWorkingDays: consec.consecutiveAbsentWorkingDays,
+            lastPresentDate: consec.lastPresentDate
+          });
+        }
+      }
+      const finalizeGroups = (map) => Array.from(map.values()).map((g) => ({
+        ...g,
+        attendancePercentage: g.scheduled > 0 ? Math.round(g.present / g.scheduled * 1e3) / 10 : 0
+      })).sort((a, b) => b.totalActive - a.totalActive || a.key.localeCompare(b.key));
+      longestContinuousAbsence.sort(
+        (a, b) => b.consecutiveAbsentWorkingDays - a.consecutiveAbsentWorkingDays || b.totalAbsentWorkingDaysInMonth - a.totalAbsentWorkingDaysInMonth
+      );
+      topAbsenceEmployees.sort(
+        (a, b) => b.absentDaysInMonth - a.absentDaysInMonth || b.consecutiveAbsentWorkingDays - a.consecutiveAbsentWorkingDays
+      );
+      return res.json({
+        success: true,
+        date: selectedDate,
+        month: selectedMonth,
+        totalActiveEmployees: scopedEmployees.length,
+        dailyTrend,
+        monthlyTrend,
+        departmentWise: finalizeGroups(deptMap),
+        lineWise: finalizeGroups(lineMap),
+        shiftWise: finalizeGroups(shiftMap),
+        employeeTypeWise: finalizeGroups(typeMap),
+        longestContinuousAbsence: longestContinuousAbsence.slice(0, 15),
+        topAbsenceEmployees: topAbsenceEmployees.slice(0, 15)
+      });
+    } catch (err) {
+      console.error("[API Attendance Analytics] Error:", err);
+      return res.status(500).json({
+        success: false,
+        error: "Failed to load attendance analytics."
+      });
+    }
+  });
+}
+
 // serverEmployees.ts
 import crypto5 from "crypto";
-import { z as z4 } from "zod";
+import { z as z5 } from "zod";
 
 // src/utils/excelMasterNormalizer.ts
 var MASTER_FIELD_LABELS = {
@@ -10774,29 +12562,29 @@ function buildUnambiguousDesignationMapFromEmployees(employees) {
 // serverEmployees.ts
 var EMPLOYEE_ID_PATTERN2 = /^[A-Za-z0-9_.\-]+$/;
 var EMPLOYEE_BULK_BATCH_SIZE = 400;
-var BulkImportRowSchema = z4.object({
-  employeeId: z4.string().trim().min(1, "Employee ID is required.").max(128, "Employee ID must be 128 characters or fewer.").regex(
+var BulkImportRowSchema = z5.object({
+  employeeId: z5.string().trim().min(1, "Employee ID is required.").max(128, "Employee ID must be 128 characters or fewer.").regex(
     EMPLOYEE_ID_PATTERN2,
     "Employee ID may only contain letters, numbers, underscores (_), hyphens (-), and periods (.)."
   ),
-  employeeName: z4.string().trim().min(1, "Employee Name is required.").max(200, "Employee Name must be 200 characters or fewer.").optional(),
-  employeeType: z4.string().trim().min(1).max(60).optional(),
-  section: z4.string().trim().min(1, "Section is required.").max(100).optional(),
-  sectionId: z4.string().trim().min(1).max(128).optional(),
-  department: z4.string().trim().min(1, "Department is required.").max(100).optional(),
-  departmentId: z4.string().trim().min(1).max(128).optional(),
-  floor: z4.string().trim().min(1, "Production Line is required.").max(100).optional(),
-  floorId: z4.string().trim().min(1).max(128).optional(),
-  line: z4.string().trim().min(1).max(100).optional(),
-  lineId: z4.string().trim().min(1).max(128).optional(),
-  designation: z4.string().trim().min(1).max(120).optional(),
-  designationId: z4.string().trim().min(1).max(128).optional(),
-  employeeStatus: z4.string().trim().min(1).max(60).optional(),
-  rowNumber: z4.number().int().positive().optional()
+  employeeName: z5.string().trim().min(1, "Employee Name is required.").max(200, "Employee Name must be 200 characters or fewer.").optional(),
+  employeeType: z5.string().trim().min(1).max(60).optional(),
+  section: z5.string().trim().min(1, "Section is required.").max(100).optional(),
+  sectionId: z5.string().trim().min(1).max(128).optional(),
+  department: z5.string().trim().min(1, "Department is required.").max(100).optional(),
+  departmentId: z5.string().trim().min(1).max(128).optional(),
+  floor: z5.string().trim().min(1, "Production Line is required.").max(100).optional(),
+  floorId: z5.string().trim().min(1).max(128).optional(),
+  line: z5.string().trim().min(1).max(100).optional(),
+  lineId: z5.string().trim().min(1).max(128).optional(),
+  designation: z5.string().trim().min(1).max(120).optional(),
+  designationId: z5.string().trim().min(1).max(128).optional(),
+  employeeStatus: z5.string().trim().min(1).max(60).optional(),
+  rowNumber: z5.number().int().positive().optional()
 });
-var BulkImportRequestSchema = z4.object({
-  fileName: z4.string().trim().min(1, "File name is required.").max(255),
-  rows: z4.array(BulkImportRowSchema).min(1, "At least one employee row is required for import.").max(2e3, "A single import request supports up to 2,000 employee rows.")
+var BulkImportRequestSchema = z5.object({
+  fileName: z5.string().trim().min(1, "File name is required.").max(255),
+  rows: z5.array(BulkImportRowSchema).min(1, "At least one employee row is required for import.").max(2e3, "A single import request supports up to 2,000 employee rows.")
 });
 function generateServerQrToken(employeeId) {
   const rand = crypto5.randomBytes(4).toString("hex").toUpperCase();
@@ -10826,14 +12614,14 @@ function evalModuleAction(caller, userPermData, rolePermData, moduleKey, action)
   }
   return false;
 }
-var BulkEmployeeActionSchema = z4.object({
-  action: z4.enum(["ACTIVATE", "DEACTIVATE", "DELETE"]),
-  employeeIds: z4.array(z4.string().trim().min(1).max(128)).min(1, "At least one Employee ID is required.").max(1e3, "Bulk action supports up to 1,000 employees per request."),
-  confirmed: z4.literal(true, {
+var BulkEmployeeActionSchema = z5.object({
+  action: z5.enum(["ACTIVATE", "DEACTIVATE", "DELETE"]),
+  employeeIds: z5.array(z5.string().trim().min(1).max(128)).min(1, "At least one Employee ID is required.").max(1e3, "Bulk action supports up to 1,000 employees per request."),
+  confirmed: z5.literal(true, {
     message: "Explicit confirmation is required before executing bulk employee actions."
   }),
-  confirmPhrase: z4.string().trim().optional(),
-  reason: z4.string().trim().max(300).optional()
+  confirmPhrase: z5.string().trim().optional(),
+  reason: z5.string().trim().max(300).optional()
 });
 async function resolveCallerEmployeeActionPermissions(db, caller) {
   if (caller.role === "super_admin") {
@@ -11706,13 +13494,13 @@ function registerEmployeeRoutes(app, deps) {
 }
 
 // serverMasters.ts
-import { z as z5 } from "zod";
+import { z as z6 } from "zod";
 var MASTER_BULK_BATCH_SIZE = 400;
-var BulkMasterStatusSchema = z5.object({
-  resource: z5.enum(["shifts", "floors", "sections", "departments"]),
-  ids: z5.array(z5.string().trim().min(1).max(160)).min(1, "At least one record ID is required.").max(200, "Bulk master status update supports up to 200 records per request."),
-  status: z5.enum(["Active", "Inactive"]),
-  confirmed: z5.literal(true, {
+var BulkMasterStatusSchema = z6.object({
+  resource: z6.enum(["shifts", "floors", "sections", "departments"]),
+  ids: z6.array(z6.string().trim().min(1).max(160)).min(1, "At least one record ID is required.").max(200, "Bulk master status update supports up to 200 records per request."),
+  status: z6.enum(["Active", "Inactive"]),
+  confirmed: z6.literal(true, {
     message: "Explicit confirmation is required for bulk status updates."
   })
 });
@@ -11964,7 +13752,7 @@ function registerMasterRoutes(app, deps) {
 
 // serverCompanyWifi.ts
 import crypto6 from "crypto";
-import { z as z6 } from "zod";
+import { z as z7 } from "zod";
 
 // src/utils/companyWifiUtils.ts
 var COMPANY_WIFI_DENIED_MESSAGE = "Access Denied: Please connect to an authorized Company Wi-Fi network.";
@@ -12575,27 +14363,27 @@ async function enforceCompanyWifiAccess(db, req, caller, opts) {
     }
   };
 }
-var NetworkCreateSchema = z6.object({
-  networkName: z6.string().trim().min(2, "Company Wi-Fi name must be at least 2 characters.").max(80, "Company Wi-Fi name must be 80 characters or fewer."),
-  ipOrCidr: z6.string().trim().min(3, "Public IP address or CIDR range is required.").max(64),
-  status: z6.enum(["Active", "Inactive"]).default("Active")
+var NetworkCreateSchema = z7.object({
+  networkName: z7.string().trim().min(2, "Company Wi-Fi name must be at least 2 characters.").max(80, "Company Wi-Fi name must be 80 characters or fewer."),
+  ipOrCidr: z7.string().trim().min(3, "Public IP address or CIDR range is required.").max(64),
+  status: z7.enum(["Active", "Inactive"]).default("Active")
 });
-var NetworkUpdateSchema = z6.object({
-  networkName: z6.string().trim().min(2, "Company Wi-Fi name must be at least 2 characters.").max(80, "Company Wi-Fi name must be 80 characters or fewer.").optional(),
-  ipOrCidr: z6.string().trim().min(3).max(64).optional(),
-  status: z6.enum(["Active", "Inactive"]).optional()
+var NetworkUpdateSchema = z7.object({
+  networkName: z7.string().trim().min(2, "Company Wi-Fi name must be at least 2 characters.").max(80, "Company Wi-Fi name must be 80 characters or fewer.").optional(),
+  ipOrCidr: z7.string().trim().min(3).max(64).optional(),
+  status: z7.enum(["Active", "Inactive"]).optional()
 });
-var NetworkStatusSchema = z6.object({
-  status: z6.enum(["Active", "Inactive"])
+var NetworkStatusSchema = z7.object({
+  status: z7.enum(["Active", "Inactive"])
 });
-var RolePolicyUpdateSchema = z6.object({
-  accessMode: z6.enum(["RESTRICTED", "UNRESTRICTED"]),
-  allowedNetworkIds: z6.array(z6.string().trim().min(1).max(128)).max(200)
+var RolePolicyUpdateSchema = z7.object({
+  accessMode: z7.enum(["RESTRICTED", "UNRESTRICTED"]),
+  allowedNetworkIds: z7.array(z7.string().trim().min(1).max(128)).max(200)
 });
-var SettingsUpdateSchema = z6.object({
-  enforcementEnabled: z6.boolean(),
-  confirmEnable: z6.boolean().optional(),
-  trustedProxyHops: z6.number().int().min(0).max(5).optional()
+var SettingsUpdateSchema = z7.object({
+  enforcementEnabled: z7.boolean(),
+  confirmEnable: z7.boolean().optional(),
+  trustedProxyHops: z7.number().int().min(0).max(5).optional()
 });
 function registerCompanyWifiRoutes(app, deps) {
   const { db, requireVerifiedCaller } = deps;
@@ -13248,7 +15036,7 @@ function registerCompanyWifiRoutes(app, deps) {
 
 // serverDiagnostics.ts
 import crypto7 from "crypto";
-import { z as z7 } from "zod";
+import { z as z8 } from "zod";
 
 // src/utils/errorRegistry.ts
 var ERROR_CODE_REGISTRY = {
@@ -14056,8 +15844,8 @@ async function isAuthorizedForTechnicalLogs(db, caller) {
   }
   return false;
 }
-var ClientDiagnosticReportSchema = z7.object({
-  errorCode: z7.enum([
+var ClientDiagnosticReportSchema = z8.object({
+  errorCode: z8.enum([
     "NET-001",
     "NET-002",
     "DB-001",
@@ -14074,17 +15862,17 @@ var ClientDiagnosticReportSchema = z7.object({
     "VAL-001",
     "SYS-999"
   ]),
-  moduleName: z7.string().trim().min(1).max(80),
-  apiEndpoint: z7.string().trim().max(160).optional(),
-  httpStatus: z7.number().int().min(0).max(599).nullable().optional(),
-  requestId: z7.string().trim().max(64).nullable().optional(),
-  errorEventId: z7.string().trim().max(64).nullable().optional(),
-  technicalMessage: z7.string().trim().min(1).max(1200),
-  rootCauseConfidence: z7.enum(["CONFIRMED", "SUSPECTED", "UNKNOWN"]).optional(),
-  rootCauseDetails: z7.string().trim().max(600).optional(),
-  exceptionType: z7.string().trim().max(80).optional(),
-  browserDeviceInfo: z7.string().trim().max(220).optional(),
-  networkFailureClass: z7.enum([
+  moduleName: z8.string().trim().min(1).max(80),
+  apiEndpoint: z8.string().trim().max(160).optional(),
+  httpStatus: z8.number().int().min(0).max(599).nullable().optional(),
+  requestId: z8.string().trim().max(64).nullable().optional(),
+  errorEventId: z8.string().trim().max(64).nullable().optional(),
+  technicalMessage: z8.string().trim().min(1).max(1200),
+  rootCauseConfidence: z8.enum(["CONFIRMED", "SUSPECTED", "UNKNOWN"]).optional(),
+  rootCauseDetails: z8.string().trim().max(600).optional(),
+  exceptionType: z8.string().trim().max(80).optional(),
+  browserDeviceInfo: z8.string().trim().max(220).optional(),
+  networkFailureClass: z8.enum([
     "INTERNET_DISCONNECTED",
     "REQUEST_TIMEOUT",
     "DNS_OR_CONNECTION_FAILURE",
@@ -14094,7 +15882,7 @@ var ClientDiagnosticReportSchema = z7.object({
     "UNKNOWN_NETWORK_REQUEST_FAILURE",
     "NONE"
   ]).optional(),
-  dbFailureClass: z7.enum([
+  dbFailureClass: z8.enum([
     "FIRESTORE_UNAVAILABLE",
     "DATABASE_CONNECTION_FAILURE",
     "PERMISSION_DENIED",
@@ -14104,14 +15892,14 @@ var ClientDiagnosticReportSchema = z7.object({
     "TIMEOUT",
     "NONE"
   ]).optional(),
-  dbOperationCategory: z7.enum(["read", "write", "transaction", "connection"]).nullable().optional(),
-  failureStage: z7.enum(["BEFORE_BACKEND", "BACKEND_PROCESSING", "DATABASE", "CLIENT_RUNTIME"]).optional(),
-  retryCount: z7.number().int().min(0).max(20).optional(),
-  extraMetadata: z7.record(z7.string(), z7.unknown()).optional()
+  dbOperationCategory: z8.enum(["read", "write", "transaction", "connection"]).nullable().optional(),
+  failureStage: z8.enum(["BEFORE_BACKEND", "BACKEND_PROCESSING", "DATABASE", "CLIENT_RUNTIME"]).optional(),
+  retryCount: z8.number().int().min(0).max(20).optional(),
+  extraMetadata: z8.record(z8.string(), z8.unknown()).optional()
 });
-var ResolutionStatusUpdateSchema = z7.object({
-  resolutionStatus: z7.enum(["OPEN", "INVESTIGATING", "RESOLVED"]),
-  resolutionNotes: z7.string().trim().max(800).optional()
+var ResolutionStatusUpdateSchema = z8.object({
+  resolutionStatus: z8.enum(["OPEN", "INVESTIGATING", "RESOLVED"]),
+  resolutionNotes: z8.string().trim().max(800).optional()
 });
 function registerDiagnosticRoutes(app, deps) {
   const { db, requireVerifiedCaller } = deps;
@@ -14775,17 +16563,17 @@ async function syncExistingFirebaseAuthPassword(email, targetUid, newPassword, k
     return { success: false, error: err?.message || "Firebase Auth sync error." };
   }
 }
-var VerifySessionInputSchema = z8.object({
-  loginId: z8.string().trim().min(1).max(64).optional(),
-  userId: z8.string().trim().min(1).max(128).optional()
+var VerifySessionInputSchema = z9.object({
+  loginId: z9.string().trim().min(1).max(64).optional(),
+  userId: z9.string().trim().min(1).max(128).optional()
 });
-var AdminSetPasswordInputSchema = z8.object({
-  targetLoginId: z8.string().trim().min(1, "targetLoginId is required.").max(64),
-  newPassword: z8.string().min(6, "Password must be at least 6 characters.").max(128),
-  mustChangePassword: z8.boolean().optional(),
-  unlockAccount: z8.boolean().optional(),
-  revokeSessions: z8.boolean().optional(),
-  currentTargetPassword: z8.string().optional()
+var AdminSetPasswordInputSchema = z9.object({
+  targetLoginId: z9.string().trim().min(1, "targetLoginId is required.").max(64),
+  newPassword: z9.string().min(6, "Password must be at least 6 characters.").max(128),
+  mustChangePassword: z9.boolean().optional(),
+  unlockAccount: z9.boolean().optional(),
+  revokeSessions: z9.boolean().optional(),
+  currentTargetPassword: z9.string().optional()
 });
 var RESERVED_CUSTOM_ROLE_ALIASES = /* @__PURE__ */ new Set([
   "superadmin",
@@ -14794,66 +16582,66 @@ var RESERVED_CUSTOM_ROLE_ALIASES = /* @__PURE__ */ new Set([
   "system",
   "super_admin_root"
 ]);
-var DynamicRoleIdSchema = z8.string().trim().min(2, "Role ID must be at least 2 characters.").max(64, "Role ID must be 64 characters or fewer.").transform((val) => deriveStrictRoleId(val)).refine((val) => VALID_ROLE_ID_REGEX.test(val), {
+var DynamicRoleIdSchema = z9.string().trim().min(2, "Role ID must be at least 2 characters.").max(64, "Role ID must be 64 characters or fewer.").transform((val) => deriveStrictRoleId(val)).refine((val) => VALID_ROLE_ID_REGEX.test(val), {
   message: "Role ID must start with a letter and contain only lowercase letters, numbers, or underscores."
 });
-var RoleDefinitionInputSchema = z8.object({
-  roleId: z8.string().trim().max(64).optional(),
-  roleName: z8.string().trim().min(2, "Role name must be at least 2 characters.").max(48, "Role name must be 48 characters or fewer."),
-  description: z8.string().trim().min(3, "Role description must be at least 3 characters.").max(500, "Role description must be 500 characters or fewer."),
-  isActive: z8.boolean().default(true),
-  defaultPermissions: z8.record(
-    z8.string(),
-    z8.object({
-      view: z8.boolean().optional(),
-      add: z8.boolean().optional(),
-      edit: z8.boolean().optional(),
-      delete: z8.boolean().optional()
+var RoleDefinitionInputSchema = z9.object({
+  roleId: z9.string().trim().max(64).optional(),
+  roleName: z9.string().trim().min(2, "Role name must be at least 2 characters.").max(48, "Role name must be 48 characters or fewer."),
+  description: z9.string().trim().min(3, "Role description must be at least 3 characters.").max(500, "Role description must be 500 characters or fewer."),
+  isActive: z9.boolean().default(true),
+  defaultPermissions: z9.record(
+    z9.string(),
+    z9.object({
+      view: z9.boolean().optional(),
+      add: z9.boolean().optional(),
+      edit: z9.boolean().optional(),
+      delete: z9.boolean().optional()
     })
   ).optional()
 });
-var CreateUserInputSchema = z8.object({
-  callerLoginId: z8.string().trim().min(1).max(64).optional(),
-  loginId: z8.string().trim().min(2, "Login ID must be at least 2 characters.").max(64).regex(/^[a-zA-Z0-9_.-]+$/, "Login ID can only contain letters, numbers, hyphens, underscores, and dots."),
-  name: z8.string().trim().min(1, "Name is required.").max(128),
-  email: z8.string().trim().email("Valid email is required.").max(128),
+var CreateUserInputSchema = z9.object({
+  callerLoginId: z9.string().trim().min(1).max(64).optional(),
+  loginId: z9.string().trim().min(2, "Login ID must be at least 2 characters.").max(64).regex(/^[a-zA-Z0-9_.-]+$/, "Login ID can only contain letters, numbers, hyphens, underscores, and dots."),
+  name: z9.string().trim().min(1, "Name is required.").max(128),
+  email: z9.string().trim().email("Valid email is required.").max(128),
   role: DynamicRoleIdSchema,
-  password: z8.string().min(6, "Password must be at least 6 characters.").max(128),
-  modulesAllowed: z8.array(z8.string().max(64)).optional(),
-  status: z8.enum(["Active", "Inactive"]).default("Active"),
-  mustChangePassword: z8.boolean().optional()
+  password: z9.string().min(6, "Password must be at least 6 characters.").max(128),
+  modulesAllowed: z9.array(z9.string().max(64)).optional(),
+  status: z9.enum(["Active", "Inactive"]).default("Active"),
+  mustChangePassword: z9.boolean().optional()
 });
-var DeleteUserInputSchema = z8.object({
-  callerLoginId: z8.string().trim().min(1).max(64).optional(),
-  targetId: z8.string().trim().min(1).max(128).optional(),
-  targetLoginId: z8.string().trim().min(1).max(64).optional()
+var DeleteUserInputSchema = z9.object({
+  callerLoginId: z9.string().trim().min(1).max(64).optional(),
+  targetId: z9.string().trim().min(1).max(128).optional(),
+  targetLoginId: z9.string().trim().min(1).max(64).optional()
 });
-var SetUserPermissionsInputSchema = z8.object({
-  callerLoginId: z8.string().trim().min(1).max(64).optional(),
-  targetId: z8.string().trim().min(1).max(128),
+var SetUserPermissionsInputSchema = z9.object({
+  callerLoginId: z9.string().trim().min(1).max(64).optional(),
+  targetId: z9.string().trim().min(1).max(128),
   role: DynamicRoleIdSchema.optional(),
-  status: z8.enum(["Active", "Inactive"]).optional(),
-  modulesAllowed: z8.array(z8.string().max(64)).optional(),
-  permissions: z8.record(
-    z8.string(),
-    z8.object({
-      view: z8.boolean().optional(),
-      add: z8.boolean().optional(),
-      edit: z8.boolean().optional(),
-      delete: z8.boolean().optional()
+  status: z9.enum(["Active", "Inactive"]).optional(),
+  modulesAllowed: z9.array(z9.string().max(64)).optional(),
+  permissions: z9.record(
+    z9.string(),
+    z9.object({
+      view: z9.boolean().optional(),
+      add: z9.boolean().optional(),
+      edit: z9.boolean().optional(),
+      delete: z9.boolean().optional()
     })
   ).optional()
 });
-var RolePermissionsInputSchema = z8.object({
-  callerLoginId: z8.string().trim().min(1).max(64).optional(),
+var RolePermissionsInputSchema = z9.object({
+  callerLoginId: z9.string().trim().min(1).max(64).optional(),
   roleId: DynamicRoleIdSchema,
-  modulePermissions: z8.record(
-    z8.string(),
-    z8.object({
-      view: z8.boolean().optional(),
-      add: z8.boolean().optional(),
-      edit: z8.boolean().optional(),
-      delete: z8.boolean().optional()
+  modulePermissions: z9.record(
+    z9.string(),
+    z9.object({
+      view: z9.boolean().optional(),
+      add: z9.boolean().optional(),
+      edit: z9.boolean().optional(),
+      delete: z9.boolean().optional()
     })
   )
 });
@@ -15658,6 +17446,11 @@ function createApp(options = {}) {
   registerAttendanceRoutes(app, {
     db: adminDb,
     requireVerifiedCaller
+  });
+  registerAttendanceHistoryRoutes(app, {
+    db: adminDb,
+    requireVerifiedCaller,
+    nowProvider: getNowMs
   });
   registerEmployeeRoutes(app, {
     db: adminDb,
@@ -16666,10 +18459,10 @@ function createApp(options = {}) {
       return res.status(500).json({ success: false, error: err?.message || "Failed to update user permissions." });
     }
   });
-  const BulkUserStatusInputSchema = z8.object({
-    userIds: z8.array(z8.string().trim().min(1)).min(1, "Select at least one user account.").max(200),
-    status: z8.enum(["Active", "Inactive"]),
-    confirmed: z8.literal(true, {
+  const BulkUserStatusInputSchema = z9.object({
+    userIds: z9.array(z9.string().trim().min(1)).min(1, "Select at least one user account.").max(200),
+    status: z9.enum(["Active", "Inactive"]),
+    confirmed: z9.literal(true, {
       message: "Explicit confirmation is required for bulk user status updates."
     })
   });

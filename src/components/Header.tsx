@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Clock, Play, CheckCircle2, ScanLine, LogOut, Menu } from 'lucide-react';
+import { Clock, Play, CheckCircle2, ScanLine, Menu } from 'lucide-react';
 import { runAutoCloseShiftsEngine, getKolkataTimeParts } from '../services/attendanceService';
 import { isModuleAllowedForUser } from '../services/authService';
 import { getSafeErrorText } from '../services/errorHandlingService';
@@ -19,7 +19,6 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenScanner, 
   onRefreshData,
   currentUserRole,
-  onLogout,
   onToggleMobileNav
 }) => {
   const [currentTime, setCurrentTime] = useState<Date>(new Date());
@@ -186,27 +185,17 @@ export const Header: React.FC<HeaderProps> = ({
           </button>
         )}
 
-        {/* User Profile & Logout */}
+        {/* User Profile */}
         {currentUserRole && (
-          <div className="flex items-center gap-2 border-l border-slate-200 pl-3">
-            <div className="hidden sm:flex flex-col items-end text-right">
-              <span className="text-xs font-bold text-slate-800 leading-tight truncate max-w-[130px]">
+          <div className="flex items-center border-l border-slate-200 pl-3">
+            <div className="flex flex-col items-end text-right max-w-[180px] sm:max-w-[220px]">
+              <span className="text-xs font-bold text-slate-800 leading-snug whitespace-normal break-words">
                 {typeof currentUserRole.name === 'string' ? currentUserRole.name : (currentUserRole.name as any)?.name || currentUserRole.loginId}
               </span>
-              <span className="text-[10px] font-mono font-bold text-blue-600 uppercase tracking-wider">
+              <span className="text-[10px] font-mono font-bold text-blue-600 uppercase tracking-wider mt-0.5 whitespace-normal break-words">
                 {String(currentUserRole.role || 'USER').replace('_', ' ').toUpperCase()}
               </span>
             </div>
-            {onLogout && (
-              <button
-                onClick={onLogout}
-                title="Sign Out of Narid ATDC Tracker"
-                className="p-1.5 rounded-lg text-slate-500 hover:text-red-600 hover:bg-red-50 border border-slate-200 transition flex items-center gap-1 text-xs font-medium"
-              >
-                <LogOut className="w-3.5 h-3.5" />
-                <span className="hidden md:inline">Sign Out</span>
-              </button>
-            )}
           </div>
         )}
       </div>

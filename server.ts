@@ -40,6 +40,7 @@ import {
   formatLockoutDurationText,
 } from './serverLoginSecurity.ts';
 import { registerAttendanceRoutes } from './serverAttendance.ts';
+import { registerAttendanceHistoryRoutes } from './serverAttendanceHistory.ts';
 import { registerEmployeeRoutes } from './serverEmployees.ts';
 import { registerMasterRoutes } from './serverMasters.ts';
 import {
@@ -1284,6 +1285,12 @@ export function createApp(options: ServerAppOptions = {}) {
   registerAttendanceRoutes(app, {
     db: adminDb,
     requireVerifiedCaller,
+  });
+
+  registerAttendanceHistoryRoutes(app, {
+    db: adminDb,
+    requireVerifiedCaller,
+    nowProvider: getNowMs,
   });
 
   registerEmployeeRoutes(app, {

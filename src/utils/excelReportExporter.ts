@@ -105,7 +105,7 @@ function getStatusStyle(statusRaw: unknown): { fill: string; font: string } | nu
   if (status === 'AUTO CLOSED' || status === 'MISSED PUNCH OUT') {
     return { fill: 'FFEDD5', font: '9A3412' }; // Soft Orange
   }
-  if (status === 'COMPLETED' || status === 'COMPLETED + OT') {
+  if (status === 'COMPLETED' || status === 'COMPLETED + OT' || status === 'PRESENT') {
     return { fill: 'DCFCE7', font: '166534' }; // Soft Green
   }
   if (status === 'HALF DAY') {
@@ -114,8 +114,17 @@ function getStatusStyle(statusRaw: unknown): { fill: string; font: string } | nu
   if (status === 'SHORT LEAVE' || status === 'ABSENT' || status.startsWith('ABSENT')) {
     return { fill: 'FEE2E2', font: '991B1B' }; // Soft Light Red
   }
-  if (status === 'IN PROGRESS') {
+  if (status === 'IN PROGRESS' || status === 'HOLIDAY') {
     return { fill: 'DBEAFE', font: '1E40AF' }; // Soft Blue
+  }
+  if (status === 'APPROVED LEAVE' || status === 'LEAVE' || status === 'ON LEAVE') {
+    return { fill: 'F3E8FF', font: '6B21A8' }; // Soft Purple
+  }
+  if (status === 'WEEKLY OFF' || status === 'WEEKLY_OFF' || status === 'FUTURE DATE' || status === 'NOT EMPLOYED') {
+    return { fill: 'F1F5F9', font: '475569' }; // Neutral Slate
+  }
+  if (status === 'UNKNOWN') {
+    return { fill: 'E2E8F0', font: '334155' };
   }
   return null;
 }
